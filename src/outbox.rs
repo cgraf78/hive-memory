@@ -21,6 +21,9 @@ use time::OffsetDateTime;
 /// Outbox metadata schema supported by this build.
 pub const OUTBOX_SCHEMA_VERSION: u32 = 1;
 
+/// Last-seen store identity cache schema supported by this build.
+pub const STORE_IDENTITIES_SCHEMA_VERSION: u32 = 1;
+
 /// Serialized state of one outbox item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -122,6 +125,24 @@ pub struct EnqueueReport {
     pub meta_path: PathBuf,
 }
 
+/// Last-seen identity cache stored under `data_dir/store-identities.toml`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreIdentityCache {
+    /// Cache schema version.
+    pub schema_version: u32,
+    /// Cached store identities keyed by local alias.
+    pub stores: BTreeMap<String, CachedStoreIdentity>,
+}
+
+/// One cached store identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedStoreIdentity {
+    /// Stable manifest id last observed for this alias.
+    pub store_id: String,
+    /// RFC3339 timestamp when this identity was observed.
+    pub seen_at: String,
+}
+
 /// Summary of one flush run.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct FlushReport {
@@ -181,6 +202,10 @@ pub enum OutboxError {
     },
     /// Metadata TOML could not be rendered.
     RenderMeta(String),
+    /// Store identity cache TOML was malformed.
+    ParseIdentityCache(String),
+    /// Store identity cache TOML could not be rendered.
+    RenderIdentityCache(String),
     /// Metadata schema is unsupported.
     UnsupportedSchema {
         /// Metadata path with the unsupported schema.
@@ -206,6 +231,12 @@ impl Display for OutboxError {
                 )
             }
             Self::RenderMeta(message) => write!(f, "failed to render outbox metadata: {message}"),
+            Self::ParseIdentityCache(message) => {
+                write!(f, "failed to parse store identity cache: {message}")
+            }
+            Self::RenderIdentityCache(message) => {
+                write!(f, "failed to render store identity cache: {message}")
+            }
             Self::UnsupportedSchema { path, version } => write!(
                 f,
                 "unsupported outbox schema_version {version} in {}",
@@ -216,6 +247,79 @@ impl Display for OutboxError {
 }
 
 impl Error for OutboxError {}
+
+/// Return the local last-seen store identity cache path.
+pub fn store_identities_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("store-identities.toml")
+}
+
+/// Record a successfully observed manifest identity for a configured alias.
+///
+/// The cache is advisory policy input for future offline writes, not canonical
+/// memory. Flush still verifies the target manifest id before publishing any
+/// queued payload, so a stale cache can at worst create a pending item that will
+/// later refuse to flush.
+pub fn record_store_identity(
+    data_dir: &Path,
+    store_name: &str,
+    store_id: &str,
+    options: &write::AtomicWriteOptions,
+) -> Result<PathBuf, OutboxError> {
+    let path = store_identities_path(data_dir);
+    let mut cache = load_store_identity_cache(data_dir)?;
+    cache.schema_version = STORE_IDENTITIES_SCHEMA_VERSION;
+    cache.stores.insert(
+        store_name.to_owned(),
+        CachedStoreIdentity {
+            store_id: store_id.to_owned(),
+            seen_at: OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("RFC3339 formatting should not fail"),
+        },
+    );
+    let contents = toml::to_string_pretty(&cache)
+        .map_err(|err| OutboxError::RenderIdentityCache(err.to_string()))?;
+    write::write_atomic(&path, contents.as_bytes(), options).map_err(|err| OutboxError::Io {
+        action: "write store identity cache",
+        path: path.clone(),
+        message: err.to_string(),
+    })?;
+    Ok(path)
+}
+
+/// Return the cached manifest id for a store alias, when known.
+pub fn cached_store_identity(
+    data_dir: &Path,
+    store_name: &str,
+) -> Result<Option<String>, OutboxError> {
+    Ok(load_store_identity_cache(data_dir)?
+        .stores
+        .get(store_name)
+        .map(|entry| entry.store_id.clone()))
+}
+
+fn load_store_identity_cache(data_dir: &Path) -> Result<StoreIdentityCache, OutboxError> {
+    let path = store_identities_path(data_dir);
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(StoreIdentityCache {
+                schema_version: STORE_IDENTITIES_SCHEMA_VERSION,
+                stores: BTreeMap::new(),
+            });
+        }
+        Err(err) => return Err(io_error("read store identity cache", &path, err)),
+    };
+    let cache = toml::from_str::<StoreIdentityCache>(&contents)
+        .map_err(|err| OutboxError::ParseIdentityCache(err.to_string()))?;
+    if cache.schema_version != STORE_IDENTITIES_SCHEMA_VERSION {
+        return Err(OutboxError::UnsupportedSchema {
+            path,
+            version: cache.schema_version,
+        });
+    }
+    Ok(cache)
+}
 
 /// Enqueue one fully rendered memory payload under `data_dir/outbox`.
 ///

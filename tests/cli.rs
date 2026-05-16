@@ -739,6 +739,71 @@ fn remember_enqueues_outbox_when_store_unavailable_with_expected_id() {
 }
 
 #[test]
+fn remember_uses_cached_store_identity_for_offline_outbox() {
+    let dir = temp_dir("remember-outbox-cache");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+            "#,
+            data.display(),
+            personal.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+    let manifest = store::read_manifest(&personal).expect("read manifest");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Online write records the store identity.",
+        ])
+        .assert()
+        .success();
+    assert!(data.join("store-identities.toml").is_file());
+    fs::rename(&personal, dir.join("personal-offline")).expect("move store offline");
+
+    let output = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Cached identity should enqueue.",
+            "--json",
+        ])
+        .output()
+        .expect("offline remember");
+    assert!(
+        output.status.success(),
+        "offline remember failed: {output:?}"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("remember json");
+    let id = json["id"].as_str().expect("id");
+    assert_eq!(json["store_id"], manifest.store.id);
+
+    let meta: outbox::OutboxMeta = toml::from_str(
+        &fs::read_to_string(data.join("outbox/personal").join(id).join("meta.toml"))
+            .expect("read meta"),
+    )
+    .expect("parse meta");
+    assert_eq!(meta.expected_store_id, Some(manifest.store.id));
+    assert_eq!(meta.state, outbox::OutboxState::Pending);
+}
+
+#[test]
 fn remember_refuses_likely_secret_without_echoing_value() {
     let dir = temp_dir("remember-secret-refusal");
     let config = dir.join("config.toml");

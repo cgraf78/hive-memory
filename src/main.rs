@@ -830,7 +830,7 @@ fn run_promote(args: PromoteArgs, context: CliContext) -> Result<()> {
         StoreAccess::Read,
     )?;
     let store_config = &config.stores[resolved_store.name.as_str()];
-    let manifest = store::read_manifest(&store_config.root)?;
+    let manifest = read_store_manifest(&config, &resolved_store.name, store_config)?;
     let report = rebuild_store_index(&config, &resolved_store.name)?;
     let verbatim = if args.as_bullet { false } else { args.verbatim };
     let promotion = curation::promote(curation::PromotionInput {
@@ -926,6 +926,42 @@ fn load_config(config_path: Option<&std::path::Path>) -> Result<Config> {
         eprintln!("warning: {warning}");
     }
     Ok(loaded.config)
+}
+
+/// Read a store manifest and remember the observed identity for offline writes.
+///
+/// The cache is only a future enqueue hint. It never weakens flush safety:
+/// pending outbox items still carry the expected manifest id and `hm flush`
+/// refuses to publish when the reachable store has a different id.
+fn read_store_manifest(
+    config: &Config,
+    store_name: &str,
+    store_config: &StoreConfig,
+) -> Result<store::StoreManifest, store::StoreError> {
+    let manifest = store::read_manifest(&store_config.root)?;
+    if let Err(err) = outbox::record_store_identity(
+        &config.data_dir,
+        store_name,
+        &manifest.store.id,
+        &hook_options(config),
+    ) {
+        eprintln!("warning: failed to record store identity cache: {err}");
+    }
+    Ok(manifest)
+}
+
+fn known_store_identity(
+    config: &Config,
+    store_name: &str,
+    store_config: &StoreConfig,
+) -> Result<Option<String>> {
+    // Configured `expected_id` is stronger than the observational cache because
+    // it is a user-declared alias binding. The cache only helps a previously
+    // seen store keep accepting offline writes when its root is unavailable.
+    if let Some(expected_id) = &store_config.expected_id {
+        return Ok(Some(expected_id.clone()));
+    }
+    Ok(outbox::cached_store_identity(&config.data_dir, store_name)?)
 }
 
 /// Resolve project identity only when the caller supplied project context.
@@ -1031,12 +1067,18 @@ fn run_write_memory(
         write_event: should_write_event,
         options,
     };
-    let outcome = match store::read_manifest(&store_config.root) {
+    // Canonical writes stay the first choice. The outbox is used only when the
+    // selected store is temporarily unreachable and policy explicitly permits a
+    // local durable fallback; policy or manifest errors must not be hidden as
+    // offline work.
+    let outcome = match read_store_manifest(&config, &resolved_store.name, store_config) {
         Ok(manifest) => write_canonical_memory(&store_config.root, &manifest, write_input)?,
         Err(store::StoreError::Io { .. }) => {
-            let Some(expected_store_id) = store_config.expected_id.clone() else {
+            let Some(expected_store_id) =
+                known_store_identity(&config, &resolved_store.name, store_config)?
+            else {
                 anyhow::bail!(
-                    "store {} is unavailable and has no expected_id for outbox fallback",
+                    "store {} is unavailable and has no known identity for outbox fallback",
                     resolved_store.name
                 );
             };
@@ -1274,7 +1316,7 @@ fn run_search(args: SearchArgs, context: CliContext) -> Result<()> {
         StoreAccess::Read,
     )?;
     let store_config = &config.stores[resolved_store.name.as_str()];
-    let manifest = store::read_manifest(&store_config.root)?;
+    let manifest = read_store_manifest(&config, &resolved_store.name, store_config)?;
     let report = rebuild_store_index(&config, &resolved_store.name)?;
 
     let scopes = if args.scope.is_empty() {
