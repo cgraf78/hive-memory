@@ -1188,6 +1188,93 @@ fn hook_stop_reminds_when_memory_pending_remains() {
 }
 
 #[test]
+fn hook_prompt_submit_emits_context_only_when_selection_changes() {
+    let dir = temp_dir("hook-context-change");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let state = dir.join("state");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            state_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+            "#,
+            state.display(),
+            personal.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    let mut start = cargo_bin_cmd!("hm");
+    start
+        .env("HIVE_MEMORY_SESSION_ID", "session-context")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "session-start",
+            "--project",
+            "/repo-a/src/main.rs",
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    let mut same = cargo_bin_cmd!("hm");
+    let same_output = same
+        .env("HIVE_MEMORY_SESSION_ID", "session-context")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "prompt-submit",
+            "--project",
+            "/repo-a/src/main.rs",
+            "--text",
+            "Please inspect the tests.",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let same_stdout = String::from_utf8(same_output).expect("utf8 stdout");
+    assert!(same_stdout.contains("\"context_emitted\": false"));
+    assert!(!same_stdout.contains("\"kind\": \"inject_context\""));
+
+    let mut changed = cargo_bin_cmd!("hm");
+    changed
+        .env("HIVE_MEMORY_SESSION_ID", "session-context")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "prompt-submit",
+            "--project",
+            "/repo-b/src/main.rs",
+            "--text",
+            "Please inspect the tests.",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"context_emitted\": true"))
+        .stdout(predicate::str::contains("\"kind\": \"inject_context\""));
+}
+
+#[test]
 fn hook_tool_complete_clears_pending_after_session_write() {
     let dir = temp_dir("hook-tool-complete");
     let config = dir.join("config.toml");

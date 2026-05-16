@@ -33,6 +33,9 @@ pub struct HookState {
     /// Number of write receipts consumed by refresh/tool-complete.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub refreshed_receipts: usize,
+    /// Last context selection emitted to the agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_key: Option<String>,
 }
 
 /// Ephemeral receipt for a successful session memory write.
@@ -176,6 +179,20 @@ pub fn mark_receipts_refreshed(
         state.memory_pending = false;
         state.pending_reason = None;
     }
+    state.updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
+    save_state(state_dir, session_id, &state, options)?;
+    Ok(state)
+}
+
+/// Record the context selection emitted to a session.
+pub fn mark_context_key(
+    state_dir: &Path,
+    session_id: &str,
+    context_key: impl Into<String>,
+    options: &write::AtomicWriteOptions,
+) -> Result<HookState, HookStateError> {
+    let mut state = load_state(state_dir, session_id)?;
+    state.context_key = Some(context_key.into());
     state.updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
     save_state(state_dir, session_id, &state, options)?;
     Ok(state)
@@ -353,6 +370,7 @@ mod tests {
         assert!(loaded.memory_pending);
         assert_eq!(loaded.pending_reason, None);
         assert_eq!(loaded.refreshed_receipts, 0);
+        assert_eq!(loaded.context_key, None);
     }
 
     #[test]
@@ -383,6 +401,21 @@ mod tests {
 
         assert!(!state.memory_pending);
         assert_eq!(state.refreshed_receipts, 2);
+    }
+
+    #[test]
+    fn context_key_round_trips_without_clearing_pending() {
+        let dir = temp_dir("context-key");
+        mark_memory_pending(&dir, "session-1", "intent", &options()).expect("mark pending");
+
+        let state = mark_context_key(&dir, "session-1", "agent=codex|store=personal", &options())
+            .expect("mark context key");
+
+        assert!(state.memory_pending);
+        assert_eq!(
+            state.context_key.as_deref(),
+            Some("agent=codex|store=personal")
+        );
     }
 
     #[test]

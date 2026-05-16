@@ -816,6 +816,10 @@ fn run_hook_session_start(args: HookContextArgs, mut context: CliContext) -> Res
     if context.as_agent.is_none() {
         context.as_agent = std::env::var("HIVE_MEMORY_AGENT_ID").ok();
     }
+    let mut warnings = Vec::new();
+    let path_hint = args
+        .project
+        .or_else(|| std::env::var("HIVE_MEMORY_PROJECT").ok());
     let output = assemble_cli_context(
         &config,
         &context,
@@ -825,16 +829,22 @@ fn run_hook_session_start(args: HookContextArgs, mut context: CliContext) -> Res
             scopes: Vec::new(),
             sources: Vec::new(),
             project_id: std::env::var("HIVE_MEMORY_PROJECT_ID").ok(),
-            path_hint: args
-                .project
-                .or_else(|| std::env::var("HIVE_MEMORY_PROJECT").ok()),
+            path_hint: path_hint.clone(),
         },
     )?;
+    if let Some(session_id) = hook_session_id(&mut warnings) {
+        memory_hook::mark_context_key(
+            &config.state_dir,
+            &session_id,
+            hook_context_key(&config, &context, path_hint.as_deref())?,
+            &hook_options(&config),
+        )?;
+    }
 
     let response = HookResponse {
         event: "session-start",
         actions: vec![HookAction::new("inject_context", output.markdown)],
-        warnings: Vec::new(),
+        warnings,
         memory_pending: false,
         context_emitted: true,
         refresh: None,
@@ -855,36 +865,43 @@ fn run_hook_prompt_submit(args: HookPromptSubmitArgs, context: CliContext) -> Re
     let mut warnings = Vec::new();
     let mut actions = Vec::new();
     let mut memory_pending = false;
+    let session_id = hook_session_id(&mut warnings);
 
     // Resolve the same read policy used by context-rendering hooks. The current
     // slice does not yet emit context-on-selection-change, but resolving now
     // makes privacy/store errors surface in `hm` instead of later shell glue.
-    let agent_id = resolve_agent_id(context.as_agent);
+    let agent_id = resolve_agent_id(context.as_agent.clone());
     resolve_store(
         &config,
         context.store.as_deref(),
         agent_id.as_deref(),
         StoreAccess::Read,
     )?;
-    let _path_hint = args
+    let path_hint = args
         .project
         .or_else(|| std::env::var("HIVE_MEMORY_PROJECT").ok());
+    let mut context_emitted = false;
+    if let Some(action) = hook_context_action_if_changed(
+        &config,
+        &context,
+        path_hint.as_deref(),
+        session_id.as_deref(),
+    )? {
+        context_emitted = true;
+        actions.push(action);
+    }
 
     if memory_hook::prompt_has_memory_intent(&args.text) {
         let reminder = memory_intent_reminder();
         actions.push(HookAction::new("remind", reminder));
         memory_pending = true;
 
-        if let Some(session_id) = hook_session_id(&mut warnings) {
-            let options = write::AtomicWriteOptions {
-                fsync: config.storage.fsync.into(),
-                ..write::AtomicWriteOptions::default()
-            };
+        if let Some(session_id) = session_id.as_deref() {
             memory_hook::mark_memory_pending(
                 &config.state_dir,
-                &session_id,
+                session_id,
                 "prompt contained explicit durable-memory intent",
-                &options,
+                &hook_options(&config),
             )?;
         }
     }
@@ -894,7 +911,7 @@ fn run_hook_prompt_submit(args: HookPromptSubmitArgs, context: CliContext) -> Re
         actions,
         warnings,
         memory_pending,
-        context_emitted: false,
+        context_emitted,
         refresh: None,
     };
     emit_hook_response(&response, args.json)?;
@@ -910,6 +927,7 @@ fn run_hook_prompt_submit(args: HookPromptSubmitArgs, context: CliContext) -> Re
 fn run_hook_tool_complete(args: HookToolCompleteArgs, context: CliContext) -> Result<()> {
     let config = load_config(context.config_path.as_deref())?;
     let mut warnings = Vec::new();
+    let mut actions = Vec::new();
     let mut refresh = None;
 
     let agent_id = resolve_agent_id(context.as_agent.clone());
@@ -919,7 +937,7 @@ fn run_hook_tool_complete(args: HookToolCompleteArgs, context: CliContext) -> Re
         agent_id.as_deref(),
         StoreAccess::Read,
     )?;
-    let _path_hint = args
+    let path_hint = args
         .project
         .or_else(|| std::env::var("HIVE_MEMORY_PROJECT").ok());
 
@@ -929,6 +947,16 @@ fn run_hook_tool_complete(args: HookToolCompleteArgs, context: CliContext) -> Re
     } else {
         false
     };
+    let mut context_emitted = false;
+    if let Some(action) = hook_context_action_if_changed(
+        &config,
+        &context,
+        path_hint.as_deref(),
+        session_id.as_deref(),
+    )? {
+        context_emitted = true;
+        actions.push(action);
+    }
 
     if args.status == 0
         && let Some(session_id) = session_id.as_deref()
@@ -942,16 +970,12 @@ fn run_hook_tool_complete(args: HookToolCompleteArgs, context: CliContext) -> Re
             report.write_receipts = unrefreshed_receipts;
             refresh = Some(report);
 
-            let options = write::AtomicWriteOptions {
-                fsync: config.storage.fsync.into(),
-                ..write::AtomicWriteOptions::default()
-            };
             state = memory_hook::mark_receipts_refreshed(
                 &config.state_dir,
                 session_id,
                 receipts.len(),
                 true,
-                &options,
+                &hook_options(&config),
             )?;
         }
 
@@ -960,10 +984,10 @@ fn run_hook_tool_complete(args: HookToolCompleteArgs, context: CliContext) -> Re
 
     let response = HookResponse {
         event: "tool-complete",
-        actions: Vec::new(),
+        actions,
         warnings,
         memory_pending,
-        context_emitted: false,
+        context_emitted,
         refresh,
     };
     emit_hook_response(&response, args.json)?;
@@ -1075,6 +1099,75 @@ fn hook_session_id(warnings: &mut Vec<String>) -> Option<String> {
             );
             None
         }
+    }
+}
+
+fn hook_context_action_if_changed(
+    config: &Config,
+    context: &CliContext,
+    path_hint: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<Option<HookAction>> {
+    let Some(session_id) = session_id else {
+        return Ok(None);
+    };
+
+    let context_key = hook_context_key(config, context, path_hint)?;
+    let state = memory_hook::load_state(&config.state_dir, session_id)?;
+    if state.context_key.as_deref() == Some(context_key.as_str()) {
+        return Ok(None);
+    }
+
+    let output = assemble_cli_context(
+        config,
+        context,
+        ContextSelection {
+            max_tokens: Some(usize::try_from(config.defaults.hook_context_max_tokens)?),
+            include_inbox: false,
+            scopes: Vec::new(),
+            sources: Vec::new(),
+            project_id: std::env::var("HIVE_MEMORY_PROJECT_ID").ok(),
+            path_hint: path_hint.map(str::to_owned),
+        },
+    )?;
+    memory_hook::mark_context_key(
+        &config.state_dir,
+        session_id,
+        context_key,
+        &hook_options(config),
+    )?;
+
+    Ok(Some(HookAction::new("inject_context", output.markdown)))
+}
+
+fn hook_context_key(
+    config: &Config,
+    context: &CliContext,
+    path_hint: Option<&str>,
+) -> Result<String> {
+    let agent_id =
+        resolve_agent_id(context.as_agent.clone()).unwrap_or_else(|| "unknown".to_owned());
+    let resolved_store = resolve_store(
+        config,
+        context.store.as_deref(),
+        Some(agent_id.as_str()),
+        StoreAccess::Read,
+    )?;
+    let project_id = std::env::var("HIVE_MEMORY_PROJECT_ID").unwrap_or_default();
+
+    Ok(format!(
+        "agent={agent_id}\nstore={}\nproject_id={project_id}\npath={}\nscopes={}\nsources={}",
+        resolved_store.name,
+        path_hint.unwrap_or_default(),
+        config.defaults.search_scopes.join(","),
+        config.defaults.context_sources.join(",")
+    ))
+}
+
+fn hook_options(config: &Config) -> write::AtomicWriteOptions {
+    write::AtomicWriteOptions {
+        fsync: config.storage.fsync.into(),
+        ..write::AtomicWriteOptions::default()
     }
 }
 
