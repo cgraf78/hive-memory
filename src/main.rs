@@ -8,6 +8,7 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use hive_memory::config::{AdapterConfig, Config, ConfigPaths, EventSidecarPolicy, Sensitivity};
 use hive_memory::{context as memory_context, index, memory, note, render, search, store, write};
+use serde::Serialize;
 use std::path::PathBuf;
 use std::str::FromStr;
 use time::OffsetDateTime;
@@ -70,6 +71,9 @@ enum Command {
     Render(RenderArgs),
     /// Refresh indexes and configured adapter outputs.
     Refresh(RefreshArgs),
+    /// Run agent lifecycle hook policy.
+    #[command(subcommand)]
+    Hook(HookCommand),
 }
 
 /// Store lifecycle commands.
@@ -253,6 +257,24 @@ struct RefreshArgs {
     force: bool,
 }
 
+/// Agent lifecycle hook events.
+#[derive(Debug, Subcommand)]
+enum HookCommand {
+    /// Emit initial memory context for a new agent session.
+    SessionStart(HookContextArgs),
+}
+
+/// Shared hook context-selection arguments.
+#[derive(Debug, Args)]
+struct HookContextArgs {
+    /// Active project path or file hint.
+    #[arg(long)]
+    project: Option<String>,
+    /// Emit machine-readable hook actions.
+    #[arg(long)]
+    json: bool,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let context = CliContext {
@@ -268,6 +290,7 @@ fn main() -> Result<()> {
         Some(Command::Context(args)) => run_context(args, context),
         Some(Command::Render(args)) => run_render(args, context),
         Some(Command::Refresh(args)) => run_refresh(args, context),
+        Some(Command::Hook(command)) => run_hook(command, context),
         None => Ok(()),
     }
 }
@@ -465,36 +488,83 @@ fn run_search(args: SearchArgs, context: CliContext) -> Result<()> {
 
 fn run_context(args: ContextArgs, context: CliContext) -> Result<()> {
     let config = load_config(context.config_path.as_deref())?;
-    let agent_id = resolve_agent_id(context.as_agent);
-    let resolved_store = resolve_store(
+    let output = assemble_cli_context(
         &config,
+        &context,
+        ContextSelection {
+            max_tokens: args.max_tokens,
+            include_inbox: args.include_inbox,
+            scopes: args.scope,
+            sources: args.source,
+            project_id: args.project_id,
+            path_hint: args.path,
+        },
+    )?;
+
+    print!("{}", output.markdown);
+    Ok(())
+}
+
+struct ContextSelection {
+    /// Explicit token budget. Missing means command-mode or hook-mode defaults.
+    max_tokens: Option<usize>,
+    /// Explicitly opt into lower-confidence raw inbox notes.
+    include_inbox: bool,
+    /// Scope filter from CLI/hook policy. Empty defers to config defaults.
+    scopes: Vec<String>,
+    /// Source filter from CLI/hook policy. Empty defers to config defaults.
+    sources: Vec<String>,
+    /// Project identity override. Missing can still resolve from env.
+    project_id: Option<String>,
+    /// Human path/project hint to render in the context header.
+    path_hint: Option<String>,
+}
+
+/// Assemble context for CLI commands and hook entry points.
+///
+/// This is intentionally the single in-binary adapter over the library context
+/// API. Command parsing, env fallback, store affinity, and cache rebuilding are
+/// CLI concerns; once those are resolved, hooks and `hm context` should feed the
+/// same `ContextInput` shape so privacy/source/scope behavior cannot drift.
+fn assemble_cli_context(
+    config: &Config,
+    context: &CliContext,
+    selection: ContextSelection,
+) -> Result<memory_context::ContextOutput> {
+    let agent_id = resolve_agent_id(context.as_agent.clone());
+    let resolved_store = resolve_store(
+        config,
         context.store.as_deref(),
         agent_id.as_deref(),
         StoreAccess::Read,
     )?;
     let store_config = &config.stores[resolved_store.name.as_str()];
-    let report = rebuild_store_index(&config, &resolved_store.name)?;
-    let scopes = if args.scope.is_empty() {
+    let report = rebuild_store_index(config, &resolved_store.name)?;
+    let scopes = if selection.scopes.is_empty() {
         config.defaults.search_scopes.clone()
     } else {
-        args.scope
+        selection.scopes
     };
-    let sources = if args.source.is_empty() {
+    let sources = if selection.sources.is_empty() {
         config.defaults.context_sources.clone()
     } else {
-        args.source
+        selection.sources
     };
-    let include_inbox = args.include_inbox
+    let include_inbox = selection.include_inbox
         || sources
             .iter()
             .any(|source| source == "inbox" || source == "all");
-    let project_id = args
+    let project_id = selection
         .project_id
         .or_else(|| std::env::var("HIVE_MEMORY_PROJECT_ID").ok());
-    let path_hint = args
-        .path
+    let path_hint = selection
+        .path_hint
         .or_else(|| std::env::var("HIVE_MEMORY_PROJECT").ok());
-    let max_tokens = args.max_tokens.unwrap_or_else(|| {
+    let max_tokens = selection.max_tokens.unwrap_or_else(|| {
+        // Hooks run on latency-sensitive agent boundaries, so they use the
+        // configured hook budget unless the caller has explicitly provided a
+        // tighter or broader limit. Interactive `hm context` keeps the larger
+        // v1 default for inspection and manual debugging.
         if std::env::var("HIVE_MEMORY_HOOK_ACTIVE").ok().as_deref() == Some("1") {
             usize::try_from(config.defaults.hook_context_max_tokens)
                 .expect("hook context token budget fits usize")
@@ -503,7 +573,7 @@ fn run_context(args: ContextArgs, context: CliContext) -> Result<()> {
         }
     });
 
-    let output = memory_context::assemble_context(memory_context::ContextInput {
+    memory_context::assemble_context(memory_context::ContextInput {
         store_name: resolved_store.name.as_str(),
         store_root: &store_config.root,
         entries: &report.entries,
@@ -514,10 +584,8 @@ fn run_context(args: ContextArgs, context: CliContext) -> Result<()> {
         project_id: project_id.as_deref(),
         path_hint: path_hint.as_deref(),
         max_tokens,
-    })?;
-
-    print!("{}", output.markdown);
-    Ok(())
+    })
+    .map_err(Into::into)
 }
 
 fn rebuild_store_index(config: &Config, store_name: &str) -> Result<index::RebuildIndexReport> {
@@ -662,6 +730,81 @@ fn run_refresh(args: RefreshArgs, context: CliContext) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn run_hook(command: HookCommand, context: CliContext) -> Result<()> {
+    match command {
+        HookCommand::SessionStart(args) => run_hook_session_start(args, context),
+    }
+}
+
+/// Emit startup memory context for agent hooks.
+///
+/// The hook interface is deliberately policy-light for callers: dotfiles hooks
+/// pass the project hint they already know, and `hm` resolves agent identity,
+/// store affinity, source defaults, and context budgeting from config/env.
+fn run_hook_session_start(args: HookContextArgs, mut context: CliContext) -> Result<()> {
+    let config = load_config(context.config_path.as_deref())?;
+    if context.as_agent.is_none() {
+        context.as_agent = std::env::var("HIVE_MEMORY_AGENT_ID").ok();
+    }
+    let output = assemble_cli_context(
+        &config,
+        &context,
+        ContextSelection {
+            max_tokens: Some(usize::try_from(config.defaults.hook_context_max_tokens)?),
+            include_inbox: false,
+            scopes: Vec::new(),
+            sources: Vec::new(),
+            project_id: std::env::var("HIVE_MEMORY_PROJECT_ID").ok(),
+            path_hint: args
+                .project
+                .or_else(|| std::env::var("HIVE_MEMORY_PROJECT").ok()),
+        },
+    )?;
+
+    if args.json {
+        let response = HookResponse {
+            event: "session-start",
+            actions: vec![HookAction {
+                kind: "inject_context",
+                body: output.markdown,
+            }],
+            warnings: Vec::new(),
+            memory_pending: false,
+            context_emitted: true,
+            refresh: None,
+        };
+        println!("{}", serde_json::to_string_pretty(&response)?);
+    } else {
+        print!("{}", output.markdown);
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct HookResponse {
+    /// Hook event name so shell adapters can log or branch without inspecting args.
+    event: &'static str,
+    /// Ordered actions the hook runner should apply.
+    actions: Vec<HookAction>,
+    /// Non-fatal diagnostics that should be visible without failing the hook.
+    warnings: Vec<String>,
+    /// Whether the agent should be reminded that durable memory writes are pending.
+    memory_pending: bool,
+    /// Whether this response carries fresh context for prompt injection.
+    context_emitted: bool,
+    /// Future refresh status once receipt-aware refresh is implemented.
+    refresh: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct HookAction {
+    /// Small action discriminator understood by dotfiles hook adapters.
+    kind: &'static str,
+    /// Markdown/data payload for this action.
+    body: String,
 }
 
 #[derive(Debug, Default)]

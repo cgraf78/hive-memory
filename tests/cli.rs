@@ -1017,3 +1017,70 @@ fn refresh_honors_no_render_env() {
 
     assert!(!output.exists());
 }
+
+#[test]
+fn hook_session_start_emits_context_action_json() {
+    let dir = temp_dir("hook-session-start");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Hook context includes durable memory.",
+        ])
+        .assert()
+        .success();
+
+    let mut hook = cargo_bin_cmd!("hm");
+    hook.args([
+        "--config",
+        config.to_str().expect("utf8 config"),
+        "--as-agent",
+        "codex",
+        "hook",
+        "session-start",
+        "--project",
+        "/repo/src/main.rs",
+        "--json",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("\"event\": \"session-start\""))
+    .stdout(predicate::str::contains("\"kind\": \"inject_context\""))
+    .stdout(predicate::str::contains(
+        "Hook context includes durable memory.",
+    ))
+    .stdout(predicate::str::contains("\"context_emitted\": true"));
+}
+
+#[test]
+fn hook_session_start_human_output_is_context() {
+    let dir = temp_dir("hook-session-human");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+
+    let mut hook = cargo_bin_cmd!("hm");
+    hook.args([
+        "--config",
+        config.to_str().expect("utf8 config"),
+        "--as-agent",
+        "codex",
+        "hook",
+        "session-start",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("Hive Memory Context"))
+    .stdout(predicate::str::contains("agent: codex"));
+}
