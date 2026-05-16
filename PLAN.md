@@ -146,6 +146,9 @@ Default config path:
 
 ```toml
 # ~/.config/hive-memory/config.toml
+# TOML is preferred for hand-edited config. JSON may be supported later for
+# generated machine config, but TOML is the v1 human-facing format.
+
 default_store = "personal"
 state_dir = "${XDG_STATE_HOME:-${HOME}/.local/state}/hive-memory"
 cache_dir = "${XDG_CACHE_HOME:-${HOME}/.cache}/hive-memory"
@@ -183,11 +186,65 @@ backend for Chris, not a baked-in assumption. A config always has one
 `default_store`; additional named stores are optional and are used for memory
 segmentation.
 
-Environment override:
+### Configuration Precedence
+
+Use a layered config model so humans can keep durable defaults in files while
+agents/hooks can force the correct environment without editing config.
+
+Precedence, highest wins:
+
+1. CLI flags, e.g. `hm --config ... --store work`.
+2. Environment variables, e.g. `HIVE_MEMORY_STORE=work`.
+3. Local config override file, e.g. `~/.config/hive-memory/config.local.toml`.
+4. Main config file, e.g. `~/.config/hive-memory/config.toml`.
+5. Built-in defaults.
+
+This gives agents deterministic behavior via env vars and keeps human config
+readable. Hooks should generally set env vars for active agent/store/session
+identity instead of rewriting config files.
+
+### Environment Variables
+
+Core env vars:
+
+```bash
+HIVE_MEMORY_CONFIG=/path/to/config.toml       # config file path
+HIVE_MEMORY_ROOT=/path/to/root                # shorthand root for default store
+HIVE_MEMORY_STORE=personal                    # active store if --store omitted
+HIVE_MEMORY_STATE_DIR=/path/to/state
+HIVE_MEMORY_CACHE_DIR=/path/to/cache
+HIVE_MEMORY_HOST_ID=taylor
+HIVE_MEMORY_USER_ID=chris
+HIVE_MEMORY_AGENT_ID=codex
+HIVE_MEMORY_SESSION_ID=<session-id>
+HIVE_MEMORY_PROJECT=/path/to/project
+HIVE_MEMORY_SCOPE=personal
+```
+
+Adapter/render env vars:
+
+```bash
+HIVE_MEMORY_ADAPTER=codex                     # active adapter hint
+HIVE_MEMORY_RENDER_STORES=personal,work       # adapter store allowlist
+HIVE_MEMORY_INCLUDE_SCOPES=personal,project
+HIVE_MEMORY_EXCLUDE_SCOPES=work,agent-private
+```
+
+Behavior toggles:
+
+```bash
+HIVE_MEMORY_OFFLINE=1                         # write to local outbox only
+HIVE_MEMORY_NO_RENDER=1                       # skip render from hooks
+HIVE_MEMORY_NO_COMPACT=1                      # skip compaction/proposals
+HIVE_MEMORY_LOG=warn                          # error|warn|info|debug|trace
+```
+
+Examples:
 
 ```bash
 HIVE_MEMORY_ROOT=/path/to/memory hm --store personal search "..."
-HIVE_MEMORY_CONFIG=/path/to/config.toml hm --store work doctor
+HIVE_MEMORY_CONFIG=/path/to/config.toml HIVE_MEMORY_STORE=work hm doctor
+HIVE_MEMORY_AGENT_ID=codex HIVE_MEMORY_SESSION_ID=abc123 hm remember --text "..."
 ```
 
 ## Multiple Stores
@@ -622,5 +679,5 @@ selection. Default should be conservative.
 - Final repo name: `hive-memory`; primary binary: `hm`.
 - Should `hive-memory` be a symlink to `hm`, a wrapper, or omitted after v1?
 - Implementation language: Rust is favored; validate release target ergonomics before implementation.
-- Should the default canonical store include JSON events, markdown notes, or both?
+- Should the default canonical store include JSON events, markdown notes, or both? Current preference: Markdown canonical plus optional JSON event mirror.
 - Should compaction be manual-only at first, or allowed from trusted agents?
