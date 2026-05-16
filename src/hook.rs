@@ -6,10 +6,11 @@
 //! reimplement memory policy in shell.
 
 use crate::{id, write};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt::{self, Display};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
@@ -58,6 +59,24 @@ pub struct WriteReceipt {
     pub note_id: String,
     /// Whether this command created a new canonical note.
     pub created: bool,
+}
+
+/// Held local lock for one hook refresh run.
+///
+/// This is deliberately a local-process/file lock, not a distributed cloud-sync
+/// lock. It only prevents overlapping refresh work on the same host; another
+/// machine may still refresh its own synced copy independently.
+#[derive(Debug)]
+pub struct RefreshLock {
+    file: File,
+    /// Lock file path, exposed for diagnostics and tests.
+    pub path: PathBuf,
+}
+
+impl Drop for RefreshLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
 }
 
 /// Hook state load/save failure.
@@ -114,6 +133,55 @@ pub fn write_receipts_path(state_dir: &Path, session_id: &str) -> PathBuf {
         .join("runs")
         .join(id::sanitize_component(session_id))
         .join("writes.jsonl")
+}
+
+/// Return the hook refresh lock path for one agent/session pair.
+///
+/// Agent id participates in the path because long-lived agent hosts may run
+/// separate agents inside the same terminal/session namespace. The lock still
+/// lives under shared state so every hook invocation for that agent/session
+/// converges on one local coordination point.
+pub fn refresh_lock_path(state_dir: &Path, agent_id: &str, session_id: &str) -> PathBuf {
+    state_dir
+        .join("locks")
+        .join("refresh")
+        .join(id::sanitize_component(agent_id))
+        .join(format!("{}.lock", id::sanitize_component(session_id)))
+}
+
+/// Try to acquire the non-blocking hook refresh lock.
+///
+/// Returning `Ok(None)` means another refresh is already running locally and
+/// callers should report a coalesced success without consuming write receipts.
+/// Any other I/O error is surfaced because it means the hook cannot trust its
+/// local coordination state.
+pub fn try_refresh_lock(
+    state_dir: &Path,
+    agent_id: &str,
+    session_id: &str,
+) -> Result<Option<RefreshLock>, HookStateError> {
+    let path = refresh_lock_path(state_dir, agent_id, session_id);
+    let Some(parent) = path.parent() else {
+        return Err(HookStateError::Io {
+            action: "create refresh lock parent",
+            path,
+            message: "lock path has no parent".to_owned(),
+        });
+    };
+    fs::create_dir_all(parent)
+        .map_err(|err| io_error("create refresh lock parent", parent, err))?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|err| io_error("open refresh lock", &path, err))?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(RefreshLock { file, path })),
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(err) => Err(io_error("lock refresh", &path, err)),
+    }
 }
 
 /// Load hook state, returning an empty state when the session has no file yet.
@@ -340,6 +408,28 @@ mod tests {
             path,
             PathBuf::from("/tmp/hm/runs/codex-session-1/writes.jsonl")
         );
+    }
+
+    #[test]
+    fn refresh_lock_path_sanitizes_agent_and_session() {
+        let path = refresh_lock_path(Path::new("/tmp/hm"), "codex/dev", "session:1");
+
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/hm/locks/refresh/codex-dev/session-1.lock")
+        );
+    }
+
+    #[test]
+    fn refresh_lock_reports_existing_holder_without_blocking() {
+        let dir = temp_dir("refresh-lock");
+        let first = try_refresh_lock(&dir, "codex", "session-1")
+            .expect("first lock")
+            .expect("first acquired");
+        let second = try_refresh_lock(&dir, "codex", "session-1").expect("second lock");
+
+        assert!(first.path.is_file());
+        assert!(second.is_none());
     }
 
     #[test]

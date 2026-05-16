@@ -1,7 +1,8 @@
 use assert_cmd::cargo::cargo_bin_cmd;
-use hive_memory::{outbox, store};
+use fs2::FileExt;
+use hive_memory::{hook as memory_hook, outbox, store};
 use predicates::prelude::*;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -2895,6 +2896,82 @@ fn refresh_hook_mode_consumes_unrefreshed_receipts() {
         .stdout(predicate::str::contains("\"indexes\": 0"))
         .stdout(predicate::str::contains("\"write_receipts\": 0"))
         .stdout(predicate::str::contains("\"refreshed\": false"));
+}
+
+#[test]
+fn refresh_hook_mode_coalesces_when_refresh_lock_is_held() {
+    let dir = temp_dir("refresh-hook-coalesced");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let state = dir.join("state");
+    let output = dir.join("generated").join("codex.md");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            state_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+
+            [adapters.codex]
+            enabled = true
+            stores = ["personal"]
+            scopes = ["global"]
+            output = "{}"
+            "#,
+            state.display(),
+            personal.display(),
+            output.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", "refresh-session")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "A coalesced refresh should leave this receipt pending.",
+        ])
+        .assert()
+        .success();
+
+    let lock_path = memory_hook::refresh_lock_path(&state, "codex", "refresh-session");
+    fs::create_dir_all(lock_path.parent().expect("lock parent")).expect("lock parent");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("open lock");
+    lock.lock_exclusive().expect("hold refresh lock");
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_HOOK_ACTIVE", "1")
+        .env("HIVE_MEMORY_AGENT_ID", "codex")
+        .env("HIVE_MEMORY_SESSION_ID", "refresh-session")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"indexes\": 0"))
+        .stdout(predicate::str::contains("\"write_receipts\": 1"))
+        .stdout(predicate::str::contains("\"refreshed\": false"))
+        .stdout(predicate::str::contains("\"coalesced\": true"));
+
+    assert!(!output.exists());
+    assert!(!state.join("runs/refresh-session/hook-state.json").exists());
+    lock.unlock().expect("unlock refresh lock");
 }
 
 #[test]

@@ -1903,7 +1903,7 @@ fn render_json_output(
 
 fn run_refresh(args: RefreshArgs, context: CliContext) -> Result<()> {
     let config = load_config(context.config_path.as_deref())?;
-    let receipt_cursor = refresh_receipt_cursor(&config)?;
+    let receipt_cursor = refresh_receipt_cursor(&config, &context)?;
     if let Some(cursor) = receipt_cursor.as_ref()
         && cursor.unrefreshed == 0
         && !args.force
@@ -1912,6 +1912,23 @@ fn run_refresh(args: RefreshArgs, context: CliContext) -> Result<()> {
         emit_refresh_report(&report, &args)?;
         return Ok(());
     }
+
+    let _refresh_lock = if let Some(cursor) = receipt_cursor.as_ref() {
+        match memory_hook::try_refresh_lock(
+            &config.state_dir,
+            &cursor.agent_id,
+            &cursor.session_id,
+        )? {
+            Some(lock) => Some(lock),
+            None => {
+                let report = coalesced_refresh_report(args.force, cursor.unrefreshed);
+                emit_refresh_report(&report, &args)?;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
 
     let mut report = perform_refresh(&config, &context, args.force)?;
     if let Some(cursor) = receipt_cursor {
@@ -1960,6 +1977,7 @@ fn emit_refresh_report(report: &HookRefreshReport, args: &RefreshArgs) -> Result
 }
 
 struct RefreshReceiptCursor {
+    agent_id: String,
     session_id: String,
     receipt_count: usize,
     unrefreshed: usize,
@@ -1970,18 +1988,24 @@ struct RefreshReceiptCursor {
 /// Plain human `hm refresh` remains eager and deterministic. Only hook-active
 /// refreshes use write receipts as a cheap idempotency cursor, because hooks may
 /// call refresh after many tool boundaries where no memory write happened.
-fn refresh_receipt_cursor(config: &Config) -> Result<Option<RefreshReceiptCursor>> {
+fn refresh_receipt_cursor(
+    config: &Config,
+    context: &CliContext,
+) -> Result<Option<RefreshReceiptCursor>> {
     if std::env::var("HIVE_MEMORY_HOOK_ACTIVE").ok().as_deref() != Some("1") {
         return Ok(None);
     }
     let Some(session_id) = context_session_id() else {
         return Ok(None);
     };
+    let agent_id =
+        resolve_agent_id(context.as_agent.clone()).unwrap_or_else(|| "unknown".to_owned());
 
     let receipts = memory_hook::load_write_receipts(&config.state_dir, &session_id)?;
     let state = memory_hook::load_state(&config.state_dir, &session_id)?;
     let unrefreshed = receipts.len().saturating_sub(state.refreshed_receipts);
     Ok(Some(RefreshReceiptCursor {
+        agent_id,
         session_id,
         receipt_count: receipts.len(),
         unrefreshed,
@@ -2103,6 +2127,28 @@ fn skipped_refresh_report(forced: bool) -> HookRefreshReport {
         write_receipts: 0,
         refreshed: false,
         coalesced: false,
+    }
+}
+
+/// Build the successful coalesced report for overlapping hook refreshes.
+///
+/// Coalescing must leave receipts unconsumed. The refresh holding the lock is
+/// responsible for advancing the cursor after it completes successfully.
+fn coalesced_refresh_report(forced: bool, write_receipts: usize) -> HookRefreshReport {
+    HookRefreshReport {
+        indexes: 0,
+        flushed: 0,
+        skipped: 0,
+        failed: 0,
+        unbound: 0,
+        pending: 0,
+        rendered: 0,
+        written: 0,
+        render_skipped: std::env::var("HIVE_MEMORY_NO_RENDER").ok().as_deref() == Some("1"),
+        forced,
+        write_receipts,
+        refreshed: false,
+        coalesced: true,
     }
 }
 
