@@ -25,11 +25,15 @@ fn write_config(
     personal_root: &std::path::Path,
     work_root: &std::path::Path,
 ) {
+    let root = path.parent().expect("config parent");
     fs::write(
         path,
         format!(
             r#"
             default_store = "personal"
+            data_dir = "{}"
+            state_dir = "{}"
+            cache_dir = "{}"
 
             [stores.personal]
             root = "{}"
@@ -38,6 +42,9 @@ fn write_config(
             [stores.work]
             root = "{}"
             "#,
+            root.join("data").display(),
+            root.join("state").display(),
+            root.join("cache").display(),
             personal_root.display(),
             work_root.display()
         ),
@@ -2069,6 +2076,17 @@ fn context_json_reports_selection_and_sections() {
         section["body"],
         "JSON context should include TOML preferences."
     );
+
+    let cache_dir = dir.join("state/context-cache");
+    let cache_file = fs::read_dir(&cache_dir)
+        .expect("context cache dir")
+        .next()
+        .expect("context cache entry")
+        .expect("context cache file")
+        .path();
+    let cache = fs::read_to_string(cache_file).expect("read context cache");
+    assert!(cache.contains("JSON context should include TOML preferences."));
+    assert!(cache.contains("\"schema_version\": 1"));
 }
 
 #[test]

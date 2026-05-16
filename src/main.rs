@@ -13,7 +13,8 @@ use hive_memory::{
     config, context as memory_context, curation, doctor, event, hook as memory_hook, id, index,
     memory, note, outbox, project, render, search, secret, store, write,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::str::FromStr;
 use time::OffsetDateTime;
@@ -1575,7 +1576,7 @@ fn assemble_cli_context(
     })
     .map_err(anyhow::Error::from)?;
 
-    Ok(CliContextAssembly {
+    let assembly = CliContextAssembly {
         output,
         agent_id,
         project_id,
@@ -1584,7 +1585,13 @@ fn assemble_cli_context(
         store_source,
         scopes,
         sources,
-    })
+    };
+    if let Err(err) = write_context_cache(config, &assembly) {
+        // Fresh context is still correct even if the operational fallback cache
+        // cannot be updated. Warn rather than failing agent startup.
+        eprintln!("warning: failed to write context cache: {err}");
+    }
+    Ok(assembly)
 }
 
 #[derive(Debug, Serialize)]
@@ -1634,6 +1641,98 @@ struct ContextSectionJson {
     estimated_tokens: usize,
     /// Safe-to-inject body rendered for this context section.
     body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ContextCacheEntry {
+    /// Cache schema for rejecting future incompatible entries.
+    schema_version: u32,
+    /// RFC3339 write time used for max-age policy.
+    created_at: String,
+    /// Full context selection key that produced this entry.
+    key: String,
+    /// Exact Markdown injected during the successful fresh assembly.
+    markdown: String,
+    /// Agent identity used for audience filtering.
+    agent_id: Option<String>,
+    /// Project identity used for project-scoped filtering.
+    project_id: Option<String>,
+    /// Original path/project hint rendered into the context header.
+    project_hint: Option<String>,
+    /// Selected store aliases.
+    stores: Vec<String>,
+    /// Store selection source rendered in JSON output.
+    store_source: String,
+    /// Scope filter used for this assembly.
+    scopes: Vec<String>,
+    /// Source filter used for this assembly.
+    sources: Vec<String>,
+    /// Token estimate from the fresh assembly.
+    estimated_tokens: usize,
+    /// Section metadata kept so stale JSON output preserves data boundaries.
+    sections: Vec<ContextCacheSection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ContextCacheSection {
+    id: String,
+    store: String,
+    scope: String,
+    trust: String,
+    audience: Vec<String>,
+    source_path: String,
+    estimated_tokens: usize,
+    body: String,
+}
+
+fn write_context_cache(config: &Config, assembly: &CliContextAssembly) -> Result<PathBuf> {
+    // The cache is an operational fallback for unavailable stores, not a second
+    // memory source. Keep the full rendered Markdown plus section metadata so a
+    // later stale response can preserve the same data-boundary labeling without
+    // touching the store root.
+    let key = context_selection_key_from_assembly(assembly);
+    let path = context_cache_path(&config.state_dir, &key);
+    let entry = ContextCacheEntry {
+        schema_version: 1,
+        created_at: OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("RFC3339 formatting should not fail"),
+        key,
+        markdown: assembly.output.markdown.clone(),
+        agent_id: assembly.agent_id.clone(),
+        project_id: assembly.project_id.clone(),
+        project_hint: assembly.project_hint.clone(),
+        stores: assembly.stores.clone(),
+        store_source: assembly.store_source.clone(),
+        scopes: assembly.scopes.clone(),
+        sources: assembly.sources.clone(),
+        estimated_tokens: assembly.output.estimated_tokens,
+        sections: assembly
+            .output
+            .sections
+            .iter()
+            .map(|section| ContextCacheSection {
+                id: section.id.clone(),
+                store: section.store.clone(),
+                scope: section.scope.clone(),
+                trust: section.trust.as_str().to_owned(),
+                audience: section.audience.clone(),
+                source_path: section.source_path.clone(),
+                estimated_tokens: section.estimated_tokens,
+                body: section.body.clone(),
+            })
+            .collect(),
+    };
+    let json = serde_json::to_vec_pretty(&entry)?;
+    write::write_atomic(&path, &json, &hook_options(config))?;
+    Ok(path)
+}
+
+fn context_cache_path(state_dir: &std::path::Path, key: &str) -> PathBuf {
+    let digest = Sha256::digest(key.as_bytes());
+    state_dir
+        .join("context-cache")
+        .join(format!("{digest:x}.json"))
 }
 
 fn context_json(
