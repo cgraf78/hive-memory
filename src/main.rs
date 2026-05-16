@@ -7,7 +7,10 @@
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use hive_memory::config::{AdapterConfig, Config, ConfigPaths, EventSidecarPolicy, Sensitivity};
-use hive_memory::{context as memory_context, index, memory, note, render, search, store, write};
+use hive_memory::{
+    context as memory_context, hook as memory_hook, index, memory, note, render, search, store,
+    write,
+};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -262,6 +265,10 @@ struct RefreshArgs {
 enum HookCommand {
     /// Emit initial memory context for a new agent session.
     SessionStart(HookContextArgs),
+    /// Inspect a submitted prompt for context changes and memory intent.
+    PromptSubmit(HookPromptSubmitArgs),
+    /// Emit an end-of-session reminder when memory intent remains pending.
+    Stop(HookStopArgs),
 }
 
 /// Shared hook context-selection arguments.
@@ -270,6 +277,28 @@ struct HookContextArgs {
     /// Active project path or file hint.
     #[arg(long)]
     project: Option<String>,
+    /// Emit machine-readable hook actions.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Arguments for `hm hook prompt-submit`.
+#[derive(Debug, Args)]
+struct HookPromptSubmitArgs {
+    /// Active project path or file hint.
+    #[arg(long)]
+    project: Option<String>,
+    /// Prompt text submitted to the agent.
+    #[arg(long)]
+    text: String,
+    /// Emit machine-readable hook actions.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Arguments for `hm hook stop`.
+#[derive(Debug, Args)]
+struct HookStopArgs {
     /// Emit machine-readable hook actions.
     #[arg(long)]
     json: bool,
@@ -735,6 +764,8 @@ fn run_refresh(args: RefreshArgs, context: CliContext) -> Result<()> {
 fn run_hook(command: HookCommand, context: CliContext) -> Result<()> {
     match command {
         HookCommand::SessionStart(args) => run_hook_session_start(args, context),
+        HookCommand::PromptSubmit(args) => run_hook_prompt_submit(args, context),
+        HookCommand::Stop(args) => run_hook_stop(args, context),
     }
 }
 
@@ -763,22 +794,101 @@ fn run_hook_session_start(args: HookContextArgs, mut context: CliContext) -> Res
         },
     )?;
 
-    if args.json {
-        let response = HookResponse {
-            event: "session-start",
-            actions: vec![HookAction {
-                kind: "inject_context",
-                body: output.markdown,
-            }],
-            warnings: Vec::new(),
-            memory_pending: false,
-            context_emitted: true,
-            refresh: None,
-        };
-        println!("{}", serde_json::to_string_pretty(&response)?);
-    } else {
-        print!("{}", output.markdown);
+    let response = HookResponse {
+        event: "session-start",
+        actions: vec![HookAction::new("inject_context", output.markdown)],
+        warnings: Vec::new(),
+        memory_pending: false,
+        context_emitted: true,
+        refresh: None,
+    };
+    emit_hook_response(&response, args.json)?;
+
+    Ok(())
+}
+
+/// Record explicit durable-memory intent from a prompt.
+///
+/// This hook is advisory. It does not write memory for the agent; it records a
+/// session-local debt and returns a reminder action so the host integration can
+/// keep the agent aware of the durable write it should make if the fact remains
+/// relevant after the requested work.
+fn run_hook_prompt_submit(args: HookPromptSubmitArgs, context: CliContext) -> Result<()> {
+    let config = load_config(context.config_path.as_deref())?;
+    let mut warnings = Vec::new();
+    let mut actions = Vec::new();
+    let mut memory_pending = false;
+
+    // Resolve the same read policy used by context-rendering hooks. The current
+    // slice does not yet emit context-on-selection-change, but resolving now
+    // makes privacy/store errors surface in `hm` instead of later shell glue.
+    let agent_id = resolve_agent_id(context.as_agent);
+    resolve_store(
+        &config,
+        context.store.as_deref(),
+        agent_id.as_deref(),
+        StoreAccess::Read,
+    )?;
+    let _path_hint = args
+        .project
+        .or_else(|| std::env::var("HIVE_MEMORY_PROJECT").ok());
+
+    if memory_hook::prompt_has_memory_intent(&args.text) {
+        let reminder = memory_intent_reminder();
+        actions.push(HookAction::new("remind", reminder));
+        memory_pending = true;
+
+        if let Some(session_id) = hook_session_id(&mut warnings) {
+            let options = write::AtomicWriteOptions {
+                fsync: config.storage.fsync.into(),
+                ..write::AtomicWriteOptions::default()
+            };
+            memory_hook::mark_memory_pending(
+                &config.state_dir,
+                &session_id,
+                "prompt contained explicit durable-memory intent",
+                &options,
+            )?;
+        }
     }
+
+    let response = HookResponse {
+        event: "prompt-submit",
+        actions,
+        warnings,
+        memory_pending,
+        context_emitted: false,
+        refresh: None,
+    };
+    emit_hook_response(&response, args.json)?;
+
+    Ok(())
+}
+
+/// Remind at session end if explicit memory intent has not been satisfied.
+fn run_hook_stop(args: HookStopArgs, context: CliContext) -> Result<()> {
+    let config = load_config(context.config_path.as_deref())?;
+    let mut warnings = Vec::new();
+    let mut actions = Vec::new();
+    let mut memory_pending = false;
+
+    if let Some(session_id) = hook_session_id(&mut warnings) {
+        let state = memory_hook::load_state(&config.state_dir, &session_id)?;
+        memory_pending = state.memory_pending;
+        if memory_pending {
+            actions.push(HookAction::new("remind", stop_memory_reminder()));
+        }
+    }
+
+    let response = HookResponse {
+        event: "stop",
+        actions,
+        warnings,
+        memory_pending,
+        context_emitted: false,
+        refresh: None,
+    };
+    emit_hook_response(&response, args.json)?;
 
     Ok(())
 }
@@ -805,6 +915,58 @@ struct HookAction {
     kind: &'static str,
     /// Markdown/data payload for this action.
     body: String,
+}
+
+impl HookAction {
+    fn new(kind: &'static str, body: impl Into<String>) -> Self {
+        Self {
+            kind,
+            body: body.into(),
+        }
+    }
+}
+
+fn emit_hook_response(response: &HookResponse, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(response)?);
+        return Ok(());
+    }
+
+    if response.actions.is_empty() && response.warnings.is_empty() {
+        println!("hook {}: no actions", response.event);
+        return Ok(());
+    }
+
+    for warning in &response.warnings {
+        println!("warn: {warning}");
+    }
+    for action in &response.actions {
+        print!("{}: {}", action.kind, action.body);
+        if !action.body.ends_with('\n') {
+            println!();
+        }
+    }
+    Ok(())
+}
+
+fn hook_session_id(warnings: &mut Vec<String>) -> Option<String> {
+    match std::env::var("HIVE_MEMORY_SESSION_ID") {
+        Ok(value) if !value.trim().is_empty() => Some(value),
+        _ => {
+            warnings.push(
+                "HIVE_MEMORY_SESSION_ID missing; hook memory-pending state is stateless".to_owned(),
+            );
+            None
+        }
+    }
+}
+
+fn memory_intent_reminder() -> &'static str {
+    "Hive Memory: this prompt sounds like durable memory intent. If it remains useful, write it with `hm remember --scope project --text \"...\"` or `hm remember --text \"...\"`."
+}
+
+fn stop_memory_reminder() -> &'static str {
+    "Hive Memory: durable memory intent is still pending. Before ending, write any lasting preference, decision, or project fact with `hm remember`."
 }
 
 #[derive(Debug, Default)]

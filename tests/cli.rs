@@ -1084,3 +1084,105 @@ fn hook_session_start_human_output_is_context() {
     .stdout(predicate::str::contains("Hive Memory Context"))
     .stdout(predicate::str::contains("agent: codex"));
 }
+
+#[test]
+fn hook_prompt_submit_records_memory_pending() {
+    let dir = temp_dir("hook-prompt-pending");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let state = dir.join("state");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            state_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+            "#,
+            state.display(),
+            personal.display()
+        ),
+    )
+    .expect("write config");
+
+    let mut prompt = cargo_bin_cmd!("hm");
+    prompt
+        .env("HIVE_MEMORY_SESSION_ID", "session-1")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "prompt-submit",
+            "--text",
+            "Please remember this repo prefers cargo-dist releases.",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"event\": \"prompt-submit\""))
+        .stdout(predicate::str::contains("\"kind\": \"remind\""))
+        .stdout(predicate::str::contains("\"memory_pending\": true"));
+
+    let state_file = state.join("runs/session-1/hook-state.json");
+    let state_json = fs::read_to_string(state_file).expect("hook state");
+    assert!(state_json.contains("\"memory_pending\": true"));
+}
+
+#[test]
+fn hook_stop_reminds_when_memory_pending_remains() {
+    let dir = temp_dir("hook-stop-pending");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let state = dir.join("state");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            state_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+            "#,
+            state.display(),
+            personal.display()
+        ),
+    )
+    .expect("write config");
+
+    let mut prompt = cargo_bin_cmd!("hm");
+    prompt
+        .env("HIVE_MEMORY_SESSION_ID", "session-2")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "hook",
+            "prompt-submit",
+            "--text",
+            "For future reference, this project uses snapshot tests.",
+        ])
+        .assert()
+        .success();
+
+    let mut stop = cargo_bin_cmd!("hm");
+    stop.env("HIVE_MEMORY_SESSION_ID", "session-2")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "hook",
+            "stop",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"event\": \"stop\""))
+        .stdout(predicate::str::contains("\"kind\": \"remind\""))
+        .stdout(predicate::str::contains(
+            "durable memory intent is still pending",
+        ))
+        .stdout(predicate::str::contains("\"memory_pending\": true"));
+}
