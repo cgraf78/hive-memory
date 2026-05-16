@@ -8,8 +8,8 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use hive_memory::config::{AdapterConfig, Config, ConfigPaths, EventSidecarPolicy, Sensitivity};
 use hive_memory::{
-    context as memory_context, hook as memory_hook, index, memory, note, project, render, search,
-    store, write,
+    context as memory_context, doctor, hook as memory_hook, index, memory, note, project, render,
+    search, store, write,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -80,6 +80,8 @@ enum Command {
     /// Run agent lifecycle hook policy.
     #[command(subcommand)]
     Hook(HookCommand),
+    /// Run top-level diagnostics.
+    Doctor(DoctorArgs),
 }
 
 /// Store lifecycle commands.
@@ -169,6 +171,17 @@ struct StoreShowArgs {
 struct StoreDoctorArgs {
     /// Store alias to diagnose. Defaults to all configured stores.
     name: Option<String>,
+}
+
+/// Arguments for `hm doctor`.
+#[derive(Debug, Args)]
+struct DoctorArgs {
+    /// Run the hook/update-safe subset.
+    #[arg(long)]
+    quick: bool,
+    /// Emit machine-readable output.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Arguments for `hm stores migrate`.
@@ -387,6 +400,7 @@ fn main() -> Result<()> {
         Some(Command::Refresh(args)) => run_refresh(args, context),
         Some(Command::Projects(command)) => run_projects(command, context),
         Some(Command::Hook(command)) => run_hook(command, context),
+        Some(Command::Doctor(args)) => run_doctor(args, context),
         None => Ok(()),
     }
 }
@@ -395,6 +409,39 @@ struct CliContext {
     config_path: Option<PathBuf>,
     store: Option<String>,
     as_agent: Option<String>,
+}
+
+fn run_doctor(args: DoctorArgs, context: CliContext) -> Result<()> {
+    let config = load_config(context.config_path.as_deref())?;
+    let report = doctor::run(doctor::DoctorInput {
+        config: &config,
+        quick: args.quick,
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "doctor: {} (errors={} warnings={})",
+            if report.ok { "ok" } else { "fail" },
+            report.summary.errors,
+            report.summary.warnings
+        );
+        for check in &report.checks {
+            if check.severity == doctor::DoctorSeverity::Info {
+                continue;
+            }
+            println!("{}: {}", check.severity, check.message);
+            for path in &check.paths {
+                println!("  path: {path}");
+            }
+        }
+    }
+
+    if !report.ok {
+        anyhow::bail!("doctor found errors");
+    }
+    Ok(())
 }
 
 fn run_stores(command: StoresCommand, config_path: Option<PathBuf>) -> Result<()> {

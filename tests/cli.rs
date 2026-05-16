@@ -267,6 +267,113 @@ fn stores_migrate_reports_no_v1_migrations() {
 }
 
 #[test]
+fn doctor_quick_reports_clean_adapter_install() {
+    let dir = temp_dir("doctor-clean-adapter");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    let output = dir.join("generated").join("codex.md");
+    let target = dir.join("AGENTS.md");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+
+            [adapters.codex]
+            enabled = true
+            stores = ["personal"]
+            scopes = ["global"]
+            output = "{}"
+            install_target = "{}"
+            install_mode = "include"
+            "#,
+            data.display(),
+            personal.display(),
+            output.display(),
+            target.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    let mut render = cargo_bin_cmd!("hm");
+    render
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "render",
+            "--configured",
+            "--install",
+            "--quiet",
+        ])
+        .assert()
+        .success();
+
+    let mut doctor = cargo_bin_cmd!("hm");
+    doctor
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "doctor",
+            "--quick",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("doctor: ok (errors=0 warnings=0)"));
+}
+
+#[test]
+fn doctor_warns_for_unknown_project_binding_store() {
+    let dir = temp_dir("doctor-project-binding");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    fs::create_dir_all(data.join("projects")).expect("project binding dir");
+    fs::write(
+        data.join("projects/bound-project.toml"),
+        "project_id = \"bound-project\"\nstore = \"missing\"\n",
+    )
+    .expect("binding");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+            "#,
+            data.display(),
+            personal.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    let mut doctor = cargo_bin_cmd!("hm");
+    doctor
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "doctor",
+            "--quick",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"warnings\": 1"))
+        .stdout(predicate::str::contains(
+            "project bound-project is bound to unknown store missing",
+        ));
+}
+
+#[test]
 fn remember_writes_note_and_event() {
     let dir = temp_dir("remember");
     let config = dir.join("config.toml");

@@ -97,6 +97,43 @@ pub struct UninstallAdapterReport {
     pub metadata_path: Option<PathBuf>,
 }
 
+/// Input for checking whether an adapter is visible to its agent.
+#[derive(Debug, Clone)]
+pub struct InspectAdapterInstallInput<'a> {
+    /// Adapter id, such as `codex` or `claude`.
+    pub adapter: &'a str,
+    /// Generated adapter output that the marker should include.
+    pub output: &'a Path,
+    /// Adapter instruction file that the agent loads.
+    pub install_target: &'a Path,
+}
+
+/// Non-mutating adapter visibility report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterInstallInspection {
+    /// Resolved file that would be edited by install.
+    pub target: PathBuf,
+    /// Whether the instruction file exists.
+    pub target_exists: bool,
+    /// Whether the adapter marker block is present.
+    pub installed: bool,
+    /// Include body found inside the adapter marker block.
+    pub include: Option<String>,
+    /// Whether the include body points at the configured output path.
+    pub include_matches: bool,
+}
+
+/// Non-mutating generated output report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderFileInspection {
+    /// Render output path.
+    pub output: PathBuf,
+    /// Whether the output file exists.
+    pub exists: bool,
+    /// Whether the file has a valid generated marker and matching checksum.
+    pub valid: bool,
+}
+
 /// Render-file failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RenderError {
@@ -412,6 +449,64 @@ pub fn uninstall_adapter(
     })
 }
 
+/// Inspect a generated adapter output without modifying it.
+///
+/// Doctor uses this instead of open-coding marker parsing so render, install,
+/// and diagnostics all agree on the generated-file checksum contract.
+pub fn inspect_rendered_file(output: &Path) -> Result<RenderFileInspection, RenderError> {
+    match fs::read_to_string(output) {
+        Ok(contents) => {
+            validate_existing(output, &contents, false)?;
+            Ok(RenderFileInspection {
+                output: output.to_path_buf(),
+                exists: true,
+                valid: true,
+            })
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(RenderFileInspection {
+            output: output.to_path_buf(),
+            exists: false,
+            valid: false,
+        }),
+        Err(err) => Err(io_error("read render output", output, err)),
+    }
+}
+
+/// Inspect whether an adapter include marker is installed and current.
+///
+/// This is the read-only counterpart to [`install_adapter`]. Dotfiles update can
+/// run `hm doctor --quick` after install and get the same symlink resolution and
+/// marker interpretation used by the mutating install path.
+pub fn inspect_adapter_install(
+    input: InspectAdapterInstallInput<'_>,
+) -> Result<AdapterInstallInspection, RenderError> {
+    let target = resolve_install_target(input.install_target)?;
+    let contents = match fs::read_to_string(&target) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AdapterInstallInspection {
+                target,
+                target_exists: false,
+                installed: false,
+                include: None,
+                include_matches: false,
+            });
+        }
+        Err(err) => return Err(io_error("read install target", &target, err)),
+    };
+    let normalized = normalize_lf(&contents);
+    let include = marker_body(&target, &normalized, input.adapter)?;
+    let expected = format!("@{}", input.output.display());
+    let include_matches = include.as_deref() == Some(expected.as_str());
+    Ok(AdapterInstallInspection {
+        target,
+        target_exists: true,
+        installed: include.is_some(),
+        include,
+        include_matches,
+    })
+}
+
 /// Render the complete generated file contents.
 pub fn render_generated(body: &str) -> String {
     format!(
@@ -541,44 +636,15 @@ fn upsert_marker(
     name: &str,
     block: &str,
 ) -> Result<String, RenderError> {
-    let begin = format!("# BEGIN hive-memory:{name}");
-    let end = format!("# END hive-memory:{name}");
-    let lines = contents.lines().map(str::to_owned).collect::<Vec<_>>();
-    let begin_positions = lines
-        .iter()
-        .enumerate()
-        .filter_map(|(index, line)| (line == &begin).then_some(index))
-        .collect::<Vec<_>>();
-    let end_positions = lines
-        .iter()
-        .enumerate()
-        .filter_map(|(index, line)| (line == &end).then_some(index))
-        .collect::<Vec<_>>();
-
-    if begin_positions.len() != end_positions.len() || begin_positions.len() > 1 {
-        return Err(RenderError::ConflictingMarkers {
-            path: path.to_path_buf(),
-            marker: name.to_owned(),
-        });
-    }
-
-    if begin_positions.is_empty() {
+    let lines = contents.lines().collect::<Vec<_>>();
+    let Some((begin_index, end_index)) = marker_span(path, &lines, name)? else {
         let mut output = contents.trim_end_matches('\n').to_owned();
         if !output.is_empty() {
             output.push_str("\n\n");
         }
         output.push_str(block);
         return Ok(output);
-    }
-
-    let begin_index = begin_positions[0];
-    let end_index = end_positions[0];
-    if end_index <= begin_index {
-        return Err(RenderError::ConflictingMarkers {
-            path: path.to_path_buf(),
-            marker: name.to_owned(),
-        });
-    }
+    };
 
     let mut output = String::new();
     for line in &lines[..begin_index] {
@@ -599,38 +665,10 @@ fn upsert_marker(
 /// markers are errors for the same reason as install: the tool should stop and
 /// let the user inspect ambiguous instruction-file edits.
 fn remove_marker(path: &Path, contents: &str, name: &str) -> Result<String, RenderError> {
-    let begin = format!("# BEGIN hive-memory:{name}");
-    let end = format!("# END hive-memory:{name}");
-    let lines = contents.lines().map(str::to_owned).collect::<Vec<_>>();
-    let begin_positions = lines
-        .iter()
-        .enumerate()
-        .filter_map(|(index, line)| (line == &begin).then_some(index))
-        .collect::<Vec<_>>();
-    let end_positions = lines
-        .iter()
-        .enumerate()
-        .filter_map(|(index, line)| (line == &end).then_some(index))
-        .collect::<Vec<_>>();
-
-    if begin_positions.len() != end_positions.len() || begin_positions.len() > 1 {
-        return Err(RenderError::ConflictingMarkers {
-            path: path.to_path_buf(),
-            marker: name.to_owned(),
-        });
-    }
-    if begin_positions.is_empty() {
+    let lines = contents.lines().collect::<Vec<_>>();
+    let Some((begin_index, end_index)) = marker_span(path, &lines, name)? else {
         return Ok(contents.to_owned());
-    }
-
-    let begin_index = begin_positions[0];
-    let end_index = end_positions[0];
-    if end_index <= begin_index {
-        return Err(RenderError::ConflictingMarkers {
-            path: path.to_path_buf(),
-            marker: name.to_owned(),
-        });
-    }
+    };
 
     let mut output = String::new();
     for line in &lines[..begin_index] {
@@ -642,6 +680,54 @@ fn remove_marker(path: &Path, contents: &str, name: &str) -> Result<String, Rend
         output.push('\n');
     }
     Ok(collapse_blank_lines(output.trim_end_matches('\n')))
+}
+
+fn marker_body(path: &Path, contents: &str, name: &str) -> Result<Option<String>, RenderError> {
+    let lines = contents.lines().collect::<Vec<_>>();
+    let Some((begin_index, end_index)) = marker_span(path, &lines, name)? else {
+        return Ok(None);
+    };
+    Ok(Some(lines[begin_index + 1..end_index].join("\n")))
+}
+
+fn marker_span(
+    path: &Path,
+    lines: &[&str],
+    name: &str,
+) -> Result<Option<(usize, usize)>, RenderError> {
+    let begin = format!("# BEGIN hive-memory:{name}");
+    let end = format!("# END hive-memory:{name}");
+    let begin_positions = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| (*line == begin).then_some(index))
+        .collect::<Vec<_>>();
+    let end_positions = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| (*line == end).then_some(index))
+        .collect::<Vec<_>>();
+
+    if begin_positions.len() != end_positions.len() || begin_positions.len() > 1 {
+        return Err(RenderError::ConflictingMarkers {
+            path: path.to_path_buf(),
+            marker: name.to_owned(),
+        });
+    }
+    if begin_positions.is_empty() {
+        return Ok(None);
+    }
+
+    let begin_index = begin_positions[0];
+    let end_index = end_positions[0];
+    if end_index <= begin_index {
+        return Err(RenderError::ConflictingMarkers {
+            path: path.to_path_buf(),
+            marker: name.to_owned(),
+        });
+    }
+
+    Ok(Some((begin_index, end_index)))
 }
 
 fn collapse_blank_lines(contents: &str) -> String {

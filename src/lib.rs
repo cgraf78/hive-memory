@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod context;
+pub mod doctor;
 pub mod event;
 pub mod hook;
 pub mod id;
