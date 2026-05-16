@@ -321,6 +321,9 @@ struct WriteMemoryArgs {
     /// Permit detected secrets only when config and a secret store allow it.
     #[arg(long)]
     allow_secret_write: bool,
+    /// Emit machine-readable output.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Arguments for `hm search`.
@@ -1005,18 +1008,38 @@ fn run_write_memory(
         project_id: project_id.clone(),
         subject: args.subject,
         tags: args.tags,
-        audience,
+        audience: audience.clone(),
         source_kind: args.source_kind,
         source_ref: args.source_ref,
         write_event: should_write_event,
         options,
     })?;
 
-    println!("id: {}", result.id);
-    println!("store: {}", resolved_store.name);
-    println!("note: {}", result.note_path.display());
-    if let Some(path) = result.event_path {
-        println!("event: {}", path.display());
+    if args.json {
+        let output = WriteMemoryJson {
+            id: result.id.clone(),
+            store: resolved_store.name.clone(),
+            store_id: manifest.store.id.clone(),
+            store_source: resolved_store.source.to_string(),
+            scope: scope.clone(),
+            project_id: project_id.clone(),
+            audience: audience.clone(),
+            note_path: result.note_path.display().to_string(),
+            event_path: result
+                .event_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            created: true,
+            duplicate_of: None,
+        };
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("id: {}", result.id);
+        println!("store: {}", resolved_store.name);
+        println!("note: {}", result.note_path.display());
+        if let Some(path) = &result.event_path {
+            println!("event: {}", path.display());
+        }
     }
     append_session_write_receipt(
         &config,
@@ -1026,6 +1049,21 @@ fn run_write_memory(
         &result.id,
     );
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct WriteMemoryJson {
+    id: String,
+    store: String,
+    store_id: String,
+    store_source: String,
+    scope: String,
+    project_id: Option<String>,
+    audience: Vec<String>,
+    note_path: String,
+    event_path: Option<String>,
+    created: bool,
+    duplicate_of: Option<String>,
 }
 
 fn run_search(args: SearchArgs, context: CliContext) -> Result<()> {

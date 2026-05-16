@@ -528,6 +528,44 @@ fn remember_writes_note_and_event() {
 }
 
 #[test]
+fn remember_json_reports_stable_write_fields() {
+    let dir = temp_dir("remember-json");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "remember",
+            "--text",
+            "Chris prefers JSON write output.",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"id\": \""))
+        .stdout(predicate::str::contains("\"store\": \"personal\""))
+        .stdout(predicate::str::contains("\"store_id\": \""))
+        .stdout(predicate::str::contains(
+            "\"store_source\": \"agent-default\"",
+        ))
+        .stdout(predicate::str::contains("\"scope\": \"global\""))
+        .stdout(predicate::str::contains("\"project_id\": null"))
+        .stdout(predicate::str::contains("\"audience\": []"))
+        .stdout(predicate::str::contains("\"note_path\": \""))
+        .stdout(predicate::str::contains("\"event_path\": \""))
+        .stdout(predicate::str::contains("\"created\": true"))
+        .stdout(predicate::str::contains("\"duplicate_of\": null"));
+}
+
+#[test]
 fn remember_refuses_likely_secret_without_echoing_value() {
     let dir = temp_dir("remember-secret-refusal");
     let config = dir.join("config.toml");
