@@ -2,6 +2,7 @@ use assert_cmd::cargo::cargo_bin_cmd;
 use predicates::prelude::*;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -1413,4 +1414,60 @@ fn hook_tool_complete_nonzero_status_does_not_clear_pending() {
         .success()
         .stdout(predicate::str::contains("\"memory_pending\": true"))
         .stdout(predicate::str::contains("\"refresh\": null"));
+}
+
+#[test]
+fn projects_resolve_uses_git_root_from_file_hint() {
+    let dir = temp_dir("projects-resolve-git");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    let repo = dir.join("repo");
+    let file = repo.join("src/app.rs");
+    write_config(&config, &personal, &work);
+    fs::create_dir_all(file.parent().expect("file parent")).expect("repo src");
+    fs::write(&file, "fn main() {}\n").expect("source file");
+    let init = Command::new("git")
+        .args(["-C", repo.to_str().expect("utf8 repo"), "init"])
+        .output()
+        .expect("git init");
+    assert!(init.status.success());
+    let remote = Command::new("git")
+        .args([
+            "-C",
+            repo.to_str().expect("utf8 repo"),
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:cgraf78/hive-memory.git",
+        ])
+        .output()
+        .expect("git remote");
+    assert!(remote.status.success());
+
+    let mut resolve = cargo_bin_cmd!("hm");
+    resolve
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "projects",
+            "resolve",
+            file.to_str().expect("utf8 file"),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"project_source\": \"git-remote\"",
+        ))
+        .stdout(predicate::str::contains(
+            "\"project_id\": \"github-com-cgraf78-hive-memory-",
+        ))
+        .stdout(predicate::str::contains(format!(
+            "\"project_root\": \"{}\"",
+            repo.display()
+        )))
+        .stdout(predicate::str::contains(
+            "\"store_source\": \"global-default\"",
+        ));
 }

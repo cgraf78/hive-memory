@@ -12,6 +12,7 @@ pub mod id;
 pub mod index;
 pub mod memory;
 pub mod note;
+pub mod project;
 pub mod render;
 pub mod search;
 pub mod store;

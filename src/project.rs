@@ -1,0 +1,402 @@
+//! Project identity resolution.
+//!
+//! Agent sessions are often launched from subdirectories, editor buffers, or
+//! tool-specific working directories. Project identity therefore cannot be
+//! process CWD by default. This module turns an explicit path hint into a stable
+//! project id, falling back to CWD only when callers provide no better signal.
+
+use crate::id;
+use sha2::{Digest, Sha256};
+use std::error::Error;
+use std::fmt::{self, Display};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// Input for resolving one project identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveProjectInput {
+    /// Path, file, or directory hint supplied by CLI/env/hook code.
+    pub hint: PathBuf,
+    /// Explicit project id from CLI.
+    pub explicit_project_id: Option<String>,
+    /// Project id from `HIVE_MEMORY_PROJECT_ID`.
+    pub env_project_id: Option<String>,
+}
+
+/// Resolved project identity and root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectResolution {
+    /// Stable project id used in memory metadata.
+    pub project_id: String,
+    /// Root directory used for project-relative decisions.
+    pub project_root: PathBuf,
+    /// Original path hint after absolutizing/canonicalizing enough for display.
+    pub project_hint: PathBuf,
+    /// Where the project id came from.
+    pub source: ProjectIdSource,
+}
+
+/// Source of a resolved project id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectIdSource {
+    /// Caller supplied the project id directly.
+    Explicit,
+    /// Environment supplied `HIVE_MEMORY_PROJECT_ID`.
+    Env,
+    /// A `.hive-memory/project.toml` marker supplied the id.
+    Marker,
+    /// Git remote identity was normalized into a project id.
+    GitRemote,
+    /// Filesystem path fallback was hashed into a stable local project id.
+    Path,
+}
+
+impl Display for ProjectIdSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Explicit => "explicit",
+            Self::Env => "env",
+            Self::Marker => "marker",
+            Self::GitRemote => "git-remote",
+            Self::Path => "path",
+        };
+        f.write_str(value)
+    }
+}
+
+/// Project resolution failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectError {
+    /// Current directory could not be read when no hint was supplied.
+    CurrentDir(String),
+    /// Marker file existed but was unreadable or malformed.
+    Marker {
+        /// Marker file path.
+        path: PathBuf,
+        /// Original error rendered for diagnostics.
+        message: String,
+    },
+}
+
+impl Display for ProjectError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CurrentDir(message) => {
+                write!(f, "failed to resolve current directory: {message}")
+            }
+            Self::Marker { path, message } => {
+                write!(
+                    f,
+                    "failed to read project marker {}: {message}",
+                    path.display()
+                )
+            }
+        }
+    }
+}
+
+impl Error for ProjectError {}
+
+/// Resolve a stable project id from a path hint and optional explicit IDs.
+///
+/// Identity precedence follows the v1 spec: CLI id, env id, marker file,
+/// normalized git origin URL, then local path. Root discovery still uses the
+/// path hint so explicit IDs can be attached to the correct checkout without
+/// trusting process CWD.
+pub fn resolve_project(input: ResolveProjectInput) -> Result<ProjectResolution, ProjectError> {
+    let project_hint = absolutize_hint(&input.hint)?;
+    let start_dir = starting_dir(&project_hint);
+    let marker = find_marker(&start_dir)?;
+    let git_root = find_git_root(&start_dir);
+    let project_root = marker
+        .as_ref()
+        .map(|marker| marker.root.clone())
+        .or_else(|| git_root.clone())
+        .unwrap_or_else(|| start_dir.clone());
+
+    if let Some(project_id) = input.explicit_project_id.filter(|value| !value.is_empty()) {
+        return Ok(ProjectResolution {
+            project_id,
+            project_root,
+            project_hint,
+            source: ProjectIdSource::Explicit,
+        });
+    }
+    if let Some(project_id) = input.env_project_id.filter(|value| !value.is_empty()) {
+        return Ok(ProjectResolution {
+            project_id,
+            project_root,
+            project_hint,
+            source: ProjectIdSource::Env,
+        });
+    }
+    if let Some(marker) = marker {
+        return Ok(ProjectResolution {
+            project_id: marker.project_id,
+            project_root,
+            project_hint,
+            source: ProjectIdSource::Marker,
+        });
+    }
+    if let Some(root) = git_root
+        && let Some(remote) = git_origin_url(&root)
+    {
+        let normalized = normalize_remote_url(&remote);
+        return Ok(ProjectResolution {
+            project_id: derived_id(&normalized),
+            project_root: root,
+            project_hint,
+            source: ProjectIdSource::GitRemote,
+        });
+    }
+
+    let path_key = project_root.to_string_lossy();
+    Ok(ProjectResolution {
+        project_id: path_id(&project_root, &path_key),
+        project_root,
+        project_hint,
+        source: ProjectIdSource::Path,
+    })
+}
+
+/// Normalize a git origin URL so protocol/auth changes preserve project id.
+pub fn normalize_remote_url(input: &str) -> String {
+    let mut value = input.trim().trim_end_matches('/').to_owned();
+    for prefix in ["ssh://", "https://", "http://", "git://"] {
+        if let Some(stripped) = value.strip_prefix(prefix) {
+            value = stripped.to_owned();
+            break;
+        }
+    }
+    if let Some((_, rest)) = value.split_once('@') {
+        value = rest.to_owned();
+    }
+    if let Some(stripped) = value.strip_suffix(".git") {
+        value = stripped.to_owned();
+    }
+
+    let slash_index = value.find('/');
+    let colon_index = value.find(':');
+    let scp_like = match (colon_index, slash_index) {
+        (Some(_), None) => true,
+        (Some(colon), Some(slash)) => colon < slash,
+        _ => false,
+    };
+    let (host, rest) = if scp_like {
+        let (host, rest) = value.split_once(':').expect("colon index exists");
+        (
+            host.to_ascii_lowercase(),
+            rest.trim_start_matches('/').to_owned(),
+        )
+    } else if let Some((host, rest)) = value.split_once('/') {
+        (
+            host.to_ascii_lowercase(),
+            rest.trim_start_matches('/').to_owned(),
+        )
+    } else {
+        (value.to_ascii_lowercase(), String::new())
+    };
+
+    if rest.is_empty() {
+        host
+    } else {
+        format!("{host}/{}", rest.trim_end_matches('/'))
+    }
+}
+
+fn absolutize_hint(hint: &Path) -> Result<PathBuf, ProjectError> {
+    let path = if hint.as_os_str().is_empty() {
+        std::env::current_dir().map_err(|err| ProjectError::CurrentDir(err.to_string()))?
+    } else if hint.is_absolute() {
+        hint.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|err| ProjectError::CurrentDir(err.to_string()))?
+            .join(hint)
+    };
+
+    Ok(fs::canonicalize(&path).unwrap_or(path))
+}
+
+fn starting_dir(path: &Path) -> PathBuf {
+    if path.is_file() {
+        path.parent().unwrap_or(path).to_path_buf()
+    } else {
+        path.to_path_buf()
+    }
+}
+
+struct Marker {
+    root: PathBuf,
+    project_id: String,
+}
+
+fn find_marker(start: &Path) -> Result<Option<Marker>, ProjectError> {
+    for dir in start.ancestors() {
+        let path = dir.join(".hive-memory-project");
+        if path.is_file() {
+            let contents = fs::read_to_string(&path).map_err(|err| ProjectError::Marker {
+                path: path.clone(),
+                message: err.to_string(),
+            })?;
+            let value = contents
+                .parse::<toml::Table>()
+                .map_err(|err| ProjectError::Marker {
+                    path: path.clone(),
+                    message: err.to_string(),
+                })?;
+            let project_id = value
+                .get("id")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| ProjectError::Marker {
+                    path: path.clone(),
+                    message: "missing id string".to_owned(),
+                })?;
+            return Ok(Some(Marker {
+                root: dir.to_path_buf(),
+                project_id: project_id.to_owned(),
+            }));
+        }
+    }
+    Ok(None)
+}
+
+fn find_git_root(start: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .args(["-C", start.to_str()?, "rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = String::from_utf8(output.stdout).ok()?;
+    let root = root.trim();
+    (!root.is_empty()).then(|| PathBuf::from(root))
+}
+
+fn git_origin_url(root: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["-C", root.to_str()?, "remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let remote = String::from_utf8(output.stdout).ok()?;
+    let remote = remote.trim();
+    (!remote.is_empty()).then(|| remote.to_owned())
+}
+
+fn derived_id(key: &str) -> String {
+    let slug = slug(key);
+    format!("{slug}-{}", short_hash(key))
+}
+
+fn path_id(root: &Path, key: &str) -> String {
+    let name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(id::sanitize_component)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "project".to_owned())
+        .to_ascii_lowercase();
+    format!("{name}-{}", short_hash(key))
+}
+
+fn slug(value: &str) -> String {
+    let mut output = String::new();
+    let mut previous_dash = false;
+    for ch in value.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            output.push(ch);
+            previous_dash = false;
+        } else if !previous_dash {
+            output.push('-');
+            previous_dash = true;
+        }
+    }
+    output.trim_matches('-').to_owned()
+}
+
+fn short_hash(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))[..12].to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "hive-memory-project-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    #[test]
+    fn normalizes_common_git_url_forms() {
+        let expected = "github.com/cgraf78/hive-memory";
+
+        assert_eq!(
+            normalize_remote_url("git@github.com:cgraf78/hive-memory.git"),
+            expected
+        );
+        assert_eq!(
+            normalize_remote_url("ssh://git@github.com/cgraf78/hive-memory"),
+            expected
+        );
+        assert_eq!(
+            normalize_remote_url("https://github.com/cgraf78/hive-memory.git"),
+            expected
+        );
+    }
+
+    #[test]
+    fn marker_file_overrides_path_identity() {
+        let root = temp_dir("marker");
+        let nested = root.join("a/b");
+        fs::create_dir_all(&nested).expect("nested");
+        fs::write(
+            root.join(".hive-memory-project"),
+            "id = \"project-explicit\"\n",
+        )
+        .expect("marker");
+
+        let resolved = resolve_project(ResolveProjectInput {
+            hint: nested,
+            explicit_project_id: None,
+            env_project_id: None,
+        })
+        .expect("resolve project");
+
+        assert_eq!(resolved.project_id, "project-explicit");
+        assert_eq!(resolved.project_root, root);
+        assert_eq!(resolved.source, ProjectIdSource::Marker);
+    }
+
+    #[test]
+    fn explicit_id_wins_but_keeps_resolved_root() {
+        let root = temp_dir("explicit");
+        fs::write(root.join(".hive-memory-project"), "id = \"marker-id\"\n").expect("marker");
+
+        let resolved = resolve_project(ResolveProjectInput {
+            hint: root.join("missing-file.rs"),
+            explicit_project_id: Some("cli-id".to_owned()),
+            env_project_id: Some("env-id".to_owned()),
+        })
+        .expect("resolve project");
+
+        assert_eq!(resolved.project_id, "cli-id");
+        assert_eq!(resolved.project_root, root);
+        assert_eq!(resolved.source, ProjectIdSource::Explicit);
+    }
+}

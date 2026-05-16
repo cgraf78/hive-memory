@@ -8,8 +8,8 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use hive_memory::config::{AdapterConfig, Config, ConfigPaths, EventSidecarPolicy, Sensitivity};
 use hive_memory::{
-    context as memory_context, hook as memory_hook, index, memory, note, render, search, store,
-    write,
+    context as memory_context, hook as memory_hook, index, memory, note, project, render, search,
+    store, write,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -74,6 +74,9 @@ enum Command {
     Render(RenderArgs),
     /// Refresh indexes and configured adapter outputs.
     Refresh(RefreshArgs),
+    /// Resolve project identity and local project policy.
+    #[command(subcommand)]
+    Projects(ProjectsCommand),
     /// Run agent lifecycle hook policy.
     #[command(subcommand)]
     Hook(HookCommand),
@@ -92,6 +95,26 @@ enum StoresCommand {
     Doctor(StoreDoctorArgs),
     /// Run schema migrators when a future schema is available.
     Migrate(StoreMigrateArgs),
+}
+
+/// Project identity commands.
+#[derive(Debug, Subcommand)]
+enum ProjectsCommand {
+    /// Resolve a path/file hint to a stable project id.
+    Resolve(ProjectResolveArgs),
+}
+
+/// Arguments for `hm projects resolve`.
+#[derive(Debug, Args)]
+struct ProjectResolveArgs {
+    /// Path, file, or directory hint. Defaults to HIVE_MEMORY_PROJECT, then CWD.
+    path: Option<PathBuf>,
+    /// Explicit project id override.
+    #[arg(long)]
+    project_id: Option<String>,
+    /// Emit machine-readable output.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Arguments for `hm stores init`.
@@ -335,6 +358,7 @@ fn main() -> Result<()> {
         Some(Command::Context(args)) => run_context(args, context),
         Some(Command::Render(args)) => run_render(args, context),
         Some(Command::Refresh(args)) => run_refresh(args, context),
+        Some(Command::Projects(command)) => run_projects(command, context),
         Some(Command::Hook(command)) => run_hook(command, context),
         None => Ok(()),
     }
@@ -390,6 +414,63 @@ fn run_stores(command: StoresCommand, config_path: Option<PathBuf>) -> Result<()
             run_store_migrate(&config, args.store.as_deref(), args.dry_run)
         }
     }
+}
+
+fn run_projects(command: ProjectsCommand, context: CliContext) -> Result<()> {
+    match command {
+        ProjectsCommand::Resolve(args) => run_project_resolve(args, context),
+    }
+}
+
+fn run_project_resolve(args: ProjectResolveArgs, context: CliContext) -> Result<()> {
+    let config = load_config(context.config_path.as_deref())?;
+    let hint = args
+        .path
+        .or_else(|| std::env::var("HIVE_MEMORY_PROJECT").ok().map(PathBuf::from))
+        .unwrap_or_default();
+    let project = project::resolve_project(project::ResolveProjectInput {
+        hint,
+        explicit_project_id: args.project_id,
+        env_project_id: std::env::var("HIVE_MEMORY_PROJECT_ID").ok(),
+    })?;
+    let agent_id = resolve_agent_id(context.as_agent);
+    let store = resolve_store(
+        &config,
+        context.store.as_deref(),
+        agent_id.as_deref(),
+        StoreAccess::Read,
+    )?;
+
+    if args.json {
+        let output = ProjectResolveOutput {
+            project_id: project.project_id,
+            project_root: project.project_root.display().to_string(),
+            project_hint: project.project_hint.display().to_string(),
+            project_source: project.source.to_string(),
+            store: store.name,
+            store_source: store.source.to_string(),
+        };
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("project_id: {}", project.project_id);
+        println!("project_root: {}", project.project_root.display());
+        println!("project_hint: {}", project.project_hint.display());
+        println!("project_source: {}", project.source);
+        println!("store: {}", store.name);
+        println!("store_source: {}", store.source);
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct ProjectResolveOutput {
+    project_id: String,
+    project_root: String,
+    project_hint: String,
+    project_source: String,
+    store: String,
+    store_source: String,
 }
 
 fn parse_sensitivity(input: &str) -> std::result::Result<Sensitivity, String> {
@@ -1473,11 +1554,33 @@ fn store_inputs<'a>(
 
 struct ResolvedStore {
     name: String,
+    source: StoreSource,
 }
 
+#[derive(Debug, Clone, Copy)]
 enum StoreAccess {
     Read,
     Write,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StoreSource {
+    Cli,
+    Env,
+    AgentDefault,
+    GlobalDefault,
+}
+
+impl std::fmt::Display for StoreSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Cli => "cli",
+            Self::Env => "env",
+            Self::AgentDefault => "agent-default",
+            Self::GlobalDefault => "global-default",
+        };
+        f.write_str(value)
+    }
 }
 
 /// Resolve the single store a CLI command should use and enforce agent policy.
@@ -1492,14 +1595,17 @@ fn resolve_store(
     agent_id: Option<&str>,
     access: StoreAccess,
 ) -> Result<ResolvedStore> {
-    let name = if let Some(store) = explicit_store {
-        store.to_owned()
+    let (name, source) = if let Some(store) = explicit_store {
+        (store.to_owned(), StoreSource::Cli)
     } else if let Ok(store) = std::env::var("HIVE_MEMORY_STORE") {
-        store
+        (store, StoreSource::Env)
     } else if let Some(agent_id) = agent_id {
-        config.effective_agent_policy(agent_id).default_store
+        (
+            config.effective_agent_policy(agent_id).default_store,
+            StoreSource::AgentDefault,
+        )
     } else {
-        config.default_store.clone()
+        (config.default_store.clone(), StoreSource::GlobalDefault)
     };
 
     let Some(_store) = config.stores.get(&name) else {
@@ -1520,7 +1626,7 @@ fn resolve_store(
         }
     }
 
-    Ok(ResolvedStore { name })
+    Ok(ResolvedStore { name, source })
 }
 
 fn resolve_agent_id(explicit: Option<String>) -> Option<String> {
