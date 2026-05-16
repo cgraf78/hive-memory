@@ -10,8 +10,8 @@ use hive_memory::config::{
     AdapterConfig, Config, ConfigPaths, EventSidecarPolicy, Sensitivity, StoreConfig,
 };
 use hive_memory::{
-    context as memory_context, curation, doctor, hook as memory_hook, index, memory, note, outbox,
-    project, render, search, secret, store, write,
+    config, context as memory_context, curation, doctor, hook as memory_hook, index, memory, note,
+    outbox, project, render, search, secret, store, write,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -102,7 +102,7 @@ enum StoresCommand {
     /// Initialize a store root with a manifest and canonical directories.
     Init(StoreInitArgs),
     /// List configured stores and root availability.
-    List,
+    List(StoreListArgs),
     /// Show one configured store, defaulting to the global default store.
     Show(StoreShowArgs),
     /// Run store diagnostics.
@@ -240,11 +240,22 @@ struct StoreInitArgs {
     sensitivity: Sensitivity,
 }
 
+/// Arguments for `hm stores list`.
+#[derive(Debug, Args)]
+struct StoreListArgs {
+    /// Emit machine-readable output.
+    #[arg(long)]
+    json: bool,
+}
+
 /// Arguments for `hm stores show`.
 #[derive(Debug, Args)]
 struct StoreShowArgs {
     /// Store alias to show. Defaults to config.default_store.
     name: Option<String>,
+    /// Emit machine-readable output.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Arguments for `hm stores doctor`.
@@ -504,7 +515,7 @@ fn main() -> Result<()> {
         as_agent: cli.as_agent,
     };
     match cli.command {
-        Some(Command::Stores(command)) => run_stores(command, context.config_path),
+        Some(Command::Stores(command)) => run_stores(command, context),
         Some(Command::Remember(args)) => run_write_memory(note::EntryKind::Remember, args, context),
         Some(Command::Note(args)) => run_write_memory(note::EntryKind::Note, args, context),
         Some(Command::Search(args)) => run_search(args, context),
@@ -561,7 +572,7 @@ fn run_doctor(args: DoctorArgs, context: CliContext) -> Result<()> {
     Ok(())
 }
 
-fn run_stores(command: StoresCommand, config_path: Option<PathBuf>) -> Result<()> {
+fn run_stores(command: StoresCommand, context: CliContext) -> Result<()> {
     match command {
         StoresCommand::Init(args) => {
             let options = store::StoreInitOptions {
@@ -579,29 +590,26 @@ fn run_stores(command: StoresCommand, config_path: Option<PathBuf>) -> Result<()
             );
             Ok(())
         }
-        StoresCommand::List => {
-            let config = load_config(config_path.as_deref())?;
-            for (name, store) in &config.stores {
-                let available = if store.root.join("manifest.toml").is_file() {
-                    "available"
-                } else {
-                    "missing"
-                };
-                println!("{name}\t{}\t{available}", store.root.display());
-            }
-            Ok(())
+        StoresCommand::List(args) => {
+            let config = load_config(context.config_path.as_deref())?;
+            list_stores(&config, resolve_agent_id(context.as_agent), args.json)
         }
         StoresCommand::Show(args) => {
-            let config = load_config(config_path.as_deref())?;
-            show_store(&config, args.name.as_deref())?;
+            let config = load_config(context.config_path.as_deref())?;
+            show_store(
+                &config,
+                args.name.as_deref(),
+                resolve_agent_id(context.as_agent),
+                args.json,
+            )?;
             Ok(())
         }
         StoresCommand::Doctor(args) => {
-            let config = load_config(config_path.as_deref())?;
+            let config = load_config(context.config_path.as_deref())?;
             run_store_doctor(&config, args.name.as_deref())
         }
         StoresCommand::Migrate(args) => {
-            let config = load_config(config_path.as_deref())?;
+            let config = load_config(context.config_path.as_deref())?;
             run_store_migrate(&config, args.store.as_deref(), args.dry_run)
         }
     }
@@ -2119,11 +2127,118 @@ fn render_stores(
     Ok(adapter.stores.clone())
 }
 
-fn show_store(config: &Config, name: Option<&str>) -> Result<()> {
+/// Print configured store inventory.
+///
+/// The JSON form is intentionally policy-aware when an agent id is active:
+/// hooks and adapter installers can ask `hm` whether a store is readable or
+/// writable instead of duplicating the effective-agent-policy fallback rules.
+fn list_stores(config: &Config, agent_id: Option<String>, json: bool) -> Result<()> {
+    let policy = agent_id
+        .as_deref()
+        .map(|agent_id| config.effective_agent_policy(agent_id));
+    if json {
+        let output = config
+            .stores
+            .iter()
+            .map(|(name, store)| store_list_json(config, name, store, policy.as_ref()))
+            .collect::<Vec<_>>();
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
+
+    for (name, store) in &config.stores {
+        let available = if store.root.join("manifest.toml").is_file() {
+            "available"
+        } else {
+            "missing"
+        };
+        println!("{name}\t{}\t{available}", store.root.display());
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct StoreListJson {
+    /// Local store alias from config.
+    name: String,
+    /// Stable manifest identity when a parseable manifest is present.
+    store_id: Option<String>,
+    /// Configured store root.
+    root: String,
+    /// Whether the root currently advertises a manifest file.
+    ///
+    /// This mirrors the human `stores list` availability check. Manifest
+    /// validity remains a doctor/show concern so list output stays cheap and
+    /// tolerant of temporarily broken stores.
+    available: bool,
+    /// Whether this is config.default_store.
+    default: bool,
+    /// Configured sensitivity, available even when the store root is offline.
+    sensitivity: Sensitivity,
+    /// Whether the active agent can read this store; null without agent policy.
+    readable: Option<bool>,
+    /// Whether the active agent can write this store; null without agent policy.
+    writable: Option<bool>,
+    /// Whether this is the active agent's resolved default store.
+    default_for_agent: Option<bool>,
+}
+
+fn store_list_json(
+    config: &Config,
+    name: &str,
+    store: &StoreConfig,
+    policy: Option<&config::EffectiveAgentPolicy>,
+) -> StoreListJson {
+    let manifest = store::read_manifest(&store.root).ok();
+    let readable = policy.map(|policy| {
+        policy.allow_all_stores || policy.read_stores.iter().any(|allowed| allowed == name)
+    });
+    let writable = policy.map(|policy| {
+        policy.allow_all_stores || policy.write_stores.iter().any(|allowed| allowed == name)
+    });
+    StoreListJson {
+        name: name.to_owned(),
+        store_id: manifest.map(|manifest| manifest.store.id),
+        root: store.root.display().to_string(),
+        available: store.root.join("manifest.toml").is_file(),
+        default: config.default_store == name,
+        sensitivity: store.sensitivity,
+        readable,
+        writable,
+        default_for_agent: policy.map(|policy| policy.default_store == name),
+    }
+}
+
+/// Print one store's configured values plus current manifest state.
+///
+/// Human output preserves the compact diagnostic shape used by early store
+/// commands. JSON output exposes both config and manifest because automation
+/// often needs to distinguish "configured here" from "identity present there."
+fn show_store(
+    config: &Config,
+    name: Option<&str>,
+    agent_id: Option<String>,
+    json: bool,
+) -> Result<()> {
     let name = name.unwrap_or(&config.default_store);
     let Some(store) = config.stores.get(name) else {
         anyhow::bail!("unknown store: {name}");
     };
+
+    if json {
+        let manifest = store::read_manifest(&store.root).ok();
+        let output = StoreShowJson {
+            name: name.to_owned(),
+            config: store_config_json(store),
+            manifest,
+            available: store.root.join("manifest.toml").is_file(),
+            effective_agent_policy: agent_id.as_deref().map(|agent_id| {
+                effective_agent_policy_json(config.effective_agent_policy(agent_id))
+            }),
+        };
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
 
     println!("name: {name}");
     println!("root: {}", store.root.display());
@@ -2140,6 +2255,62 @@ fn show_store(config: &Config, name: Option<&str>) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct StoreShowJson {
+    /// Local store alias being inspected.
+    name: String,
+    /// Configured values for this alias.
+    config: StoreConfigJson,
+    /// Parsed manifest when the root has a valid manifest.
+    manifest: Option<store::StoreManifest>,
+    /// Whether the root currently advertises a manifest file.
+    available: bool,
+    /// Resolved agent policy when an agent id is active.
+    effective_agent_policy: Option<EffectiveAgentPolicyJson>,
+}
+
+#[derive(Debug, Serialize)]
+struct StoreConfigJson {
+    /// Configured store root.
+    root: String,
+    /// Optional manifest id this alias expects.
+    expected_id: Option<String>,
+    /// Optional human-facing description.
+    description: Option<String>,
+    /// Configured sensitivity fallback.
+    sensitivity: Sensitivity,
+}
+
+#[derive(Debug, Serialize)]
+struct EffectiveAgentPolicyJson {
+    /// Store selected by default for the active agent.
+    default_store: String,
+    /// Stores readable by the active agent.
+    read_stores: Vec<String>,
+    /// Stores writable by the active agent.
+    write_stores: Vec<String>,
+    /// Whether explicit all-store operations are permitted.
+    allow_all_stores: bool,
+}
+
+fn store_config_json(store: &StoreConfig) -> StoreConfigJson {
+    StoreConfigJson {
+        root: store.root.display().to_string(),
+        expected_id: store.expected_id.clone(),
+        description: store.description.clone(),
+        sensitivity: store.sensitivity,
+    }
+}
+
+fn effective_agent_policy_json(policy: config::EffectiveAgentPolicy) -> EffectiveAgentPolicyJson {
+    EffectiveAgentPolicyJson {
+        default_store: policy.default_store,
+        read_stores: policy.read_stores,
+        write_stores: policy.write_stores,
+        allow_all_stores: policy.allow_all_stores,
+    }
 }
 
 fn run_store_doctor(config: &Config, name: Option<&str>) -> Result<()> {

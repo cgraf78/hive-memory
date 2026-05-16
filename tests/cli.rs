@@ -209,6 +209,69 @@ fn stores_list_reads_configured_stores() {
 }
 
 #[test]
+fn stores_list_json_reports_agent_policy_fields() {
+    let dir = temp_dir("stores-list-json");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "{}"
+
+            [stores.work]
+            root = "{}"
+            sensitivity = "internal"
+
+            [agents.codex]
+            default_store = "work"
+            read_stores = ["personal", "work"]
+            write_stores = ["work"]
+            "#,
+            personal.display(),
+            work.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&work, "work");
+
+    let output = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "stores",
+            "list",
+            "--json",
+        ])
+        .output()
+        .expect("run stores list");
+    assert!(output.status.success(), "stores list failed: {output:?}");
+    let stores: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stores list json");
+    let stores = stores.as_array().expect("stores list array");
+    let personal = stores
+        .iter()
+        .find(|store| store["name"] == "personal")
+        .expect("personal store");
+    let work = stores
+        .iter()
+        .find(|store| store["name"] == "work")
+        .expect("work store");
+
+    assert_eq!(personal["readable"], true);
+    assert_eq!(personal["writable"], false);
+    assert_eq!(work["available"], true);
+    assert_eq!(work["sensitivity"], "internal");
+    assert_eq!(work["default_for_agent"], true);
+}
+
+#[test]
 fn stores_show_defaults_to_config_default_store() {
     let dir = temp_dir("stores-show");
     let config = dir.join("config.toml");
@@ -239,6 +302,59 @@ fn stores_show_defaults_to_config_default_store() {
     .stdout(predicate::str::contains("name: personal"))
     .stdout(predicate::str::contains("available: true"))
     .stdout(predicate::str::contains("manifest_id: "));
+}
+
+#[test]
+fn stores_show_json_reports_config_manifest_and_agent_policy() {
+    let dir = temp_dir("stores-show-json");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "{}"
+            description = "Personal memory"
+
+            [stores.work]
+            root = "{}"
+
+            [agents.codex]
+            default_store = "personal"
+            read_stores = ["personal"]
+            write_stores = ["personal"]
+            "#,
+            personal.display(),
+            work.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    let output = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "stores",
+            "show",
+            "--json",
+        ])
+        .output()
+        .expect("run stores show");
+    assert!(output.status.success(), "stores show failed: {output:?}");
+    let show: serde_json::Value = serde_json::from_slice(&output.stdout).expect("stores show json");
+
+    assert_eq!(show["name"], "personal");
+    assert_eq!(show["config"]["description"], "Personal memory");
+    assert!(show["manifest"].is_object());
+    assert_eq!(show["available"], true);
+    assert_eq!(show["effective_agent_policy"]["default_store"], "personal");
 }
 
 #[test]
