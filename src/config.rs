@@ -12,6 +12,7 @@ use std::fmt::{self, Display};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 const TOP_LEVEL_KEYS: &[&str] = &[
     "schema_version",
@@ -157,6 +158,41 @@ pub enum Sensitivity {
     Private,
     Secret,
 }
+
+impl FromStr for Sensitivity {
+    type Err = SensitivityParseError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        match input {
+            "public" => Ok(Self::Public),
+            "internal" => Ok(Self::Internal),
+            "private" => Ok(Self::Private),
+            "secret" => Ok(Self::Secret),
+            _ => Err(SensitivityParseError {
+                value: input.to_owned(),
+            }),
+        }
+    }
+}
+
+/// Error returned when parsing a sensitivity value from CLI or env input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SensitivityParseError {
+    /// Original value that did not match the supported sensitivity vocabulary.
+    pub value: String,
+}
+
+impl Display for SensitivityParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid sensitivity {}; expected one of public, internal, private, secret",
+            self.value
+        )
+    }
+}
+
+impl Error for SensitivityParseError {}
 
 /// Per-agent store policy from config.
 ///
