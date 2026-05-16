@@ -6,5 +6,6 @@
 
 pub mod config;
 pub mod id;
+pub mod note;
 pub mod store;
 pub mod write;
