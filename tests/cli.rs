@@ -562,6 +562,52 @@ fn doctor_warns_for_unknown_project_binding_store() {
 }
 
 #[test]
+fn doctor_warns_for_pending_and_unbound_outbox_items() {
+    let dir = temp_dir("doctor-outbox");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    write_data_config(&config, &data, &personal);
+    init_store(&personal, "personal");
+    write_outbox_note_item(
+        &data,
+        "personal",
+        "pending-note",
+        Some("known-store".to_owned()),
+        "inbox/notes/pending-note.md",
+        b"pending\n",
+        outbox::OutboxState::Pending,
+    );
+    write_outbox_note_item(
+        &data,
+        "personal",
+        "unbound-note",
+        None,
+        "inbox/notes/unbound-note.md",
+        b"unbound\n",
+        outbox::OutboxState::Unbound,
+    );
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "doctor",
+            "--quick",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"warnings\": 2"))
+        .stdout(predicate::str::contains(
+            "local outbox has 2 item(s): pending=1 unbound=1 unreadable=0",
+        ))
+        .stdout(predicate::str::contains(
+            "1 outbox item(s) require explicit store binding",
+        ));
+}
+
+#[test]
 fn doctor_full_warns_for_likely_secret_in_private_note_without_echoing_value() {
     let dir = temp_dir("doctor-note-secret");
     let config = dir.join("config.toml");

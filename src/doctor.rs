@@ -5,7 +5,7 @@
 //! the configured stores, local project bindings, and adapter links be trusted
 //! before an agent relies on them?
 
-use crate::{config, note, project, render, secret, store};
+use crate::{config, note, outbox, project, render, secret, store};
 use serde::Serialize;
 use std::fs;
 use std::path::Path;
@@ -105,6 +105,7 @@ pub fn run(input: DoctorInput<'_>) -> DoctorReport {
 
     check_stores(input.config, &mut checks);
     check_project_bindings(input.config, &mut checks);
+    check_outbox(input.config, &mut checks);
     check_adapters(input.config, input.quick, &mut checks);
     // Secret scanning is deliberately kept off the quick path. Hooks and
     // update-time health checks need cheap structural validation, while this
@@ -145,6 +146,95 @@ fn check_stores(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
                 )),
             }
         }
+    }
+}
+
+fn check_outbox(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
+    let root = config.data_dir.join("outbox");
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            checks.push(pass(
+                "outbox",
+                "local outbox is empty",
+                vec![root.display().to_string()],
+            ));
+            return;
+        }
+        Err(err) => {
+            checks.push(warn(
+                "outbox",
+                format!("failed to read local outbox: {err}"),
+                vec![root.display().to_string()],
+            ));
+            return;
+        }
+    };
+
+    let mut total = 0usize;
+    let mut pending = 0usize;
+    let mut unbound = 0usize;
+    let mut unreadable = 0usize;
+    let mut paths = Vec::new();
+    for store_entry in entries {
+        let Ok(store_entry) = store_entry else {
+            unreadable += 1;
+            continue;
+        };
+        let Ok(item_entries) = fs::read_dir(store_entry.path()) else {
+            unreadable += 1;
+            continue;
+        };
+        for item_entry in item_entries {
+            let Ok(item_entry) = item_entry else {
+                unreadable += 1;
+                continue;
+            };
+            let meta_path = item_entry.path().join("meta.toml");
+            let meta = fs::read_to_string(&meta_path)
+                .map_err(|err| err.to_string())
+                .and_then(|contents| {
+                    toml::from_str::<outbox::OutboxMeta>(&contents).map_err(|err| err.to_string())
+                });
+            match meta {
+                Ok(meta) => {
+                    total += 1;
+                    paths.push(meta_path.display().to_string());
+                    match meta.state {
+                        outbox::OutboxState::Pending => pending += 1,
+                        outbox::OutboxState::Unbound => unbound += 1,
+                    }
+                }
+                Err(_) => unreadable += 1,
+            }
+        }
+    }
+
+    // Outbox debt is local operational state. Warn instead of erroring so
+    // `hm doctor` remains useful while a store is intentionally offline, but
+    // keep unbound items prominent because they require an explicit decision.
+    if total == 0 && unreadable == 0 {
+        checks.push(pass(
+            "outbox",
+            "local outbox is empty",
+            vec![root.display().to_string()],
+        ));
+        return;
+    }
+
+    checks.push(warn(
+        "outbox",
+        format!(
+            "local outbox has {total} item(s): pending={pending} unbound={unbound} unreadable={unreadable}"
+        ),
+        paths,
+    ));
+    if unbound > 0 {
+        checks.push(warn(
+            "outbox.unbound",
+            format!("{unbound} outbox item(s) require explicit store binding"),
+            vec![root.display().to_string()],
+        ));
     }
 }
 
