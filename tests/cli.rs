@@ -2138,7 +2138,11 @@ fn hook_context_fails_when_store_unavailable_without_cache() {
             "--json",
         ])
         .assert()
-        .failure()
+        .code(5)
+        .stderr(predicate::str::contains("\"ok\": false"))
+        .stderr(predicate::str::contains(
+            "\"code\": \"backend_unavailable\"",
+        ))
         .stderr(predicate::str::contains(
             "store personal is unavailable and no valid context cache exists",
         ));

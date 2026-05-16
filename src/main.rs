@@ -15,6 +15,8 @@ use hive_memory::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::error::Error;
+use std::fmt::{self, Display};
 use std::path::PathBuf;
 use std::str::FromStr;
 use time::OffsetDateTime;
@@ -520,8 +522,16 @@ struct HookStopArgs {
     json: bool,
 }
 
-fn main() -> Result<()> {
+fn main() {
     let cli = Cli::parse();
+    let json = cli.wants_json();
+    if let Err(err) = run(cli) {
+        emit_cli_error(&err, json);
+        std::process::exit(exit_code(&err));
+    }
+}
+
+fn run(cli: Cli) -> Result<()> {
     let context = CliContext {
         config_path: cli.config,
         store: cli.store,
@@ -543,6 +553,116 @@ fn main() -> Result<()> {
         Some(Command::Promote(args)) => run_promote(args, context),
         Some(Command::Inbox(command)) => run_inbox(command, context),
         None => Ok(()),
+    }
+}
+
+impl Cli {
+    /// Return whether this invocation has opted into structured CLI output.
+    ///
+    /// Error rendering happens after command dispatch fails, so it cannot ask
+    /// the already-failed command how to report diagnostics. Keep this list in
+    /// lockstep with command structs that expose `--json`; those commands owe
+    /// callers a stable JSON success *and* failure envelope.
+    fn wants_json(&self) -> bool {
+        match &self.command {
+            Some(Command::Stores(StoresCommand::List(args))) => args.json,
+            Some(Command::Stores(StoresCommand::Show(args))) => args.json,
+            Some(Command::Remember(args)) | Some(Command::Note(args)) => args.json,
+            Some(Command::Search(args)) => args.json,
+            Some(Command::Context(args)) => args.json,
+            Some(Command::Render(args)) => args.json,
+            Some(Command::Refresh(args)) => args.json,
+            Some(Command::Flush(args)) | Some(Command::Outbox(OutboxCommand::Flush(args))) => {
+                args.json
+            }
+            Some(Command::Projects(ProjectsCommand::Resolve(args))) => args.json,
+            Some(Command::Hook(HookCommand::SessionStart(args))) => args.json,
+            Some(Command::Hook(HookCommand::PromptSubmit(args))) => args.json,
+            Some(Command::Hook(HookCommand::ToolComplete(args))) => args.json,
+            Some(Command::Hook(HookCommand::Stop(args))) => args.json,
+            Some(Command::Doctor(args)) => args.json,
+            Some(Command::Promote(args)) => args.json,
+            Some(Command::Inbox(InboxCommand::List(args))) => args.json,
+            Some(Command::Inbox(InboxCommand::Stale(args))) => args.json,
+            Some(Command::Inbox(InboxCommand::Show(args))) => args.json,
+            _ => false,
+        }
+    }
+}
+
+/// Operational failure for a store backend that may become reachable later.
+///
+/// Hooks need to distinguish this from malformed config or unsafe policy
+/// failures. A backend-unavailable error can usually be retried after a mount,
+/// sync client, or network path comes back, and JSON hook adapters can present
+/// that as stale/missing memory context rather than as a broken installation.
+#[derive(Debug)]
+struct BackendUnavailable {
+    message: String,
+}
+
+impl Display for BackendUnavailable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl Error for BackendUnavailable {}
+
+#[derive(Debug, Serialize)]
+struct JsonErrorOutput<'a> {
+    ok: bool,
+    error: JsonErrorBody<'a>,
+}
+
+#[derive(Debug, Serialize)]
+struct JsonErrorBody<'a> {
+    code: &'a str,
+    message: String,
+    details: serde_json::Value,
+}
+
+fn emit_cli_error(err: &anyhow::Error, json: bool) {
+    if json {
+        // JSON commands should never fall back to anyhow's human text. Hook
+        // adapters and agent integrations branch on `error.code`, while
+        // `message` remains suitable for logs and terminal display.
+        let output = JsonErrorOutput {
+            ok: false,
+            error: JsonErrorBody {
+                code: error_code(err),
+                message: err.to_string(),
+                details: serde_json::json!({}),
+            },
+        };
+        eprintln!(
+            "{}",
+            serde_json::to_string_pretty(&output).expect("serialize JSON error")
+        );
+    } else {
+        eprintln!("Error: {err}");
+    }
+}
+
+/// Return the stable machine code for an operational CLI error.
+fn error_code(err: &anyhow::Error) -> &'static str {
+    if err.downcast_ref::<BackendUnavailable>().is_some() {
+        "backend_unavailable"
+    } else if err.downcast_ref::<config::ConfigError>().is_some() {
+        "config_error"
+    } else {
+        "error"
+    }
+}
+
+/// Return the process status for an operational CLI error.
+fn exit_code(err: &anyhow::Error) -> i32 {
+    if err.downcast_ref::<BackendUnavailable>().is_some() {
+        5
+    } else if err.downcast_ref::<config::ConfigError>().is_some() {
+        3
+    } else {
+        1
     }
 }
 
@@ -1564,13 +1684,20 @@ fn assemble_cli_context(
     if std::env::var("HIVE_MEMORY_HOOK_ACTIVE").ok().as_deref() == Some("1")
         && let Err(store::StoreError::Io { .. }) = store::read_manifest(&store_config.root)
     {
+        // Hook context runs at agent startup/prompt boundaries, where failing
+        // hard on an offline cloud/mount path is worse than using the last
+        // known-good context. Outside hook mode, interactive commands should
+        // rebuild normally and surface the underlying store read failure.
         if let Some(assembly) = load_context_cache(config, &context_key, store_source.clone())? {
             return Ok(assembly);
         }
-        anyhow::bail!(
-            "store {} is unavailable and no valid context cache exists",
-            resolved_store.name
-        );
+        return Err(BackendUnavailable {
+            message: format!(
+                "store {} is unavailable and no valid context cache exists",
+                resolved_store.name
+            ),
+        }
+        .into());
     }
     let report = rebuild_store_index(config, &resolved_store.name)?;
     let max_tokens = selection.max_tokens.unwrap_or_else(|| {
