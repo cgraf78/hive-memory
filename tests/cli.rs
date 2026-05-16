@@ -1762,6 +1762,93 @@ fn context_json_reports_selection_and_sections() {
 }
 
 #[test]
+fn context_if_changed_suppresses_unchanged_session_output() {
+    let dir = temp_dir("context-if-changed");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let state = dir.join("state");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            state_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+            "#,
+            state.display(),
+            personal.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Changed context cursor memory.",
+        ])
+        .assert()
+        .success();
+
+    let first = cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", "session-context-json")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "context",
+            "--if-changed",
+            "--json",
+        ])
+        .output()
+        .expect("first context");
+    assert!(first.status.success(), "first context failed: {first:?}");
+    let first_json: serde_json::Value =
+        serde_json::from_slice(&first.stdout).expect("first context json");
+    assert_eq!(first_json["emitted"], true);
+    assert_eq!(
+        first_json["sections"].as_array().expect("sections").len(),
+        1
+    );
+
+    let second = cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", "session-context-json")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "context",
+            "--if-changed",
+            "--json",
+        ])
+        .output()
+        .expect("second context");
+    assert!(second.status.success(), "second context failed: {second:?}");
+    let second_json: serde_json::Value =
+        serde_json::from_slice(&second.stdout).expect("second context json");
+    assert_eq!(second_json["emitted"], false);
+    assert_eq!(second_json["estimated_tokens"], 0);
+    let second_sections = second_json["sections"].as_array().expect("sections");
+    assert!(second_sections.is_empty());
+
+    let silent = cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", "session-context-json")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "context",
+            "--if-changed",
+        ])
+        .output()
+        .expect("silent context");
+    assert!(silent.status.success(), "silent context failed: {silent:?}");
+    assert!(silent.stdout.is_empty());
+}
+
+#[test]
 fn context_requires_include_inbox_for_raw_note() {
     let dir = temp_dir("context-include-inbox");
     let config = dir.join("config.toml");

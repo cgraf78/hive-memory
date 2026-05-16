@@ -389,6 +389,9 @@ struct ContextArgs {
     /// Active path hint to display in context headers.
     #[arg(long)]
     path: Option<String>,
+    /// Suppress output when this session already saw the same context selection.
+    #[arg(long)]
+    if_changed: bool,
     /// Emit machine-readable output.
     #[arg(long)]
     json: bool,
@@ -1212,6 +1215,31 @@ fn run_context(args: ContextArgs, context: CliContext) -> Result<()> {
         },
     )?;
 
+    // Without a session id there is no durable cursor to compare against.
+    // Treat that as "changed" and emit fresh context instead of making one-off
+    // CLI/debug calls fail because they are outside a managed agent session.
+    if args.if_changed
+        && let Some(session_id) = context_session_id()
+    {
+        let context_key = context_selection_key_from_assembly(&assembly);
+        let state = memory_hook::load_state(&config.state_dir, &session_id)?;
+        if state.context_key.as_deref() == Some(context_key.as_str()) {
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&context_json_suppressed(assembly, false, None))?
+                );
+            }
+            return Ok(());
+        }
+        memory_hook::mark_context_key(
+            &config.state_dir,
+            &session_id,
+            context_key,
+            &hook_options(&config),
+        )?;
+    }
+
     if args.json {
         println!(
             "{}",
@@ -1415,6 +1443,27 @@ fn context_json(
                 body: section.body,
             })
             .collect(),
+    }
+}
+
+fn context_json_suppressed(
+    assembly: CliContextAssembly,
+    stale: bool,
+    cache_created_at: Option<String>,
+) -> ContextJsonOutput {
+    ContextJsonOutput {
+        agent_id: assembly.agent_id,
+        project_id: assembly.project_id,
+        project_hint: assembly.project_hint,
+        stores: assembly.stores,
+        store_source: assembly.store_source,
+        scopes: assembly.scopes,
+        sources: assembly.sources,
+        estimated_tokens: 0,
+        emitted: false,
+        stale,
+        cache_created_at,
+        sections: Vec::new(),
     }
 }
 
@@ -1950,6 +1999,12 @@ fn hook_session_id(warnings: &mut Vec<String>) -> Option<String> {
     }
 }
 
+fn context_session_id() -> Option<String> {
+    std::env::var("HIVE_MEMORY_SESSION_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
 fn hook_context_action_if_changed(
     config: &Config,
     context: &CliContext,
@@ -1994,6 +2049,41 @@ fn hook_context_action_if_changed(
     )))
 }
 
+fn context_selection_key_from_assembly(assembly: &CliContextAssembly) -> String {
+    let agent_id = assembly.agent_id.as_deref().unwrap_or("unknown");
+    context_selection_key(
+        agent_id,
+        &assembly.stores,
+        assembly.project_id.as_deref(),
+        assembly.project_hint.as_deref(),
+        &assembly.scopes,
+        &assembly.sources,
+    )
+}
+
+/// Return the stable cursor used by `hm context --if-changed` and hook refreshes.
+///
+/// This key intentionally tracks selection identity, not memory file mtimes.
+/// New memory writes are handled by write receipts and refresh; this cursor is
+/// only for long-lived agents moving between projects, stores, or render policy.
+fn context_selection_key(
+    agent_id: &str,
+    stores: &[String],
+    project_id: Option<&str>,
+    path_hint: Option<&str>,
+    scopes: &[String],
+    sources: &[String],
+) -> String {
+    format!(
+        "agent={agent_id}\nstores={}\nproject_id={}\npath={}\nscopes={}\nsources={}",
+        stores.join(","),
+        project_id.unwrap_or_default(),
+        path_hint.unwrap_or_default(),
+        scopes.join(","),
+        sources.join(",")
+    )
+}
+
 fn hook_context_key(
     config: &Config,
     context: &CliContext,
@@ -2011,13 +2101,13 @@ fn hook_context_key(
         StoreAccess::Read,
     )?;
 
-    let project_id = project_id.unwrap_or_default();
-    Ok(format!(
-        "agent={agent_label}\nstore={}\nproject_id={project_id}\npath={}\nscopes={}\nsources={}",
-        resolved_store.name,
-        path_hint.unwrap_or_default(),
-        config.defaults.search_scopes.join(","),
-        config.defaults.context_sources.join(",")
+    Ok(context_selection_key(
+        &agent_label,
+        &[resolved_store.name],
+        project_id.as_deref(),
+        path_hint,
+        &config.defaults.search_scopes,
+        &config.defaults.context_sources,
     ))
 }
 
