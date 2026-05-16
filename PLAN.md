@@ -89,6 +89,11 @@ The implementation and installer must support the same practical platform matrix
 as Chris's personal dotfiles/shdeps environment. The project should be
 installable as a normal `shdeps` dependency from personal dotfiles.
 
+Why this matters: `hm` runs from agent lifecycle hooks, so installation must be
+boring and reliable on every host where agents run. Precompiled binaries avoid
+requiring a Rust toolchain during dotfiles bootstrap and make hook startup fast
+and predictable.
+
 Distribution requirements:
 
 - Publish precompiled release binaries for every supported platform.
@@ -186,6 +191,11 @@ Important: store roots are always configurable. Google Drive is just one good
 backend for Chris, not a baked-in assumption. A config always has one
 `default_store`; additional named stores are optional and are used for memory
 segmentation.
+
+Why this matters: config files capture durable human intent, while environment
+variables let wrappers, hooks, and agent launchers select the right store/scope
+for the current context without editing files. This keeps the system flexible
+without making agents guess.
 
 ### Configuration Precedence
 
@@ -290,6 +300,11 @@ Rules:
 Avoid accidental leakage: rendering a work store into a personal agent config, or
 personal store into a work/client context, must require explicit config.
 
+Benefit: segmentation keeps unrelated memories from contaminating each other and
+lets users decide which hives should be available in which environments. A single
+default store preserves simple ergonomics for common use, while named stores
+support work/client/family/private boundaries without forking the tool.
+
 ## Canonical Directory Layout
 
 ```text
@@ -335,6 +350,11 @@ personal store into a work/client context, must require explicit config.
     # adapter output stays local and rebuildable
 ```
 
+Why this layout: curated memory, raw inbox entries, generated adapter output, and
+local indexes have different lifecycles. Keeping them separate makes it obvious
+what humans edit, what agents append, what compaction produces, and what can be
+rebuilt or deleted safely.
+
 ## Canonical Data Format
 
 Markdown is the canonical durable human-readable memory format. JSON is used for
@@ -356,6 +376,29 @@ manage the hive safely.
 Raw memory must be durable and non-lossy: compaction creates summaries and
 curated updates, but does not delete raw notes/events by default. Retention or
 archival policy is explicit and opt-in.
+
+### Why JSON Events Exist
+
+Markdown is great for humans, but agents also need predictable structured data.
+JSON event files provide that structure without making the human-readable note
+format carry every machine concern.
+
+JSON events are useful for:
+
+- **Reliable indexing**: an indexer can read timestamps, store IDs, scopes,
+  project IDs, tags, confidence, and source metadata without scraping prose.
+- **Dedupe and idempotency**: event IDs let agents retry writes or imports without
+  accidentally recording the same observation multiple times.
+- **Audit trails**: structured source fields can record which agent/session/tool
+  produced a memory, which helps debug bad memories later.
+- **Compaction input**: compactors can select events by type, scope, confidence,
+  age, or project before asking a model to summarize.
+- **Future integrations**: other tools can consume events without parsing
+  Markdown front matter conventions.
+
+JSON events should not replace Markdown. The Markdown note remains the canonical
+record a human can read. JSON is a sidecar/event stream for operations that
+benefit from strict structure.
 
 ### Manifest
 
@@ -392,7 +435,16 @@ Example:
 This avoids collisions even when many sessions on the same host write at the
 same time.
 
+Benefit: unique, sortable filenames make cloud-drive sync safe. Agents do not
+need a central coordinator to write memories; they only need to choose a unique
+path and atomically publish it.
+
 ## Concurrency Model
+
+The concurrency model optimizes for cloud-synced folders and many independent
+agent sessions. It avoids shared hot files on the write path because cloud sync
+systems are good at moving distinct files and bad at merging concurrent edits to
+the same file.
 
 ### Rule 1: agents do not append to shared hot files
 
@@ -452,6 +504,10 @@ always be rebuilt from canonical files.
 
 ## Write Types
 
+Writes separate human-readable content from machine-oriented metadata. The goal
+is not to duplicate everything forever; it is to preserve a durable note while
+providing enough structure for indexing, compaction, and diagnostics.
+
 ### Raw note
 
 Human-readable markdown with front matter:
@@ -499,6 +555,11 @@ JSON sidecar/event from the same operation when structured processing needs it.
 
 ## CLI Surface
 
+The CLI is the stable contract for agents. Hooks and prompts should call `hm`
+instead of reimplementing path rules, store selection, locking, or metadata
+formatting. Human commands should make inspection and correction easy when agent
+automation gets something wrong.
+
 Agent-optimized commands:
 
 ```bash
@@ -527,6 +588,10 @@ hm status
 
 Adapters render canonical memory into the format each agent expects.
 
+Benefit: each agent gets native-feeling context files, but the canonical store
+stays vendor-neutral. Adding a new agent should mean writing a renderer, not
+changing how memory is stored.
+
 ### Claude
 
 - Render global rules into `~/.claude/CLAUDE.md` or an included/generated block.
@@ -553,6 +618,10 @@ Adapters render canonical memory into the format each agent expects.
 
 Dotfiles should own installation and bootstrap, not memory content.
 
+Benefit: dotfiles make `hm` appear consistently on every machine, while the
+memory store remains configurable and private. This keeps bootstrap reproducible
+without committing personal memory into dotfiles.
+
 Tracked in dotfiles:
 
 ```text
@@ -578,6 +647,11 @@ Merge hook behavior:
 ## Backend Flexibility
 
 Initial backend: `filesystem`.
+
+Why filesystem first: it matches GDrive/Dropbox/Syncthing/local-directory use
+cases, keeps the canonical store inspectable, and avoids requiring a server. The
+backend boundary still leaves room for future storage implementations if a real
+need appears.
 
 Filesystem backend requirements:
 
@@ -607,6 +681,10 @@ Future backends can implement the same operations:
 But the CLI and adapters should not know which backend is underneath.
 
 ## Edge Cases
+
+These cases are part of the core design, not afterthoughts. The system should be
+safe under concurrent agents, flaky cloud sync, offline laptops, and accidental
+misconfiguration.
 
 ### Multiple sessions on same host write simultaneously
 
@@ -673,6 +751,11 @@ Every note has scope metadata. Adapter render commands require explicit scope
 selection. Default should be conservative.
 
 ## MVP Plan
+
+The MVP should validate the hardest architectural bets first: configurable
+stores, safe concurrent writes, readable canonical memory, and useful rendered
+context for the two primary coding agents. Smarter compaction and richer search
+can build on that foundation.
 
 1. Build `hive-memory` as a standalone repo.
 2. Implement filesystem backend with configurable named stores and a required
