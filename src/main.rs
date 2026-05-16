@@ -420,6 +420,9 @@ struct RefreshArgs {
     /// Run even when future receipt tracking would otherwise skip work.
     #[arg(long)]
     force: bool,
+    /// Emit machine-readable output.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Arguments for `hm flush`.
@@ -1400,6 +1403,11 @@ fn run_render(args: RenderArgs, context: CliContext) -> Result<()> {
 fn run_refresh(args: RefreshArgs, context: CliContext) -> Result<()> {
     let config = load_config(context.config_path.as_deref())?;
     let report = perform_refresh(&config, &context, args.force)?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
 
     if !args.quiet {
         println!(
