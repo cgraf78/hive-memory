@@ -112,13 +112,13 @@ Distribution requirements:
   on every machine just to install/use `hm`.
 - CI should build/test/release the supported targets.
 
-Likely release artifacts:
+Likely release artifacts use the versioned release format:
 
 ```text
-hm-aarch64-apple-darwin.tar.gz
-hm-x86_64-apple-darwin.tar.gz
-hm-x86_64-unknown-linux-gnu.tar.gz
-hm-aarch64-unknown-linux-gnu.tar.gz
+hm-vX.Y.Z-aarch64-apple-darwin.tar.gz
+hm-vX.Y.Z-x86_64-apple-darwin.tar.gz
+hm-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
+hm-vX.Y.Z-aarch64-unknown-linux-gnu.tar.gz
 ```
 
 WSL should use the Linux binaries. Musl Linux binaries are a deferred release
@@ -150,6 +150,9 @@ Planned Rust stack:
 - plain text/front-matter handling initially; add Markdown parsing only when needed
 - simple text search first; `rusqlite`/SQLite FTS later for local indexing
 - `assert_cmd`, `predicates`, `tempfile` for CLI tests
+- Rust edition 2024 unless target constraints require 2021; document MSRV before
+  first release
+- Prefer `cargo-dist` for release archives/checksums unless it blocks target needs
 
 Keep the architecture modular but not framework-heavy: storage, writer, index,
 renderers, and compactor as clean modules under one binary crate at first. Split
@@ -184,16 +187,28 @@ kind = "filesystem"   # filesystem first; future: s3, webdav, sqlite, postgres
 case_sensitive = "auto"
 atomic_rename = "auto"
 
-[adapters]
-claude = true
-codex = true
-openclaw = false
-gemini = false
+[defaults]
+write_scope = "global"
+search_scopes = ["global", "project"]
+render_scopes = ["global", "project"]
+event_sidecar = "always" # never|always
 
-[scopes]
-default_write = "personal"
-include = ["personal", "project"]
-exclude = ["work", "agent-private"]
+[privacy]
+default_render_policy = "conservative"
+allow_all_stores_flag = true
+warn_sensitive_broad_render = true
+
+[adapters.claude]
+enabled = true
+stores = ["personal"]
+scopes = ["global", "project"]
+output = "${HOME}/.claude/hive-memory.generated.md"
+
+[adapters.codex]
+enabled = true
+stores = ["personal"]
+scopes = ["global", "project"]
+output = "${HOME}/.codex/hive-memory.generated.md"
 ```
 
 Important: store roots are always configurable. Google Drive is just one good
@@ -239,7 +254,7 @@ HIVE_MEMORY_USER_ID=chris
 HIVE_MEMORY_AGENT_ID=codex
 HIVE_MEMORY_SESSION_ID=<session-id>
 HIVE_MEMORY_PROJECT=/path/to/project
-HIVE_MEMORY_SCOPE=personal
+HIVE_MEMORY_SCOPE=global
 ```
 
 Adapter/render env vars:
@@ -247,8 +262,8 @@ Adapter/render env vars:
 ```bash
 HIVE_MEMORY_ADAPTER=codex                     # active adapter hint
 HIVE_MEMORY_RENDER_STORES=personal,work       # adapter store allowlist
-HIVE_MEMORY_INCLUDE_SCOPES=personal,project
-HIVE_MEMORY_EXCLUDE_SCOPES=work,agent-private
+HIVE_MEMORY_INCLUDE_SCOPES=global,project
+HIVE_MEMORY_EXCLUDE_SCOPES=agent-private
 ```
 
 Behavior toggles:
@@ -295,8 +310,10 @@ Rules:
 
 - Every store has its own root, manifest, inbox, memories, locks, and generated
   views.
-- Store names are stable IDs, not display names. Prefer lowercase
-  `[a-z0-9][a-z0-9_-]*`.
+- Config store keys and CLI store names are local aliases. Prefer lowercase
+  `[a-z0-9][a-z0-9_-]*`. The manifest `store.id` UUID is the durable store
+  identity; `store.name` is the preferred human-readable name and should usually
+  match the configured alias.
 - The default store is used when no `--store` is provided.
 - Adapters declare which stores they include, and the default should be
   conservative.
@@ -313,6 +330,20 @@ Benefit: segmentation keeps unrelated memories from contaminating each other and
 lets users decide which hives should be available in which environments. A single
 default store preserves simple ergonomics for common use, while named stores
 support work/client/family/private boundaries without forking the tool.
+
+### Store vs Scope Model
+
+Stores are privacy/trust boundaries: personal, work, client-specific, family, or
+team hives. Scopes are categories inside one selected store. V1 built-in scopes
+are:
+
+- `global`: broadly relevant within the selected store
+- `project`: tied to a project path or project ID
+- `agent-private`: available only to an explicitly selected adapter/agent
+
+Custom scopes may be configured later, but `personal` and `work` should normally
+be stores, not scopes. This avoids confusing commands like “write personal scope
+inside work store” and keeps privacy boundaries enforceable.
 
 ## Canonical Directory Layout
 
@@ -448,6 +479,15 @@ Benefit: unique, sortable filenames make cloud-drive sync safe. Agents do not
 need a central coordinator to write memories; they only need to choose a unique
 path and atomically publish it.
 
+V1 ID/path rules:
+
+- IDs are extensionless; filenames are `<id>.md` and `<id>.json`.
+- Markdown notes and JSON sidecars from the same write share the same ID.
+- Random suffix is at least 8 lowercase hex/base32 characters.
+- `host_id`, `agent_id`, and similar filename components are sanitized to
+  `[a-zA-Z0-9_-]` with other characters replaced by `-`.
+- Collision retry limit: at least 5 attempts before returning a write error.
+
 ## Concurrency Model
 
 The concurrency model optimizes for cloud-synced folders and many independent
@@ -524,12 +564,13 @@ Human-readable markdown with front matter:
 ```markdown
 ---
 type: note
+entry_kind: remember # remember|note
 id: 20260516T154233.184921Z_taylor_12345_codex_a8f31c
 created_at: 2026-05-16T15:42:33.184921Z
 agent_id: codex
 host_id: taylor
 session_id: abc123
-scope: personal
+scope: global
 project_id: ds
 tags: [preference, workflow]
 confidence: high
@@ -549,7 +590,7 @@ JSON for reliable machine processing:
   "created_at": "...",
   "agent_id": "codex",
   "host_id": "taylor",
-  "scope": "personal",
+  "scope": "global",
   "subject": "workflow.preference",
   "body": "...",
   "source": {
@@ -573,12 +614,12 @@ Agent-optimized commands:
 
 ```bash
 hm context [--agent codex] [--project PATH] [--max-tokens N]
-hm remember --scope personal --text "..."
+hm remember --scope global --text "..."
 hm note --scope project --project PATH --text "..."
-hm search "query" [--scope personal,project] [--stores personal,work]
+hm search "query" [--scope global,project] [--stores personal,work]
 hm render [claude|codex|openclaw|gemini|all]
 hm sync --quiet
-hm compact [--scope personal|project] [--dry-run]
+hm compact [--scope global|project] [--dry-run]
 hm stores list
 hm doctor
 ```
@@ -601,15 +642,19 @@ Benefit: each agent gets native-feeling context files, but the canonical store
 stays vendor-neutral. Adding a new agent should mean writing a renderer, not
 changing how memory is stored.
 
+V1 renderers write generated include files only. They do not overwrite canonical
+agent config files such as `CLAUDE.md` or `AGENTS.md` unless a future
+adapter-specific migration command is added.
+
 ### Claude
 
-- Render global rules into `~/.claude/CLAUDE.md` or an included/generated block.
+- Render a generated include file such as `~/.claude/hive-memory.generated.md`.
 - Optionally render project memories for Claude project directories.
 - Claude hooks call generic `hm`, not Claude-only sync code.
 
 ### Codex
 
-- Render `~/.codex/AGENTS.md` or configured fallback docs.
+- Render a generated include file such as `~/.codex/hive-memory.generated.md`.
 - Use existing Codex lifecycle hooks to refresh context and write notes.
 
 ### OpenClaw
@@ -795,10 +840,31 @@ Why this cut line: the risky parts are filesystem safety, store selection,
 rendering boundaries, and install ergonomics. Those should be solved before
 adding smarter search, compaction, or remote backends.
 
+## V1 Required / Deferred Matrix
+
+| Feature | V1 required? | Notes |
+| --- | --- | --- |
+| filesystem backend | yes | canonical backend |
+| config loader | yes | CLI/env/local/main/default precedence |
+| stores init/list/show/doctor | yes | minimum store lifecycle |
+| remember/note | yes | append-only Markdown notes |
+| JSON sidecars | yes | always for `remember`; configurable for `note` |
+| search | yes | simple deterministic text search |
+| context | yes | conservative scope/store filtering |
+| Claude render | yes | generated file only |
+| Codex render | yes | generated file only |
+| local outbox/sync | yes | required for laptop/offline ergonomics |
+| import claude-memory | deferred | useful migration, not core write path |
+| compact proposals | deferred | proposal-only after core commands work |
+| OpenClaw adapter | deferred | after Claude/Codex stabilize |
+| release artifacts/shdeps | required for v1 release | not required for first code milestone |
+
 ## V1 Implementation Spec
 
-This section turns the design into implementation contracts. When code and docs
-disagree, prefer this section for v1 behavior and update it deliberately.
+This section is normative for v1. Earlier sections provide rationale and examples
+and must be updated if they conflict with this implementation spec. When code and
+docs disagree, prefer this section for v1 behavior and update the docs
+deliberately.
 
 ### Config Schema
 
@@ -827,6 +893,7 @@ user_id = "default"
 
 [stores.personal]
 root = "${HOME}/gdrive/hive-memory/personal"
+expected_id = "018f5f57-bd9b-7d33-9e21-1f44f0c5a013" # optional manifest binding
 description = "Personal memory"
 sensitivity = "private" # public|internal|private|secret
 
@@ -842,26 +909,30 @@ atomic_rename = "auto" # auto|true|false
 fsync = "best-effort"   # never|best-effort|required
 
 [defaults]
-write_scope = "personal"
-search_scopes = ["personal", "project"]
-render_scopes = ["personal", "project"]
-event_sidecar = "auto" # never|auto|always
+write_scope = "global"
+search_scopes = ["global", "project"]
+render_scopes = ["global", "project"]
+event_sidecar = "always" # never|always
 
 [privacy]
 default_render_policy = "conservative" # conservative|configured-only
 allow_all_stores_flag = true
 warn_sensitive_broad_render = true
 
+[offline]
+enabled = true
+mode = "auto" # auto|always|never
+
 [adapters.claude]
 enabled = true
 stores = ["personal"]
-scopes = ["personal", "project"]
+scopes = ["global", "project"]
 output = "${HOME}/.claude/hive-memory.generated.md"
 
 [adapters.codex]
 enabled = true
 stores = ["personal"]
-scopes = ["personal", "project"]
+scopes = ["global", "project"]
 output = "${HOME}/.codex/hive-memory.generated.md"
 ```
 
@@ -870,6 +941,7 @@ Validation rules:
 - `schema_version` defaults to `1` when absent.
 - `default_store` is required after all config layers are merged.
 - `stores.<name>.root` is required for every configured store.
+- `stores.<name>.expected_id` is optional but enables manifest identity checks.
 - store names must match `[a-z0-9][a-z0-9_-]*`.
 - `${VAR}` and `${VAR:-fallback}` expansion is supported in path-like fields.
 - unknown top-level keys should warn in v1, not fail, unless they are dangerous.
@@ -900,7 +972,7 @@ sensitivity = "private"
 [policies]
 append_only_inbox = true
 allow_direct_curated_edits = false
-retention = "keep-raw" # keep-raw|archive-after-days|delete-after-days
+retention = { mode = "keep-raw" } # or { mode = "archive-after-days", days = 90 }
 
 [capabilities]
 json_events = true
@@ -911,7 +983,8 @@ compaction = "manual" # manual|propose|auto
 Validation rules:
 
 - `store.id` is generated once and remains stable even if the display name or
-  configured alias changes.
+  configured alias changes. The UUID is authoritative; config store keys are
+  local aliases.
 - `store.name` should match the configured store name; mismatch is a doctor
   warning, not destructive repair.
 - `schema_version > supported` is a hard error unless `--force` is used for
@@ -931,9 +1004,11 @@ Canonical notes live under:
 <root>/inbox/notes/YYYY/MM/DD/<note-id>.md
 ```
 
-V1 front matter uses YAML-compatible `---` delimiters with simple scalar/list
-values. TOML front matter can be considered later, but YAML-style front matter is
-more broadly familiar to Markdown tools.
+V1 front matter uses YAML-compatible `---` delimiters with a constrained value
+set: strings, booleans, RFC3339 timestamps, nulls, and string arrays. TOML front
+matter can be considered later, but YAML-style front matter is more broadly
+familiar to Markdown tools. The implementation should parse this with
+`serde_yaml` or an equivalent constrained parser.
 
 Required fields:
 
@@ -941,13 +1016,14 @@ Required fields:
 ---
 schema_version: 1
 type: note
+entry_kind: remember # remember|note
 id: 20260516T154233.184921Z_taylor_12345_codex_a8f31c
 store_id: 018f5f57-bd9b-7d33-9e21-1f44f0c5a013
 store_name: personal
 created_at: 2026-05-16T15:42:33.184921Z
 agent_id: codex
 host_id: taylor
-scope: personal
+scope: global
 confidence: medium
 ---
 
@@ -982,6 +1058,10 @@ Rules:
 Why front matter: the human text remains clean Markdown, while metadata stays
 machine-readable enough for filtering and auditing.
 
+Project ID derivation: V1 project IDs default to a slug derived from the detected
+repository root basename plus a short hash of the canonical path. Users may
+override with `--project-id` or project aliases in `memories/projects/*/aliases.toml`.
+
 ### JSON Event Schema
 
 Structured events live under:
@@ -1008,7 +1088,7 @@ V1 event shape:
   "host_id": "taylor",
   "user_id": "chris",
   "session_id": "abc123",
-  "scope": "personal",
+  "scope": "global",
   "project_id": "ds",
   "subject": "workflow.preference",
   "tags": ["preference", "workflow"],
@@ -1039,15 +1119,15 @@ Rules:
 - `body` should be enough for indexing and dedupe, but the Markdown note remains
   the canonical human-readable record.
 - `confidence` is one of `low`, `medium`, `high`.
-- `scope` is one of `personal`, `work`, `project`, `agent-private`, or a
-  configured custom scope.
+- `scope` is one of `global`, `project`, `agent-private`, or a configured custom
+  scope. `personal` and `work` should normally be stores, not scopes.
 - JSON events may exist without Markdown only for purely operational events such
   as compaction metadata, but memory observations should have Markdown.
 
 When to write JSON:
 
-- `hm remember` and `hm note`: write Markdown always; write JSON when
-  `event_sidecar = "always"` or `"auto"` and structured fields are present.
+- `hm remember`: write Markdown and JSON event sidecar by default.
+- `hm note`: write Markdown always; write JSON when `event_sidecar = "always"`.
 - `hm import`: write JSON to preserve import provenance and dedupe IDs.
 - `hm compact`: write JSON metadata describing inputs/outputs of compaction.
 - `hm doctor`: may write JSON diagnostic reports only under local state/cache,
@@ -1090,7 +1170,22 @@ outbox/                 # offline writes waiting for store root
 locks/                  # local process locks
 runs/                   # last render/sync/doctor metadata
 indexes/                # rebuildable local index if not treated as cache
+quarantine/             # safe quarantine for stale temps/conflicts
 ```
+
+Outbox item shape:
+
+```text
+state/outbox/<store-alias>/<id>/
+  meta.toml
+  note.md
+  event.json
+```
+
+Outbox `meta.toml` records target store alias, expected store ID, final relative
+paths, payload hashes, created_at, attempt count, and last_error. `hm sync` is
+idempotent: if the final path already exists with the same hash, mark flushed; if
+it exists with a different hash, refuse and report a conflict.
 
 Cache contents:
 
@@ -1105,15 +1200,23 @@ Rules:
 - Deleting cache must never lose memory.
 - Deleting state may lose pending offline outbox writes, so `doctor` should warn
   when outbox is non-empty.
+- Offline writes require a known store manifest identity. If the active store root
+  is unavailable and the store's expected manifest ID is unknown, write commands
+  refuse unless an explicit force flag is used.
 
 ## V1 Command Contracts
 
 General CLI behavior:
 
 - `--config PATH` selects config path.
-- `--store NAME` selects the active store for write/render commands.
-- `--stores a,b` selects multiple stores for read/search/context commands.
+- `--store NAME` selects one active store for write/render commands.
+- `--stores a,b` selects multiple explicit store aliases for read/search/context
+  commands.
 - `--all-stores` is read-only and explicit.
+- `--scope a,b` filters scopes for read/search/context commands.
+- `--scope SCOPE` on write commands selects exactly one write scope.
+- `--include-secret` allows read-only inclusion of `secret` stores only when
+  config permits it.
 - `--json` prints machine-readable output.
 - `--quiet` suppresses non-error human chatter.
 - `--dry-run` shows planned writes without changing files.
@@ -1123,6 +1226,25 @@ General CLI behavior:
 - exit code `3`: config/schema validation failure.
 - exit code `4`: privacy/safety refusal.
 - exit code `5`: backend unavailable and no outbox fallback.
+
+JSON error shape:
+
+```json
+{
+  "ok": false,
+  "error": { "code": "privacy_refusal", "message": "...", "details": {} }
+}
+```
+
+Input rules:
+
+- If `--text` is provided, stdin is ignored unless a command explicitly supports
+  combining them.
+- If `--text` is absent and stdin is not a TTY, read stdin.
+- If both text and stdin are absent for write commands, return CLI usage error.
+- Comma-list flags trim whitespace and reject empty entries.
+- `--force` must be narrowly scoped by command and should be disabled for
+  non-interactive hooks unless config explicitly allows it.
 
 ### `hm remember`
 
@@ -1139,7 +1261,7 @@ Inputs:
 
 - `--text TEXT` or stdin required.
 - optional `--scope`, `--project`, `--subject`, `--tags`, `--confidence`.
-- defaults: active store, configured default write scope, confidence `medium`.
+- defaults: active store, configured default write scope `global`, confidence `medium`.
 
 Writes:
 
@@ -1149,7 +1271,8 @@ Writes:
 Output:
 
 - human: created note ID and relative path.
-- JSON: `{ "id", "store", "note_path", "event_path" }`.
+- JSON: `{ "id", "store", "note_path", "event_path" }`; `event_path` is
+  `null` when no sidecar is written.
 
 Errors/refusals:
 
@@ -1188,6 +1311,9 @@ V1 behavior:
 - default store only unless `--stores` or `--all-stores` is passed.
 - default scopes from config.
 - returns path, score/rank, title/snippet, store, scope, and timestamp when known.
+- deterministic ordering: substring/exactness score, newer timestamp, then
+  lexical path.
+- default result limit: 20 unless `--limit` is provided.
 
 Output:
 
@@ -1205,7 +1331,7 @@ Examples:
 
 ```bash
 hm context --agent codex --project /repo --max-tokens 4000
-hm context --stores personal,work --scope personal,project
+hm context --stores personal,work --scope global,project
 ```
 
 Behavior:
@@ -1215,7 +1341,7 @@ Behavior:
 - prioritizes rules/preferences, project memory, recent high-confidence notes,
   and relevant search results.
 - respects `--max-tokens` approximately; exact tokenizer matching is not required
-  in v1.
+  in v1. Default token-ish budget: 4000.
 - refuses `--all-stores` when config disables broad reads.
 
 Output:
@@ -1249,6 +1375,7 @@ Safety:
 
 - refuses broad sensitive-store render unless explicitly configured.
 - refuses to overwrite non-generated files unless `--force` and backup are used.
+- validates a generated-file marker before replacing existing adapter output.
 
 ### `hm sync`
 
@@ -1260,6 +1387,8 @@ Behavior:
 - retry failed temp/atomic writes where safe.
 - optionally refresh local search index if configured.
 - does not replace Google Drive/Dropbox/Syncthing/iCloud transport.
+- refuses to flush an outbox item if the destination manifest identity conflicts
+  with recorded outbox metadata.
 
 Output:
 
@@ -1299,21 +1428,27 @@ Checks:
 - adapter outputs are generated-file safe.
 - sensitive stores are not broadly rendered.
 - local outbox has pending writes.
+- store roots have suspicious permissions, e.g. world-readable private/secret
+  stores.
+- write targets resolve through symlinks or escape expected roots.
+- private stores appear inside git repos without an explicit acknowledgement.
 
 Modes:
 
 - default: read-only diagnostics.
 - `--quick`: config/root checks suitable for hooks.
-- `--fix`: safe repairs only, e.g. create missing directories, quarantine stale
-  temp files. Never delete canonical notes/events by default.
+- `--fix`: safe repairs only, e.g. create missing directories, create generated
+  `.gitignore` files, quarantine stale temp files under `state/quarantine/`.
+  Never delete canonical notes/events by default.
 - `--json`: machine-readable diagnostic report.
 
 ### `hm compact`
 
 Purpose: propose or perform promotion of raw notes into curated memory.
 
-V1 recommendation: implement `--dry-run`/proposal flow first. Automatic writes to
-curated memory can come later.
+Deferred v1 recommendation: implement `--dry-run`/proposal flow after the core
+write/search/render path works. Automatic writes to curated memory can come
+later.
 
 Behavior:
 
@@ -1326,7 +1461,8 @@ Behavior:
 ### `hm import claude-memory`
 
 Purpose: import existing Claude memory-sync content without making Claude the
-canonical architecture.
+canonical architecture. This is deferred until the core write/search/render path
+is stable.
 
 Behavior:
 
@@ -1344,6 +1480,8 @@ context. The system should prevent accidental leakage by default.
 
 Principles:
 
+- Create private stores with restrictive permissions where the platform supports
+  it: directories `0700`, files `0600`.
 - Reads across stores are opt-in.
 - Renders are configured allowlists, not global dumps.
 - Store sensitivity is metadata used for warnings/refusals.
@@ -1352,6 +1490,8 @@ Principles:
   configured for that surface.
 - `doctor` warns about broad render policies and unknown adapter outputs.
 - `hm context` should print active store/scope metadata so mistakes are visible.
+- Absolute paths, host IDs, and session IDs can be sensitive; renderers should
+  omit or relativize them unless needed for debugging/provenance.
 
 Recommended sensitivity levels:
 
@@ -1362,10 +1502,12 @@ Recommended sensitivity levels:
 
 Refusal cases:
 
-- `--all-stores` with a `secret` store unless `--include-secret` exists and config
-  allows it.
+- `--all-stores` with a `secret` store unless `--include-secret` is passed and
+  config allows it.
 - rendering a `private`/`secret` store to an adapter without explicit allowlist.
 - writing to a store whose manifest identity conflicts with config unless forced.
+- if config and manifest sensitivity disagree, use the stricter sensitivity and
+  emit a doctor warning.
 - overwriting a non-generated adapter output file.
 
 Why this matters: memory tools are only helpful if users trust that context will
@@ -1374,6 +1516,12 @@ not bleed across personal/work/client/public boundaries.
 ## Release and CI Plan
 
 Use GitHub Actions for tests and releases.
+
+Recommended repository: `cgraf78/hive-memory`.
+
+`hm --version` should print `hm X.Y.Z (git <short-sha>, schema <n>)` when build
+metadata is available. Checksums use SHA-256 lines compatible with `sha256sum -c`.
+Minimum glibc baseline should be documented before the first Linux release.
 
 Recommended jobs:
 
@@ -1393,6 +1541,15 @@ aarch64-unknown-linux-gnu
 x86_64-apple-darwin
 aarch64-apple-darwin
 ```
+
+Installer target mapping:
+
+| OS/arch | Target |
+| --- | --- |
+| Linux x86_64, including WSL | `x86_64-unknown-linux-gnu` |
+| Linux aarch64 | `aarch64-unknown-linux-gnu` |
+| macOS Intel | `x86_64-apple-darwin` |
+| macOS Apple Silicon | `aarch64-apple-darwin` |
 
 Deferred target:
 
@@ -1444,7 +1601,7 @@ Installer responsibilities:
 
 - detect OS/arch target.
 - download matching archive and `checksums.txt`.
-- verify checksum when possible.
+- verify checksum before installing.
 - install `hm` into the dotfiles-managed bin dir.
 - optionally install `hive-memory` alias only after that deferred decision is
   made.
@@ -1458,24 +1615,26 @@ When ready, create GitHub issues roughly in this order:
 
 1. **Project skeleton**: Rust crate, clap CLI, CI fmt/clippy/test.
 2. **License and metadata**: MIT license, README badges, contribution notes.
-3. **Config loader**: TOML config, local overrides, env/CLI precedence, path
+3. **Binary namespace check**: validate `hm` against Homebrew/Apt/common CLI
+   namespaces before public release.
+4. **Config loader**: TOML config, local overrides, env/CLI precedence, path
    expansion.
-4. **Store initialization**: manifest schema, directory creation, `hm stores`.
-5. **ID and atomic writer**: sortable IDs, temp-write/rename, collision retry.
-6. **Markdown note writer**: `hm remember`, `hm note`, front matter, tests.
-7. **JSON event sidecars**: event schema, event policy, import/dedupe helpers.
-8. **Doctor diagnostics**: config/root/manifest/temp/conflict checks.
-9. **Simple search**: text search over Markdown and selected JSON fields.
-10. **Context assembler**: scope/store selection, project context, max-token
+5. **Store initialization**: manifest schema, directory creation, `hm stores`.
+6. **ID and atomic writer**: sortable IDs, temp-write/rename, collision retry.
+7. **Markdown note writer**: `hm remember`, `hm note`, front matter, tests.
+8. **JSON event sidecars**: event schema, event policy, import/dedupe helpers.
+9. **Doctor diagnostics**: config/root/manifest/temp/conflict checks.
+10. **Simple search**: text search over Markdown and selected JSON fields.
+11. **Context assembler**: scope/store selection, project context, max-token
     approximation.
-11. **Adapter render framework**: generated-file safety, atomic render writes.
-12. **Claude adapter**: configured render output and hook expectations.
-13. **Codex adapter**: configured render output and hook expectations.
-14. **Local outbox and sync**: unavailable root fallback and flush behavior.
-15. **Import Claude memory**: append-only migration with provenance/dedupe.
-16. **Release automation**: target builds, archives, checksums, smoke install.
-17. **Dotfiles integration PR**: shdeps install + hooks + config template.
-18. **Compaction proposals**: dry-run/proposal flow, locks, provenance.
+12. **Adapter render framework**: generated-file safety, atomic render writes.
+13. **Claude adapter**: configured render output and hook expectations.
+14. **Codex adapter**: configured render output and hook expectations.
+15. **Local outbox and sync**: unavailable root fallback and flush behavior.
+16. **Import Claude memory**: append-only migration with provenance/dedupe.
+17. **Release automation**: target builds, archives, checksums, smoke install.
+18. **Dotfiles integration PR**: shdeps install + hooks + config template.
+19. **Compaction proposals**: dry-run/proposal flow, locks, provenance.
 
 Keep each issue small enough to review independently. The early issues should
 avoid model calls entirely; `hm` needs a deterministic foundation before agents
@@ -1495,8 +1654,9 @@ can build on that foundation.
    and `doctor`.
 4. Implement Claude and Codex render adapters first.
 5. Wire through dotfiles hooks.
-6. Add `hm import claude-memory` for existing Claude `memory-sync` data.
-7. Add OpenClaw adapter after Claude/Codex path is stable.
+6. Add local outbox and `hm sync` flush behavior.
+7. Add release artifacts and shdeps install support for v1 release.
+8. Defer `hm import claude-memory`, compaction proposals, and OpenClaw adapter until core v1 is stable.
 
 ## Settled Decisions
 
