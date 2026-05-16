@@ -2087,6 +2087,34 @@ fn context_json_reports_selection_and_sections() {
     let cache = fs::read_to_string(cache_file).expect("read context cache");
     assert!(cache.contains("JSON context should include TOML preferences."));
     assert!(cache.contains("\"schema_version\": 1"));
+
+    fs::rename(&personal, dir.join("personal-offline")).expect("move store offline");
+    let stale_output = cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_HOOK_ACTIVE", "1")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "context",
+            "--path",
+            "/repo/src/main.rs",
+            "--json",
+        ])
+        .output()
+        .expect("run stale context json");
+    assert!(
+        stale_output.status.success(),
+        "stale context failed: {stale_output:?}"
+    );
+    let stale_context: serde_json::Value =
+        serde_json::from_slice(&stale_output.stdout).expect("stale context json");
+    assert_eq!(stale_context["stale"], true);
+    assert!(stale_context["cache_created_at"].as_str().is_some());
+    assert_eq!(
+        stale_context["sections"][0]["body"],
+        "JSON context should include TOML preferences."
+    );
 }
 
 #[test]

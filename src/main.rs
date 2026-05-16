@@ -1468,9 +1468,11 @@ fn run_context(args: ContextArgs, context: CliContext) -> Result<()> {
     }
 
     if args.json {
+        let stale = assembly.stale;
+        let cache_created_at = assembly.cache_created_at.clone();
         println!(
             "{}",
-            serde_json::to_string_pretty(&context_json(assembly, true, false, None))?
+            serde_json::to_string_pretty(&context_json(assembly, true, stale, cache_created_at))?
         );
     } else {
         print!("{}", assembly.output.markdown);
@@ -1502,6 +1504,8 @@ struct CliContextAssembly {
     store_source: String,
     scopes: Vec<String>,
     sources: Vec<String>,
+    stale: bool,
+    cache_created_at: Option<String>,
 }
 
 /// Assemble context for CLI commands and hook entry points.
@@ -1548,6 +1552,21 @@ fn assemble_cli_context(
     let store_name = resolved_store.name.clone();
     let store_source = resolved_store.source.to_string();
     let store_config = &config.stores[resolved_store.name.as_str()];
+    let stores = vec![store_name.clone()];
+    let context_key = context_selection_key(
+        agent_id.as_deref().unwrap_or("unknown"),
+        &stores,
+        project_id.as_deref(),
+        path_hint.as_deref(),
+        &scopes,
+        &sources,
+    );
+    if std::env::var("HIVE_MEMORY_HOOK_ACTIVE").ok().as_deref() == Some("1")
+        && let Err(store::StoreError::Io { .. }) = store::read_manifest(&store_config.root)
+        && let Some(assembly) = load_context_cache(config, &context_key, store_source.clone())?
+    {
+        return Ok(assembly);
+    }
     let report = rebuild_store_index(config, &resolved_store.name)?;
     let max_tokens = selection.max_tokens.unwrap_or_else(|| {
         // Hooks run on latency-sensitive agent boundaries, so they use the
@@ -1581,10 +1600,12 @@ fn assemble_cli_context(
         agent_id,
         project_id,
         project_hint: path_hint,
-        stores: vec![store_name],
+        stores,
         store_source,
         scopes,
         sources,
+        stale: false,
+        cache_created_at: None,
     };
     if let Err(err) = write_context_cache(config, &assembly) {
         // Fresh context is still correct even if the operational fallback cache
@@ -1733,6 +1754,121 @@ fn context_cache_path(state_dir: &std::path::Path, key: &str) -> PathBuf {
     state_dir
         .join("context-cache")
         .join(format!("{digest:x}.json"))
+}
+
+/// Load a last-success context assembly for an exact selection key.
+///
+/// This is intentionally stricter than a generic "last context" cache. Hook
+/// fallback should only replay context after the same agent/store/project/scope
+/// policy has been selected again; otherwise an offline store could leak stale
+/// memory into the wrong long-lived agent session.
+fn load_context_cache(
+    config: &Config,
+    key: &str,
+    store_source: String,
+) -> Result<Option<CliContextAssembly>> {
+    let path = context_cache_path(&config.state_dir, key);
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let entry: ContextCacheEntry = serde_json::from_str(&contents)?;
+    if entry.schema_version != 1 || entry.key != key {
+        return Ok(None);
+    }
+    // Cache fallback happens only after store resolution has enforced the
+    // current agent policy. Matching the full context key keeps stale data tied
+    // to the same selected store/project/scope/source set instead of treating
+    // the cache as a general read source.
+    if !context_cache_is_fresh(&entry.created_at, &config.defaults.context_cache_max_age) {
+        return Ok(None);
+    }
+
+    let markdown = format!(
+        "> Hive Memory context is stale offline cache from {}; stores: {}.\n\n{}",
+        entry.created_at,
+        entry.stores.join(","),
+        entry.markdown
+    );
+    let sections = entry
+        .sections
+        .into_iter()
+        .map(|section| memory_context::ContextSection {
+            id: section.id,
+            store: section.store,
+            scope: section.scope,
+            trust: cached_trust(&section.trust),
+            audience: section.audience,
+            source_path: section.source_path,
+            estimated_tokens: section.estimated_tokens,
+            body: section.body,
+        })
+        .collect();
+
+    Ok(Some(CliContextAssembly {
+        output: memory_context::ContextOutput {
+            markdown,
+            sections,
+            estimated_tokens: entry.estimated_tokens,
+        },
+        agent_id: entry.agent_id,
+        project_id: entry.project_id,
+        project_hint: entry.project_hint,
+        stores: entry.stores,
+        store_source,
+        scopes: entry.scopes,
+        sources: entry.sources,
+        stale: true,
+        cache_created_at: Some(entry.created_at),
+    }))
+}
+
+/// Return whether a context cache entry is still acceptable for hook fallback.
+///
+/// Future timestamps are rejected instead of treated as fresh. That keeps clock
+/// skew or manually edited cache files from extending stale memory indefinitely.
+fn context_cache_is_fresh(created_at: &str, max_age: &str) -> bool {
+    let Ok(created_at) =
+        OffsetDateTime::parse(created_at, &time::format_description::well_known::Rfc3339)
+    else {
+        return false;
+    };
+    let Some(max_age) = parse_context_cache_max_age(max_age) else {
+        return false;
+    };
+    let age = OffsetDateTime::now_utc() - created_at;
+    !age.is_negative() && age <= max_age
+}
+
+/// Parse compact max-age durations used by config, such as `10m` or `2h`.
+fn parse_context_cache_max_age(input: &str) -> Option<time::Duration> {
+    // Keep this grammar intentionally tiny and explicit. Hook fallback policy
+    // should be auditable from config, not dependent on a permissive duration
+    // parser whose accepted syntax changes under us.
+    let trimmed = input.trim();
+    let unit = trimmed.chars().last()?;
+    let number = trimmed[..trimmed.len().saturating_sub(unit.len_utf8())]
+        .parse::<i64>()
+        .ok()?;
+    if number < 0 {
+        return None;
+    }
+    match unit {
+        'd' => Some(time::Duration::days(number)),
+        'h' => Some(time::Duration::hours(number)),
+        'm' => Some(time::Duration::minutes(number)),
+        's' => Some(time::Duration::seconds(number)),
+        _ => None,
+    }
+}
+
+fn cached_trust(value: &str) -> memory_context::TrustLevel {
+    match value {
+        "curated" => memory_context::TrustLevel::Curated,
+        "raw" => memory_context::TrustLevel::Raw,
+        _ => memory_context::TrustLevel::Remembered,
+    }
 }
 
 fn context_json(
