@@ -1,0 +1,18 @@
+[package]
+name = "hive-memory"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Vendor-neutral shared memory infrastructure for AI agents."
+
+[[bin]]
+name = "hm"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.100"
+clap = { version = "4.5.53", features = ["derive"] }
+
+[dev-dependencies]
+assert_cmd = "2.1.1"
+predicates = "3.1.3"

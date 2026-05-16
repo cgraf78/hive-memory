@@ -2,7 +2,8 @@
 
 Vendor-neutral shared memory infrastructure for AI agents.
 
-Status: design/planning phase. Implementation has not started yet.
+Status: early implementation. The normative v1 behavior is still defined by
+the spec while the CLI is built out in small tested slices.
 
 The planned primary binary is `hm`.
 
