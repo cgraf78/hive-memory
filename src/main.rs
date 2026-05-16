@@ -176,6 +176,9 @@ struct WriteMemoryArgs {
     /// Optional project identity.
     #[arg(long)]
     project_id: Option<String>,
+    /// Project path or file hint used to derive project identity.
+    #[arg(long)]
+    project: Option<PathBuf>,
     /// Optional short subject.
     #[arg(long)]
     subject: Option<String>,
@@ -236,6 +239,9 @@ struct ContextArgs {
     /// Active project id for project-scoped memory.
     #[arg(long)]
     project_id: Option<String>,
+    /// Active project path or file hint.
+    #[arg(long)]
+    project: Option<String>,
     /// Active path hint to display in context headers.
     #[arg(long)]
     path: Option<String>,
@@ -500,6 +506,29 @@ fn load_config(config_path: Option<&std::path::Path>) -> Result<Config> {
     Ok(loaded.config)
 }
 
+fn resolve_project_id(
+    explicit_project_id: Option<String>,
+    project_hint: Option<&str>,
+) -> Result<Option<String>> {
+    let env_project_id = std::env::var("HIVE_MEMORY_PROJECT_ID").ok();
+    let hint = project_hint
+        .map(PathBuf::from)
+        .or_else(|| std::env::var("HIVE_MEMORY_PROJECT").ok().map(PathBuf::from));
+
+    if explicit_project_id.is_none() && env_project_id.is_none() && hint.is_none() {
+        return Ok(None);
+    }
+
+    Ok(Some(
+        project::resolve_project(project::ResolveProjectInput {
+            hint: hint.unwrap_or_default(),
+            explicit_project_id,
+            env_project_id,
+        })?
+        .project_id,
+    ))
+}
+
 fn run_write_memory(
     entry_kind: note::EntryKind,
     args: WriteMemoryArgs,
@@ -522,10 +551,11 @@ fn run_write_memory(
         .scope
         .clone()
         .unwrap_or_else(|| config.defaults.write_scope.clone());
-    let project_id = args
-        .project_id
-        .clone()
-        .or_else(|| std::env::var("HIVE_MEMORY_PROJECT_ID").ok());
+    let project_hint = args
+        .project
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string());
+    let project_id = resolve_project_id(args.project_id.clone(), project_hint.as_deref())?;
     let audience = resolve_audience(&args, &scope, &writer_agent_id)?;
     let should_write_event = match entry_kind {
         note::EntryKind::Remember => true,
@@ -623,6 +653,8 @@ fn run_search(args: SearchArgs, context: CliContext) -> Result<()> {
 
 fn run_context(args: ContextArgs, context: CliContext) -> Result<()> {
     let config = load_config(context.config_path.as_deref())?;
+    let path_hint = args.project.or(args.path);
+    let project_id = resolve_project_id(args.project_id, path_hint.as_deref())?;
     let output = assemble_cli_context(
         &config,
         &context,
@@ -631,8 +663,8 @@ fn run_context(args: ContextArgs, context: CliContext) -> Result<()> {
             include_inbox: args.include_inbox,
             scopes: args.scope,
             sources: args.source,
-            project_id: args.project_id,
-            path_hint: args.path,
+            project_id,
+            path_hint,
         },
     )?;
 

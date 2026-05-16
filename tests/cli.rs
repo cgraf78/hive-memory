@@ -670,6 +670,75 @@ fn context_requires_include_inbox_for_raw_note() {
 }
 
 #[test]
+fn remember_project_hint_feeds_project_context() {
+    let dir = temp_dir("remember-project-hint");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    let repo = dir.join("repo");
+    let file = repo.join("src/lib.rs");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    fs::create_dir_all(file.parent().expect("file parent")).expect("repo src");
+    fs::write(&file, "// source\n").expect("source file");
+    let init = Command::new("git")
+        .args(["-C", repo.to_str().expect("utf8 repo"), "init"])
+        .output()
+        .expect("git init");
+    assert!(init.status.success());
+    let remote = Command::new("git")
+        .args([
+            "-C",
+            repo.to_str().expect("utf8 repo"),
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/cgraf78/hive-memory.git",
+        ])
+        .output()
+        .expect("git remote");
+    assert!(remote.status.success());
+
+    let mut remember = cargo_bin_cmd!("hm");
+    let output = remember
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--scope",
+            "project",
+            "--project",
+            file.to_str().expect("utf8 file"),
+            "--text",
+            "Project hints derive memory identity.",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).expect("utf8 stdout");
+    let note_path = stdout_value(&stdout, "note:");
+    let note = fs::read_to_string(note_path).expect("read note");
+    assert!(note.contains("project_id = \"github-com-cgraf78-hive-memory-"));
+
+    let mut context = cargo_bin_cmd!("hm");
+    context
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "context",
+            "--project",
+            file.to_str().expect("utf8 file"),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Project hints derive memory identity.",
+        ));
+}
+
+#[test]
 fn render_writes_adapter_output() {
     let dir = temp_dir("render");
     let config = dir.join("config.toml");
