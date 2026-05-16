@@ -71,6 +71,32 @@ pub struct InstallAdapterReport {
     pub metadata_path: Option<PathBuf>,
 }
 
+/// Input for uninstalling adapter markers from an agent instruction file.
+#[derive(Debug, Clone)]
+pub struct UninstallAdapterInput<'a> {
+    /// Adapter id whose include marker should be removed.
+    pub adapter: &'a str,
+    /// Adapter instruction file that the agent loads.
+    pub install_target: &'a Path,
+    /// Remove the shared policy block as well.
+    pub all: bool,
+    /// Atomic writer behavior.
+    pub options: write::AtomicWriteOptions,
+}
+
+/// Result of uninstalling adapter markers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UninstallAdapterReport {
+    /// Resolved file actually edited. Symlink targets are canonicalized.
+    pub target: PathBuf,
+    /// Whether the instruction file changed.
+    pub written: bool,
+    /// Rolling backup path written before the change.
+    pub backup_path: Option<PathBuf>,
+    /// Backup metadata path written before the change.
+    pub metadata_path: Option<PathBuf>,
+}
+
 /// Render-file failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RenderError {
@@ -316,6 +342,76 @@ pub fn install_adapter(
     })
 }
 
+/// Remove adapter include markers from an agent instruction file.
+///
+/// By default this removes only the selected adapter block. The shared policy
+/// block remains because another adapter may still rely on it, and because the
+/// policy is stable instructional text rather than generated memory. Callers
+/// must opt into `all` when they want to remove the policy block too.
+pub fn uninstall_adapter(
+    input: UninstallAdapterInput<'_>,
+) -> Result<UninstallAdapterReport, RenderError> {
+    let target = resolve_install_target(input.install_target)?;
+    ensure_writable(&target)?;
+
+    let existing = read_optional(&target)?;
+    let eol = line_ending(&existing);
+    let normalized = normalize_lf(&existing);
+    let without_adapter = remove_marker(&target, &normalized, input.adapter)?;
+    let uninstalled = if input.all {
+        remove_marker(&target, &without_adapter, "policy")?
+    } else {
+        without_adapter
+    };
+    let uninstalled = denormalize_eol(&uninstalled, eol);
+
+    if uninstalled == existing {
+        return Ok(UninstallAdapterReport {
+            target,
+            written: false,
+            backup_path: None,
+            metadata_path: None,
+        });
+    }
+
+    let backup_path = backup_install_path(&target);
+    let metadata_path = backup_metadata_path(&target);
+    write::write_atomic(&backup_path, existing.as_bytes(), &input.options).map_err(|err| {
+        RenderError::Io {
+            action: "write uninstall backup",
+            path: backup_path.clone(),
+            message: err.to_string(),
+        }
+    })?;
+    let markers = if input.all {
+        vec![input.adapter, "policy"]
+    } else {
+        vec![input.adapter]
+    };
+    let metadata = render_install_metadata(&existing, &uninstalled, &markers);
+    write::write_atomic(&metadata_path, metadata.as_bytes(), &input.options).map_err(|err| {
+        RenderError::Io {
+            action: "write uninstall backup metadata",
+            path: metadata_path.clone(),
+            message: err.to_string(),
+        }
+    })?;
+    write::write_atomic(&target, uninstalled.as_bytes(), &input.options).map_err(|err| {
+        RenderError::Io {
+            action: "write uninstall target",
+            path: target.clone(),
+            message: err.to_string(),
+        }
+    })?;
+
+    Ok(UninstallAdapterReport {
+        target,
+        written: true,
+        backup_path: Some(backup_path),
+        metadata_path: Some(metadata_path),
+    })
+}
+
 /// Render the complete generated file contents.
 pub fn render_generated(body: &str) -> String {
     format!(
@@ -495,6 +591,72 @@ fn upsert_marker(
         output.push('\n');
     }
     Ok(output)
+}
+
+/// Remove one managed marker block when it is present.
+///
+/// Absence is success so uninstall stays idempotent. Malformed or duplicate
+/// markers are errors for the same reason as install: the tool should stop and
+/// let the user inspect ambiguous instruction-file edits.
+fn remove_marker(path: &Path, contents: &str, name: &str) -> Result<String, RenderError> {
+    let begin = format!("# BEGIN hive-memory:{name}");
+    let end = format!("# END hive-memory:{name}");
+    let lines = contents.lines().map(str::to_owned).collect::<Vec<_>>();
+    let begin_positions = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| (line == &begin).then_some(index))
+        .collect::<Vec<_>>();
+    let end_positions = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| (line == &end).then_some(index))
+        .collect::<Vec<_>>();
+
+    if begin_positions.len() != end_positions.len() || begin_positions.len() > 1 {
+        return Err(RenderError::ConflictingMarkers {
+            path: path.to_path_buf(),
+            marker: name.to_owned(),
+        });
+    }
+    if begin_positions.is_empty() {
+        return Ok(contents.to_owned());
+    }
+
+    let begin_index = begin_positions[0];
+    let end_index = end_positions[0];
+    if end_index <= begin_index {
+        return Err(RenderError::ConflictingMarkers {
+            path: path.to_path_buf(),
+            marker: name.to_owned(),
+        });
+    }
+
+    let mut output = String::new();
+    for line in &lines[..begin_index] {
+        output.push_str(line);
+        output.push('\n');
+    }
+    for line in &lines[end_index + 1..] {
+        output.push_str(line);
+        output.push('\n');
+    }
+    Ok(collapse_blank_lines(output.trim_end_matches('\n')))
+}
+
+fn collapse_blank_lines(contents: &str) -> String {
+    let mut output = String::new();
+    let mut previous_blank = false;
+    for line in contents.lines() {
+        let blank = line.is_empty();
+        if blank && previous_blank {
+            continue;
+        }
+        output.push_str(line);
+        output.push('\n');
+        previous_blank = blank;
+    }
+    output
 }
 
 fn backup_install_path(target: &Path) -> PathBuf {
@@ -838,5 +1000,79 @@ mod tests {
         .expect_err("conflicting marker");
 
         assert!(matches!(error, RenderError::ConflictingMarkers { .. }));
+    }
+
+    #[test]
+    fn uninstall_adapter_removes_include_and_keeps_policy_by_default() {
+        let dir = temp_dir("uninstall");
+        let target = dir.join("AGENTS.md");
+        let output = dir.join("codex.generated.md");
+        install_adapter(InstallAdapterInput {
+            adapter: "codex",
+            output: &output,
+            install_target: &target,
+            policy_body: "Policy.",
+            options: options(),
+        })
+        .expect("install adapter");
+
+        let report = uninstall_adapter(UninstallAdapterInput {
+            adapter: "codex",
+            install_target: &target,
+            all: false,
+            options: options(),
+        })
+        .expect("uninstall adapter");
+        let contents = fs::read_to_string(&target).expect("read target");
+
+        assert!(report.written);
+        assert!(report.backup_path.expect("backup").is_file());
+        assert!(contents.contains("# BEGIN hive-memory:policy"));
+        assert!(!contents.contains("# BEGIN hive-memory:codex"));
+    }
+
+    #[test]
+    fn uninstall_adapter_all_removes_policy_block() {
+        let dir = temp_dir("uninstall-all");
+        let target = dir.join("AGENTS.md");
+        let output = dir.join("codex.generated.md");
+        install_adapter(InstallAdapterInput {
+            adapter: "codex",
+            output: &output,
+            install_target: &target,
+            policy_body: "Policy.",
+            options: options(),
+        })
+        .expect("install adapter");
+
+        uninstall_adapter(UninstallAdapterInput {
+            adapter: "codex",
+            install_target: &target,
+            all: true,
+            options: options(),
+        })
+        .expect("uninstall adapter");
+        let contents = fs::read_to_string(&target).expect("read target");
+
+        assert!(!contents.contains("# BEGIN hive-memory:policy"));
+        assert!(!contents.contains("# BEGIN hive-memory:codex"));
+    }
+
+    #[test]
+    fn uninstall_adapter_missing_marker_is_noop() {
+        let dir = temp_dir("uninstall-noop");
+        let target = dir.join("AGENTS.md");
+        fs::write(&target, "# Existing\n").expect("instruction file");
+
+        let report = uninstall_adapter(UninstallAdapterInput {
+            adapter: "codex",
+            install_target: &target,
+            all: false,
+            options: options(),
+        })
+        .expect("uninstall adapter");
+
+        assert!(!report.written);
+        assert!(report.backup_path.is_none());
     }
 }
