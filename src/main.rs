@@ -6,8 +6,8 @@
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
-use hive_memory::config::{Config, ConfigPaths, EventSidecarPolicy, Sensitivity};
-use hive_memory::{context as memory_context, index, memory, note, search, store, write};
+use hive_memory::config::{AdapterConfig, Config, ConfigPaths, EventSidecarPolicy, Sensitivity};
+use hive_memory::{context as memory_context, index, memory, note, render, search, store, write};
 use std::path::PathBuf;
 use std::str::FromStr;
 use time::OffsetDateTime;
@@ -55,6 +55,8 @@ enum Command {
     Search(SearchArgs),
     /// Assemble agent-readable memory context.
     Context(ContextArgs),
+    /// Render adapter memory include files.
+    Render(RenderArgs),
 }
 
 /// Store lifecycle commands.
@@ -196,6 +198,28 @@ struct ContextArgs {
     path: Option<String>,
 }
 
+/// Arguments for `hm render`.
+#[derive(Debug, Args)]
+struct RenderArgs {
+    /// Adapter id to render, such as codex or claude.
+    adapter: Option<String>,
+    /// Render every enabled configured adapter.
+    #[arg(long)]
+    configured: bool,
+    /// Refresh only the generated marker checksum for existing outputs.
+    #[arg(long)]
+    upgrade_marker: bool,
+    /// Overwrite a drifted generated output.
+    #[arg(long)]
+    force: bool,
+    /// Write a backup when forcing a drifted generated output.
+    #[arg(long)]
+    backup: bool,
+    /// Suppress per-adapter output.
+    #[arg(long)]
+    quiet: bool,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let context = CliContext {
@@ -209,6 +233,7 @@ fn main() -> Result<()> {
         Some(Command::Note(args)) => run_write_memory(note::EntryKind::Note, args, context),
         Some(Command::Search(args)) => run_search(args, context),
         Some(Command::Context(args)) => run_context(args, context),
+        Some(Command::Render(args)) => run_render(args, context),
         None => Ok(()),
     }
 }
@@ -480,6 +505,152 @@ fn rebuild_store_index(config: &Config, store_name: &str) -> Result<index::Rebui
         eprintln!("warning: {}: {}", warning.path.display(), warning.message);
     }
     Ok(report)
+}
+
+fn run_render(args: RenderArgs, context: CliContext) -> Result<()> {
+    let config = load_config(context.config_path.as_deref())?;
+    let adapters = selected_adapters(&config, &args)?;
+    let options = write::AtomicWriteOptions {
+        fsync: config.storage.fsync.into(),
+        ..write::AtomicWriteOptions::default()
+    };
+
+    for adapter_name in adapters {
+        let adapter = &config.adapters[adapter_name.as_str()];
+        let Some(output) = adapter.output.as_ref() else {
+            anyhow::bail!("adapter {adapter_name} has no output configured");
+        };
+
+        let report = if args.upgrade_marker {
+            render::upgrade_marker(output, options.clone())?
+        } else {
+            let body = render_adapter_body(&config, adapter_name.as_str(), adapter, &context)?;
+            render::write_rendered_file(render::RenderFileInput {
+                output,
+                body: &body,
+                options: options.clone(),
+                force: args.force,
+                backup: args.backup,
+            })?
+        };
+
+        if !args.quiet {
+            println!("adapter: {adapter_name}");
+            println!("output: {}", report.output.display());
+            println!("written: {}", report.written);
+            println!("sha256: {}", report.sha256);
+            if let Some(path) = report.backup_path {
+                println!("backup: {}", path.display());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn selected_adapters(config: &Config, args: &RenderArgs) -> Result<Vec<String>> {
+    if args.configured {
+        let adapters = config
+            .adapters
+            .iter()
+            .filter(|(_name, adapter)| adapter.enabled)
+            .map(|(name, _adapter)| name.clone())
+            .collect::<Vec<_>>();
+        if adapters.is_empty() {
+            anyhow::bail!("no enabled adapters configured");
+        }
+        return Ok(adapters);
+    }
+
+    let Some(adapter) = args.adapter.as_ref() else {
+        anyhow::bail!("hm render requires an adapter or --configured");
+    };
+    if !config.adapters.contains_key(adapter) {
+        anyhow::bail!("unknown adapter: {adapter}");
+    }
+    Ok(vec![adapter.clone()])
+}
+
+/// Render one adapter's generated include body.
+///
+/// Adapter config owns the store allowlist and render scopes. The active CLI
+/// store may further narrow that list for debugging, but cannot expand past the
+/// adapter allowlist. This keeps render-time policy with `hm` rather than with
+/// agent-specific shell hooks.
+fn render_adapter_body(
+    config: &Config,
+    adapter_name: &str,
+    adapter: &AdapterConfig,
+    context: &CliContext,
+) -> Result<String> {
+    let stores = render_stores(config, adapter_name, adapter, context.store.as_deref())?;
+    let scopes = if adapter.scopes.is_empty() {
+        config.defaults.render_scopes.clone()
+    } else {
+        adapter.scopes.clone()
+    };
+    let sources = config.defaults.context_sources.clone();
+    let include_inbox = sources
+        .iter()
+        .any(|source| source == "inbox" || source == "all");
+    let project_id = std::env::var("HIVE_MEMORY_PROJECT_ID").ok();
+    let path_hint = std::env::var("HIVE_MEMORY_PROJECT").ok();
+    let mut body = String::new();
+
+    for store_name in stores {
+        resolve_store(
+            config,
+            Some(store_name.as_str()),
+            Some(adapter_name),
+            StoreAccess::Read,
+        )?;
+        let store_config = &config.stores[store_name.as_str()];
+        let report = rebuild_store_index(config, store_name.as_str())?;
+        let output = memory_context::assemble_context(memory_context::ContextInput {
+            store_name: store_name.as_str(),
+            store_root: &store_config.root,
+            entries: &report.entries,
+            scopes: &scopes,
+            sources: &sources,
+            include_inbox,
+            agent_id: Some(adapter_name),
+            project_id: project_id.as_deref(),
+            path_hint: path_hint.as_deref(),
+            max_tokens: 4000,
+        })?;
+        body.push_str(&output.markdown);
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+    }
+
+    Ok(body)
+}
+
+/// Resolve which stores an adapter may render for this invocation.
+///
+/// Empty adapter store lists are rejected here instead of being treated as
+/// "all stores"; broad renders should always be explicit in config.
+fn render_stores(
+    config: &Config,
+    adapter_name: &str,
+    adapter: &AdapterConfig,
+    explicit_store: Option<&str>,
+) -> Result<Vec<String>> {
+    if let Some(store) = explicit_store {
+        if !adapter.stores.is_empty() && !adapter.stores.iter().any(|allowed| allowed == store) {
+            anyhow::bail!("adapter {adapter_name} may not render store {store}");
+        }
+        if !config.stores.contains_key(store) {
+            anyhow::bail!("unknown store: {store}");
+        }
+        return Ok(vec![store.to_owned()]);
+    }
+
+    if adapter.stores.is_empty() {
+        anyhow::bail!("adapter {adapter_name} has no render stores configured");
+    }
+    Ok(adapter.stores.clone())
 }
 
 fn show_store(config: &Config, name: Option<&str>) -> Result<()> {

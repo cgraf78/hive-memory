@@ -667,3 +667,132 @@ fn context_requires_include_inbox_for_raw_note() {
         .stdout(predicate::str::contains("trust=\"raw\""))
         .stdout(predicate::str::contains("Raw context note."));
 }
+
+#[test]
+fn render_writes_adapter_output() {
+    let dir = temp_dir("render");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let output = dir.join("generated").join("codex.md");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "{}"
+
+            [adapters.codex]
+            enabled = true
+            stores = ["personal"]
+            scopes = ["global"]
+            output = "{}"
+            "#,
+            personal.display(),
+            output.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Rendered context includes TOML memory.",
+        ])
+        .assert()
+        .success();
+
+    let mut render = cargo_bin_cmd!("hm");
+    render
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "render",
+            "codex",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("adapter: codex"))
+        .stdout(predicate::str::contains("written: true"));
+
+    let rendered = fs::read_to_string(output).expect("read render output");
+    assert!(rendered.starts_with("<!-- hive-memory:generated v=1 sha256="));
+    assert!(rendered.contains("Rendered context includes TOML memory."));
+}
+
+#[test]
+fn render_refuses_drifted_output_without_force_backup() {
+    let dir = temp_dir("render-drift");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let output = dir.join("generated").join("codex.md");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "{}"
+
+            [adapters.codex]
+            enabled = true
+            stores = ["personal"]
+            scopes = ["global"]
+            output = "{}"
+            "#,
+            personal.display(),
+            output.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Rendered drift memory.",
+        ])
+        .assert()
+        .success();
+
+    let mut first_render = cargo_bin_cmd!("hm");
+    first_render
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "render",
+            "codex",
+        ])
+        .assert()
+        .success();
+    fs::write(
+        &output,
+        fs::read_to_string(&output).expect("read render") + "manual edit\n",
+    )
+    .expect("drift render output");
+
+    let mut second_render = cargo_bin_cmd!("hm");
+    second_render
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "render",
+            "codex",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "refusing to overwrite edited render file",
+        ));
+}
