@@ -1423,7 +1423,7 @@ Versioning:
 
 - `0.x`: schema/CLI can change with changelog notes.
 - `1.0`: config schema, note/event schemas, and command output contracts should
-  be stable or migrateable.
+  be stable or migratable.
 - store `schema_version` changes require migrators or clear read-only behavior.
 
 ### shdeps Install Recommendation
