@@ -7,7 +7,7 @@
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use hive_memory::config::{Config, ConfigPaths, EventSidecarPolicy, Sensitivity};
-use hive_memory::{index, memory, note, search, store, write};
+use hive_memory::{context as memory_context, index, memory, note, search, store, write};
 use std::path::PathBuf;
 use std::str::FromStr;
 use time::OffsetDateTime;
@@ -53,6 +53,8 @@ enum Command {
     Note(WriteMemoryArgs),
     /// Search remembered memory.
     Search(SearchArgs),
+    /// Assemble agent-readable memory context.
+    Context(ContextArgs),
 }
 
 /// Store lifecycle commands.
@@ -171,6 +173,29 @@ struct SearchArgs {
     scope: Vec<String>,
 }
 
+/// Arguments for `hm context`.
+#[derive(Debug, Args)]
+struct ContextArgs {
+    /// Maximum approximate tokens to emit.
+    #[arg(long)]
+    max_tokens: Option<usize>,
+    /// Include lower-confidence raw `hm note` entries.
+    #[arg(long)]
+    include_inbox: bool,
+    /// Optional comma-separated scope filter.
+    #[arg(long, value_delimiter = ',')]
+    scope: Vec<String>,
+    /// Optional comma-separated source filter.
+    #[arg(long, value_delimiter = ',')]
+    source: Vec<String>,
+    /// Active project id for project-scoped memory.
+    #[arg(long)]
+    project_id: Option<String>,
+    /// Active path hint to display in context headers.
+    #[arg(long)]
+    path: Option<String>,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let context = CliContext {
@@ -183,6 +208,7 @@ fn main() -> Result<()> {
         Some(Command::Remember(args)) => run_write_memory(note::EntryKind::Remember, args, context),
         Some(Command::Note(args)) => run_write_memory(note::EntryKind::Note, args, context),
         Some(Command::Search(args)) => run_search(args, context),
+        Some(Command::Context(args)) => run_context(args, context),
         None => Ok(()),
     }
 }
@@ -343,22 +369,7 @@ fn run_search(args: SearchArgs, context: CliContext) -> Result<()> {
         StoreAccess::Read,
     )?;
     let store_config = &config.stores[resolved_store.name.as_str()];
-    let options = write::AtomicWriteOptions {
-        fsync: config.storage.fsync.into(),
-        ..write::AtomicWriteOptions::default()
-    };
-    // Rebuild before searching so this first read path is correct even when
-    // notes were edited by another process. A future lazy index can optimize
-    // this behind the same library boundary without changing the CLI contract.
-    let report = index::rebuild_index(index::RebuildIndexInput {
-        store_name: resolved_store.name.as_str(),
-        store_root: &store_config.root,
-        cache_dir: &config.cache_dir,
-        options,
-    })?;
-    for warning in &report.warnings {
-        eprintln!("warning: {}: {}", warning.path.display(), warning.message);
-    }
+    let report = rebuild_store_index(&config, &resolved_store.name)?;
 
     let scopes = if args.scope.is_empty() {
         config.defaults.search_scopes.clone()
@@ -391,6 +402,84 @@ fn run_search(args: SearchArgs, context: CliContext) -> Result<()> {
         println!("snippet: {}", hit.snippet);
     }
     Ok(())
+}
+
+fn run_context(args: ContextArgs, context: CliContext) -> Result<()> {
+    let config = load_config(context.config_path.as_deref())?;
+    let agent_id = resolve_agent_id(context.as_agent);
+    let resolved_store = resolve_store(
+        &config,
+        context.store.as_deref(),
+        agent_id.as_deref(),
+        StoreAccess::Read,
+    )?;
+    let store_config = &config.stores[resolved_store.name.as_str()];
+    let report = rebuild_store_index(&config, &resolved_store.name)?;
+    let scopes = if args.scope.is_empty() {
+        config.defaults.search_scopes.clone()
+    } else {
+        args.scope
+    };
+    let sources = if args.source.is_empty() {
+        config.defaults.context_sources.clone()
+    } else {
+        args.source
+    };
+    let include_inbox = args.include_inbox
+        || sources
+            .iter()
+            .any(|source| source == "inbox" || source == "all");
+    let project_id = args
+        .project_id
+        .or_else(|| std::env::var("HIVE_MEMORY_PROJECT_ID").ok());
+    let path_hint = args
+        .path
+        .or_else(|| std::env::var("HIVE_MEMORY_PROJECT").ok());
+    let max_tokens = args.max_tokens.unwrap_or_else(|| {
+        if std::env::var("HIVE_MEMORY_HOOK_ACTIVE").ok().as_deref() == Some("1") {
+            usize::try_from(config.defaults.hook_context_max_tokens)
+                .expect("hook context token budget fits usize")
+        } else {
+            4000
+        }
+    });
+
+    let output = memory_context::assemble_context(memory_context::ContextInput {
+        store_name: resolved_store.name.as_str(),
+        store_root: &store_config.root,
+        entries: &report.entries,
+        scopes: &scopes,
+        sources: &sources,
+        include_inbox,
+        agent_id: agent_id.as_deref(),
+        project_id: project_id.as_deref(),
+        path_hint: path_hint.as_deref(),
+        max_tokens,
+    })?;
+
+    print!("{}", output.markdown);
+    Ok(())
+}
+
+fn rebuild_store_index(config: &Config, store_name: &str) -> Result<index::RebuildIndexReport> {
+    let store_config = &config.stores[store_name];
+    let options = write::AtomicWriteOptions {
+        fsync: config.storage.fsync.into(),
+        ..write::AtomicWriteOptions::default()
+    };
+    // Read commands rebuild for correctness in this first implementation, so
+    // direct file edits and writes from other processes are visible immediately.
+    // A later lazy mtime/inode check can live behind this helper.
+    let report = index::rebuild_index(index::RebuildIndexInput {
+        store_name,
+        store_root: &store_config.root,
+        cache_dir: &config.cache_dir,
+        options,
+    })?;
+    for warning in &report.warnings {
+        eprintln!("warning: {}: {}", warning.path.display(), warning.message);
+    }
+    Ok(report)
 }
 
 fn show_store(config: &Config, name: Option<&str>) -> Result<()> {

@@ -562,3 +562,108 @@ fn search_enforces_agent_read_store_policy() {
             "agent codex may not read store work",
         ));
 }
+
+#[test]
+fn context_renders_remembered_memory() {
+    let dir = temp_dir("context");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "remember",
+            "--text",
+            "Context should include TOML preferences.",
+        ])
+        .assert()
+        .success();
+
+    let mut context = cargo_bin_cmd!("hm");
+    context
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "context",
+            "--path",
+            "/repo/src/main.rs",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Hive Memory Context"))
+        .stdout(predicate::str::contains("store: personal"))
+        .stdout(predicate::str::contains("agent: codex"))
+        .stdout(predicate::str::contains("<memory id=\""))
+        .stdout(predicate::str::contains(
+            "Context should include TOML preferences.",
+        ));
+}
+
+#[test]
+fn context_requires_include_inbox_for_raw_note() {
+    let dir = temp_dir("context-include-inbox");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "{}"
+
+            [stores.work]
+            root = "{}"
+
+            [defaults]
+            event_sidecar = "never"
+            "#,
+            personal.display(),
+            work.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    let mut note = cargo_bin_cmd!("hm");
+    note.args([
+        "--config",
+        config.to_str().expect("utf8 config"),
+        "note",
+        "--text",
+        "Raw context note.",
+    ])
+    .assert()
+    .success();
+
+    let mut default_context = cargo_bin_cmd!("hm");
+    default_context
+        .args(["--config", config.to_str().expect("utf8 config"), "context"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Raw context note.").not());
+
+    let mut inbox_context = cargo_bin_cmd!("hm");
+    inbox_context
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "context",
+            "--include-inbox",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("trust=\"raw\""))
+        .stdout(predicate::str::contains("Raw context note."));
+}
