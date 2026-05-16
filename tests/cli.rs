@@ -189,3 +189,56 @@ fn stores_show_rejects_unknown_store() {
     .failure()
     .stderr(predicate::str::contains("unknown store: missing"));
 }
+
+#[test]
+fn stores_doctor_warns_for_missing_manifest() {
+    let dir = temp_dir("stores-doctor");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    let mut doctor = cargo_bin_cmd!("hm");
+
+    doctor
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "stores",
+            "doctor",
+            "personal",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("store: personal"))
+        .stdout(predicate::str::contains("manifest: missing"))
+        .stdout(predicate::str::contains("warning: missing manifest"));
+}
+
+#[test]
+fn stores_migrate_reports_no_v1_migrations() {
+    let dir = temp_dir("stores-migrate");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    let mut migrate = cargo_bin_cmd!("hm");
+
+    migrate
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "stores",
+            "migrate",
+            "--dry-run",
+            "--store",
+            "personal",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("stores_checked: 1"))
+        .stdout(predicate::str::contains("migrations_run: 0"))
+        .stdout(predicate::str::contains("dry_run: true"))
+        .stdout(predicate::str::contains(
+            "status: no migrations for schema v1",
+        ));
+}

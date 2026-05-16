@@ -5,7 +5,7 @@
 //! is actually here." Keeping those responsibilities separate lets folders
 //! move, sync, or get renamed without changing the store's identity.
 
-use crate::config::Sensitivity;
+use crate::config::{Sensitivity, StoreConfig};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt::{self, Display};
@@ -49,6 +49,54 @@ pub struct StoreInitOptions {
     pub description: Option<String>,
     /// Store sensitivity copied from config/CLI into the manifest.
     pub sensitivity: Sensitivity,
+}
+
+/// Inputs for store diagnostics.
+///
+/// The caller passes the local config alias and store config so diagnostics can
+/// compare "where config points" with "what the manifest says is there" without
+/// requiring the store module to load global config itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreDoctorInput<'a> {
+    /// Local config alias being diagnosed.
+    pub name: &'a str,
+    /// Configured store values for that alias.
+    pub config: &'a StoreConfig,
+}
+
+/// Diagnostic result for one configured store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreDoctorReport {
+    /// Local config alias that was checked.
+    pub name: String,
+    /// Filesystem root from config.
+    pub root: PathBuf,
+    /// Whether a parseable manifest file was found.
+    pub manifest_available: bool,
+    /// Warnings/errors discovered for this store.
+    pub issues: Vec<StoreDoctorIssue>,
+}
+
+/// Store diagnostic finding.
+///
+/// Missing manifests and alias drift are warnings because they are expected in
+/// early setup or after a harmless local alias rename. Newer/corrupt manifests
+/// are errors because continuing could interpret store data incorrectly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreDoctorIssue {
+    /// Finding severity.
+    pub level: StoreDoctorLevel,
+    /// Human-readable diagnostic message.
+    pub message: String,
+}
+
+/// Severity for a store diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreDoctorLevel {
+    /// Non-fatal setup or drift issue.
+    Warning,
+    /// Fatal issue that makes the store unsafe to use automatically.
+    Error,
 }
 
 /// Parsed `manifest.toml` from a store root.
@@ -147,6 +195,20 @@ pub enum StoreError {
         /// Newest schema version supported by this build.
         supported: u32,
     },
+}
+
+/// V1 migration result.
+///
+/// V1 supports only schema 1, so migration is intentionally a no-op. Keeping a
+/// real return type makes the CLI workflow stable before future migrators exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationReport {
+    /// Number of configured stores inspected.
+    pub stores_checked: usize,
+    /// Number of migrations that ran.
+    pub migrations_run: usize,
+    /// Whether this was a dry-run request.
+    pub dry_run: bool,
 }
 
 impl Display for StoreError {
@@ -299,6 +361,121 @@ pub fn read_manifest(root: &Path) -> Result<StoreManifest, StoreError> {
         message: err.to_string(),
     })?;
     StoreManifest::from_toml_str(&contents)
+}
+
+/// Run diagnostics for one configured store.
+///
+/// This is intentionally non-destructive. Missing manifests and config/manifest
+/// mismatches are surfaced as findings for `hm stores doctor`; repair commands
+/// can build on the same checks later without hiding drift.
+pub fn doctor_store(input: StoreDoctorInput<'_>) -> StoreDoctorReport {
+    let mut report = StoreDoctorReport {
+        name: input.name.to_owned(),
+        root: input.config.root.clone(),
+        manifest_available: false,
+        issues: Vec::new(),
+    };
+
+    let manifest_path = manifest_path(&input.config.root);
+    if !manifest_path.is_file() {
+        report.issues.push(StoreDoctorIssue {
+            level: StoreDoctorLevel::Warning,
+            message: format!(
+                "missing manifest; initialize with `hm stores init {} --root {}`",
+                input.name,
+                input.config.root.display()
+            ),
+        });
+        return report;
+    }
+
+    match read_manifest(&input.config.root) {
+        Ok(manifest) => {
+            report.manifest_available = true;
+            if manifest.store.name != input.name {
+                report.issues.push(StoreDoctorIssue {
+                    level: StoreDoctorLevel::Warning,
+                    message: format!(
+                        "manifest store.name is {}, config alias is {}",
+                        manifest.store.name, input.name
+                    ),
+                });
+            }
+
+            if let Some(expected_id) = &input.config.expected_id
+                && expected_id != &manifest.store.id
+            {
+                report.issues.push(StoreDoctorIssue {
+                    level: StoreDoctorLevel::Error,
+                    message: format!(
+                        "manifest store.id is {}, config expected_id is {}",
+                        manifest.store.id, expected_id
+                    ),
+                });
+            }
+
+            if manifest.store.sensitivity != input.config.sensitivity {
+                let stricter =
+                    stricter_sensitivity(manifest.store.sensitivity, input.config.sensitivity);
+                report.issues.push(StoreDoctorIssue {
+                    level: StoreDoctorLevel::Warning,
+                    message: format!(
+                        "sensitivity mismatch: config={}, manifest={}, effective={}",
+                        input.config.sensitivity, manifest.store.sensitivity, stricter
+                    ),
+                });
+            }
+        }
+        Err(err) => {
+            report.issues.push(StoreDoctorIssue {
+                level: StoreDoctorLevel::Error,
+                message: err.to_string(),
+            });
+        }
+    }
+
+    report
+}
+
+/// Return the stricter of two sensitivity classes.
+pub fn stricter_sensitivity(left: Sensitivity, right: Sensitivity) -> Sensitivity {
+    if sensitivity_rank(left) >= sensitivity_rank(right) {
+        left
+    } else {
+        right
+    }
+}
+
+/// Report v1 migration status for configured stores.
+///
+/// No schema migrators exist in v1. The command still checks manifests so a
+/// future migration workflow has a real, testable entry point from day one.
+pub fn migrate_stores<'a, I>(stores: I, dry_run: bool) -> Result<MigrationReport, StoreError>
+where
+    I: IntoIterator<Item = StoreDoctorInput<'a>>,
+{
+    let mut stores_checked = 0;
+    for store in stores {
+        stores_checked += 1;
+        if manifest_path(&store.config.root).is_file() {
+            read_manifest(&store.config.root)?;
+        }
+    }
+
+    Ok(MigrationReport {
+        stores_checked,
+        migrations_run: 0,
+        dry_run,
+    })
+}
+
+fn sensitivity_rank(sensitivity: Sensitivity) -> u8 {
+    match sensitivity {
+        Sensitivity::Public => 0,
+        Sensitivity::Internal => 1,
+        Sensitivity::Private => 2,
+        Sensitivity::Secret => 3,
+    }
 }
 
 fn create_store_root(root: &Path) -> Result<(), StoreError> {
@@ -509,5 +686,119 @@ mod tests {
         let err = init_store(&options).expect_err("second init fails");
 
         assert_eq!(err, StoreError::ManifestExists(root.join("manifest.toml")));
+    }
+
+    #[test]
+    fn doctor_warns_for_missing_manifest() {
+        let root = temp_dir("doctor-missing");
+        let config = StoreConfig {
+            root: root.clone(),
+            expected_id: None,
+            description: None,
+            sensitivity: Sensitivity::Private,
+        };
+
+        let report = doctor_store(StoreDoctorInput {
+            name: "personal",
+            config: &config,
+        });
+
+        assert!(!report.manifest_available);
+        assert_eq!(report.issues.len(), 1);
+        assert_eq!(report.issues[0].level, StoreDoctorLevel::Warning);
+        assert!(report.issues[0].message.contains("missing manifest"));
+    }
+
+    #[test]
+    fn doctor_warns_for_alias_and_sensitivity_drift() {
+        let root = temp_dir("doctor-drift");
+        let manifest = StoreManifest::with_identity(
+            "old-name",
+            None,
+            Sensitivity::Secret,
+            "018f5f57-bd9b-7d33-9e21-1f44f0c5a013".to_owned(),
+            "2026-05-16T00:00:00Z".to_owned(),
+        );
+        create_store_root(&root).expect("create root");
+        write_manifest_atomic(&root, &manifest).expect("write manifest");
+        let config = StoreConfig {
+            root: root.clone(),
+            expected_id: None,
+            description: None,
+            sensitivity: Sensitivity::Private,
+        };
+
+        let report = doctor_store(StoreDoctorInput {
+            name: "personal",
+            config: &config,
+        });
+
+        assert!(report.manifest_available);
+        assert_eq!(report.issues.len(), 2);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.message.contains("manifest store.name"))
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.message.contains("effective=secret"))
+        );
+    }
+
+    #[test]
+    fn doctor_errors_for_expected_id_mismatch() {
+        let root = temp_dir("doctor-expected-id");
+        let manifest = StoreManifest::with_identity(
+            "personal",
+            None,
+            Sensitivity::Private,
+            "018f5f57-bd9b-7d33-9e21-1f44f0c5a013".to_owned(),
+            "2026-05-16T00:00:00Z".to_owned(),
+        );
+        create_store_root(&root).expect("create root");
+        write_manifest_atomic(&root, &manifest).expect("write manifest");
+        let config = StoreConfig {
+            root,
+            expected_id: Some("wrong-id".to_owned()),
+            description: None,
+            sensitivity: Sensitivity::Private,
+        };
+
+        let report = doctor_store(StoreDoctorInput {
+            name: "personal",
+            config: &config,
+        });
+
+        assert_eq!(report.issues.len(), 1);
+        assert_eq!(report.issues[0].level, StoreDoctorLevel::Error);
+        assert!(report.issues[0].message.contains("expected_id"));
+    }
+
+    #[test]
+    fn migrate_v1_reports_no_migrators() {
+        let root = temp_dir("migrate");
+        let config = StoreConfig {
+            root,
+            expected_id: None,
+            description: None,
+            sensitivity: Sensitivity::Private,
+        };
+
+        let report = migrate_stores(
+            [StoreDoctorInput {
+                name: "personal",
+                config: &config,
+            }],
+            true,
+        )
+        .expect("migration report");
+
+        assert_eq!(report.stores_checked, 1);
+        assert_eq!(report.migrations_run, 0);
+        assert!(report.dry_run);
     }
 }

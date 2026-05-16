@@ -51,6 +51,10 @@ enum StoresCommand {
     List,
     /// Show one configured store, defaulting to the global default store.
     Show(StoreShowArgs),
+    /// Run store diagnostics.
+    Doctor(StoreDoctorArgs),
+    /// Run schema migrators when a future schema is available.
+    Migrate(StoreMigrateArgs),
 }
 
 /// Arguments for `hm stores init`.
@@ -77,6 +81,24 @@ struct StoreInitArgs {
 struct StoreShowArgs {
     /// Store alias to show. Defaults to config.default_store.
     name: Option<String>,
+}
+
+/// Arguments for `hm stores doctor`.
+#[derive(Debug, Args)]
+struct StoreDoctorArgs {
+    /// Store alias to diagnose. Defaults to all configured stores.
+    name: Option<String>,
+}
+
+/// Arguments for `hm stores migrate`.
+#[derive(Debug, Args)]
+struct StoreMigrateArgs {
+    /// Check what would migrate without changing stores.
+    #[arg(long)]
+    dry_run: bool,
+    /// Store alias to migrate. Defaults to all configured stores.
+    #[arg(long)]
+    store: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -122,6 +144,14 @@ fn run_stores(command: StoresCommand, config_path: Option<PathBuf>) -> Result<()
             show_store(&config, args.name.as_deref())?;
             Ok(())
         }
+        StoresCommand::Doctor(args) => {
+            let config = load_config(config_path.as_deref())?;
+            run_store_doctor(&config, args.name.as_deref())
+        }
+        StoresCommand::Migrate(args) => {
+            let config = load_config(config_path.as_deref())?;
+            run_store_migrate(&config, args.store.as_deref(), args.dry_run)
+        }
     }
 }
 
@@ -164,4 +194,84 @@ fn show_store(config: &Config, name: Option<&str>) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn run_store_doctor(config: &Config, name: Option<&str>) -> Result<()> {
+    let reports = doctor_reports(config, name)?;
+    let mut has_error = false;
+
+    for report in &reports {
+        println!("store: {}", report.name);
+        println!("root: {}", report.root.display());
+        println!(
+            "manifest: {}",
+            if report.manifest_available {
+                "present"
+            } else {
+                "missing"
+            }
+        );
+        if report.issues.is_empty() {
+            println!("status: ok");
+        } else {
+            for issue in &report.issues {
+                let level = match issue.level {
+                    store::StoreDoctorLevel::Warning => "warning",
+                    store::StoreDoctorLevel::Error => {
+                        has_error = true;
+                        "error"
+                    }
+                };
+                println!("{level}: {}", issue.message);
+            }
+        }
+    }
+
+    if has_error {
+        anyhow::bail!("store doctor found errors");
+    }
+    Ok(())
+}
+
+fn run_store_migrate(config: &Config, name: Option<&str>, dry_run: bool) -> Result<()> {
+    let inputs = store_inputs(config, name)?;
+    let report = store::migrate_stores(inputs, dry_run)?;
+    println!("stores_checked: {}", report.stores_checked);
+    println!("migrations_run: {}", report.migrations_run);
+    println!("dry_run: {}", report.dry_run);
+    if report.migrations_run == 0 {
+        println!("status: no migrations for schema v1");
+    }
+    Ok(())
+}
+
+fn doctor_reports(config: &Config, name: Option<&str>) -> Result<Vec<store::StoreDoctorReport>> {
+    Ok(store_inputs(config, name)?
+        .into_iter()
+        .map(store::doctor_store)
+        .collect())
+}
+
+fn store_inputs<'a>(
+    config: &'a Config,
+    name: Option<&'a str>,
+) -> Result<Vec<store::StoreDoctorInput<'a>>> {
+    if let Some(name) = name {
+        let Some(store) = config.stores.get(name) else {
+            anyhow::bail!("unknown store: {name}");
+        };
+        return Ok(vec![store::StoreDoctorInput {
+            name,
+            config: store,
+        }]);
+    }
+
+    Ok(config
+        .stores
+        .iter()
+        .map(|(name, store)| store::StoreDoctorInput {
+            name: name.as_str(),
+            config: store,
+        })
+        .collect())
 }
