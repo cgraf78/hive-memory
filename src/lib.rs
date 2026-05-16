@@ -5,6 +5,7 @@
 //! as the CLI without reimplementing context detection or shelling out to `hm`.
 
 pub mod config;
+pub mod event;
 pub mod id;
 pub mod note;
 pub mod store;

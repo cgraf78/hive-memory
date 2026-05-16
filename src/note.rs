@@ -356,6 +356,15 @@ where
     })))
 }
 
+/// Return the store-relative canonical Markdown note path.
+///
+/// JSON sidecars and index records use this exact relative path to pair machine
+/// metadata back to the canonical human-readable note without embedding a
+/// host-specific absolute path.
+pub fn note_relative_path(id: &str, created_at: OffsetDateTime) -> PathBuf {
+    note_day_relative_dir(created_at).join(format!("{id}.md"))
+}
+
 fn validate_front_matter(front_matter: &NoteFrontMatter) -> Result<(), NoteError> {
     if front_matter.schema_version != NOTE_SCHEMA_VERSION {
         return Err(NoteError::UnsupportedSchema(front_matter.schema_version));
@@ -398,8 +407,11 @@ fn validate_rfc3339(field: &'static str, value: &str) -> Result<(), NoteError> {
 }
 
 fn note_day_dir(store_root: &Path, created_at: OffsetDateTime) -> PathBuf {
-    store_root
-        .join("inbox/notes")
+    store_root.join(note_day_relative_dir(created_at))
+}
+
+fn note_day_relative_dir(created_at: OffsetDateTime) -> PathBuf {
+    PathBuf::from("inbox/notes")
         .join(format!("{:04}", created_at.year()))
         .join(format!("{:02}", u8::from(created_at.month())))
         .join(format!("{:02}", created_at.day()))
