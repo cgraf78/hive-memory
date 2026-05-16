@@ -27,8 +27,10 @@ crippling.
 - **Favor clean, elegant designs**: keep the system cohesive, readable, and
   nicely componentized. Prefer small, well-named pieces with clear boundaries
   over tangled or overly clever implementation.
-- **Single-source shared knowledge**: canonical memory has one neutral home.
-  Agent-specific files are rendered views, not competing sources of truth.
+- **Single-source shared knowledge**: within a memory store, canonical memory has
+  one neutral home. Agent-specific files are rendered views, not competing
+  sources of truth. Multiple stores are allowed for intentional segmentation,
+  but each store remains internally single-source.
 - **Expose clean interfaces**: agents call `hm context`, `remember`,
   `note`, `render`, and `doctor`; they do not reimplement path mapping, locking,
   indexing, or scope filtering.
@@ -144,12 +146,20 @@ Default config path:
 
 ```toml
 # ~/.config/hive-memory/config.toml
-root = "${HOME}/gdrive/hive-memory"
+default_store = "personal"
 state_dir = "${XDG_STATE_HOME:-${HOME}/.local/state}/hive-memory"
 cache_dir = "${XDG_CACHE_HOME:-${HOME}/.cache}/hive-memory"
 
 host_id = "auto"      # auto = stable machine id derived by CLI
-user_id = "default"   # namespace within one memory root
+user_id = "default"   # namespace within each memory store
+
+[stores.personal]
+root = "${HOME}/gdrive/hive-memory/personal"
+description = "Default personal hive memory"
+
+[stores.work]
+root = "${HOME}/gdrive/hive-memory/work"
+description = "Optional segmented work memory"
 
 [storage]
 kind = "filesystem"   # filesystem first; future: s3, webdav, sqlite, postgres
@@ -168,15 +178,58 @@ include = ["personal", "project"]
 exclude = ["work", "agent-private"]
 ```
 
-Important: `root` is always configurable. Google Drive is just one good backend
-for Chris, not a baked-in assumption.
+Important: store roots are always configurable. Google Drive is just one good
+backend for Chris, not a baked-in assumption. A config always has one
+`default_store`; additional named stores are optional and are used for memory
+segmentation.
 
 Environment override:
 
 ```bash
-HIVE_MEMORY_ROOT=/path/to/memory hm search "..."
-HIVE_MEMORY_CONFIG=/path/to/config.toml hm doctor
+HIVE_MEMORY_ROOT=/path/to/memory hm --store personal search "..."
+HIVE_MEMORY_CONFIG=/path/to/config.toml hm --store work doctor
 ```
+
+## Multiple Stores
+
+`hive-memory` should support multiple named memory stores. There is always one
+configured default store, but commands may target another store explicitly.
+
+Use cases:
+
+- personal vs work memory
+- client/project segmentation
+- experimental/private agent stores
+- shared family/team store vs private store
+- high-trust local store vs lower-trust shared store
+
+Command model:
+
+```bash
+hm search "workflow preference"              # uses default_store
+hm --store work search "release checklist"   # explicit store
+hm --store personal remember --text "..."
+hm stores list
+hm stores doctor
+```
+
+Rules:
+
+- Every store has its own root, manifest, inbox, memories, locks, and generated
+  views.
+- Store names are stable IDs, not display names. Prefer lowercase
+  `[a-z0-9][a-z0-9_-]*`.
+- The default store is used when no `--store` is provided.
+- Adapters declare which stores they include, and the default should be
+  conservative.
+- Cross-store search/context is opt-in via `--all-stores` or explicit
+  `--store a --store b`.
+- Notes/events record their `store_id` in front matter/JSON metadata.
+- Compaction and locks are per-store unless a future cross-store operation is
+  explicitly requested.
+
+Avoid accidental leakage: rendering a work store into a personal agent config, or
+personal store into a work/client context, must require explicit config.
 
 ## Canonical Directory Layout
 
@@ -393,6 +446,7 @@ hm search "query" [--scope personal,project]
 hm render [claude|codex|openclaw|gemini|all]
 hm sync --quiet
 hm compact [--scope personal|project] [--dry-run]
+hm stores list
 hm doctor
 ```
 
@@ -536,6 +590,18 @@ or host is unreachable and timeout passed.
 CLI writes to local outbox in `state_dir/outbox/`, then flushes when root returns.
 This is optional but important for laptop/offline ergonomics.
 
+### Wrong-store writes
+
+If a session is in a context configured for a non-default store, hooks should pass
+`--store <name>` explicitly. `hm context` output should include the active store
+name so agents can notice if they are about to write to the wrong hive.
+
+### Cross-store leakage
+
+Adapters must not render all stores by default. Store inclusion is explicit in
+config, and `doctor` should warn when a sensitive store is included in a broad
+adapter target.
+
 ### Privacy leak risk
 
 Every note has scope metadata. Adapter render commands require explicit scope
@@ -544,8 +610,8 @@ selection. Default should be conservative.
 ## Recommendation for MVP
 
 1. Build `hive-memory` as a standalone repo.
-2. Implement filesystem backend with configurable root.
-3. Implement collision-safe `note`, `remember`, `search`, `context`, `doctor`.
+2. Implement filesystem backend with configurable named stores and a required default store.
+3. Implement collision-safe `note`, `remember`, `search`, `context`, `stores`, `doctor`.
 4. Implement Claude and Codex render adapters first.
 5. Wire through dotfiles hooks.
 6. Migrate existing Claude `memory-sync` data with `import-claude`.
