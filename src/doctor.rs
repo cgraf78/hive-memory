@@ -5,7 +5,7 @@
 //! the configured stores, local project bindings, and adapter links be trusted
 //! before an agent relies on them?
 
-use crate::{config, project, render, store};
+use crate::{config, note, project, render, secret, store};
 use serde::Serialize;
 use std::fs;
 use std::path::Path;
@@ -104,6 +104,12 @@ pub fn run(input: DoctorInput<'_>) -> DoctorReport {
     check_stores(input.config, &mut checks);
     check_project_bindings(input.config, &mut checks);
     check_adapters(input.config, input.quick, &mut checks);
+    // Secret scanning is deliberately kept off the quick path. Hooks and
+    // update-time health checks need cheap structural validation, while this
+    // audit walks note content and is intended for explicit human review.
+    if !input.quick {
+        check_note_secrets(input.config, &mut checks);
+    }
 
     summarize(checks)
 }
@@ -312,6 +318,110 @@ fn inspect_adapter_install(
             vec![install_target.display().to_string()],
         )),
     }
+}
+
+fn check_note_secrets(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
+    for (store_name, store_config) in &config.stores {
+        if store_config.sensitivity == config::Sensitivity::Secret {
+            checks.push(pass(
+                format!("store.{store_name}.note-secrets"),
+                format!("store {store_name} is a secret store; note secret scan skipped"),
+                vec![store_config.root.display().to_string()],
+            ));
+            continue;
+        }
+
+        let notes_root = store_config.root.join("inbox/notes");
+        let note_paths = match collect_markdown_files(&notes_root) {
+            Ok(paths) => paths,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                checks.push(pass(
+                    format!("store.{store_name}.note-secrets"),
+                    format!("store {store_name} has no notes to scan"),
+                    vec![notes_root.display().to_string()],
+                ));
+                continue;
+            }
+            Err(err) => {
+                checks.push(error(
+                    format!("store.{store_name}.note-secrets"),
+                    format!("failed to scan notes for likely secrets: {err}"),
+                    vec![notes_root.display().to_string()],
+                ));
+                continue;
+            }
+        };
+
+        let mut issues = 0usize;
+        for path in note_paths {
+            match scan_note_for_secrets(&path) {
+                Ok(detectors) if detectors.is_empty() => {}
+                Ok(detectors) => {
+                    issues += 1;
+                    checks.push(warn(
+                        format!("store.{store_name}.note-secrets"),
+                        format!(
+                            "note contains likely secret material; detectors: {}",
+                            detectors.join(",")
+                        ),
+                        vec![path.display().to_string()],
+                    ));
+                }
+                Err(message) => {
+                    issues += 1;
+                    checks.push(warn(
+                        format!("store.{store_name}.note-secrets"),
+                        format!("failed to parse note during secret scan: {message}"),
+                        vec![path.display().to_string()],
+                    ));
+                }
+            }
+        }
+
+        if issues == 0 {
+            checks.push(pass(
+                format!("store.{store_name}.note-secrets"),
+                format!("store {store_name} notes contain no likely secrets"),
+                vec![notes_root.display().to_string()],
+            ));
+        }
+    }
+}
+
+fn scan_note_for_secrets(path: &Path) -> Result<Vec<String>, String> {
+    let contents = fs::read_to_string(path).map_err(|err| err.to_string())?;
+    let parsed = note::parse_note(&contents).map_err(|err| err.to_string())?;
+    // Reuse the write-time detectors against the body only: front matter holds
+    // hm metadata, and diagnostics must identify detectors without echoing a
+    // matched value back into terminal scrollback, logs, or agent transcripts.
+    Ok(secret::detect(&parsed.body)
+        .into_iter()
+        .map(|finding| finding.detector_id)
+        .collect())
+}
+
+fn collect_markdown_files(root: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
+    let mut paths = Vec::new();
+    collect_markdown_files_into(root, &mut paths)?;
+    paths.sort();
+    Ok(paths)
+}
+
+fn collect_markdown_files_into(
+    root: &Path,
+    paths: &mut Vec<std::path::PathBuf>,
+) -> std::io::Result<()> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            collect_markdown_files_into(&path, paths)?;
+        } else if path.extension().and_then(|value| value.to_str()) == Some("md") {
+            paths.push(path);
+        }
+    }
+    Ok(())
 }
 
 fn summarize(checks: Vec<DoctorCheck>) -> DoctorReport {

@@ -389,6 +389,67 @@ fn doctor_warns_for_unknown_project_binding_store() {
 }
 
 #[test]
+fn doctor_full_warns_for_likely_secret_in_private_note_without_echoing_value() {
+    let dir = temp_dir("doctor-note-secret");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+            "#,
+            data.display(),
+            personal.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    let mut remember = cargo_bin_cmd!("hm");
+    let output = remember
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "normal durable memory",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).expect("utf8 stdout");
+    let note_path = PathBuf::from(stdout_value(&stdout, "note:"));
+    let secret_value = "localvalueforsecretdetection";
+    let note = fs::read_to_string(&note_path).expect("read note");
+    fs::write(
+        &note_path,
+        format!("{note}\napi_key = \"{secret_value}\"\n"),
+    )
+    .expect("append fixture secret");
+
+    let mut doctor = cargo_bin_cmd!("hm");
+    doctor
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "doctor",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("detectors: secret-assignment"))
+        .stdout(predicate::str::contains(secret_value).not());
+}
+
+#[test]
 fn remember_writes_note_and_event() {
     let dir = temp_dir("remember");
     let config = dir.join("config.toml");
