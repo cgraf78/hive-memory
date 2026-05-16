@@ -1903,8 +1903,35 @@ fn render_json_output(
 
 fn run_refresh(args: RefreshArgs, context: CliContext) -> Result<()> {
     let config = load_config(context.config_path.as_deref())?;
-    let report = perform_refresh(&config, &context, args.force)?;
+    let receipt_cursor = refresh_receipt_cursor(&config)?;
+    if let Some(cursor) = receipt_cursor.as_ref()
+        && cursor.unrefreshed == 0
+        && !args.force
+    {
+        let report = skipped_refresh_report(args.force);
+        emit_refresh_report(&report, &args)?;
+        return Ok(());
+    }
 
+    let mut report = perform_refresh(&config, &context, args.force)?;
+    if let Some(cursor) = receipt_cursor {
+        report.write_receipts = cursor.unrefreshed;
+        // `hm refresh` owns only maintenance idempotency. Memory-pending debt is
+        // cleared by `hm hook tool-complete`, where the hook knows the tool
+        // actually succeeded and a receipt should satisfy the prompt reminder.
+        memory_hook::mark_receipts_refreshed(
+            &config.state_dir,
+            &cursor.session_id,
+            cursor.receipt_count,
+            false,
+            &hook_options(&config),
+        )?;
+    }
+
+    emit_refresh_report(&report, &args)
+}
+
+fn emit_refresh_report(report: &HookRefreshReport, args: &RefreshArgs) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
@@ -1912,7 +1939,7 @@ fn run_refresh(args: RefreshArgs, context: CliContext) -> Result<()> {
 
     if !args.quiet {
         println!(
-            "refresh: indexes={} flushed={} skipped={} failed={} unbound={} pending={} rendered={} written={} render_skipped={} forced={}",
+            "refresh: indexes={} flushed={} skipped={} failed={} unbound={} pending={} rendered={} written={} render_skipped={} forced={} write_receipts={} refreshed={} coalesced={}",
             report.indexes,
             report.flushed,
             report.skipped,
@@ -1922,11 +1949,43 @@ fn run_refresh(args: RefreshArgs, context: CliContext) -> Result<()> {
             report.rendered,
             report.written,
             report.render_skipped,
-            report.forced
+            report.forced,
+            report.write_receipts,
+            report.refreshed,
+            report.coalesced
         );
     }
 
     Ok(())
+}
+
+struct RefreshReceiptCursor {
+    session_id: String,
+    receipt_count: usize,
+    unrefreshed: usize,
+}
+
+/// Return hook-session receipt progress when refresh is running in hook mode.
+///
+/// Plain human `hm refresh` remains eager and deterministic. Only hook-active
+/// refreshes use write receipts as a cheap idempotency cursor, because hooks may
+/// call refresh after many tool boundaries where no memory write happened.
+fn refresh_receipt_cursor(config: &Config) -> Result<Option<RefreshReceiptCursor>> {
+    if std::env::var("HIVE_MEMORY_HOOK_ACTIVE").ok().as_deref() != Some("1") {
+        return Ok(None);
+    }
+    let Some(session_id) = context_session_id() else {
+        return Ok(None);
+    };
+
+    let receipts = memory_hook::load_write_receipts(&config.state_dir, &session_id)?;
+    let state = memory_hook::load_state(&config.state_dir, &session_id)?;
+    let unrefreshed = receipts.len().saturating_sub(state.refreshed_receipts);
+    Ok(Some(RefreshReceiptCursor {
+        session_id,
+        receipt_count: receipts.len(),
+        unrefreshed,
+    }))
 }
 
 fn run_flush(args: FlushArgs, context: CliContext) -> Result<()> {
@@ -2021,7 +2080,30 @@ fn perform_refresh(
         forced,
         write_receipts: 0,
         refreshed: true,
+        coalesced: false,
     })
+}
+
+/// Build the successful no-op report for receipt-aware hook refresh.
+///
+/// A skipped refresh means no writes happened since the last consumed receipt,
+/// so there is no maintenance work to do and no receipt cursor to advance.
+fn skipped_refresh_report(forced: bool) -> HookRefreshReport {
+    HookRefreshReport {
+        indexes: 0,
+        flushed: 0,
+        skipped: 0,
+        failed: 0,
+        unbound: 0,
+        pending: 0,
+        rendered: 0,
+        written: 0,
+        render_skipped: std::env::var("HIVE_MEMORY_NO_RENDER").ok().as_deref() == Some("1"),
+        forced,
+        write_receipts: 0,
+        refreshed: false,
+        coalesced: false,
+    }
 }
 
 fn run_hook(command: HookCommand, context: CliContext) -> Result<()> {
@@ -2282,6 +2364,8 @@ struct HookRefreshReport {
     write_receipts: usize,
     /// Stable boolean for hook adapters that only need success/failure state.
     refreshed: bool,
+    /// Whether another hook refresh was already running for this session.
+    coalesced: bool,
 }
 
 #[derive(Debug, Serialize)]

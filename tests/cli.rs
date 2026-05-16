@@ -2714,6 +2714,190 @@ fn refresh_honors_no_render_env() {
 }
 
 #[test]
+fn refresh_hook_mode_skips_without_unrefreshed_receipts() {
+    let dir = temp_dir("refresh-hook-no-receipts");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let state = dir.join("state");
+    let output = dir.join("generated").join("codex.md");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            state_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+
+            [adapters.codex]
+            enabled = true
+            stores = ["personal"]
+            scopes = ["global"]
+            output = "{}"
+            "#,
+            state.display(),
+            personal.display(),
+            output.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_HOOK_ACTIVE", "1")
+        .env("HIVE_MEMORY_SESSION_ID", "refresh-session")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"indexes\": 0"))
+        .stdout(predicate::str::contains("\"rendered\": 0"))
+        .stdout(predicate::str::contains("\"written\": 0"))
+        .stdout(predicate::str::contains("\"write_receipts\": 0"))
+        .stdout(predicate::str::contains("\"refreshed\": false"))
+        .stdout(predicate::str::contains("\"coalesced\": false"));
+
+    assert!(!output.exists());
+}
+
+#[test]
+fn refresh_force_ignores_hook_receipt_skip() {
+    let dir = temp_dir("refresh-hook-force");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let state = dir.join("state");
+    let output = dir.join("generated").join("codex.md");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            state_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+
+            [adapters.codex]
+            enabled = true
+            stores = ["personal"]
+            scopes = ["global"]
+            output = "{}"
+            "#,
+            state.display(),
+            personal.display(),
+            output.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_HOOK_ACTIVE", "1")
+        .env("HIVE_MEMORY_SESSION_ID", "refresh-session")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--force",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"indexes\": 1"))
+        .stdout(predicate::str::contains("\"forced\": true"))
+        .stdout(predicate::str::contains("\"refreshed\": true"));
+
+    assert!(output.exists());
+}
+
+#[test]
+fn refresh_hook_mode_consumes_unrefreshed_receipts() {
+    let dir = temp_dir("refresh-hook-receipts");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let state = dir.join("state");
+    let output = dir.join("generated").join("codex.md");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            state_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+
+            [adapters.codex]
+            enabled = true
+            stores = ["personal"]
+            scopes = ["global"]
+            output = "{}"
+            "#,
+            state.display(),
+            personal.display(),
+            output.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", "refresh-session")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Receipt-aware refresh should render this memory.",
+        ])
+        .assert()
+        .success();
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_HOOK_ACTIVE", "1")
+        .env("HIVE_MEMORY_SESSION_ID", "refresh-session")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"indexes\": 1"))
+        .stdout(predicate::str::contains("\"rendered\": 1"))
+        .stdout(predicate::str::contains("\"write_receipts\": 1"))
+        .stdout(predicate::str::contains("\"refreshed\": true"))
+        .stdout(predicate::str::contains("\"coalesced\": false"));
+
+    let rendered = fs::read_to_string(output).expect("read render output");
+    assert!(rendered.contains("Receipt-aware refresh should render this memory."));
+    let state_json =
+        fs::read_to_string(state.join("runs/refresh-session/hook-state.json")).expect("state");
+    assert!(state_json.contains("\"refreshed_receipts\": 1"));
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_HOOK_ACTIVE", "1")
+        .env("HIVE_MEMORY_SESSION_ID", "refresh-session")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"indexes\": 0"))
+        .stdout(predicate::str::contains("\"write_receipts\": 0"))
+        .stdout(predicate::str::contains("\"refreshed\": false"));
+}
+
+#[test]
 fn hook_session_start_emits_context_action_json() {
     let dir = temp_dir("hook-session-start");
     let config = dir.join("config.toml");
