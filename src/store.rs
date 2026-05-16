@@ -6,11 +6,11 @@
 //! move, sync, or get renamed without changing the store's identity.
 
 use crate::config::{Sensitivity, StoreConfig};
+use crate::write::{self, AtomicWriteOptions, FsyncPolicy};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt::{self, Display};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -523,57 +523,41 @@ fn write_manifest_atomic(root: &Path, manifest: &StoreManifest) -> Result<(), St
         return Err(StoreError::ManifestExists(manifest_path));
     }
 
-    let temp_path = root.join(format!(
-        ".manifest.toml.tmp-{}-{}",
-        std::process::id(),
-        Uuid::now_v7()
-    ));
     let contents = manifest.to_toml_string()?;
-
-    {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-            .map_err(|err| StoreError::Io {
-                action: "create temporary manifest",
-                path: temp_path.clone(),
-                message: err.to_string(),
-            })?;
-        file.write_all(contents.as_bytes())
-            .map_err(|err| StoreError::Io {
-                action: "write temporary manifest",
-                path: temp_path.clone(),
-                message: err.to_string(),
-            })?;
-        file.sync_all().map_err(|err| StoreError::Io {
-            action: "sync temporary manifest",
-            path: temp_path.clone(),
-            message: err.to_string(),
-        })?;
-    }
-
-    if manifest_path.exists() {
-        remove_temp_manifest(&temp_path);
-        return Err(StoreError::ManifestExists(manifest_path));
-    }
-
-    fs::rename(&temp_path, &manifest_path).map_err(|err| {
-        remove_temp_manifest(&temp_path);
-        StoreError::Io {
-            action: "install manifest",
-            path: manifest_path,
-            message: err.to_string(),
-        }
-    })
+    write::write_atomic(
+        &manifest_path,
+        contents.as_bytes(),
+        &AtomicWriteOptions {
+            fsync: FsyncPolicy::Required,
+            max_attempts: 1,
+            skip_parent_fsync: false,
+        },
+    )
+    .map(|_| ())
+    .map_err(store_error_from_atomic)
 }
 
 fn manifest_path(root: &Path) -> PathBuf {
     root.join("manifest.toml")
 }
 
-fn remove_temp_manifest(path: &Path) {
-    let _ = fs::remove_file(path);
+fn store_error_from_atomic(err: write::AtomicWriteError) -> StoreError {
+    match err {
+        write::AtomicWriteError::Io {
+            action,
+            path,
+            message,
+        } => StoreError::Io {
+            action,
+            path,
+            message,
+        },
+        other => StoreError::Io {
+            action: "write manifest",
+            path: PathBuf::from("manifest.toml"),
+            message: other.to_string(),
+        },
+    }
 }
 
 fn now_rfc3339() -> String {
