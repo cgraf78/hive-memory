@@ -131,6 +131,10 @@ pub struct Config {
     pub host_id: String,
     /// Human/user identity used for attribution when available.
     pub user_id: String,
+    /// Filesystem/storage behavior that affects write durability.
+    pub storage: StorageConfig,
+    /// Default command policy for writes, search, context, and hooks.
+    pub defaults: DefaultsConfig,
     /// Configured stores keyed by local alias.
     pub stores: BTreeMap<String, StoreConfig>,
     /// Optional per-agent access policy keyed by agent id.
@@ -139,6 +143,73 @@ pub struct Config {
     pub privacy: PrivacyConfig,
     /// Render/install targets for agent-visible context files.
     pub adapters: BTreeMap<String, AdapterConfig>,
+}
+
+/// Storage behavior from config.
+///
+/// V1 has only the filesystem backend, but keeping the storage policy explicit
+/// lets write commands choose durability behavior without hardcoding it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageConfig {
+    /// Backend kind. V1 expects `filesystem`.
+    pub kind: String,
+    /// Case-sensitivity mode: `auto`, `true`, or `false`.
+    pub case_sensitive: String,
+    /// Atomic rename support mode: `auto`, `true`, or `false`.
+    pub atomic_rename: String,
+    /// Fsync policy used by canonical writes.
+    pub fsync: FsyncMode,
+}
+
+/// Config-level fsync policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FsyncMode {
+    Never,
+    #[default]
+    BestEffort,
+    Required,
+}
+
+impl From<FsyncMode> for crate::write::FsyncPolicy {
+    fn from(value: FsyncMode) -> Self {
+        match value {
+            FsyncMode::Never => Self::Never,
+            FsyncMode::BestEffort => Self::BestEffort,
+            FsyncMode::Required => Self::Required,
+        }
+    }
+}
+
+/// Command defaults from config.
+///
+/// These values are policy, not CLI presentation. Commands should ask this
+/// struct for defaults instead of quietly choosing their own scope/source rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultsConfig {
+    /// Default scope for `hm remember` and `hm note`.
+    pub write_scope: String,
+    /// Default scopes for search commands.
+    pub search_scopes: Vec<String>,
+    /// Default source classes included in context.
+    pub context_sources: Vec<String>,
+    /// Default scopes rendered into adapter-visible context.
+    pub render_scopes: Vec<String>,
+    /// Whether `hm note` writes a JSON sidecar by default.
+    pub event_sidecar: EventSidecarPolicy,
+    /// Hook-mode context token budget.
+    pub hook_context_max_tokens: u32,
+    /// Max age string for hook context cache fallback.
+    pub context_cache_max_age: String,
+}
+
+/// Sidecar policy for note writes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EventSidecarPolicy {
+    Never,
+    #[default]
+    Always,
 }
 
 /// Configuration for a named memory store.
@@ -743,11 +814,44 @@ impl Config {
             )?,
             host_id: raw.host_id.unwrap_or_else(|| "auto".to_owned()),
             user_id: raw.user_id.unwrap_or_else(|| "default".to_owned()),
+            storage: StorageConfig::from_raw(raw.storage),
+            defaults: DefaultsConfig::from_raw(raw.defaults),
             stores,
             agents,
             privacy,
             adapters,
         })
+    }
+}
+
+impl StorageConfig {
+    fn from_raw(raw: RawStorageConfig) -> Self {
+        Self {
+            kind: raw.kind.unwrap_or_else(|| "filesystem".to_owned()),
+            case_sensitive: raw.case_sensitive.unwrap_or_else(|| "auto".to_owned()),
+            atomic_rename: raw.atomic_rename.unwrap_or_else(|| "auto".to_owned()),
+            fsync: raw.fsync.unwrap_or_default(),
+        }
+    }
+}
+
+impl DefaultsConfig {
+    fn from_raw(raw: RawDefaultsConfig) -> Self {
+        Self {
+            write_scope: raw.write_scope.unwrap_or_else(|| "global".to_owned()),
+            search_scopes: raw
+                .search_scopes
+                .unwrap_or_else(|| vec!["global".to_owned(), "project".to_owned()]),
+            context_sources: raw
+                .context_sources
+                .unwrap_or_else(|| vec!["curated".to_owned(), "remembered".to_owned()]),
+            render_scopes: raw
+                .render_scopes
+                .unwrap_or_else(|| vec!["global".to_owned(), "project".to_owned()]),
+            event_sidecar: raw.event_sidecar.unwrap_or_default(),
+            hook_context_max_tokens: raw.hook_context_max_tokens.unwrap_or(4000),
+            context_cache_max_age: raw.context_cache_max_age.unwrap_or_else(|| "7d".to_owned()),
+        }
     }
 }
 
@@ -820,6 +924,8 @@ struct RawConfig {
     host_id: Option<String>,
     user_id: Option<String>,
     stores: BTreeMap<String, RawStoreConfig>,
+    storage: RawStorageConfig,
+    defaults: RawDefaultsConfig,
     agents: BTreeMap<String, RawAgentConfig>,
     privacy: RawPrivacyConfig,
     adapters: BTreeMap<String, RawAdapterConfig>,
@@ -836,6 +942,8 @@ impl Default for RawConfig {
             host_id: None,
             user_id: None,
             stores: BTreeMap::new(),
+            storage: RawStorageConfig::default(),
+            defaults: RawDefaultsConfig::default(),
             agents: BTreeMap::new(),
             privacy: RawPrivacyConfig::default(),
             adapters: BTreeMap::new(),
@@ -850,6 +958,27 @@ struct RawStoreConfig {
     expected_id: Option<String>,
     description: Option<String>,
     sensitivity: Option<Sensitivity>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawStorageConfig {
+    kind: Option<String>,
+    case_sensitive: Option<String>,
+    atomic_rename: Option<String>,
+    fsync: Option<FsyncMode>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawDefaultsConfig {
+    write_scope: Option<String>,
+    search_scopes: Option<Vec<String>>,
+    context_sources: Option<Vec<String>>,
+    render_scopes: Option<Vec<String>>,
+    event_sidecar: Option<EventSidecarPolicy>,
+    hook_context_max_tokens: Option<u32>,
+    context_cache_max_age: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1119,7 +1248,56 @@ mod tests {
             loaded.config.cache_dir,
             PathBuf::from("/tmp/cache/hive-memory")
         );
+        assert_eq!(loaded.config.storage.kind, "filesystem");
+        assert_eq!(loaded.config.storage.fsync, FsyncMode::BestEffort);
+        assert_eq!(loaded.config.defaults.write_scope, "global");
+        assert_eq!(
+            loaded.config.defaults.search_scopes,
+            vec!["global", "project"]
+        );
+        assert_eq!(
+            loaded.config.defaults.event_sidecar,
+            EventSidecarPolicy::Always
+        );
         assert!(loaded.warnings.is_empty());
+    }
+
+    #[test]
+    fn loads_storage_and_command_defaults() {
+        let loaded = LoadedConfig::from_str_with_env(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "/tmp/personal"
+
+            [storage]
+            fsync = "required"
+
+            [defaults]
+            write_scope = "project"
+            search_scopes = ["project"]
+            context_sources = ["remembered"]
+            render_scopes = ["global"]
+            event_sidecar = "never"
+            hook_context_max_tokens = 1234
+            context_cache_max_age = "2d"
+            "#,
+            env,
+        )
+        .expect("config loads");
+
+        assert_eq!(loaded.config.storage.fsync, FsyncMode::Required);
+        assert_eq!(loaded.config.defaults.write_scope, "project");
+        assert_eq!(loaded.config.defaults.search_scopes, vec!["project"]);
+        assert_eq!(loaded.config.defaults.context_sources, vec!["remembered"]);
+        assert_eq!(loaded.config.defaults.render_scopes, vec!["global"]);
+        assert_eq!(
+            loaded.config.defaults.event_sidecar,
+            EventSidecarPolicy::Never
+        );
+        assert_eq!(loaded.config.defaults.hook_context_max_tokens, 1234);
+        assert_eq!(loaded.config.defaults.context_cache_max_age, "2d");
     }
 
     #[test]
