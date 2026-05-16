@@ -6,10 +6,11 @@
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
-use hive_memory::config::{Config, ConfigPaths, Sensitivity};
-use hive_memory::store;
+use hive_memory::config::{Config, ConfigPaths, EventSidecarPolicy, Sensitivity};
+use hive_memory::{memory, note, store, write};
 use std::path::PathBuf;
 use std::str::FromStr;
+use time::OffsetDateTime;
 
 // Clap derives user-facing help from doc comments, so keep implementation
 // rationale as normal comments and reserve CLI docs for actual help text.
@@ -26,6 +27,12 @@ struct Cli {
     /// Main config file to load.
     #[arg(long, global = true)]
     config: Option<PathBuf>,
+    /// Active store alias for commands that read or write one store.
+    #[arg(long, global = true)]
+    store: Option<String>,
+    /// Agent identity used for store-affinity policy.
+    #[arg(long, global = true)]
+    as_agent: Option<String>,
     /// Command to run.
     #[command(subcommand)]
     command: Option<Command>,
@@ -40,6 +47,10 @@ enum Command {
     /// Manage memory stores.
     #[command(subcommand)]
     Stores(StoresCommand),
+    /// Remember a durable fact/preference/context note.
+    Remember(WriteMemoryArgs),
+    /// Write a lower-confidence raw note.
+    Note(WriteMemoryArgs),
 }
 
 /// Store lifecycle commands.
@@ -101,12 +112,66 @@ struct StoreMigrateArgs {
     store: Option<String>,
 }
 
+/// Arguments for `hm remember` and `hm note`.
+#[derive(Debug, Args)]
+struct WriteMemoryArgs {
+    /// Markdown body to write.
+    #[arg(long)]
+    text: String,
+    /// Memory scope. Defaults to config.defaults.write_scope.
+    #[arg(long)]
+    scope: Option<String>,
+    /// Writer confidence.
+    #[arg(long, default_value = "medium", value_parser = parse_confidence)]
+    confidence: note::Confidence,
+    /// Optional project identity.
+    #[arg(long)]
+    project_id: Option<String>,
+    /// Optional short subject.
+    #[arg(long)]
+    subject: Option<String>,
+    /// Optional comma-separated tags.
+    #[arg(long, value_delimiter = ',')]
+    tags: Vec<String>,
+    /// Optional permitted agents for agent-private writes.
+    #[arg(long, value_delimiter = ',')]
+    audience: Vec<String>,
+    /// Use the writer agent as the agent-private audience.
+    #[arg(long)]
+    audience_writer_only: bool,
+    /// Optional source kind, such as session, hook, or import.
+    #[arg(long)]
+    source_kind: Option<String>,
+    /// Optional source reference.
+    #[arg(long)]
+    source_ref: Option<String>,
+    /// Write a JSON sidecar for `hm note` regardless of config defaults.
+    #[arg(long, conflicts_with = "no_event")]
+    event: bool,
+    /// Skip the JSON sidecar for `hm note` regardless of config defaults.
+    #[arg(long)]
+    no_event: bool,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let context = CliContext {
+        config_path: cli.config,
+        store: cli.store,
+        as_agent: cli.as_agent,
+    };
     match cli.command {
-        Some(Command::Stores(command)) => run_stores(command, cli.config),
+        Some(Command::Stores(command)) => run_stores(command, context.config_path),
+        Some(Command::Remember(args)) => run_write_memory(note::EntryKind::Remember, args, context),
+        Some(Command::Note(args)) => run_write_memory(note::EntryKind::Note, args, context),
         None => Ok(()),
     }
+}
+
+struct CliContext {
+    config_path: Option<PathBuf>,
+    store: Option<String>,
+    as_agent: Option<String>,
 }
 
 fn run_stores(command: StoresCommand, config_path: Option<PathBuf>) -> Result<()> {
@@ -160,6 +225,15 @@ fn parse_sensitivity(input: &str) -> std::result::Result<Sensitivity, String> {
         .map_err(|_| "expected one of: public, internal, private, secret".to_owned())
 }
 
+fn parse_confidence(input: &str) -> std::result::Result<note::Confidence, String> {
+    match input {
+        "low" => Ok(note::Confidence::Low),
+        "medium" => Ok(note::Confidence::Medium),
+        "high" => Ok(note::Confidence::High),
+        _ => Err("expected one of: low, medium, high".to_owned()),
+    }
+}
+
 /// Load CLI-selected config and report non-fatal warnings.
 ///
 /// The path resolution policy lives in `ConfigPaths`; this function only
@@ -171,6 +245,69 @@ fn load_config(config_path: Option<&std::path::Path>) -> Result<Config> {
         eprintln!("warning: {warning}");
     }
     Ok(loaded.config)
+}
+
+fn run_write_memory(
+    entry_kind: note::EntryKind,
+    args: WriteMemoryArgs,
+    context: CliContext,
+) -> Result<()> {
+    let config = load_config(context.config_path.as_deref())?;
+    let agent_id = resolve_agent_id(context.as_agent);
+    let resolved_store =
+        resolve_write_store(&config, context.store.as_deref(), agent_id.as_deref())?;
+    let store_config = &config.stores[resolved_store.name.as_str()];
+    let manifest = store::read_manifest(&store_config.root)?;
+    let created_at = OffsetDateTime::now_utc();
+    let host_id = resolve_host_id(&config);
+    let writer_agent_id = agent_id.unwrap_or_else(|| "human".to_owned());
+    let scope = args
+        .scope
+        .clone()
+        .unwrap_or_else(|| config.defaults.write_scope.clone());
+    let audience = resolve_audience(&args, &scope, &writer_agent_id)?;
+    let should_write_event = match entry_kind {
+        note::EntryKind::Remember => true,
+        note::EntryKind::Note => {
+            args.event
+                || (!args.no_event && config.defaults.event_sidecar == EventSidecarPolicy::Always)
+        }
+    };
+    let options = write::AtomicWriteOptions {
+        fsync: config.storage.fsync.into(),
+        ..write::AtomicWriteOptions::default()
+    };
+    let result = memory::write_record(memory::WriteRecordInput {
+        root: &store_config.root,
+        manifest: &manifest,
+        entry_kind,
+        created_at,
+        agent_id: writer_agent_id,
+        host_id,
+        user_id: config.user_id.clone(),
+        session_id: std::env::var("HIVE_MEMORY_SESSION_ID").ok(),
+        scope,
+        confidence: args.confidence,
+        body: args.text,
+        project_id: args
+            .project_id
+            .or_else(|| std::env::var("HIVE_MEMORY_PROJECT_ID").ok()),
+        subject: args.subject,
+        tags: args.tags,
+        audience,
+        source_kind: args.source_kind,
+        source_ref: args.source_ref,
+        write_event: should_write_event,
+        options,
+    })?;
+
+    println!("id: {}", result.id);
+    println!("store: {}", resolved_store.name);
+    println!("note: {}", result.note_path.display());
+    if let Some(path) = result.event_path {
+        println!("event: {}", path.display());
+    }
+    Ok(())
 }
 
 fn show_store(config: &Config, name: Option<&str>) -> Result<()> {
@@ -274,4 +411,81 @@ fn store_inputs<'a>(
             config: store,
         })
         .collect())
+}
+
+struct ResolvedStore {
+    name: String,
+}
+
+fn resolve_write_store(
+    config: &Config,
+    explicit_store: Option<&str>,
+    agent_id: Option<&str>,
+) -> Result<ResolvedStore> {
+    let name = if let Some(store) = explicit_store {
+        store.to_owned()
+    } else if let Ok(store) = std::env::var("HIVE_MEMORY_STORE") {
+        store
+    } else if let Some(agent_id) = agent_id {
+        config.effective_agent_policy(agent_id).default_store
+    } else {
+        config.default_store.clone()
+    };
+
+    let Some(_store) = config.stores.get(&name) else {
+        anyhow::bail!("unknown store: {name}");
+    };
+
+    if let Some(agent_id) = agent_id {
+        let policy = config.effective_agent_policy(agent_id);
+        if !policy.write_stores.iter().any(|store| store == &name) {
+            anyhow::bail!(
+                "agent {agent_id} may not write store {name}; configured write stores: {}",
+                policy.write_stores.join(",")
+            );
+        }
+    }
+
+    Ok(ResolvedStore { name })
+}
+
+fn resolve_agent_id(explicit: Option<String>) -> Option<String> {
+    explicit.or_else(|| std::env::var("HIVE_MEMORY_AGENT_ID").ok())
+}
+
+/// Resolve the host label written into memory metadata.
+///
+/// `auto` intentionally stays lightweight here. A richer machine identity can
+/// be configured explicitly without making every hook pay for hostname probes.
+fn resolve_host_id(config: &Config) -> String {
+    if config.host_id != "auto" {
+        return config.host_id.clone();
+    }
+
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "unknown-host".to_owned())
+}
+
+fn resolve_audience(
+    args: &WriteMemoryArgs,
+    scope: &str,
+    writer_agent_id: &str,
+) -> Result<Vec<String>> {
+    // Non-private scopes do not carry an audience, even if the caller supplied
+    // one. Visibility is easier to audit when audience has one meaning:
+    // narrowing `agent-private` records.
+    if scope != "agent-private" {
+        return Ok(Vec::new());
+    }
+
+    if args.audience_writer_only {
+        return Ok(vec![writer_agent_id.to_owned()]);
+    }
+
+    if args.audience.is_empty() {
+        anyhow::bail!("agent-private writes require --audience or --audience-writer-only");
+    }
+
+    Ok(args.audience.clone())
 }

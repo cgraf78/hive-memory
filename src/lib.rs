@@ -7,6 +7,7 @@
 pub mod config;
 pub mod event;
 pub mod id;
+pub mod memory;
 pub mod note;
 pub mod store;
 pub mod write;

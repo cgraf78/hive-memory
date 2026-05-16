@@ -42,6 +42,28 @@ fn write_config(
     .expect("write config");
 }
 
+fn init_store(root: &std::path::Path, name: &str) {
+    let mut cmd = cargo_bin_cmd!("hm");
+    cmd.args([
+        "stores",
+        "init",
+        name,
+        "--root",
+        root.to_str().expect("utf8 path"),
+    ])
+    .assert()
+    .success();
+}
+
+fn stdout_value(stdout: &str, key: &str) -> String {
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(key))
+        .expect("stdout key")
+        .trim()
+        .to_owned()
+}
+
 #[test]
 fn version_prints_binary_name() {
     let mut cmd = cargo_bin_cmd!("hm");
@@ -241,4 +263,100 @@ fn stores_migrate_reports_no_v1_migrations() {
         .stdout(predicate::str::contains(
             "status: no migrations for schema v1",
         ));
+}
+
+#[test]
+fn remember_writes_note_and_event() {
+    let dir = temp_dir("remember");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    let mut remember = cargo_bin_cmd!("hm");
+
+    let output = remember
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "remember",
+            "--text",
+            "Chris prefers TOML config.",
+            "--subject",
+            "workflow.preference",
+            "--tags",
+            "preference,config",
+        ])
+        .output()
+        .expect("run remember");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let note_path = PathBuf::from(stdout_value(&stdout, "note:"));
+    let event_path = PathBuf::from(stdout_value(&stdout, "event:"));
+    let note = fs::read_to_string(note_path).expect("read note");
+    let event = fs::read_to_string(event_path).expect("read event");
+    assert!(note.contains("entry_kind = \"remember\""));
+    assert!(note.contains("related_event_id = "));
+    assert!(note.contains("Chris prefers TOML config."));
+    assert!(event.contains("\"type\": \"memory.observation\""));
+    assert!(event.contains("\"note_path\": \"inbox/notes/"));
+}
+
+#[test]
+fn note_respects_never_sidecar_default() {
+    let dir = temp_dir("note-no-event");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "{}"
+
+            [stores.work]
+            root = "{}"
+
+            [defaults]
+            event_sidecar = "never"
+            "#,
+            personal.display(),
+            work.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+    let mut note = cargo_bin_cmd!("hm");
+
+    let output = note
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "note",
+            "--text",
+            "Raw lower-confidence note.",
+        ])
+        .output()
+        .expect("run note");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let note_path = PathBuf::from(stdout_value(&stdout, "note:"));
+    let note = fs::read_to_string(note_path).expect("read note");
+    assert!(note.contains("entry_kind = \"note\""));
+    assert!(!stdout.contains("event:"));
 }
