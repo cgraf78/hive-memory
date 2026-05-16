@@ -565,6 +565,54 @@ fn search_enforces_agent_read_store_policy() {
 }
 
 #[test]
+fn search_allows_agent_with_all_store_affinity() {
+    let dir = temp_dir("search-agent-all-stores");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "{}"
+
+            [stores.work]
+            root = "{}"
+
+            [agents.codex]
+            default_store = "personal"
+            read_stores = ["personal"]
+            write_stores = ["personal"]
+            allow_all_stores = true
+            "#,
+            personal.display(),
+            work.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&work, "work");
+
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "--store",
+            "work",
+            "search",
+            "toml",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("store: work"));
+}
+
+#[test]
 fn context_renders_remembered_memory() {
     let dir = temp_dir("context");
     let config = dir.join("config.toml");
@@ -1110,6 +1158,102 @@ fn hook_session_start_emits_context_action_json() {
         .success();
 
     let mut hook = cargo_bin_cmd!("hm");
+    hook.env("HIVE_MEMORY_SESSION_ID", "hook-binding")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "session-start",
+            "--project",
+            "/repo/src/main.rs",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"event\": \"session-start\""))
+        .stdout(predicate::str::contains("\"kind\": \"inject_context\""))
+        .stdout(predicate::str::contains(
+            "Hook context includes durable memory.",
+        ))
+        .stdout(predicate::str::contains("\"context_emitted\": true"));
+}
+
+#[test]
+fn hook_session_start_resolves_project_binding_from_path_hint() {
+    let dir = temp_dir("hook-project-binding");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    let repo = dir.join("repo");
+    fs::create_dir_all(repo.join("src")).expect("repo");
+    fs::write(
+        repo.join(".hive-memory-project"),
+        "id = \"hook-bound-project\"\n",
+    )
+    .expect("marker");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+
+            [stores.work]
+            root = "{}"
+
+            [agents.codex]
+            default_store = "personal"
+            read_stores = ["personal", "work"]
+            write_stores = ["personal", "work"]
+            "#,
+            data.display(),
+            personal.display(),
+            work.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+    init_store(&work, "work");
+
+    let mut bind = cargo_bin_cmd!("hm");
+    bind.args([
+        "--config",
+        config.to_str().expect("utf8 config"),
+        "projects",
+        "bind",
+        repo.to_str().expect("utf8 repo"),
+        "--store",
+        "work",
+    ])
+    .assert()
+    .success();
+
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "remember",
+            "--project",
+            repo.to_str().expect("utf8 repo"),
+            "--scope",
+            "project",
+            "--text",
+            "Hook path hints should use the bound work store.",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("store: work"));
+
+    let mut hook = cargo_bin_cmd!("hm");
     hook.args([
         "--config",
         config.to_str().expect("utf8 config"),
@@ -1118,17 +1262,15 @@ fn hook_session_start_emits_context_action_json() {
         "hook",
         "session-start",
         "--project",
-        "/repo/src/main.rs",
+        repo.join("src/main.rs").to_str().expect("utf8 project"),
         "--json",
     ])
     .assert()
     .success()
-    .stdout(predicate::str::contains("\"event\": \"session-start\""))
-    .stdout(predicate::str::contains("\"kind\": \"inject_context\""))
+    .stdout(predicate::str::contains("store: work"))
     .stdout(predicate::str::contains(
-        "Hook context includes durable memory.",
-    ))
-    .stdout(predicate::str::contains("\"context_emitted\": true"));
+        "Hook path hints should use the bound work store.",
+    ));
 }
 
 #[test]
@@ -1539,4 +1681,232 @@ fn projects_resolve_uses_git_root_from_file_hint() {
         .stdout(predicate::str::contains(
             "\"store_source\": \"global-default\"",
         ));
+}
+
+#[test]
+fn projects_bind_and_unbind_local_store_affinity() {
+    let dir = temp_dir("projects-bind");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    let repo = dir.join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    fs::write(
+        repo.join(".hive-memory-project"),
+        "id = \"bound-project\"\n",
+    )
+    .expect("marker");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+
+            [stores.work]
+            root = "{}"
+            "#,
+            data.display(),
+            personal.display(),
+            work.display()
+        ),
+    )
+    .expect("write config");
+
+    let mut bind = cargo_bin_cmd!("hm");
+    bind.args([
+        "--config",
+        config.to_str().expect("utf8 config"),
+        "projects",
+        "bind",
+        repo.to_str().expect("utf8 repo"),
+        "--store",
+        "work",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("project_id: bound-project"))
+    .stdout(predicate::str::contains("store: work"));
+
+    let binding = fs::read_to_string(data.join("projects/bound-project.toml")).expect("binding");
+    assert!(binding.contains("store = \"work\""));
+
+    let mut resolve = cargo_bin_cmd!("hm");
+    resolve
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "projects",
+            "resolve",
+            repo.to_str().expect("utf8 repo"),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"store\": \"work\""))
+        .stdout(predicate::str::contains(
+            "\"store_source\": \"project-binding\"",
+        ));
+
+    let mut unbind = cargo_bin_cmd!("hm");
+    unbind
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "projects",
+            "unbind",
+            repo.to_str().expect("utf8 repo"),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("removed: true"));
+
+    let mut resolve_after = cargo_bin_cmd!("hm");
+    resolve_after
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "projects",
+            "resolve",
+            repo.to_str().expect("utf8 repo"),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"store\": \"personal\""))
+        .stdout(predicate::str::contains(
+            "\"store_source\": \"global-default\"",
+        ));
+}
+
+#[test]
+fn project_binding_cannot_bypass_agent_affinity() {
+    let dir = temp_dir("projects-bind-affinity");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    let repo = dir.join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    fs::write(
+        repo.join(".hive-memory-project"),
+        "id = \"bound-project\"\n",
+    )
+    .expect("marker");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+
+            [stores.work]
+            root = "{}"
+
+            [agents.codex]
+            default_store = "personal"
+            read_stores = ["personal"]
+            write_stores = ["personal"]
+            "#,
+            data.display(),
+            personal.display(),
+            work.display()
+        ),
+    )
+    .expect("write config");
+
+    let mut bind = cargo_bin_cmd!("hm");
+    bind.args([
+        "--config",
+        config.to_str().expect("utf8 config"),
+        "projects",
+        "bind",
+        repo.to_str().expect("utf8 repo"),
+        "--store",
+        "work",
+    ])
+    .assert()
+    .success();
+
+    let mut resolve = cargo_bin_cmd!("hm");
+    resolve
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "projects",
+            "resolve",
+            repo.to_str().expect("utf8 repo"),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "agent codex may not read store work",
+        ));
+}
+
+#[test]
+fn projects_bind_validates_active_agent_read_and_write_affinity() {
+    let dir = temp_dir("projects-bind-agent-affinity");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    let repo = dir.join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    fs::write(
+        repo.join(".hive-memory-project"),
+        "id = \"bound-project\"\n",
+    )
+    .expect("marker");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+
+            [stores.work]
+            root = "{}"
+
+            [agents.codex]
+            default_store = "personal"
+            read_stores = ["personal", "work"]
+            write_stores = ["personal"]
+            "#,
+            data.display(),
+            personal.display(),
+            work.display()
+        ),
+    )
+    .expect("write config");
+
+    let mut bind = cargo_bin_cmd!("hm");
+    bind.args([
+        "--config",
+        config.to_str().expect("utf8 config"),
+        "--as-agent",
+        "codex",
+        "projects",
+        "bind",
+        repo.to_str().expect("utf8 repo"),
+        "--store",
+        "work",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains(
+        "agent codex may not write store work",
+    ));
 }

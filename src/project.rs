@@ -5,7 +5,8 @@
 //! process CWD by default. This module turns an explicit path hint into a stable
 //! project id, falling back to CWD only when callers provide no better signal.
 
-use crate::id;
+use crate::{id, write};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fmt::{self, Display};
@@ -77,6 +78,13 @@ pub enum ProjectError {
         /// Original error rendered for diagnostics.
         message: String,
     },
+    /// Local project binding could not be read, written, or parsed.
+    Binding {
+        /// Binding file path.
+        path: PathBuf,
+        /// Original error rendered for diagnostics.
+        message: String,
+    },
 }
 
 impl Display for ProjectError {
@@ -92,11 +100,32 @@ impl Display for ProjectError {
                     path.display()
                 )
             }
+            Self::Binding { path, message } => {
+                write!(
+                    f,
+                    "failed to access project binding {}: {message}",
+                    path.display()
+                )
+            }
         }
     }
 }
 
 impl Error for ProjectError {}
+
+/// Local machine policy binding from a project id to a preferred store.
+///
+/// Bindings live under `data_dir`, not inside a memory store or project repo,
+/// because they represent this machine's private store affinity decision. This
+/// keeps work/personal routing out of shared repositories and out of the
+/// canonical memory stores that other machines may sync.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectBinding {
+    /// Project id this binding applies to.
+    pub project_id: String,
+    /// Configured store alias preferred for this project.
+    pub store: String,
+}
 
 /// Resolve a stable project id from a path hint and optional explicit IDs.
 ///
@@ -202,6 +231,80 @@ pub fn normalize_remote_url(input: &str) -> String {
         host
     } else {
         format!("{host}/{}", rest.trim_end_matches('/'))
+    }
+}
+
+/// Return the local binding file for a project id.
+///
+/// Project IDs can come from marker files, remotes, or paths. Sanitizing here
+/// makes the on-disk contract safe no matter which source produced the id.
+pub fn binding_path(data_dir: &Path, project_id: &str) -> PathBuf {
+    data_dir
+        .join("projects")
+        .join(format!("{}.toml", id::sanitize_component(project_id)))
+}
+
+/// Load a local project binding, returning `None` when no binding exists.
+///
+/// Missing means the project has no local affinity and should continue through
+/// normal agent/default store resolution; parse and I/O errors are surfaced
+/// because a corrupt binding would otherwise silently route memory elsewhere.
+pub fn load_binding(
+    data_dir: &Path,
+    project_id: &str,
+) -> Result<Option<ProjectBinding>, ProjectError> {
+    let path = binding_path(data_dir, project_id);
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(ProjectError::Binding {
+                path,
+                message: err.to_string(),
+            });
+        }
+    };
+    let binding =
+        toml::from_str::<ProjectBinding>(&contents).map_err(|err| ProjectError::Binding {
+            path: path.clone(),
+            message: err.to_string(),
+        })?;
+    Ok(Some(binding))
+}
+
+/// Write or replace a local project store binding.
+///
+/// Bindings are small, but still policy-bearing. Use the shared atomic writer so
+/// hooks and long-lived agents never observe a partial TOML file.
+pub fn save_binding(
+    data_dir: &Path,
+    binding: &ProjectBinding,
+    options: &write::AtomicWriteOptions,
+) -> Result<PathBuf, ProjectError> {
+    let path = binding_path(data_dir, &binding.project_id);
+    let contents = toml::to_string_pretty(binding).map_err(|err| ProjectError::Binding {
+        path: path.clone(),
+        message: err.to_string(),
+    })?;
+    write::write_atomic(&path, contents.as_bytes(), options).map_err(|err| {
+        ProjectError::Binding {
+            path: path.clone(),
+            message: err.to_string(),
+        }
+    })?;
+    Ok(path)
+}
+
+/// Remove a local project binding. Missing bindings are already unbound.
+pub fn remove_binding(data_dir: &Path, project_id: &str) -> Result<Option<PathBuf>, ProjectError> {
+    let path = binding_path(data_dir, project_id);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(Some(path)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(ProjectError::Binding {
+            path,
+            message: err.to_string(),
+        }),
     }
 }
 
@@ -358,6 +461,29 @@ mod tests {
             normalize_remote_url("https://github.com/cgraf78/hive-memory.git"),
             expected
         );
+    }
+
+    #[test]
+    fn local_binding_round_trips_and_removes() {
+        let dir = temp_dir("binding");
+        let binding = ProjectBinding {
+            project_id: "github-com-cgraf78-hive-memory-abc123".to_owned(),
+            store: "work".to_owned(),
+        };
+        let options = write::AtomicWriteOptions {
+            fsync: write::FsyncPolicy::Never,
+            ..write::AtomicWriteOptions::default()
+        };
+
+        let path = save_binding(&dir, &binding, &options).expect("save binding");
+        let loaded = load_binding(&dir, &binding.project_id).expect("load binding");
+        let removed = remove_binding(&dir, &binding.project_id).expect("remove binding");
+        let missing = load_binding(&dir, &binding.project_id).expect("load missing binding");
+
+        assert!(path.ends_with("projects/github-com-cgraf78-hive-memory-abc123.toml"));
+        assert_eq!(loaded, Some(binding));
+        assert_eq!(removed, Some(path));
+        assert_eq!(missing, None);
     }
 
     #[test]

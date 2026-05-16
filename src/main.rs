@@ -102,6 +102,10 @@ enum StoresCommand {
 enum ProjectsCommand {
     /// Resolve a path/file hint to a stable project id.
     Resolve(ProjectResolveArgs),
+    /// Bind a project to a local preferred store.
+    Bind(ProjectBindArgs),
+    /// Remove a local project store binding.
+    Unbind(ProjectUnbindArgs),
 }
 
 /// Arguments for `hm projects resolve`.
@@ -115,6 +119,23 @@ struct ProjectResolveArgs {
     /// Emit machine-readable output.
     #[arg(long)]
     json: bool,
+}
+
+/// Arguments for `hm projects bind`.
+#[derive(Debug, Args)]
+struct ProjectBindArgs {
+    /// Path, file, or directory hint for the project to bind.
+    path: PathBuf,
+    /// Store alias to prefer for this project on this machine.
+    #[arg(long)]
+    store: String,
+}
+
+/// Arguments for `hm projects unbind`.
+#[derive(Debug, Args)]
+struct ProjectUnbindArgs {
+    /// Path, file, or directory hint for the project to unbind.
+    path: PathBuf,
 }
 
 /// Arguments for `hm stores init`.
@@ -425,6 +446,8 @@ fn run_stores(command: StoresCommand, config_path: Option<PathBuf>) -> Result<()
 fn run_projects(command: ProjectsCommand, context: CliContext) -> Result<()> {
     match command {
         ProjectsCommand::Resolve(args) => run_project_resolve(args, context),
+        ProjectsCommand::Bind(args) => run_project_bind(args, context),
+        ProjectsCommand::Unbind(args) => run_project_unbind(args, context),
     }
 }
 
@@ -440,9 +463,11 @@ fn run_project_resolve(args: ProjectResolveArgs, context: CliContext) -> Result<
         env_project_id: std::env::var("HIVE_MEMORY_PROJECT_ID").ok(),
     })?;
     let agent_id = resolve_agent_id(context.as_agent);
+    let binding = project::load_binding(&config.data_dir, &project.project_id)?;
     let store = resolve_store(
         &config,
         context.store.as_deref(),
+        binding.as_ref().map(|binding| binding.store.as_str()),
         agent_id.as_deref(),
         StoreAccess::Read,
     )?;
@@ -466,6 +491,60 @@ fn run_project_resolve(args: ProjectResolveArgs, context: CliContext) -> Result<
         println!("store_source: {}", store.source);
     }
 
+    Ok(())
+}
+
+fn run_project_bind(args: ProjectBindArgs, context: CliContext) -> Result<()> {
+    let config = load_config(context.config_path.as_deref())?;
+    let project = project::resolve_project(project::ResolveProjectInput {
+        hint: args.path,
+        explicit_project_id: None,
+        env_project_id: std::env::var("HIVE_MEMORY_PROJECT_ID").ok(),
+    })?;
+    let agent_id = resolve_agent_id(context.as_agent);
+    // A binding can affect both read and write commands. When an active agent
+    // identity is present, validate both sides now so a local affinity file
+    // cannot bless a store the agent would be unable to use safely.
+    resolve_store(
+        &config,
+        Some(args.store.as_str()),
+        None,
+        agent_id.as_deref(),
+        StoreAccess::Read,
+    )?;
+    resolve_store(
+        &config,
+        Some(args.store.as_str()),
+        None,
+        agent_id.as_deref(),
+        StoreAccess::Write,
+    )?;
+    let binding = project::ProjectBinding {
+        project_id: project.project_id.clone(),
+        store: args.store,
+    };
+    let path = project::save_binding(&config.data_dir, &binding, &hook_options(&config))?;
+
+    println!("project_id: {}", project.project_id);
+    println!("store: {}", binding.store);
+    println!("binding: {}", path.display());
+    Ok(())
+}
+
+fn run_project_unbind(args: ProjectUnbindArgs, context: CliContext) -> Result<()> {
+    let config = load_config(context.config_path.as_deref())?;
+    let project = project::resolve_project(project::ResolveProjectInput {
+        hint: args.path,
+        explicit_project_id: None,
+        env_project_id: std::env::var("HIVE_MEMORY_PROJECT_ID").ok(),
+    })?;
+    let removed = project::remove_binding(&config.data_dir, &project.project_id)?;
+
+    println!("project_id: {}", project.project_id);
+    println!("removed: {}", removed.is_some());
+    if let Some(path) = removed {
+        println!("binding: {}", path.display());
+    }
     Ok(())
 }
 
@@ -529,6 +608,17 @@ fn resolve_project_id(
     ))
 }
 
+/// Return the local project binding store, if this invocation has a project id.
+///
+/// The caller still passes the returned alias through `resolve_store`; loading a
+/// binding is only affinity discovery, not authorization.
+fn project_binding_store(config: &Config, project_id: Option<&str>) -> Result<Option<String>> {
+    let Some(project_id) = project_id else {
+        return Ok(None);
+    };
+    Ok(project::load_binding(&config.data_dir, project_id)?.map(|binding| binding.store))
+}
+
 fn run_write_memory(
     entry_kind: note::EntryKind,
     args: WriteMemoryArgs,
@@ -536,17 +626,7 @@ fn run_write_memory(
 ) -> Result<()> {
     let config = load_config(context.config_path.as_deref())?;
     let agent_id = resolve_agent_id(context.as_agent);
-    let resolved_store = resolve_store(
-        &config,
-        context.store.as_deref(),
-        agent_id.as_deref(),
-        StoreAccess::Write,
-    )?;
-    let store_config = &config.stores[resolved_store.name.as_str()];
-    let manifest = store::read_manifest(&store_config.root)?;
-    let created_at = OffsetDateTime::now_utc();
-    let host_id = resolve_host_id(&config);
-    let writer_agent_id = agent_id.unwrap_or_else(|| "human".to_owned());
+    let writer_agent_id = agent_id.clone().unwrap_or_else(|| "human".to_owned());
     let scope = args
         .scope
         .clone()
@@ -555,7 +635,22 @@ fn run_write_memory(
         .project
         .as_ref()
         .map(|path| path.to_string_lossy().to_string());
+    // Store affinity can come from a local project binding, so resolve project
+    // identity before choosing the write store. This keeps work/personal routing
+    // centralized in `hm` instead of requiring hook scripts or agents to infer it.
     let project_id = resolve_project_id(args.project_id.clone(), project_hint.as_deref())?;
+    let project_binding = project_binding_store(&config, project_id.as_deref())?;
+    let resolved_store = resolve_store(
+        &config,
+        context.store.as_deref(),
+        project_binding.as_deref(),
+        agent_id.as_deref(),
+        StoreAccess::Write,
+    )?;
+    let store_config = &config.stores[resolved_store.name.as_str()];
+    let manifest = store::read_manifest(&store_config.root)?;
+    let created_at = OffsetDateTime::now_utc();
+    let host_id = resolve_host_id(&config);
     let audience = resolve_audience(&args, &scope, &writer_agent_id)?;
     let should_write_event = match entry_kind {
         note::EntryKind::Remember => true,
@@ -612,6 +707,7 @@ fn run_search(args: SearchArgs, context: CliContext) -> Result<()> {
     let resolved_store = resolve_store(
         &config,
         context.store.as_deref(),
+        None,
         agent_id.as_deref(),
         StoreAccess::Read,
     )?;
@@ -699,14 +795,6 @@ fn assemble_cli_context(
     selection: ContextSelection,
 ) -> Result<memory_context::ContextOutput> {
     let agent_id = resolve_agent_id(context.as_agent.clone());
-    let resolved_store = resolve_store(
-        config,
-        context.store.as_deref(),
-        agent_id.as_deref(),
-        StoreAccess::Read,
-    )?;
-    let store_config = &config.stores[resolved_store.name.as_str()];
-    let report = rebuild_store_index(config, &resolved_store.name)?;
     let scopes = if selection.scopes.is_empty() {
         config.defaults.search_scopes.clone()
     } else {
@@ -721,12 +809,23 @@ fn assemble_cli_context(
         || sources
             .iter()
             .any(|source| source == "inbox" || source == "all");
-    let project_id = selection
-        .project_id
-        .or_else(|| std::env::var("HIVE_MEMORY_PROJECT_ID").ok());
     let path_hint = selection
         .path_hint
         .or_else(|| std::env::var("HIVE_MEMORY_PROJECT").ok());
+    // Hooks often know an active buffer or tool path but not a precomputed
+    // project id. Resolve here so hook adapters can stay policy-light while
+    // still benefiting from project-scoped memory and local store bindings.
+    let project_id = resolve_project_id(selection.project_id, path_hint.as_deref())?;
+    let project_binding = project_binding_store(config, project_id.as_deref())?;
+    let resolved_store = resolve_store(
+        config,
+        context.store.as_deref(),
+        project_binding.as_deref(),
+        agent_id.as_deref(),
+        StoreAccess::Read,
+    )?;
+    let store_config = &config.stores[resolved_store.name.as_str()];
+    let report = rebuild_store_index(config, &resolved_store.name)?;
     let max_tokens = selection.max_tokens.unwrap_or_else(|| {
         // Hooks run on latency-sensitive agent boundaries, so they use the
         // configured hook budget unless the caller has explicitly provided a
@@ -980,19 +1079,13 @@ fn run_hook_prompt_submit(args: HookPromptSubmitArgs, context: CliContext) -> Re
     let mut memory_pending = false;
     let session_id = hook_session_id(&mut warnings);
 
-    // Resolve the same read policy used by context-rendering hooks. The current
-    // slice does not yet emit context-on-selection-change, but resolving now
-    // makes privacy/store errors surface in `hm` instead of later shell glue.
-    let agent_id = resolve_agent_id(context.as_agent.clone());
-    resolve_store(
-        &config,
-        context.store.as_deref(),
-        agent_id.as_deref(),
-        StoreAccess::Read,
-    )?;
     let path_hint = args
         .project
         .or_else(|| std::env::var("HIVE_MEMORY_PROJECT").ok());
+    // Validate the same read policy used by possible context refresh below.
+    // Prompt hooks should fail inside `hm` when project affinity is outside
+    // agent policy, not leave shell adapters to discover that later.
+    validate_hook_context_read_policy(&config, &context, path_hint.as_deref())?;
     let mut context_emitted = false;
     if let Some(action) = hook_context_action_if_changed(
         &config,
@@ -1043,16 +1136,12 @@ fn run_hook_tool_complete(args: HookToolCompleteArgs, context: CliContext) -> Re
     let mut actions = Vec::new();
     let mut refresh = None;
 
-    let agent_id = resolve_agent_id(context.as_agent.clone());
-    resolve_store(
-        &config,
-        context.store.as_deref(),
-        agent_id.as_deref(),
-        StoreAccess::Read,
-    )?;
     let path_hint = args
         .project
         .or_else(|| std::env::var("HIVE_MEMORY_PROJECT").ok());
+    // Tool completion may refresh generated context, so use the same
+    // project-aware store selection that the refreshable context path uses.
+    validate_hook_context_read_policy(&config, &context, path_hint.as_deref())?;
 
     let session_id = hook_session_id(&mut warnings);
     let mut memory_pending = if let Some(session_id) = session_id.as_deref() {
@@ -1258,23 +1347,49 @@ fn hook_context_key(
     context: &CliContext,
     path_hint: Option<&str>,
 ) -> Result<String> {
-    let agent_id =
-        resolve_agent_id(context.as_agent.clone()).unwrap_or_else(|| "unknown".to_owned());
+    let agent_id = resolve_agent_id(context.as_agent.clone());
+    let agent_label = agent_id.clone().unwrap_or_else(|| "unknown".to_owned());
+    let project_id = resolve_project_id(None, path_hint)?;
+    let project_binding = project_binding_store(config, project_id.as_deref())?;
     let resolved_store = resolve_store(
         config,
         context.store.as_deref(),
-        Some(agent_id.as_str()),
+        project_binding.as_deref(),
+        agent_id.as_deref(),
         StoreAccess::Read,
     )?;
-    let project_id = std::env::var("HIVE_MEMORY_PROJECT_ID").unwrap_or_default();
 
+    let project_id = project_id.unwrap_or_default();
     Ok(format!(
-        "agent={agent_id}\nstore={}\nproject_id={project_id}\npath={}\nscopes={}\nsources={}",
+        "agent={agent_label}\nstore={}\nproject_id={project_id}\npath={}\nscopes={}\nsources={}",
         resolved_store.name,
         path_hint.unwrap_or_default(),
         config.defaults.search_scopes.join(","),
         config.defaults.context_sources.join(",")
     ))
+}
+
+/// Validate read-side hook policy without assembling or emitting context.
+///
+/// Prompt/tool hooks call this before doing auxiliary work so policy failures
+/// are reported by `hm` consistently, while the shell hook remains a thin event
+/// adapter with no duplicate store-affinity logic.
+fn validate_hook_context_read_policy(
+    config: &Config,
+    context: &CliContext,
+    path_hint: Option<&str>,
+) -> Result<()> {
+    let agent_id = resolve_agent_id(context.as_agent.clone());
+    let project_id = resolve_project_id(None, path_hint)?;
+    let project_binding = project_binding_store(config, project_id.as_deref())?;
+    resolve_store(
+        config,
+        context.store.as_deref(),
+        project_binding.as_deref(),
+        agent_id.as_deref(),
+        StoreAccess::Read,
+    )?;
+    Ok(())
 }
 
 fn hook_options(config: &Config) -> write::AtomicWriteOptions {
@@ -1429,6 +1544,7 @@ fn render_adapter_body(
         resolve_store(
             config,
             Some(store_name.as_str()),
+            None,
             Some(adapter_name),
             StoreAccess::Read,
         )?;
@@ -1599,6 +1715,7 @@ enum StoreAccess {
 enum StoreSource {
     Cli,
     Env,
+    ProjectBinding,
     AgentDefault,
     GlobalDefault,
 }
@@ -1608,6 +1725,7 @@ impl std::fmt::Display for StoreSource {
         let value = match self {
             Self::Cli => "cli",
             Self::Env => "env",
+            Self::ProjectBinding => "project-binding",
             Self::AgentDefault => "agent-default",
             Self::GlobalDefault => "global-default",
         };
@@ -1618,12 +1736,15 @@ impl std::fmt::Display for StoreSource {
 /// Resolve the single store a CLI command should use and enforce agent policy.
 ///
 /// All one-store commands share the same precedence: explicit `--store`, then
-/// `HIVE_MEMORY_STORE`, then the active agent's configured default store, then
-/// the global default. Centralizing that order keeps read and write commands
-/// from drifting as the command surface grows.
+/// `HIVE_MEMORY_STORE`, then local project binding, then the active agent's
+/// configured default store, then the global default. Centralizing that order
+/// keeps read, write, context, and hook commands from drifting as the command
+/// surface grows. Callers that do not have project context pass `None` for the
+/// binding slot rather than trying to derive path policy locally.
 fn resolve_store(
     config: &Config,
     explicit_store: Option<&str>,
+    project_binding: Option<&str>,
     agent_id: Option<&str>,
     access: StoreAccess,
 ) -> Result<ResolvedStore> {
@@ -1631,6 +1752,8 @@ fn resolve_store(
         (store.to_owned(), StoreSource::Cli)
     } else if let Ok(store) = std::env::var("HIVE_MEMORY_STORE") {
         (store, StoreSource::Env)
+    } else if let Some(store) = project_binding {
+        (store.to_owned(), StoreSource::ProjectBinding)
     } else if let Some(agent_id) = agent_id {
         (
             config.effective_agent_policy(agent_id).default_store,
@@ -1650,7 +1773,7 @@ fn resolve_store(
             StoreAccess::Read => (&policy.read_stores, "read"),
             StoreAccess::Write => (&policy.write_stores, "write"),
         };
-        if !allowed_stores.iter().any(|store| store == &name) {
+        if !policy.allow_all_stores && !allowed_stores.iter().any(|store| store == &name) {
             anyhow::bail!(
                 "agent {agent_id} may not {access_name} store {name}; configured {access_name} stores: {}",
                 allowed_stores.join(",")
