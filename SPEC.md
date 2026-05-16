@@ -12,11 +12,12 @@ conflict, prefer this file for v1 behavior and update both documents deliberatel
 | filesystem backend | yes | canonical backend |
 | config loader | yes | CLI/env/local/main/default precedence |
 | stores init/list/show/doctor | yes | minimum store lifecycle |
+| agent store affinity | yes | per-agent default/read/write store policy |
 | remember/note | yes | append-only Markdown notes |
 | JSON sidecars | yes | always for `remember`; configurable for `note` |
 | search | yes | simple deterministic text search backed by local index |
 | local triage index | yes | rebuildable jsonl index in cache_dir; not full FTS |
-| context | yes | curated-only by default; raw inbox opt-in |
+| context | yes | curated + remembered by default; raw inbox opt-in |
 | Claude render + `--install` | yes | generated file + include marker in `~/.claude/CLAUDE.md` |
 | Codex render + `--install` | yes | generated file + include block through `~/.codex/AGENTS.md` |
 | local outbox/flush | yes | required for laptop/offline ergonomics; data_dir, not state_dir |
@@ -83,15 +84,31 @@ fsync = "best-effort"   # never|best-effort|required
 [defaults]
 write_scope = "global"
 search_scopes = ["global", "project"]
-context_sources = ["curated"]   # curated|inbox|all; curated-only default per Trust Boundary
+context_sources = ["curated", "remembered"] # curated|remembered|inbox|all
 render_scopes = ["global", "project"]
 event_sidecar = "always" # never|always
+hook_context_max_tokens = 4000
+context_cache_max_age = "7d"
+
+[agents.codex]
+default_store = "personal"
+read_stores = ["personal"]  # stores usable by search/context/render hooks
+write_stores = ["personal"] # stores usable by remember/note
+allow_all_stores = false
+
+[agents.claude]
+default_store = "personal"
+read_stores = ["personal"]
+write_stores = ["personal"]
+allow_all_stores = false
 
 [privacy]
 default_render_policy = "conservative" # conservative|configured-only
 allow_all_stores_flag = true
 warn_sensitive_broad_render = true
 secret_refuses_cloud_roots = true       # see Security and Privacy Model
+allow_secret_writes = false             # requires secret store + --allow-secret-write
+allow_hook_secret_writes = false        # non-interactive hooks stay safer by default
 
 [offline]
 enabled = true
@@ -127,10 +144,18 @@ Validation rules:
 - `stores.<name>.expected_id` is optional but enables manifest identity checks.
 - `stores.<name>.sensitivity = "secret"` MUST NOT use a cloud-synced root path
   when `privacy.secret_refuses_cloud_roots = true` (default). See Security model.
+- `privacy.allow_hook_secret_writes = true` requires
+  `privacy.allow_secret_writes = true`; otherwise config validation fails. Hook
+  secret writes are an extra opt-in on top of secret-store targeting and
+  `--allow-secret-write`.
 - store names must match `[a-z0-9][a-z0-9_-]*`.
 - `${VAR}` and `${VAR:-fallback}` expansion is supported in path-like fields.
 - unknown top-level keys should warn in v1, not fail, unless they are dangerous.
 - unknown subkeys under known tables should warn so typos are visible.
+- `agents.<id>.default_store`, `read_stores`, and `write_stores` must reference
+  configured store aliases. Missing agent entries resolve to the global
+  `default_store` with `read_stores = [default_store]` and
+  `write_stores = [default_store]`, which preserves simple single-store installs.
 - enabled adapters require `output`; `install_target` is required when dotfiles
   update or `hm render --install` should make the adapter visible.
 - `adapters.<name>.install_mode` must be `include` in v1.
@@ -138,8 +163,8 @@ Validation rules:
 - CLI flags and environment variables override merged config, not source files.
 
 Why this shape: humans get one readable TOML file; launchers get deterministic
-overrides; adapters get explicit store/scope allowlists; and future schema
-migration has an obvious version field.
+overrides; agents get explicit store affinity; adapters get explicit render
+allowlists; and future schema migration has an obvious version field.
 
 ### Store Manifest Schema
 
@@ -278,14 +303,32 @@ machine-readable enough for filtering and auditing.
 
 V1 project IDs are stable across hosts, clones, and protocol changes.
 
+Project path inputs are hints, not identity by themselves. `--project PATH`,
+`HIVE_MEMORY_PROJECT`, and `hm projects resolve PATH` may point at a repo root,
+subdirectory, or file. `hm` canonicalizes the hint before deriving identity:
+
+1. If the hint is a file, use its parent directory as the starting point.
+2. Walk upward for the nearest `.hive-memory-project`; when found, use that
+   directory as the project root and the file's explicit ID as the identity.
+3. Otherwise, walk upward for the nearest git worktree root and use that root's
+   normalized `origin` URL when present.
+4. Otherwise, use the canonicalized starting directory as a local path project.
+
+Process CWD is only a last-resort hint when no CLI/env/project-specific path is
+available. Launching an agent from a subdirectory should therefore resolve to
+the same project as launching from the repo root, and hook adapters should pass
+the active file path or tool working path instead of the agent process CWD when
+that information is available.
+
 Derivation precedence (highest wins):
 
 1. `--project-id <id>` CLI flag.
 2. `HIVE_MEMORY_PROJECT_ID` environment variable.
-3. `.hive-memory-project` file at the repo root containing a single `id = "..."`
-   TOML line. OPTIONAL — not auto-created. Recommended only when the remote
-   URL is unstable (forks, mirror moves) or when committing the binding is
-   acceptable for the repo's privacy posture.
+3. `.hive-memory-project` file at the resolved project root containing a single
+   `id = "..."` TOML line. OPTIONAL — not auto-created. Recommended only when
+   the remote URL is unstable (forks, mirror moves), when a monorepo subtree is
+   the real memory project, or when committing the binding is acceptable for the
+   repo's privacy posture.
 4. Derived: `sha256(normalize(git_remote_origin_url))[:12]` prefixed with a
    readable slug, e.g. `github-com-cgraf78-hive-memory-018f5f57bd9b`.
 5. Fallback: `sha256(canonical_path)[:12]` prefixed with the path basename
@@ -311,6 +354,21 @@ Aliases:
 - `hm doctor` warns when unclaimed `project_id` values exist that no alias
   chain points to.
 
+Local project store binding:
+
+- `hm projects bind PATH --store NAME` writes a local-only binding under
+  `data_dir/projects/` from resolved project ID to preferred store alias.
+- `hm projects unbind PATH` removes that local binding.
+- `hm projects resolve [PATH] --as-agent <id>` prints the derived project ID,
+  effective store, and whether the store came from CLI/env, local project
+  binding, agent default, or global default.
+- Bindings are intentionally local data, not canonical store data. They capture
+  "this checkout belongs to the work store on this machine" without committing a
+  private work/personal policy into the project repo.
+- A project binding never bypasses agent store affinity. If a bound store is not
+  in the active agent's read/write policy, the command fails with exit `4`
+  instead of silently using the bound store.
+
 #### Audience and agent-private
 
 Notes/events with `scope = "agent-private"` MUST include an `audience` field
@@ -326,7 +384,8 @@ Render/search/context filtering:
   matching the writing `agent_id`.
 - `scope = "agent-private"` AND `audience = ["a", "b"]` → readable only when
   the invoking adapter identifies itself as `a` or `b`.
-- Adapters MUST pass `--as-agent <id>` (or `HIVE_MEMORY_ADAPTER`) when rendering.
+- Adapters MUST pass `--as-agent <id>` (or set `HIVE_MEMORY_AGENT_ID`) when
+  rendering.
 - `hm doctor` warns when agent-private notes lack an explicit `audience`.
 
 ### JSON Event Schema
@@ -496,7 +555,8 @@ State dir contents (ephemeral, OK to lose):
 
 ```text
 locks/                  # local process locks (fcntl/flock)
-runs/                   # last render/flush/doctor metadata
+runs/                   # last render/flush/doctor metadata and session receipts
+context-cache/           # last successful hook context per agent/project/store
 quarantine/             # safe quarantine for stale temps/conflicts
 ```
 
@@ -536,8 +596,8 @@ data-dir wipe; doctor cleans archives older than `[offline].archive_retention_da
 Local triage index:
 
 - `cache/indexes/<store-alias>.jsonl` — one line per inbox note containing
-  `{id, store_id, scope, project_id, audience, tags, subject, confidence,
-  agent_id, created_at, note_path, event_path}`.
+  `{id, store_id, entry_kind, scope, project_id, audience, tags, subject,
+  confidence, agent_id, created_at, note_path, event_path}`.
 - Rebuilt on `hm flush` and lazily on read commands when the inbox directory's
   recursive mtime/inode marker has changed since the last build.
 - NOT full-text search — search still reads matched lines from the underlying
@@ -562,21 +622,90 @@ Rules:
 
 ## V1 Command Contracts
 
+### Intended Use Model
+
+`hm` is the policy boundary. Adjacent surfaces provide facts and display
+results:
+
+- Agent launchers provide `HIVE_MEMORY_AGENT_ID`, `HIVE_MEMORY_SESSION_ID`, and
+  the best available `HIVE_MEMORY_PROJECT` path hint to normal tool subprocesses.
+- Agents call direct commands such as `hm remember`, `hm note`, `hm search`, and
+  `hm context`.
+- Hook adapters call `hm hook <event>` once per lifecycle event and translate its
+  returned actions into agent-specific context, warning, and reminder surfaces.
+- Humans use `hm inbox`, `hm promote`, `hm projects`, `hm stores`, and
+  `hm doctor` to inspect and curate.
+- Install/update automation uses `hm render --configured --install --quiet` and
+  `hm doctor --quick` to keep adapter-visible memory linked.
+
+The lower-level commands `hm context --if-changed`, `hm refresh`, and `hm flush`
+remain stable for debugging, maintenance, and unusual integrations, but v1
+dotfiles hooks should not orchestrate them directly.
+
+### Store Affinity and Resolution
+
+Store selection is a privacy boundary, not just a convenience default.
+
+- Human commands without `HIVE_MEMORY_AGENT_ID` may use any configured store,
+  subject to sensitivity rules and explicit `--include-secret` refusals.
+- Agent/hook commands with `HIVE_MEMORY_AGENT_ID` are constrained by
+  `[agents.<id>]`. If no matching section exists, v1 creates a conservative
+  effective policy with `default_store = <global default_store>`,
+  `read_stores = [default_store]`, `write_stores = [default_store]`, and
+  `allow_all_stores = false`.
+- Write store resolution is: explicit `--store`, then `HIVE_MEMORY_STORE`, then
+  local project binding for `--project` / `HIVE_MEMORY_PROJECT`, then
+  `agents.<id>.default_store`, then global `default_store`. The resolved write
+  store MUST be present in `write_stores` for agent/hook commands.
+- Read store resolution is: explicit `--stores`, explicit `--store`,
+  `HIVE_MEMORY_STORES`, `HIVE_MEMORY_STORE`, local project binding for
+  `--project` / `HIVE_MEMORY_PROJECT`, then `agents.<id>.default_store`, then
+  global `default_store`. The resolved stores MUST be a subset of `read_stores`
+  for agent/hook commands.
+- `--all-stores` is read-only. For humans, it expands to all configured stores
+  allowed by privacy flags. For agents, it expands only to `read_stores` and is
+  refused unless `agents.<id>.allow_all_stores = true`.
+- `adapters.<name>.stores` is a render allowlist, not the source of agent access
+  authority. When an adapter name matches an agent ID, its render stores MUST be
+  a subset of that agent's `read_stores`.
+- A named-store request outside the effective policy is exit `4`
+  (`privacy_refusal`) rather than silently falling back to another store.
+
 General CLI behavior:
 
 - `--config PATH` selects config path.
-- `--store NAME` selects one active store for write/render commands.
+- `--store NAME` selects one active store for write/render commands and is a
+  single-store shorthand for read/search/context commands.
 - `--stores a,b` selects multiple explicit store aliases for read/search/context
   commands.
 - `--all-stores` is read-only and explicit.
+- `HIVE_MEMORY_STORES=a,b` provides the launcher or low-level integration
+  default for read commands; explicit `--stores` wins.
+- `HIVE_MEMORY_HOOK_ACTIVE=1` tells `hm` the caller is an agent lifecycle hook,
+  not an interactive human command. In this mode `hm context` enables safe cache
+  fallback, and maintenance commands such as `hm refresh` use hook-safe
+  coalescing locks by default. `hm hook <event>` applies these semantics
+  internally, so hook adapters do not need to set this variable for the normal
+  hook workflow.
 - `--scope a,b` filters scopes for read/search/context commands.
 - `--scope SCOPE` on write commands selects exactly one write scope.
 - `--include-secret` allows read-only inclusion of `secret` stores only when
   config permits it.
+- `--allow-secret-write` permits write commands to store text that matches
+  secret detectors only when the resolved store has `sensitivity = "secret"` and
+  config explicitly enables secret writes. It is refused in hook mode unless
+  config allows non-interactive secret writes. This flag never permits writing
+  detected secrets into public/internal/private stores.
 - `--include-inbox` opts read commands into raw inbox notes (excluded by default
   under the Trust Boundary model).
 - `--as-agent ID` declares the invoking adapter's agent identity for audience
-  filtering. Hooks should set `HIVE_MEMORY_ADAPTER` instead.
+  filtering and write metadata. Launchers and hook adapters may provide
+  `HIVE_MEMORY_AGENT_ID`; `--as-agent` wins when both are present.
+- `--project PATH` provides the project path hint for project-scoped commands.
+  Launchers and hook adapters should provide the best available active file,
+  buffer, tool working path, or launch path via `--project` or
+  `HIVE_MEMORY_PROJECT` so agent commands do not have to interpolate `$PWD`
+  themselves. CWD is only the fallback when no hint is provided.
 - `--json` prints machine-readable output.
 - `--quiet` suppresses non-error human chatter.
 - `--dry-run` shows planned writes without changing files.
@@ -586,6 +715,16 @@ General CLI behavior:
 - exit code `3`: config/schema validation failure.
 - exit code `4`: privacy/safety refusal.
 - exit code `5`: backend unavailable and no outbox fallback.
+
+Hook ergonomics rule: lifecycle hooks should need only event facts plus one
+simple command. The preferred hook interface is `hm hook <event>`, which owns
+context selection, project-switch detection, prompt memory-intent heuristics,
+receipt-aware refresh, and memory-pending state. Low-level primitives such as
+`hm context`, `hm refresh`, and `hm projects resolve` remain available for human
+debugging and direct agent commands, but hook scripts should not orchestrate
+them by default. Any design that requires hooks to parse config, inspect store
+manifests, compute project IDs, manage cache files, detect prompt intent, or
+sequence flush/render manually belongs in `hm` instead.
 
 JSON error shape:
 
@@ -599,15 +738,24 @@ JSON error shape:
 Stable `--json` success field sets. Fields are mandatory unless explicitly noted:
 
 - `hm remember` / `hm note`:
-  `{ "id", "store", "store_id", "note_path", "event_path" }`, where
-  `event_path` is `null` when no sidecar is written.
+  `{ "id", "store", "store_id", "store_source", "scope", "project_id",
+  "audience", "note_path", "event_path", "created", "duplicate_of" }`, where
+  `project_id` is `null` for non-project writes, `event_path` is `null` when no
+  sidecar is written, `created` is `false` when an idempotency/dedupe rule
+  returned an existing item, and `duplicate_of` is `null` unless a prior item
+  was reused.
 - `hm search`:
   `[ { "id", "store", "store_id", "scope", "trust", "audience", "path",
   "title", "snippet", "score", "created_at" } ]`.
 - `hm context --json`:
-  `{ "stores", "scopes", "sources", "estimated_tokens", "sections" }`, where
-  each section contains `{ "id", "store", "scope", "trust", "audience",
-  "source_path", "estimated_tokens", "body" }`.
+  `{ "agent_id", "project_id", "project_hint", "stores", "store_source",
+  "scopes", "sources", "estimated_tokens", "emitted", "stale",
+  "cache_created_at", "sections" }`, where `emitted = false` means
+  `--if-changed` found no context-selection change and produced no Markdown
+  body, `stale` is `true` only for last-success cache fallback,
+  `cache_created_at` is `null` for fresh context, and each section contains
+  `{ "id", "store", "scope", "trust", "audience", "source_path",
+  "estimated_tokens", "body" }`.
 - `hm render --json`:
   `{ "adapter", "output_path", "written", "sha256", "installed", "visible",
   "install_targets", "backup_paths" }`; install fields are empty arrays when the
@@ -615,10 +763,27 @@ Stable `--json` success field sets. Fields are mandatory unless explicitly noted
 - `hm flush --json`:
   `{ "flushed", "skipped", "failed", "unbound", "pending", "items" }`, where
   each item contains `{ "id", "store", "state", "result", "message" }`.
+- `hm refresh --json`:
+  `{ "flushed", "skipped", "failed", "unbound", "pending", "rendered",
+  "render_skipped", "coalesced", "write_receipts", "refreshed" }`, where
+  `refreshed = false` means no unrefreshed session writes were present and the
+  command skipped expensive work.
+- `hm hook <event> --json`:
+  `{ "event", "actions", "warnings", "memory_pending", "context_emitted",
+  "refresh" }`, where `actions` is an ordered list of hook adapter actions such
+  as `{ "kind": "inject_context", "body": "..." }`,
+  `{ "kind": "remind", "body": "..." }`, or `{ "kind": "warn", "body": "..." }`.
+  `refresh` is `null` unless the event ran receipt-aware refresh.
 - `hm stores list --json`:
-  `[ { "name", "store_id", "root", "available", "default", "sensitivity" } ]`.
+  `[ { "name", "store_id", "root", "available", "default", "sensitivity",
+  "readable", "writable", "default_for_agent" } ]`; the last three fields are
+  computed from `HIVE_MEMORY_AGENT_ID` / `--as-agent` when present and are `null`
+  for unrestricted human invocations.
 - `hm stores show --json`:
-  `{ "name", "config", "manifest", "available" }`.
+  `{ "name", "config", "manifest", "available", "effective_agent_policy" }`.
+- `hm projects resolve --json`:
+  `{ "project_id", "project_root", "project_hint", "store", "store_source",
+  "agent_id", "readable", "writable" }`.
 - `hm doctor --json`:
   `{ "ok", "summary", "checks" }`, where `summary` contains
   `{ "errors", "warnings" }` and each check contains
@@ -635,8 +800,21 @@ Input rules:
 - If both text and stdin are absent for write commands, return CLI usage error.
 - Comma-list flags trim whitespace and reject empty entries.
 - `--force` is narrowly scoped per command and disabled for non-interactive
-  hooks unless config explicitly allows it. `--force` MUST NOT bypass manifest
-  identity checks on outbox flush (see Local State section).
+  hooks unless config explicitly allows it. Exception: `hm refresh --force` is
+  allowed in hook mode because it only bypasses the session-receipt no-op
+  optimization; it MUST NOT bypass privacy, manifest identity, or generated-file
+  drift refusals. `--force` MUST NOT bypass manifest identity checks on outbox
+  flush (see Local State section).
+- `--idempotency-key KEY` may be passed to write commands. Reusing the same key
+  with the same normalized payload returns the existing ID; reusing it with a
+  different payload is a safety refusal. Retrying callers should use this after
+  a transient backend failure.
+- Write commands run built-in secret detectors before writing canonical memory
+  or durable outbox data. Likely credentials, private keys, API tokens, SSH keys,
+  OAuth tokens, and high-entropy bearer strings are exit `4`
+  (`privacy_refusal`) by default. The refusal message should say that Hive
+  Memory does not store secrets by default and should include only detector IDs,
+  not the matched secret text.
 
 ### `hm remember`
 
@@ -653,26 +831,41 @@ Inputs:
 
 - `--text TEXT` or stdin required.
 - optional `--scope`, `--project`, `--subject`, `--tags`, `--confidence`,
-  `--audience` (repeatable).
+  `--audience` (repeatable), `--idempotency-key`, `--allow-secret-write`.
 - defaults: active store, configured default write scope `global`, confidence
-  `medium`, empty audience.
+  `high`, empty audience. Project-scoped writes use `--project`,
+  `HIVE_MEMORY_PROJECT`, or the current working directory as a last-resort hint
+  in that order.
 
 Writes:
 
 - Markdown note under `inbox/notes/` with TOML front matter.
 - JSON event sidecar according to `event_sidecar` policy.
+- The note is written with `entry_kind = "remember"` and is included by default
+  in `hm context` as `trust = "remembered"` after source labeling and escaping.
+- Exact normalized duplicates in the same store/scope/project/audience are
+  idempotent by default for `remember`: return the existing ID instead of writing
+  another note. `--idempotency-key` makes retry behavior explicit and stricter.
+- When `HIVE_MEMORY_SESSION_ID` is present, append a lightweight write receipt
+  under `state_dir/runs/<session-id>/writes.jsonl` after a successful created or
+  duplicate/idempotent write. The receipt records the resolved store, scope,
+  project ID, note ID, and created/duplicate status. Receipts are ephemeral
+  coordination state for hooks; deleting them must never lose canonical memory.
 
 Output:
 
 - human: created note ID and relative path.
-- JSON: `{ "id", "store", "store_id", "note_path", "event_path" }`;
-  `event_path` is `null` when no sidecar is written.
+- JSON: same field set as the stable `hm remember` / `hm note` JSON contract
+  above.
 
 Errors/refusals:
 
 - refuse empty text.
 - refuse `scope = "agent-private"` without `--audience` unless `--audience-writer-only`
   is set (records `audience = [agent_id]`).
+- refuse write store outside the effective agent `write_stores` policy.
+- refuse likely secret material unless `--allow-secret-write` is permitted for a
+  resolved `secret` store.
 - refuse broad/sensitive scope mismatch unless `--force` and config allows it.
 - write to outbox when active store is unavailable and offline fallback is enabled.
 
@@ -685,6 +878,10 @@ Differences from `remember`:
 - accepts multiline stdin by default.
 - sets `entry_kind = "note"` with less semantic `subject` structure.
 - should not imply the content is already a stable preference/fact.
+- is excluded from default `hm context`; use `--include-inbox` for triage or
+  `hm promote` to turn it into curated memory.
+- does not perform automatic duplicate suppression unless `--idempotency-key` is
+  provided.
 
 Use `remember` for high-signal memory; use `note` for raw observations or longer
 session notes.
@@ -710,8 +907,10 @@ V1 behavior:
 - collapses note/event pairs (same `id`) into a single hit; the Markdown body
   is the source of the snippet.
 - default store only unless `--stores` or `--all-stores` is passed.
+- under agent policy, default store means the agent's `default_store`, and
+  explicit stores must be within the agent's `read_stores`.
 - default scopes from config; default sources from `[defaults].context_sources`
-  (curated unless `--include-inbox`).
+  (`curated` and `remembered` unless overridden).
 - returns path, score/rank, title/snippet, store, scope, audience, and
   timestamp.
 - deterministic ordering: substring/exactness score, newer timestamp, then
@@ -736,20 +935,34 @@ Examples:
 hm context --as-agent codex --project /repo --max-tokens 4000
 hm context --stores personal,work --scope global,project
 hm context --include-inbox --as-agent codex
+HIVE_MEMORY_HOOK_ACTIVE=1 HIVE_MEMORY_AGENT_ID=codex HIVE_MEMORY_PROJECT=/repo hm context
+HIVE_MEMORY_HOOK_ACTIVE=1 HIVE_MEMORY_SESSION_ID=abc hm context --if-changed
 ```
 
 Behavior:
 
 - reads selected stores/scopes only.
+- under agent policy, default store means the agent's `default_store`, and
+  explicit stores must be within the agent's `read_stores`.
+- when `HIVE_MEMORY_HOOK_ACTIVE=1`, uses `defaults.hook_context_max_tokens`
+  when no explicit `--max-tokens` is provided, enables last-success cache
+  fallback, and still enforces the active agent's read policy before returning
+  either fresh or cached context.
 - includes active store name, sources used, and render policy in a small
-  header.
-- v1 default sources are CURATED ONLY (rules/, people/, memories/global/,
-  memories/projects/<id>/). Raw inbox notes are EXCLUDED unless
-  `--include-inbox` is passed (see Trust Boundary).
+  header. The header MUST also include the active agent ID (when known), resolved
+  project ID, path hint, store source (`cli`, `env`, `project-binding`,
+  `agent-default`, or `global-default`), and selected store aliases. Cached
+  fallback context MUST mark itself stale/offline in that header, including the
+  cache creation time and selected store aliases.
+- v1 default sources include curated memory (rules/, people/, memories/global/,
+  memories/projects/<id>/) and high-signal `hm remember` entries. Raw `hm note`
+  inbox entries are EXCLUDED unless `--include-inbox` is passed (see Trust
+  Boundary).
 - each rendered memory is wrapped in an explicit data-boundary block:
-  `<memory id=X agent=Y store=Z scope=W trust=raw|curated>...</memory>`.
+  `<memory id=X agent=Y store=Z scope=W trust=raw|remembered|curated>...</memory>`.
 - prioritizes rules/preferences, project memory, recent high-confidence notes
-  (only when --include-inbox), and relevant search results.
+  from `hm remember`, and relevant search results. Raw notes only participate
+  when `--include-inbox` is passed.
 - respects `--max-tokens` approximately; the v1 heuristic is `len(utf8_bytes) / 4`
   for budget estimation. Default token-ish budget: 4000.
 - refuses `--all-stores` when config disables broad reads.
@@ -759,12 +972,33 @@ Behavior:
   with `---`, `+++`, or `<memory`/`</memory` to prevent source content from
   terminating the data-boundary block. Raw inbox content remains excluded unless
   `--include-inbox` is passed.
+- on successful fresh assembly, writes a last-success cache under
+  `state_dir/context-cache/` keyed by agent ID, project ID, resolved stores,
+  scopes, and source set. This cache is an operational fallback only; deleting it
+  must not lose memory.
+- cached fallback is used only when the selected store roots are unavailable,
+  the cache is not older than `defaults.context_cache_max_age`, and every cached
+  store is still permitted by the active agent's current read policy. A privacy
+  refusal never falls back to stale context.
+- `--if-changed` is the low-level primitive used by `hm hook` for long-lived
+  sessions. It resolves the same
+  agent/project/store/scope/source selection as a normal context call, compares
+  it with the last context selection emitted for `HIVE_MEMORY_SESSION_ID`, and
+  emits no Markdown when the selection is unchanged. When the selection changed
+  (for example the agent moved from one repo to another), it emits context and
+  records the new selection under `state_dir/runs/<session-id>/context.json`.
+  Hook adapters should prefer `hm hook <event>`; one-off integrations may call
+  this directly instead of implementing their own project-switch detector.
+- `--if-changed` compares selection identity, not file mtimes. New memory writes
+  are handled by `hm refresh` receipts; project/store switches are handled by
+  `hm context --if-changed`.
 
 Output:
 
 - Markdown context block suitable for injecting into agent prompts/files.
+- With `--if-changed`, no output when unchanged; exit code remains `0`.
 - `--json` returns sections with source paths, audience, trust level, and
-  estimated tokens.
+  estimated tokens, plus `emitted`.
 
 ### `hm render`
 
@@ -915,6 +1149,107 @@ Output:
 
 - counts of flushed, skipped, failed, unbound, and pending items.
 
+### `hm refresh`
+
+Purpose: one-shot hook-safe maintenance after memory writes.
+
+Examples:
+
+```bash
+hm refresh --quiet
+hm refresh --quiet --force
+HIVE_MEMORY_HOOK_ACTIVE=1 HIVE_MEMORY_AGENT_ID=codex hm refresh --quiet
+```
+
+Behavior:
+
+- runs the post-write maintenance sequence hooks need: flush local outbox writes,
+  refresh affected indexes, then render configured adapters.
+- honors `HIVE_MEMORY_NO_RENDER=1` by skipping the render phase.
+- when `HIVE_MEMORY_HOOK_ACTIVE=1` and `HIVE_MEMORY_SESSION_ID` are set, reads
+  session write receipts from `state_dir/runs/<session-id>/writes.jsonl` and
+  skips expensive flush/render work when no unrefreshed writes are present,
+  unless `--force` is passed. This makes low-level integrations safe to call
+  `hm refresh --quiet` broadly without implementing a fragile shell-command
+  classifier; normal hooks should use `hm hook tool-complete`.
+- after a successful refresh, records the consumed receipt cursor under the same
+  session run state. Duplicate refresh calls are therefore cheap and idempotent.
+- uses a local per-session/per-agent coalescing lock when
+  `HIVE_MEMORY_HOOK_ACTIVE=1`; if another refresh is already running for the
+  same session, returns success with `coalesced = true` instead of queueing more
+  work. Callers should not implement their own flush/render orchestration.
+- treats temporarily unavailable store roots as non-fatal when outbox fallback is
+  enabled and no privacy/store-identity refusal occurred. Pending or unbound
+  items are reported in output and by `hm doctor`, not hidden.
+- returns non-zero for config errors, privacy refusals, manifest identity
+  conflicts, generated-file marker drift, or other conditions where continuing
+  could leak memory or overwrite user edits.
+
+Output:
+
+- human: compact one-line summary unless `--quiet`.
+- JSON: combined flush/render/coalescing summary.
+
+### `hm hook`
+
+Purpose: centralize agent lifecycle policy behind one command per hook event.
+
+Examples:
+
+```bash
+hm hook session-start --project /repo --json
+hm hook prompt-submit --project /repo --text "$PROMPT" --json
+hm hook tool-complete --project /repo/src/main.rs --status 0 --json
+hm hook stop --json
+```
+
+Subcommands:
+
+```bash
+hm hook session-start
+hm hook prompt-submit
+hm hook tool-complete
+hm hook stop
+```
+
+Behavior:
+
+- requires or infers `HIVE_MEMORY_AGENT_ID` and `HIVE_MEMORY_SESSION_ID` for
+  session-scoped behavior. Missing session ID downgrades to stateless behavior
+  with a warning rather than making hooks reimplement fallback logic.
+- accepts the same project path hint model as `hm context` through
+  `--project PATH` or `HIVE_MEMORY_PROJECT`; hooks may pass a file, buffer,
+  tool working directory, or launch path.
+- internally sets hook-mode semantics for the event. Hook scripts do not need to
+  export `HIVE_MEMORY_HOOK_ACTIVE=1` when they call `hm hook`; the command
+  applies the same recursion guards, cache fallback, and coalescing behavior
+  itself. `HIVE_MEMORY_HOOK_ACTIVE=1` remains supported for hook scripts that
+  call lower-level primitives directly.
+- `session-start`: resolves agent/project/store policy, emits initial context,
+  records the session context selection, and returns an `inject_context` action.
+- `prompt-submit`: resolves the current project/store selection, emits context
+  only when the selection changed, runs the durable-memory intent heuristic, and
+  records `memory-pending` when the heuristic matches. It returns `inject_context`
+  and/or `remind` actions as needed.
+- `tool-complete`: resolves the current project/store selection, emits context
+  only when selection changed, runs receipt-aware refresh after successful tool
+  events, and clears `memory-pending` when consumed write receipts prove a memory
+  write occurred. Hooks pass tool status and an optional active path; `hm` owns
+  deciding whether refresh/context actions are needed.
+- `stop`: if `memory-pending` remains, returns a reminder action. It may run
+  `hm refresh --force` equivalent maintenance when configured, but it MUST NOT
+  write canonical memory automatically.
+- privacy refusals, manifest identity conflicts, generated-file drift, and
+  secret write refusals are surfaced as warnings/actions for hook adapters to
+  show to the user; they are not silently downgraded to another store.
+
+Output:
+
+- human: concise action summaries suitable for hook logs.
+- JSON: ordered actions for hook adapters. Dotfiles hooks translate these actions
+  into the host-specific injection/warning surfaces; they do not inspect memory
+  policy state themselves.
+
 ### `hm promote`
 
 Purpose: promote a raw inbox note into curated memory.
@@ -973,7 +1308,10 @@ hm stores migrate [--dry-run] [--store NAME]
 Behavior:
 
 - `list`: show configured stores and root availability.
-- `show`: print merged config + manifest summary.
+- `list --as-agent <id>` or `HIVE_MEMORY_AGENT_ID=<id> hm stores list`: show the
+  effective readable/writable/default store affinity for that agent.
+- `show`: print merged config + manifest summary, including effective agent
+  policy when an agent identity is active.
 - `init`: create manifest and canonical directories for a store root.
 - `doctor`: run store-specific diagnostics.
 - `migrate`: run schema migrators when the supported schema is ahead of the
@@ -987,14 +1325,31 @@ Subcommands:
 ```bash
 hm projects list
 hm projects show [id]
+hm projects resolve [path]
+hm projects bind PATH --store NAME
+hm projects unbind PATH
 hm projects alias <old-id> <new-id>
 ```
 
 Behavior:
 
+- `resolve`: derive the project ID for `PATH` (or `HIVE_MEMORY_PROJECT`, then
+  current directory as a last resort), apply store resolution, and print the
+  effective store plus its source (`cli`, `env`, `project-binding`,
+  `agent-default`, or `global-default`). `PATH` can be a file, subdirectory, or
+  project root. This is the hook/debug command for answering "which memory store
+  would this project use?"
+- `bind`: write a local project-to-store binding under `data_dir/projects/`.
+  Bindings are local machine policy, not canonical store data, so work/personal
+  affinity does not get committed into a shared memory store.
+- `unbind`: remove the local binding for a project.
 - `alias`: write `memories/projects/<new-id>/aliases.toml` recording `<old-id>`,
   enabling memory continuity across remote renames. Single-user curation per
   the same v1 constraint as `hm promote`.
+- project bindings never bypass agent affinity. If `HIVE_MEMORY_AGENT_ID` or
+  `--as-agent` is active and the bound store is outside that agent's read/write
+  policy for the requested operation, the command exits with privacy refusal
+  instead of falling back to a different store.
 
 ### `hm doctor`
 
@@ -1005,6 +1360,10 @@ Checks (all surfaces at default verbosity unless noted):
 - config parses and validates.
 - default store exists.
 - store roots are reachable or outbox is enabled.
+- every configured agent has a valid `default_store`, `read_stores`, and
+  `write_stores`, and every adapter render store is within the matching agent's
+  read policy when an agent with the same ID exists.
+- local project store bindings point at configured stores.
 - manifests are present and schema-compatible; schema drift surfaces the
   exact `hm stores migrate` command.
 - required directories exist.
@@ -1019,6 +1378,11 @@ Checks (all surfaces at default verbosity unless noted):
 - each configured `install_target` exists and contains, or resolves to a file
   containing, its adapter's idempotently installed marker block.
 - sensitive stores are not broadly rendered.
+- agent policies do not give broad store access by accident, e.g. work/secret
+  stores in an agent's defaults without an explicit config entry.
+- remembered/note bodies do not contain likely secrets according to the current
+  detector set; doctor reports detector IDs and paths, never matched secret
+  values.
 - local outbox has pending writes; aggressively warns when items are older
   than 7 days; reports unbound items as a separate error class.
 - store roots have suspicious permissions, e.g. world-readable private/secret
@@ -1098,15 +1462,47 @@ through `~/.codex/AGENTS.md -> ../.claude/CLAUDE.md`.
 The policy block is tracked and should change rarely. It MUST instruct agents:
 
 - treat hook-provided `hm context` as durable user/project memory.
+- trust the active store header in hook-provided context; use explicit
+  `--store <name>` only when the user or task clearly names another store.
 - write durable preferences, workflow rules, repo conventions, and repeated
   corrections with `hm remember`.
 - write project-specific facts with
-  `hm remember --scope project --project "$PWD" --text "..."`.
+  `hm remember --scope project --text "..."`; hooks set `HIVE_MEMORY_PROJECT`
+  so agents do not have to infer the path from shell state.
 - use `hm note` only for lower-confidence observations worth later triage.
 - never store secrets, credentials, one-off task details, or noisy transcript
   summaries by default.
+- when working across multiple repositories/projects in one session, pass
+  `--project <path>` explicitly for memories about a project other than the
+  active context header.
 - prefer not writing when unsure; hooks may remind, but should not force memory
   creation.
+
+### Agent Runtime Environment
+
+There are two related but separate environments:
+
+- **Agent/tool subprocess environment**: the launcher or session bootstrap should
+  make `HIVE_MEMORY_AGENT_ID`, `HIVE_MEMORY_SESSION_ID`, and the best available
+  `HIVE_MEMORY_PROJECT` path hint visible to normal agent tool commands. This is
+  what makes an agent-issued command like
+  `hm remember --scope project --text "..."` land in the right project without
+  re-deriving context in the prompt. Launchers should NOT set
+  `HIVE_MEMORY_PROJECT_ID` for general long-lived agent sessions; that variable
+  intentionally pins identity and prevents path hints from following project
+  switches. Reserve it for narrow, explicitly pinned runs.
+- **Hook subprocess environment**: hook code normally calls `hm hook <event>`,
+  which applies hook-safe behavior internally. `HIVE_MEMORY_HOOK_ACTIVE=1` is
+  reserved for hook code that intentionally calls lower-level primitives such as
+  `hm context` or `hm refresh` directly. It should not be exported into the
+  long-lived agent process, because normal agent-issued `hm` commands are not
+  lifecycle hook maintenance.
+
+If a host integration cannot inject env vars into normal agent tool subprocesses,
+the installed policy must tell agents to include `--project <path>` on
+project-scoped writes. That is acceptable but less ergonomic; the preferred path
+is env-backed session context plus explicit `--project` only for cross-project
+writes.
 
 ### Hook Contract
 
@@ -1127,25 +1523,41 @@ Integration rule:
 
 Required hook behaviors:
 
-- **SessionStart**: inject fresh context by running `hm context --as-agent <id>
-  --project <cwd> --max-tokens <budget>` and passing the Markdown into the
-  agent's hook-provided additional context. This is the primary read path; the
-  generated include files are a stable fallback and bootstrap surface.
-- **UserPromptSubmit**: detect obvious durable-memory intent in the user's prompt
-  (for example "remember", "from now on", "always", "never", "note that",
-  "I prefer", "don't do X anymore"). When detected, record a session-local
-  `memory-pending` marker and inject a reminder that the agent should call
-  `hm remember` if the interpreted request is truly durable.
-- **PostToolUse**: when a tool command successfully runs `hm remember` or
-  `hm note`, clear `memory-pending`, then run `hm flush --quiet` and
-  `hm render --configured --quiet` best-effort so future sessions see the new
-  memory.
-- **Stop**: if `memory-pending` remains, emit a reminder that durable memory may
-  have been requested but no `hm remember`/`hm note` ran. Stop hooks MUST NOT
-  write new memories automatically.
+- **Shared setup**: every Hive Memory hook path calls `hm hook <event>` with
+  `HIVE_MEMORY_AGENT_ID=<id>`, `HIVE_MEMORY_SESSION_ID=<id>`, and the best
+  available project path hint (`--project PATH` or `HIVE_MEMORY_PROJECT`). The
+  path hint may be an active file, buffer, tool working path, or launch path; it
+  does not need to be a project root. Optionally pass `HIVE_MEMORY_STORE=<name>`
+  only when the launcher has a stronger context signal than config/project
+  binding. Hook code should not resolve project IDs, store bindings, agent
+  affinity, cache paths, refresh locks, prompt memory intent, or memory-pending
+  state itself; those decisions belong in `hm hook`.
+- **Re-entrancy guard**: hook entry points MUST skip Hive Memory behavior when
+  `HIVE_MEMORY_HOOK_ACTIVE=1` is already present from a parent hook process.
+  This prevents hook-launched `hm` maintenance commands from recursively
+  triggering more memory maintenance in hosts that observe subprocesses.
+- **SessionStart**: call `hm hook session-start` and inject any returned
+  `inject_context` action into the agent's hook-provided additional context.
+  This is the primary read path; the generated include files are a stable
+  fallback and bootstrap surface.
+- **Project switches in long-lived sessions**: on prompt/tool boundaries where a
+  hook has a more precise active file, buffer, or tool path than the launch path,
+  pass that path to `hm hook prompt-submit` or `hm hook tool-complete`. If `hm`
+  returns an `inject_context` action, inject it as fresh additional context for
+  the new project/store selection. Project-switch detection stays inside `hm`.
+- **UserPromptSubmit**: call `hm hook prompt-submit --text <prompt>`. `hm` owns
+  the durable-memory intent heuristic, `memory-pending` state, and reminder
+  action text.
+- **PostToolUse**: call `hm hook tool-complete --status <status>` after tool
+  events. `hm` owns receipt-aware refresh, context-if-changed behavior, and
+  clearing `memory-pending` when consumed receipts prove a memory write occurred.
+- **Stop**: call `hm hook stop`. If it returns a reminder action, show it. Stop
+  hooks MUST NOT write new memories automatically.
 
-Hooks MAY run `hm flush --quiet` on Stop as best-effort maintenance. Hooks MUST
-NOT blindly summarize sessions, prompts, or transcripts into memory.
+Hooks MAY call lower-level `hm context --if-changed` or `hm refresh --quiet` for
+manual debugging or one-off integrations, but v1 dotfiles hooks should prefer
+`hm hook <event>`. Hooks MUST NOT blindly summarize sessions, prompts, or
+transcripts into memory.
 
 ### Prompt Intent Heuristic
 
@@ -1167,7 +1579,7 @@ agent that reads context. The v1 trust boundary mitigates this:
    in an explicit data-boundary block:
 
    ```text
-   <memory id="..." agent="..." store="..." scope="..." trust="curated|raw" created="...">
+   <memory id="..." agent="..." store="..." scope="..." trust="curated|remembered|raw" created="...">
    ...body...
    </memory>
    ```
@@ -1176,11 +1588,14 @@ agent that reads context. The v1 trust boundary mitigates this:
    not instructions. Prompts that consume `hm context` output should be
    constructed to honor this boundary (see README guidance for hook authors).
 
-2. **Curated-only by default**. v1 default `[defaults].context_sources` is
-   `["curated"]`. Raw inbox notes are NEVER included in context unless the
-   caller explicitly passes `--include-inbox` or config sets a different
-   default. Curated memory is human-reviewed or has been explicitly promoted
-   from inbox via `hm promote`.
+2. **Curated + remembered by default**. v1 default
+   `[defaults].context_sources` is `["curated", "remembered"]`. Curated memory
+   is human-reviewed or explicitly promoted from inbox via `hm promote`.
+   Remembered memory comes from `hm remember`, is source-labeled as
+   `trust="remembered"`, and is visible by default because agents and hooks use
+   it for explicit durable preferences/facts. Raw `hm note` inbox entries are
+   NEVER included in context unless the caller explicitly passes
+   `--include-inbox` or config sets a different default.
 
 3. **Escape rules**. For every rendered body, lines that begin with `---`,
    `+++`, `<memory`, or `</memory` are escaped (prefixed with a zero-width
@@ -1188,18 +1603,20 @@ agent that reads context. The v1 trust boundary mitigates this:
    impersonate front matter. This applies to curated memory too; promoted
    content may still contain copied raw text.
 
-4. **Doctor patterns**. `hm doctor` flags raw inbox notes whose body exhibits
-   instruction-language patterns (regex: `(?i)^(ignore|disregard|system|you must|now do)\b`)
-   or length spikes (>5000 chars) so the user can review them before they
-   land in curated memory via `hm promote`.
+4. **Doctor patterns**. `hm doctor` flags remembered and raw inbox entries whose
+   body exhibits instruction-language patterns (regex:
+   `(?i)^(ignore|disregard|system|you must|now do)\b`) or length spikes
+   (>5000 chars) so the user can review them before they remain in default
+   context or land in curated memory via `hm promote`.
 
 5. **Trusted writers config (deferred)**. Post-v1, `[trust] allowed_writers`
    may restrict which `agent_id` values are allowed to write at all. v1 does
    not enforce this — the design exists so the schema can evolve there.
 
-This is the right-sized v1 answer: full prompt-injection defense is a deep
-area, but unreviewed-raw-notes-by-default is the dangerous part, and v1
-prevents that.
+This is the right-sized v1 answer: full prompt-injection defense is a deep area,
+but unbounded raw-note inclusion is the dangerous part. V1 keeps raw `hm note`
+content out of default context while making explicit `hm remember` writes useful
+immediately and visibly labeled.
 
 ## Performance Budget
 
@@ -1249,16 +1666,24 @@ Principles:
 - Create private stores with restrictive permissions where the platform supports
   it: directories `0700`, files `0600`.
 - Reads across stores are opt-in.
+- Agent/hook reads and writes are bounded by `[agents.<id>]` store affinity; an
+  agent cannot silently hop into a named store outside its read/write policy.
 - Renders are configured allowlists, not global dumps.
 - Store sensitivity is metadata used for warnings/refusals.
+- Write commands refuse likely secrets before writing canonical notes or durable
+  outbox items. Secret-looking content may be written only with
+  `--allow-secret-write` into a configured `secret` store whose config enables
+  secret writes; agent hooks cannot bypass this by default.
 - Agent-private scope is enforced via the `audience` field (see Markdown Note
   Schema). Default rendering excludes agent-private notes whose audience
-  does not include the active adapter.
+  does not include the active agent identity.
 - Group/chat contexts should not receive personal memory unless explicitly
   configured for that surface.
 - `doctor` warns about broad render policies and unknown adapter outputs.
 - `hm context` prints active store/scope/sources metadata so mistakes are
   visible.
+- `hm stores list --as-agent <id>` exposes the effective readable/writable store
+  set so hooks and agents can debug affinity without parsing config.
 - Absolute paths, host IDs, and session IDs are sensitive; renderers omit
   them by default unless an adapter opts in.
 
@@ -1492,6 +1917,27 @@ Test categories per module:
 - required-field absence emits exit-3 errors.
 - unknown top-level keys warn; unknown subkeys warn.
 - secret-sensitivity + cloud-sync root path = exit-3 refusal.
+- missing `[agents.<id>]` resolves to conservative default-store-only policy.
+- invalid agent default/read/write store aliases fail validation.
+- adapter render stores must be within same-name agent read policy.
+
+### Store affinity / projects
+
+- write resolution order: CLI, env, local project binding, agent default, global
+  default.
+- read resolution order: CLI stores, CLI store, env stores, env store, local
+  project binding, agent default, global default.
+- file, subdirectory, and repo-root project hints resolve to the same git-root
+  project identity.
+- `.hive-memory-project` in a monorepo subtree overrides the outer git root for
+  paths under that subtree.
+- current working directory is used only when no CLI/env path hint exists.
+- `hm projects bind` writes local data only and validates the target store alias.
+- `hm projects unbind` removes only the local binding.
+- `hm projects resolve --json` reports project ID, project root, original path
+  hint, effective store, store source, agent ID, readable, and writable.
+- project binding outside active agent policy exits with privacy refusal.
+- `hm doctor` warns on local project bindings that target missing stores.
 
 ### Store init / manifest
 
@@ -1519,6 +1965,15 @@ Test categories per module:
 - `audience` field omission for non-agent-private notes.
 - agent-private writes require explicit audience or `--audience-writer-only`;
   legacy/manual missing-audience notes warn in doctor.
+- agent policy constrains default and explicit write stores.
+- likely secret material is refused before writing canonical notes or durable
+  outbox data; refusal output does not echo the secret.
+- `--allow-secret-write` works only for configured secret stores and only when
+  config permits that mode.
+- JSON output includes resolved store source, scope, project ID, and audience so
+  agents can verify where the memory landed.
+- session write receipt is appended when `HIVE_MEMORY_SESSION_ID` is set; receipt
+  loss does not lose canonical memory.
 - normalization at write time (NFC, lowercase on case-insensitive FS).
 
 ### JSON event sidecar
@@ -1532,6 +1987,7 @@ Test categories per module:
 
 - case-insensitive substring match.
 - `--stores` / `--scope` filters.
+- agent policy constrains default and explicit read stores.
 - `--include-inbox` opt-in.
 - deterministic ordering (score → newer timestamp → lexical path).
 - default limit 20; `--limit N` respected.
@@ -1539,15 +1995,29 @@ Test categories per module:
 
 ### Context assembler
 
-- v1 default sources = curated only.
+- v1 default sources = curated + remembered.
 - `--include-inbox` opens raw notes; escape rules apply to every rendered body,
   including curated content.
 - data-boundary block emitted with required attributes.
 - audience filter under `--as-agent`.
+- agent policy constrains default and explicit context stores.
 - `--max-tokens` byte/4 approximation respected.
 - active store name in header.
+- header and JSON include active agent ID, resolved project ID, original path
+  hint, selected stores, and store source.
+- hook-active default max tokens comes from `defaults.hook_context_max_tokens`.
+- fresh context writes last-success cache.
+- `--if-changed` emits no Markdown when session context selection is unchanged,
+  emits context when project/store/scope/source selection changes, and updates
+  the session context cursor.
+- backend-unavailable hook context falls back to non-expired cache only when
+  current agent policy still permits the cached stores.
+- stale fallback context header names cache age and selected stores.
+- privacy refusal never falls back to cached context.
 - `--all-stores` refused when config disables broad reads.
 - performance budget: p95 ≤ 200ms warm on synthetic 5000-note store.
+- `hm remember` entries are visible by default; `hm note` entries are not visible
+  unless `--include-inbox` is passed.
 
 ### Adapter render framework
 
@@ -1572,17 +2042,49 @@ Test categories per module:
 
 - Installed policy block appears in the shared instruction file and remains
   stable across repeated installs.
+- Agent/tool subprocesses receive `HIVE_MEMORY_AGENT_ID`,
+  `HIVE_MEMORY_SESSION_ID`, and a best-available `HIVE_MEMORY_PROJECT` path hint
+  when the host integration supports env injection.
+- Dotfiles hook entry points call `hm hook <event>` and translate returned
+  actions into host-specific context/warning/reminder surfaces.
+- `hm hook <event>` owns prompt memory-intent detection, `memory-pending`, context
+  selection changes, receipt-aware refresh, and refresh coalescing.
+- `hm hook session-start --json` returns an `inject_context` action with the
+  same selected stores/project metadata as `hm context --json`.
+- `hm hook prompt-submit --text ... --json` records memory-pending and returns a
+  reminder action for durable-memory intent, without writing canonical memory.
+- `hm hook prompt-submit` / `hm hook tool-complete` emit context only when the
+  resolved project/store/scope/source selection changed.
+- `hm hook tool-complete --status 0 --json` consumes session write receipts,
+  runs receipt-aware refresh, and clears memory-pending when receipts prove a
+  memory write occurred.
+- `hm hook tool-complete --status nonzero` does not run refresh and does not
+  clear memory-pending.
+- `hm hook stop --json` returns a reminder action when memory-pending remains
+  and never writes canonical memory.
+- `HIVE_MEMORY_HOOK_ACTIVE=1` is scoped to hook-launched low-level `hm`
+  subprocesses and is not leaked into normal agent tool commands.
 - Hive Memory runtime behavior is implemented in the existing dotfiles
   `agent-hook-*` scripts, not in a parallel hook stack.
-- SessionStart injects `hm context` additional context with the active adapter
-  identity and project path.
-- UserPromptSubmit detects explicit memory-intent prompts and records a
-  session-local `memory-pending` marker.
-- UserPromptSubmit reminder is advisory and does not write canonical memory.
-- PostToolUse clears `memory-pending` after successful `hm remember`/`hm note`.
-- PostToolUse runs best-effort `hm flush --quiet` and
-  `hm render --configured --quiet` after memory writes.
-- Stop emits a reminder when `memory-pending` remains.
+- SessionStart injects the `inject_context` action returned by
+  `hm hook session-start`.
+- SessionStart uses last-success context cache only when the selected backend is
+  unavailable, the cache is within max age, and current agent policy still
+  allows every cached store.
+- Prompt/tool-boundary hooks pass the best active path hint to `hm hook
+  prompt-submit` / `hm hook tool-complete` so long-lived sessions receive fresh
+  context after moving to another project without hook-side project tracking.
+- General long-lived agent launchers do not set `HIVE_MEMORY_PROJECT_ID`; an
+  explicitly pinned project ID prevents path-hint based project switching.
+- `hm hook prompt-submit` reminder action is advisory and does not write
+  canonical memory.
+- PostToolUse behavior is driven by `hm hook tool-complete`; no-write events are
+  cheap when no unrefreshed session write receipts exist.
+- Hook entry points skip Hive Memory behavior when `HIVE_MEMORY_HOOK_ACTIVE=1`
+  is already present from a parent hook process.
+- `hm hook tool-complete` / `hm refresh` coalesce overlapping refreshes for the
+  same session instead of queueing duplicate flush/render work.
+- `hm hook stop` emits a reminder when `memory-pending` remains.
 - Stop does not write memories automatically.
 - Hook failures warn and continue unless a privacy/store-identity refusal occurs.
 
@@ -1595,6 +2097,14 @@ Test categories per module:
 - Flush idempotency on same-hash collision (mark flushed).
 - Flush refuses on different-hash collision (report conflict).
 - Flush respects manifest identity check; no `--force` bypass.
+- `hm refresh` runs flush, affected-index refresh, and configured render in that
+  order.
+- `hm refresh` honors `HIVE_MEMORY_NO_RENDER=1`.
+- `hm refresh` skips expensive work when hook/session write receipts have not
+  advanced.
+- `hm refresh --force` runs maintenance even without unrefreshed receipts.
+- `hm refresh` reports coalesced success when a hook refresh lock is already
+  active for the same session.
 - Unbound items never auto-flush; require `--bind`.
 - Outbox-archive snapshot written on successful flush.
 
@@ -1634,6 +2144,50 @@ Test categories per module:
 
 ## Recommended Implementation Issues
 
+Implementation strategy:
+
+- Work in small implementation cycles: code a narrow slice, run the relevant
+  tests/checks, review the diff for policy-boundary drift, fix what the review
+  finds, then move to the next slice. Do not accumulate a large unverified batch
+  of `hm` behavior before testing it.
+- Build from deterministic foundations outward. Start with config loading,
+  store/project resolution, store affinity, and privacy refusals before any
+  agent hook integration.
+- Implement direct write/query commands before lifecycle automation:
+  `hm remember`, `hm note`, indexing, `hm search`, then `hm context`.
+- Treat `hm hook <event>` as composition over tested core modules, not as its
+  own policy island. Hook behavior should call the same resolver, context,
+  receipt, refresh, and prompt-intent modules used by lower-level commands.
+- Integrate dotfiles hooks only after `hm hook <event> --json` action shapes are
+  stable and covered by tests. Hook scripts should be thin translators from
+  JSON actions to host-specific context/warning/reminder surfaces.
+- Enforce the performance budget early. `hm context` is on the agent startup
+  path, so slow behavior should fail tests before hook integration depends on it.
+- Avoid model calls in the core v1 implementation. Prompt-intent detection,
+  secret detection, context selection, and doctor checks must be deterministic.
+
+Risks to watch during implementation:
+
+- `hm hook` becoming a kitchen sink. Keep internals decomposed into small modules
+  with clear contracts: resolver, context assembler, hook state, receipts,
+  refresh, prompt intent, and action rendering.
+- Project resolution drift. File, subdirectory, repo-root, monorepo subtree,
+  no-git directory, symlink, and long-lived multi-project session cases all need
+  dedicated tests.
+- Store-affinity bypasses. Every read/write/render path must call the shared
+  resolver and enforce agent read/write policy; no command should reimplement
+  store selection.
+- Secret detector noise. The default detector should catch obvious credentials
+  and private keys without blocking normal technical notes too often. Refusals
+  must never echo matched secret values.
+- Context performance regressions. Index reads, cache fallback, token budgeting,
+  and project-switch context refresh should stay within the v1 latency budget.
+- Hook JSON action stability. `hm hook <event> --json` is an API for dotfiles and
+  future adapters; action shapes should be versioned by tests before integration.
+- Render/install drift. Generated-file markers, symlinked install targets, and
+  adapter visibility checks must remain idempotent across repeated dotfiles
+  updates.
+
 When ready, create GitHub issues roughly in this order. Each carries a
 "Tests required" sub-list from the Testing catalog.
 
@@ -1644,7 +2198,8 @@ When ready, create GitHub issues roughly in this order. Each carries a
    required: smoke `hm --version`.
 2. **License and metadata**: MIT license, README badges, contribution notes.
 3. **Config loader**: TOML config, local overrides, env/CLI precedence, path
-   expansion, cloud-sync prefix refusal. Tests: Config loader (above).
+   expansion, cloud-sync prefix refusal, agent store-affinity resolution. Tests:
+   Config loader (above).
 4. **Store initialization**: manifest schema, directory creation, `hm stores`,
    schema-migration scaffolding (`hm stores migrate` with no migrators).
    Tests: Store init / manifest.
@@ -1661,9 +2216,9 @@ When ready, create GitHub issues roughly in this order. Each carries a
    secret-on-cloud, fsync-on-FUSE. Tests: Doctor.
 10. **Simple search**: substring scan over index + matched-line snippet
     read; pair collapse. Tests: Search.
-11. **Context assembler**: scope/store selection, curated-default, data-boundary
-    blocks, escape rules, byte/4 token approx, performance budget. Tests:
-    Context assembler.
+11. **Context assembler**: scope/store selection, curated+remembered defaults,
+    data-boundary blocks, escape rules, byte/4 token approx, performance budget.
+    Tests: Context assembler.
 12. **Adapter render framework**: generated-file header + sha256 marker,
     atomic render writes, `--upgrade-marker`, refusal rules. Tests:
     Adapter render framework.
@@ -1675,8 +2230,9 @@ When ready, create GitHub issues roughly in this order. Each carries a
     installer into `~/.codex/AGENTS.md` whether it is a symlink or regular file,
     plus hook expectations.
 15. **Agent runtime hooks**: installed memory policy block, SessionStart context
-    injection, prompt memory-intent reminders, memory-pending debt tracking,
-    post-write flush/render, Stop reminders. Tests: Agent runtime hooks.
+    injection, `hm hook <event>` actions, prompt memory-intent reminders,
+    memory-pending debt tracking, receipt-aware refresh, Stop reminders. Tests:
+    Agent runtime hooks.
 16. **Local outbox and flush**: data_dir placement, unbound state, `--bind`
     workflow, outbox-archive snapshots. Tests: Outbox + flush.
 17. **Promote / inbox**: `hm promote`, `hm inbox`, single-user fcntl lock,
