@@ -796,3 +796,68 @@ fn render_refuses_drifted_output_without_force_backup() {
             "refusing to overwrite edited render file",
         ));
 }
+
+#[test]
+fn render_install_adds_instruction_markers() {
+    let dir = temp_dir("render-install");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let output = dir.join("generated").join("codex.md");
+    let install_target = dir.join("AGENTS.md");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "{}"
+
+            [adapters.codex]
+            enabled = true
+            stores = ["personal"]
+            scopes = ["global"]
+            output = "{}"
+            install_target = "{}"
+            install_mode = "include"
+            "#,
+            personal.display(),
+            output.display(),
+            install_target.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Installed render memory.",
+        ])
+        .assert()
+        .success();
+
+    let mut render = cargo_bin_cmd!("hm");
+    render
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "render",
+            "codex",
+            "--install",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("install_target: "))
+        .stdout(predicate::str::contains("installed: true"));
+
+    let instructions = fs::read_to_string(install_target).expect("read install target");
+    assert!(instructions.contains("# BEGIN hive-memory:policy"));
+    assert!(instructions.contains("# BEGIN hive-memory:codex"));
+    assert!(instructions.contains(&format!("@{}", output.display())));
+    assert!(!instructions.contains("Installed render memory."));
+}
