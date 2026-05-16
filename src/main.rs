@@ -10,8 +10,8 @@ use hive_memory::config::{
     AdapterConfig, Config, ConfigPaths, EventSidecarPolicy, Sensitivity, StoreConfig,
 };
 use hive_memory::{
-    config, context as memory_context, curation, doctor, hook as memory_hook, index, memory, note,
-    outbox, project, render, search, secret, store, write,
+    config, context as memory_context, curation, doctor, event, hook as memory_hook, id, index,
+    memory, note, outbox, project, render, search, secret, store, write,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -998,7 +998,6 @@ fn run_write_memory(
     )?;
     let store_config = &config.stores[resolved_store.name.as_str()];
     validate_secret_write(&config, store_config, args.allow_secret_write, &args.text)?;
-    let manifest = store::read_manifest(&store_config.root)?;
     let created_at = OffsetDateTime::now_utc();
     let host_id = resolve_host_id(&config);
     let audience = resolve_audience(&args, &scope, &writer_agent_id)?;
@@ -1013,9 +1012,7 @@ fn run_write_memory(
         fsync: config.storage.fsync.into(),
         ..write::AtomicWriteOptions::default()
     };
-    let result = memory::write_record(memory::WriteRecordInput {
-        root: &store_config.root,
-        manifest: &manifest,
+    let write_input = MemoryWriteFields {
         entry_kind,
         created_at,
         agent_id: writer_agent_id,
@@ -1033,19 +1030,38 @@ fn run_write_memory(
         source_ref: args.source_ref,
         write_event: should_write_event,
         options,
-    })?;
+    };
+    let outcome = match store::read_manifest(&store_config.root) {
+        Ok(manifest) => write_canonical_memory(&store_config.root, &manifest, write_input)?,
+        Err(store::StoreError::Io { .. }) => {
+            let Some(expected_store_id) = store_config.expected_id.clone() else {
+                anyhow::bail!(
+                    "store {} is unavailable and has no expected_id for outbox fallback",
+                    resolved_store.name
+                );
+            };
+            enqueue_outbox_memory(
+                &config,
+                store_config,
+                &resolved_store.name,
+                expected_store_id,
+                write_input,
+            )?
+        }
+        Err(err) => return Err(err.into()),
+    };
 
     if args.json {
         let output = WriteMemoryJson {
-            id: result.id.clone(),
+            id: outcome.id.clone(),
             store: resolved_store.name.clone(),
-            store_id: manifest.store.id.clone(),
+            store_id: outcome.store_id.clone(),
             store_source: resolved_store.source.to_string(),
             scope: scope.clone(),
             project_id: project_id.clone(),
             audience: audience.clone(),
-            note_path: result.note_path.display().to_string(),
-            event_path: result
+            note_path: outcome.note_path.display().to_string(),
+            event_path: outcome
                 .event_path
                 .as_ref()
                 .map(|path| path.display().to_string()),
@@ -1054,11 +1070,14 @@ fn run_write_memory(
         };
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        println!("id: {}", result.id);
+        println!("id: {}", outcome.id);
         println!("store: {}", resolved_store.name);
-        println!("note: {}", result.note_path.display());
-        if let Some(path) = &result.event_path {
+        println!("note: {}", outcome.note_path.display());
+        if let Some(path) = &outcome.event_path {
             println!("event: {}", path.display());
+        }
+        if let Some(path) = &outcome.outbox_path {
+            println!("outbox: {}", path.display());
         }
     }
     append_session_write_receipt(
@@ -1066,9 +1085,166 @@ fn run_write_memory(
         &resolved_store.name,
         &scope,
         project_id,
-        &result.id,
+        &outcome.id,
     );
     Ok(())
+}
+
+struct MemoryWriteFields {
+    entry_kind: note::EntryKind,
+    created_at: OffsetDateTime,
+    agent_id: String,
+    host_id: String,
+    user_id: String,
+    session_id: Option<String>,
+    scope: String,
+    confidence: note::Confidence,
+    body: String,
+    project_id: Option<String>,
+    subject: Option<String>,
+    tags: Vec<String>,
+    audience: Vec<String>,
+    source_kind: Option<String>,
+    source_ref: Option<String>,
+    write_event: bool,
+    options: write::AtomicWriteOptions,
+}
+
+struct MemoryWriteOutcome {
+    id: String,
+    store_id: String,
+    note_path: PathBuf,
+    event_path: Option<PathBuf>,
+    outbox_path: Option<PathBuf>,
+}
+
+fn write_canonical_memory(
+    store_root: &std::path::Path,
+    manifest: &store::StoreManifest,
+    input: MemoryWriteFields,
+) -> Result<MemoryWriteOutcome> {
+    let result = memory::write_record(memory::WriteRecordInput {
+        root: store_root,
+        manifest,
+        entry_kind: input.entry_kind,
+        created_at: input.created_at,
+        agent_id: input.agent_id,
+        host_id: input.host_id,
+        user_id: input.user_id,
+        session_id: input.session_id,
+        scope: input.scope,
+        confidence: input.confidence,
+        body: input.body,
+        project_id: input.project_id,
+        subject: input.subject,
+        tags: input.tags,
+        audience: input.audience,
+        source_kind: input.source_kind,
+        source_ref: input.source_ref,
+        write_event: input.write_event,
+        options: input.options,
+    })?;
+
+    Ok(MemoryWriteOutcome {
+        id: result.id,
+        store_id: manifest.store.id.clone(),
+        note_path: result.note_path,
+        event_path: result.event_path,
+        outbox_path: None,
+    })
+}
+
+fn enqueue_outbox_memory(
+    config: &Config,
+    store_config: &StoreConfig,
+    store_name: &str,
+    expected_store_id: String,
+    input: MemoryWriteFields,
+) -> Result<MemoryWriteOutcome> {
+    let id = id::new_write_id(&id::WriteIdContext {
+        host_id: input.host_id.clone(),
+        agent_id: input.agent_id.clone(),
+    });
+    let write_event = input.write_event;
+    let note_relative_path = note::note_relative_path(&id, input.created_at);
+    let event_relative_path = event::event_relative_path(&id, input.created_at);
+    let note_input = note::NoteWriteInput {
+        entry_kind: input.entry_kind,
+        store_id: expected_store_id.clone(),
+        store_name: store_name.to_owned(),
+        created_at: input.created_at,
+        agent_id: input.agent_id.clone(),
+        host_id: input.host_id.clone(),
+        scope: input.scope.clone(),
+        confidence: input.confidence,
+        body: input.body.clone(),
+        user_id: Some(input.user_id.clone()),
+        session_id: input.session_id.clone(),
+        project_id: input.project_id.clone(),
+        subject: input.subject.clone(),
+        tags: input.tags.clone(),
+        source_kind: input.source_kind.clone(),
+        source_ref: input.source_ref.clone(),
+        related_event_id: write_event.then(|| id.clone()),
+        expires_at: None,
+        audience: input.audience.clone(),
+    };
+    let note = note::render_note(&note::MarkdownNote {
+        front_matter: note_input.front_matter(id.clone())?,
+        body: input.body.clone(),
+    })?;
+    let event = if write_event {
+        Some(event::render_event(&event::MemoryEvent::observation(
+            event::EventObservationInput {
+                id: id.clone(),
+                store_id: expected_store_id.clone(),
+                store_name: store_name.to_owned(),
+                created_at: input.created_at,
+                agent_id: input.agent_id,
+                host_id: input.host_id,
+                user_id: Some(input.user_id),
+                session_id: input.session_id,
+                scope: input.scope,
+                project_id: input.project_id,
+                subject: input.subject,
+                tags: input.tags,
+                confidence: input.confidence,
+                audience: input.audience,
+                body: input.body,
+                note_path: Some(note_relative_path.clone()),
+                source: input.source_kind.map(|kind| event::EventSource {
+                    kind,
+                    r#ref: input.source_ref,
+                }),
+            },
+        )?)?)
+    } else {
+        None
+    };
+    let report = outbox::enqueue(outbox::EnqueueInput {
+        data_dir: &config.data_dir,
+        store: store_name,
+        id: &id,
+        expected_store_id: Some(expected_store_id.clone()),
+        final_note_path: store_relative_path_string(&note_relative_path),
+        note: note.into_bytes(),
+        final_event_path: write_event.then(|| store_relative_path_string(&event_relative_path)),
+        event: event.map(String::into_bytes),
+        state: outbox::OutboxState::Pending,
+        options: input.options,
+    })?;
+
+    Ok(MemoryWriteOutcome {
+        id,
+        store_id: expected_store_id,
+        note_path: store_config.root.join(note_relative_path),
+        event_path: write_event.then(|| store_config.root.join(event_relative_path)),
+        outbox_path: Some(report.item_dir),
+    })
+}
+
+fn store_relative_path_string(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 #[derive(Debug, Serialize)]

@@ -88,6 +88,40 @@ pub struct FlushInput<'a> {
     pub options: write::AtomicWriteOptions,
 }
 
+/// Request to enqueue one offline write for a later flush.
+#[derive(Debug, Clone)]
+pub struct EnqueueInput<'a> {
+    /// Durable tool data directory containing `outbox/`.
+    pub data_dir: &'a Path,
+    /// Target store alias from current policy resolution.
+    pub store: &'a str,
+    /// Stable outbox item id, normally the memory id.
+    pub id: &'a str,
+    /// Expected store manifest id. Missing means the item stays unbound.
+    pub expected_store_id: Option<String>,
+    /// Store-relative final Markdown note path.
+    pub final_note_path: String,
+    /// Rendered Markdown note payload.
+    pub note: Vec<u8>,
+    /// Store-relative final JSON event path, when present.
+    pub final_event_path: Option<String>,
+    /// Rendered JSON event payload, when present.
+    pub event: Option<Vec<u8>>,
+    /// Initial outbox state.
+    pub state: OutboxState,
+    /// Atomic writer options for payload and metadata writes.
+    pub options: write::AtomicWriteOptions,
+}
+
+/// Result of enqueueing an offline write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnqueueReport {
+    /// Outbox item directory.
+    pub item_dir: PathBuf,
+    /// Metadata path written inside the item directory.
+    pub meta_path: PathBuf,
+}
+
 /// Summary of one flush run.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct FlushReport {
@@ -182,6 +216,65 @@ impl Display for OutboxError {
 }
 
 impl Error for OutboxError {}
+
+/// Enqueue one fully rendered memory payload under `data_dir/outbox`.
+///
+/// Offline enqueue receives already rendered note/event bytes because write
+/// policy belongs to the caller: store affinity, scope, audience, and secret
+/// checks must be resolved before durable user data enters the outbox. This
+/// function owns only the recovery envelope and payload hashing contract.
+pub fn enqueue(input: EnqueueInput<'_>) -> Result<EnqueueReport, OutboxError> {
+    let item_dir = input
+        .data_dir
+        .join("outbox")
+        .join(input.store)
+        .join(input.id);
+    fs::create_dir_all(&item_dir).map_err(|err| io_error("create outbox item", &item_dir, err))?;
+    let event_sha256 = input.event.as_ref().map(|event| sha256(event));
+    let meta = OutboxMeta {
+        schema_version: OUTBOX_SCHEMA_VERSION,
+        id: input.id.to_owned(),
+        store: input.store.to_owned(),
+        expected_store_id: input.expected_store_id,
+        final_note_path: input.final_note_path,
+        note_sha256: sha256(&input.note),
+        final_event_path: input.final_event_path,
+        event_sha256,
+        created_at: OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("RFC3339 formatting should not fail"),
+        attempt_count: 0,
+        last_error: None,
+        state: input.state,
+    };
+
+    write::write_atomic_create_new(&item_dir.join("note.md"), &input.note, &input.options)
+        .map_err(|err| OutboxError::Io {
+            action: "write outbox note",
+            path: item_dir.join("note.md"),
+            message: err.to_string(),
+        })?;
+    if let Some(event) = input.event {
+        write::write_atomic_create_new(&item_dir.join("event.json"), &event, &input.options)
+            .map_err(|err| OutboxError::Io {
+                action: "write outbox event",
+                path: item_dir.join("event.json"),
+                message: err.to_string(),
+            })?;
+    }
+    let meta_path = item_dir.join("meta.toml");
+    write::write_atomic_create_new(&meta_path, render_meta(&meta)?.as_bytes(), &input.options)
+        .map_err(|err| OutboxError::Io {
+            action: "write outbox metadata",
+            path: meta_path.clone(),
+            message: err.to_string(),
+        })?;
+
+    Ok(EnqueueReport {
+        item_dir,
+        meta_path,
+    })
+}
 
 /// Flush all auto-bindable pending outbox items.
 ///

@@ -682,6 +682,63 @@ fn remember_json_reports_stable_write_fields() {
 }
 
 #[test]
+fn remember_enqueues_outbox_when_store_unavailable_with_expected_id() {
+    let dir = temp_dir("remember-outbox");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("missing-personal");
+    let expected_id = "018f5f57-bd9b-7d33-9e21-1f44f0c5a013";
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+            expected_id = "{}"
+            "#,
+            data.display(),
+            personal.display(),
+            expected_id
+        ),
+    )
+    .expect("write config");
+
+    let output = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Offline write should enqueue.",
+            "--json",
+        ])
+        .output()
+        .expect("run remember");
+    assert!(output.status.success(), "remember failed: {output:?}");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("remember json");
+    let id = json["id"].as_str().expect("id");
+    assert_eq!(json["store_id"], expected_id);
+    let note_path = json["note_path"].as_str().expect("note path");
+    assert!(note_path.contains("missing-personal/inbox/notes/"));
+
+    let item_dir = data.join("outbox/personal").join(id);
+    let meta: outbox::OutboxMeta =
+        toml::from_str(&fs::read_to_string(item_dir.join("meta.toml")).expect("read meta"))
+            .expect("parse meta");
+    assert_eq!(meta.store, "personal");
+    assert_eq!(meta.expected_store_id.as_deref(), Some(expected_id));
+    assert_eq!(meta.state, outbox::OutboxState::Pending);
+    assert!(item_dir.join("note.md").is_file());
+    assert!(item_dir.join("event.json").is_file());
+    let note = fs::read_to_string(item_dir.join("note.md")).expect("read outbox note");
+    assert!(note.contains("Offline write should enqueue."));
+    assert!(note.contains(expected_id));
+}
+
+#[test]
 fn remember_refuses_likely_secret_without_echoing_value() {
     let dir = temp_dir("remember-secret-refusal");
     let config = dir.join("config.toml");
