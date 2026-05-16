@@ -165,9 +165,12 @@ pub struct StorageConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FsyncMode {
+    /// Never ask the filesystem to sync data explicitly.
     Never,
+    /// Try to sync, but treat unsupported or failed syncs as warnings.
     #[default]
     BestEffort,
+    /// Treat data or directory sync failure as a failed write.
     Required,
 }
 
@@ -207,7 +210,9 @@ pub struct DefaultsConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum EventSidecarPolicy {
+    /// `hm note` writes only the Markdown note unless the caller opts in.
     Never,
+    /// `hm note` writes a paired JSON event unless the caller opts out.
     #[default]
     Always,
 }
@@ -236,10 +241,14 @@ pub struct StoreConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Sensitivity {
+    /// Intended for memory that can be broadly shared.
     Public,
+    /// Intended for non-public team or organization context.
     Internal,
+    /// Intended for one user's ordinary personal/project memory.
     #[default]
     Private,
+    /// Intended for explicitly approved secret material.
     Secret,
 }
 

@@ -71,6 +71,10 @@ fn contains_assignment_secret(text: &str) -> bool {
         let Some((_key, value)) = split_assignment(line) else {
             return false;
         };
+        // Assignment-style detection is intentionally key-driven. Broad
+        // entropy checks would catch too much ordinary technical prose and make
+        // memory writes frustrating, while obvious credential keys give useful
+        // protection without pretending to be a full DLP scanner.
         let key = line
             .split(['=', ':'])
             .next()

@@ -33,7 +33,9 @@ pub struct DoctorReport {
 /// Count summary for a doctor report.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct DoctorSummary {
+    /// Number of error-severity checks. Non-zero makes the report fail.
     pub errors: usize,
+    /// Number of warning-severity checks. Warnings do not make `ok` false.
     pub warnings: usize,
 }
 

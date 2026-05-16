@@ -637,6 +637,12 @@ fn load_config(config_path: Option<&std::path::Path>) -> Result<Config> {
     Ok(loaded.config)
 }
 
+/// Resolve project identity only when the caller supplied project context.
+///
+/// Most commands should not guess a project from process CWD just because `hm`
+/// happened to start inside a directory. Hooks and long-lived agents can move
+/// across projects, so callers must provide a path hint or explicit/env project
+/// id before project-scoped filtering or local store affinity applies.
 fn resolve_project_id(
     explicit_project_id: Option<String>,
     project_hint: Option<&str>,
@@ -1866,6 +1872,9 @@ fn validate_secret_write(
         return Ok(());
     }
 
+    // Detector ids are safe to print; matched values are intentionally not part
+    // of `SecretFinding` so command errors, hook JSON, and transcripts do not
+    // re-leak the material the guard is trying to protect.
     let detector_ids = findings
         .iter()
         .map(|finding| finding.detector_id.as_str())
