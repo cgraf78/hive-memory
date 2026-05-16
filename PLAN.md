@@ -10,8 +10,11 @@ The project should avoid assumptions about one person, one agent, Claude Code,
 Google Drive, or any specific machine layout. Those are adapters/config, not core
 architecture.
 
-The canonical CLI is `hive-memory`. A short `hm` alias should be installed for
-agent/human ergonomics once command names are stable.
+The primary binary should be `hm` for agent/human ergonomics. `hive-memory` may
+be installed as a compatibility alias/wrapper for discoverability, but docs and
+hooks should prefer `hm` once the command surface is stable. Local checks found
+no obvious `hm` binary collision on the current Linux host; release planning
+should still check Homebrew/Apt/common CLI namespaces before finalizing.
 
 ## Design Principles
 
@@ -26,7 +29,7 @@ crippling.
   over tangled or overly clever implementation.
 - **Single-source shared knowledge**: canonical memory has one neutral home.
   Agent-specific files are rendered views, not competing sources of truth.
-- **Expose clean interfaces**: agents call `hive-memory context`, `remember`,
+- **Expose clean interfaces**: agents call `hm context`, `remember`,
   `note`, `render`, and `doctor`; they do not reimplement path mapping, locking,
   indexing, or scope filtering.
 - **Compose from single-purpose parts**: storage backend, note writer, indexer,
@@ -52,13 +55,16 @@ crippling.
 - **Adapters are edges**: Claude, Codex, OpenClaw, Gemini, etc. consume rendered
   views. No agent owns the canonical memory format.
 - **Small sharp CLI**: agents should not reimplement filesystem rules. They call
-  `hive-memory` for reads, writes, rendering, locking, and diagnostics.
+  `hm` for reads, writes, rendering, locking, and diagnostics.
 - **Human-legible by default**: a human can browse the memory root and understand
   it without running the CLI.
 - **Generated means disposable**: rendered files, search indexes, caches, and lock
   state are local or rebuildable unless explicitly marked canonical.
 - **Scope and privacy are first-class**: personal/work/project/agent-private scopes
   are metadata, not naming conventions only.
+- **Minimal required human maintenance**: agents should handle routine capture,
+  sync, indexing, compaction proposals, and rendering. Humans should review or
+  steer important memory changes, not babysit the system daily.
 
 ## Non-Goals
 
@@ -67,6 +73,70 @@ crippling.
 - Not a Git workflow requirement for memory writes.
 - Not a transcript-hoarding system. Transcripts can be imported/summarized, but
   long-term memory is curated and scoped.
+
+## Platform and Distribution Requirements
+
+Supported platforms for v1:
+
+- Linux
+- macOS
+- WSL
+
+The implementation and installer must support the same practical platform matrix
+as Chris's personal dotfiles/shdeps environment. The project should be
+installable as a normal `shdeps` dependency from personal dotfiles.
+
+Distribution requirements:
+
+- Publish precompiled release binaries for every supported platform.
+- Provide a `shdeps`-friendly install flow that can download the correct binary
+  for the current OS/architecture.
+- Keep source builds possible for contributors, but do not require Rust tooling
+  on every machine just to install/use `hm`.
+- CI should build/test/release the supported targets.
+
+Likely release artifacts:
+
+```text
+hm-aarch64-apple-darwin.tar.gz
+hm-x86_64-apple-darwin.tar.gz
+hm-x86_64-unknown-linux-gnu.tar.gz
+hm-aarch64-unknown-linux-gnu.tar.gz
+```
+
+WSL should use the Linux binaries. If musl builds are practical, prefer adding
+`x86_64-unknown-linux-musl` for broad Linux compatibility; otherwise document the
+glibc expectation clearly.
+
+## Implementation Language Recommendation
+
+Rust is a strong fit for this project.
+
+Why Rust fits:
+
+- fast startup and low runtime overhead for lifecycle hooks
+- single static-ish binary ergonomics for shdeps installation
+- strong cross-platform filesystem/path handling
+- good libraries for CLI parsing, TOML, Markdown/front matter, JSON, locking,
+  SQLite/FTS, and release automation
+- memory safety and explicit error handling for a tool that will touch lots of
+  user data
+- good learning opportunity without forcing a large app/runtime framework
+
+Recommended Rust stack:
+
+- `clap` for CLI
+- `serde`, `serde_json`, `toml` for config/events
+- `anyhow` for app errors; consider `thiserror` for library modules
+- `time` or `chrono` for timestamps
+- `uuid`/random suffix or ULID-style IDs for write paths
+- `pulldown-cmark` or plain text handling initially; avoid over-parsing Markdown
+- `rusqlite` or `tantivy` later for local search/indexing; start simple
+- `assert_cmd`, `predicates`, `tempfile` for CLI tests
+
+Keep the architecture modular but not framework-heavy: storage, writer, index,
+renderers, and compactor as clean modules under one binary crate at first. Split
+crates only after a second real consumer needs it.
 
 ## Configuration
 
@@ -104,8 +174,8 @@ for Chris, not a baked-in assumption.
 Environment override:
 
 ```bash
-HIVE_MEMORY_ROOT=/path/to/memory hive-memory search "..."
-HIVE_MEMORY_CONFIG=/path/to/config.toml hive-memory doctor
+HIVE_MEMORY_ROOT=/path/to/memory hm search "..."
+HIVE_MEMORY_CONFIG=/path/to/config.toml hm doctor
 ```
 
 ## Canonical Directory Layout
@@ -151,6 +221,26 @@ HIVE_MEMORY_CONFIG=/path/to/config.toml hive-memory doctor
     .gitignore
     # optional shared generated artifacts, but default generated output is local
 ```
+
+## Canonical Data Format
+
+Favor Markdown for durable human-readable memory. JSON is valuable for structured
+machine events, but should not become the only understandable source of truth.
+
+Recommended v1 approach:
+
+- Canonical human memory: `.md` files with small YAML/TOML-style front matter.
+- Structured event mirror: optional `.json` event files for reliable machine
+  processing, dedupe, and future indexing.
+- Local indexes: SQLite/FTS or other index files in local state/cache only,
+  rebuildable from canonical Markdown/events.
+
+This gives humans easy browsing/editing while giving agents enough structure to
+manage the hive safely.
+
+Raw memory must be durable and non-lossy: compaction creates summaries and
+curated updates, but does not delete raw notes/events by default. Retention or
+archival policy should be explicit and opt-in.
 
 ### Manifest
 
@@ -296,24 +386,24 @@ The CLI may write both: a markdown note for humans and a JSON event for machines
 Agent-optimized commands:
 
 ```bash
-hive-memory context [--agent codex] [--project PATH] [--max-tokens N]
-hive-memory remember --scope personal --text "..."
-hive-memory note --scope project --project PATH --text "..."
-hive-memory search "query" [--scope personal,project]
-hive-memory render [claude|codex|openclaw|gemini|all]
-hive-memory sync --quiet
-hive-memory compact [--scope personal|project] [--dry-run]
-hive-memory doctor
+hm context [--agent codex] [--project PATH] [--max-tokens N]
+hm remember --scope personal --text "..."
+hm note --scope project --project PATH --text "..."
+hm search "query" [--scope personal,project]
+hm render [claude|codex|openclaw|gemini|all]
+hm sync --quiet
+hm compact [--scope personal|project] [--dry-run]
+hm doctor
 ```
 
 Human-optimized commands:
 
 ```bash
-hive-memory open
-hive-memory inbox
-hive-memory promote <note-id>
-hive-memory edit global/MEMORY.md
-hive-memory status
+hm open
+hm inbox
+hm promote <note-id>
+hm edit global/MEMORY.md
+hm status
 ```
 
 ## Adapter Model
@@ -324,7 +414,7 @@ Adapters render canonical memory into the format each agent expects.
 
 - Render global rules into `~/.claude/CLAUDE.md` or an included/generated block.
 - Optionally render project memories for Claude project directories.
-- Claude hooks call generic `hive-memory`, not Claude-only sync code.
+- Claude hooks call generic `hm`, not Claude-only sync code.
 
 ### Codex
 
@@ -363,10 +453,10 @@ Untracked / machine-local:
 
 Merge hook behavior:
 
-1. ensure `hive-memory` CLI is installed or available
+1. ensure `hm` CLI is installed or available
 2. materialize config from template + local overrides
-3. run `hive-memory doctor --quick`
-4. run `hive-memory render all --quiet`
+3. run `hm doctor --quick`
+4. run `hm render all --quiet`
 
 ## Backend Flexibility
 
@@ -463,9 +553,8 @@ selection. Default should be conservative.
 
 ## Open Questions
 
-- Final repo name: `hive-memory`.
-- Should `hm` be installed as a symlink, shell alias, or tiny wrapper? Prefer symlink/wrapper so agents can rely on it outside interactive shells.
-- Implementation language: shell+Python for portability, or Rust/Go for single
-  binary ergonomics?
+- Final repo name: `hive-memory`; primary binary: `hm`.
+- Should `hive-memory` be a symlink to `hm`, a wrapper, or omitted after v1?
+- Implementation language: Rust is favored; validate release target ergonomics before implementation.
 - Should the default canonical store include JSON events, markdown notes, or both?
 - Should compaction be manual-only at first, or allowed from trusted agents?
