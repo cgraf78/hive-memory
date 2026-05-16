@@ -559,22 +559,25 @@ providing enough structure for indexing, compaction, and diagnostics.
 
 ### Raw note
 
-Human-readable markdown with front matter:
+Human-readable markdown with TOML front matter (delimited by `+++`). TOML
+keeps the structured-metadata format consistent with config and manifests
+and avoids the unmaintained `serde_yaml` dependency:
 
 ```markdown
----
-type: note
-entry_kind: remember # remember|note
-id: 20260516T154233.184921Z_taylor_12345_codex_a8f31c
-created_at: 2026-05-16T15:42:33.184921Z
-agent_id: codex
-host_id: taylor
-session_id: abc123
-scope: global
-project_id: ds
-tags: [preference, workflow]
-confidence: high
----
++++
+type = "note"
+entry_kind = "remember"   # remember|note
+id = "20260516T154233.184921Z_taylor_12345_codex_a8f31c"
+created_at = "2026-05-16T15:42:33.184921Z"
+agent_id = "codex"
+host_id = "taylor"
+session_id = "abc123"
+scope = "global"
+project_id = "github-com-cgraf78-hive-memory-018f5f57"
+tags = ["preference", "workflow"]
+confidence = "high"
+audience = []             # non-empty for agent-private notes
++++
 
 Chris prefers ...
 ```
@@ -592,6 +595,7 @@ JSON for reliable machine processing:
   "host_id": "taylor",
   "scope": "global",
   "subject": "workflow.preference",
+  "audience": [],
   "body": "...",
   "source": {
     "kind": "session",
@@ -602,6 +606,8 @@ JSON for reliable machine processing:
 
 The CLI writes the Markdown note as the canonical record. It may also write a
 JSON sidecar/event from the same operation when structured processing needs it.
+When both files share an `id`, they form ONE logical record; search/context
+collapse the pair into a single hit.
 
 ## CLI Surface
 
@@ -613,14 +619,17 @@ automation gets something wrong.
 Agent-optimized commands:
 
 ```bash
-hm context [--agent codex] [--project PATH] [--max-tokens N]
-hm remember --scope global --text "..."
+hm context [--agent codex] [--project PATH] [--max-tokens N] [--include-inbox]
+hm remember --scope global --text "..." [--audience codex]
 hm note --scope project --project PATH --text "..."
-hm search "query" [--scope global,project] [--stores personal,work]
+hm search "query" [--scope global,project] [--stores personal,work] [--include-inbox]
 hm render [claude|codex|openclaw|gemini|all]
-hm sync --quiet
+hm render claude --install        # add @import line to ~/.claude/CLAUDE.md
+hm flush [--quiet] [--bind <id> --store <name>]
 hm compact [--scope global|project] [--dry-run]
 hm stores list
+hm stores migrate [--dry-run]
+hm projects list
 hm doctor
 ```
 
@@ -628,11 +637,15 @@ Human-optimized commands:
 
 ```bash
 hm open
-hm inbox
-hm promote <note-id>
+hm inbox [list|stale|show]
+hm promote <note-id> [--to <curated-file>]
+hm projects alias <old-id> <new-id>
 hm edit global/MEMORY.md
 hm status
 ```
+
+`hm sync` is renamed to `hm flush` to avoid confusion with cloud-drive sync.
+`hm outbox flush` is an alias.
 
 ## Adapter Model
 
@@ -765,33 +778,40 @@ If final path exists, generate a new random suffix and retry. Log a warning.
 
 It reports and can quarantine them.
 
-### Curated memory edited while compactor runs
+### Curated memory edited while curator runs
 
-Compactor reads current file hash before edit. Before writing, it re-reads and
-verifies hash. If changed, abort or rebase.
+V1 curated writes (`hm promote`, `hm edit`, future `hm compact --apply`) are
+SINGLE-USER per store. The curator acquires a LOCAL fcntl/flock on the target
+file, reads the current hash before edit, and re-checks the hash before
+writing. Cross-host curated coordination is deferred to v2; cloud-drive lock
+directories with TTL are NOT real distributed locks and are not used as such.
+README and `hm doctor` warn: "Do not run `hm promote` on two hosts
+simultaneously against the same store."
 
 ### Agent crashes mid-write
 
 Temp file remains. `doctor` removes/quarantines stale `.tmp.*` files older than
 TTL.
 
-### Agent crashes holding compaction lock
-
-Lock has `expires_at`. Later compactor may recover after TTL if process is gone
-or host is unreachable and timeout passed.
-
 ### Backend unavailable
 
-CLI writes to local outbox in `state_dir/outbox/`, then flushes when the active
-store root returns. This is optional but important for laptop/offline ergonomics.
-`hm sync` means flush/reconcile local hive-memory state; filesystem/cloud-drive
-backends still rely on their own sync engine for cross-machine transport.
+CLI writes to local outbox in `data_dir/outbox/` (XDG_DATA_HOME, not
+XDG_STATE_HOME — pending memory is durable user data, not ephemeral state).
+On successful flush, `hm flush` also writes a snapshot to
+`<store-root>/.outbox-archive/<host-id>/<date>/` as a safety net that survives
+local data-dir wipe. The filesystem/cloud-drive backend still relies on its
+own sync engine for cross-machine transport; `hm flush` only handles
+hive-memory's own outbox.
 
 ### Wrong-store writes
 
-If a session is in a context configured for a non-default store, hooks should pass
-`--store <name>` explicitly. `hm context` output should include the active store
-name so agents can notice if they are about to write to the wrong hive.
+If a session is configured for a non-default store, hooks pass `--store <name>`
+explicitly. `hm context` output includes the active store name so agents can
+notice when a write is targeting the wrong store. Offline writes whose target store manifest identity is
+unknown are enqueued with `state = "unbound"` and NEVER auto-flush; they
+require explicit reconciliation via `hm flush --bind <outbox-id> --store <name>`.
+There is no `--force` escape hatch for unbound items: that's the point of the
+unbound state.
 
 ### Cross-store leakage
 
@@ -815,12 +835,23 @@ In scope for v1:
 - filesystem backend
 - TOML config with CLI/env/local/main/default precedence
 - one required default store plus optional named stores
-- append-only Markdown notes
-- optional JSON sidecar/event files for structured processing
-- simple text search over canonical files
-- context rendering for Claude and Codex first
-- doctor diagnostics for config, roots, temp files, conflicts, and permissions
-- local outbox plus `hm sync` flush for offline writes
+- append-only Markdown notes with TOML front matter
+- JSON sidecar/event files for structured processing (paired with Markdown by ID)
+- simple text search over canonical files, backed by a local triage index
+- context rendering for Claude (with `--install` for `@import` line) and Codex
+- trust-boundary rendering: source-labeled blocks, raw inbox excluded by default
+- `hm promote` + `hm inbox` curation workflow (single-user per store)
+- doctor diagnostics for config, roots, temp files, conflicts, permissions,
+  trust-boundary patterns, audience presence, secret-on-cloud refusal
+- local outbox in XDG_DATA_HOME plus `hm flush` for offline writes, with
+  per-store `.outbox-archive/` snapshot on flush
+- performance budget (`hm context` p95 ≤ 200ms warm / ≤ 500ms cold on a
+  5000-note store) enforced by CI integration tests
+- cloud-sync simulation test harness as a dedicated CI job
+- explicit schema-migration contract (`hm stores migrate` scaffolded; no
+  migrators ship in v1)
+- stable 1.0 contract surface (config/manifest/front-matter/event schemas,
+  exit codes, `--json` shapes, marker syntax)
 - GitHub Actions release binaries for supported platforms
 - shdeps-friendly install snippet/artifacts
 
@@ -829,16 +860,19 @@ Explicitly out of scope for v1:
 - vector/semantic search as a required dependency
 - non-filesystem backends
 - automatic model-driven compaction without review
+- cross-host curated writes (compaction-apply, multi-host `hm promote`)
 - cross-store writes in a single command
 - background daemon/service
 - encrypted-at-rest store format
 - Git as a required backend or write path
 - full transcript ingestion as default behavior
 - every possible agent adapter
+- trusted-writer enforcement (`[trust] allowed_writers` is post-v1)
 
 Why this cut line: the risky parts are filesystem safety, store selection,
-rendering boundaries, and install ergonomics. Those should be solved before
-adding smarter search, compaction, or remote backends.
+trust-boundary rendering, install ergonomics, and the 1.0 stability surface.
+Those should be solved before adding smarter search, compaction, or remote
+backends.
 
 ## V1 Specification
 
@@ -852,21 +886,29 @@ SPEC.md conflict, prefer SPEC.md for v1 behavior and update both deliberately.
 
 ## MVP Plan
 
-The MVP should validate the hardest architectural bets first: configurable
-stores, safe concurrent writes, readable canonical memory, and useful rendered
-context for the two primary coding agents. Smarter compaction and richer search
-can build on that foundation.
+The MVP validates the hardest architectural bets first: configurable stores,
+safe concurrent writes, readable canonical memory, trust-boundary rendering,
+and useful rendered context for the two primary coding agents. The detailed
+issue order lives in SPEC.md; the broad sequencing here is:
 
-1. Build `hive-memory` as a standalone repo.
-2. Implement filesystem backend with configurable named stores and a required
-   default store.
-3. Implement collision-safe `note`, `remember`, `search`, `context`, `stores`,
-   and `doctor`.
-4. Implement Claude and Codex render adapters first.
-5. Wire through dotfiles hooks.
-6. Add local outbox and `hm sync` flush behavior.
-7. Add release artifacts and shdeps install support for v1 release.
-8. Defer `hm import claude-memory`, compaction proposals, and OpenClaw adapter until core v1 is stable.
+1. Validate the `hm` binary-name namespace before cementing CLI examples.
+2. Build `hive-memory` as a standalone Rust crate with CI scaffolding.
+3. Implement config loader (with cloud-root secret refusal) and store
+   initialization (manifest schema + `hm stores migrate` scaffold).
+4. Implement collision-safe atomic writer, Markdown note writer (TOML front
+   matter), JSON event sidecar with pairing.
+5. Implement the local triage index in `cache/indexes/` and doctor diagnostics.
+6. Implement `hm search` and `hm context` (curated-by-default, data-boundary
+   blocks, performance budget).
+7. Implement adapter render framework (magic header + sha256 marker) and the
+   Claude `--install` flow (with backup, idempotent markers, symlink refusal).
+8. Implement Codex adapter, local outbox under XDG_DATA_HOME, `hm flush` with
+   unbound-state handling, `hm promote`, and `hm inbox`.
+9. Add trust-boundary doctor patterns, cloud-sync simulation harness, and
+   performance benchmark suite to CI.
+10. Wire dotfiles hooks; add release artifacts and shdeps install support.
+11. Defer `hm import claude-memory`, compaction proposals, OpenClaw adapter,
+    cross-host curated writes, and at-rest encryption until core v1 stabilizes.
 
 ## Settled Decisions
 
@@ -874,10 +916,32 @@ can build on that foundation.
 - Primary binary: `hm`.
 - Implementation language: Rust.
 - Config format: TOML.
-- Canonical human memory format: Markdown.
+- Canonical human memory format: Markdown with TOML front matter (`+++` delimiters).
 - Structured machine event format: JSON where useful.
-- Local indexes/caches are rebuildable and not canonical.
+- Note/event pairs (same `id`) collapse into one logical record.
+- Local indexes/caches are rebuildable and not canonical; they live in
+  `cache_dir` not `state_dir`.
+- Outbox is durable user data: lives under `data_dir` (XDG_DATA_HOME) with a
+  per-store `.outbox-archive/` snapshot for crash recovery.
 - Multiple named stores are supported, with one required default store.
+- `hm sync` is renamed to `hm flush` (`hm outbox flush` alias). Flush is local;
+  cloud-drive transport is the user's sync engine.
+- Project identity derives from a normalized git remote URL hash with optional
+  `.hive-memory-project` override and `aliases.toml` chain for rename survival.
+- v1 curated writes are SINGLE-USER per store. Cross-host curated coordination
+  is deferred.
+- `hm context` default sources are `["curated"]`; raw inbox is opt-in
+  (`--include-inbox`) under the trust-boundary model.
+- Agent-private scope is enforced via an explicit `audience` field; the writer
+  is the default audience when none is provided.
+- Adapter render uses a magic-header + sha256 generated-file marker; Claude
+  adapter installs an `@hive-memory.generated.md` line into `~/.claude/CLAUDE.md`
+  with backup and idempotent markers.
+- `secret`-sensitivity stores refuse cloud-synced root paths by default.
+- v1 ships a CI-enforced performance budget for `hm context`/`hm search`/`hm flush`.
+- The 1.0 stability surface is explicitly scoped in SPEC.md "Stability Contracts"
+  (schemas, exit codes, `--json` shapes, marker syntax); search ranking, context
+  ordering, token heuristic, and human-text output are free to evolve in 1.x.
 
 ## Deferred Decisions
 
@@ -885,6 +949,26 @@ can build on that foundation.
   v1. `hm` remains the primary documented command either way.
 - Whether v1 releases should include musl Linux binaries in addition to glibc
   binaries.
-- Exact local search/index implementation after the simple text-search MVP.
+- Exact local FTS implementation when post-v1 demand exceeds the v1 triage
+  index. SQLite/FTS remains the leading candidate.
 - Default compaction policy: manual approval only, trusted-agent proposals, or
   trusted-agent automatic compaction with review logs.
+- `[trust] allowed_writers` enforcement (restrict which `agent_id` values may
+  write at all) — schema-prepared but not enforced in v1.
+- Whether at-rest encryption is added in v2 for `secret`-sensitivity stores, or
+  whether `secret` remains permissions+exclusion-based indefinitely.
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | — |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | CLEAR (PLAN) | 24 issues raised + resolved (8 in primary review, 16 from codex outside-voice) |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | — |
+| Outside Voice | `/codex review` | Independent 2nd opinion | 1 | issues_found | 16 codex findings: 2 P0, 9 P1, 4 P2, 1 P3 — all addressed in this update |
+| DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
+
+- **CODEX:** 16 substantive findings, all 16 addressed in spec updates. 2 cross-model tensions (perf budget D8 vs index-required-for-budget; project ID D2 vs URL stability) resolved by tightening D11 (lightweight local triage index) and D12 (URL normalization + opt-in override + alias chain).
+- **CROSS-MODEL:** strong overlap on scope-and-safety boundaries. Primary review caught integration wiring + naming + format choices; codex caught threat-model + durability + audience-enforcement gaps. Net: no contradictions remain.
+- **UNRESOLVED:** 0. Every finding has a recorded decision and a spec edit.
+- **VERDICT:** ENG CLEARED — ready to begin issue filing per the updated SPEC.md "Recommended Implementation Issues" list. The 24 decisions are captured in SPEC.md (normative) and reflected in PLAN.md "Settled Decisions" (rationale). Implementation tasks artifact: `~/.gstack/projects/cgraf78-hive-memory/tasks-eng-review-*.jsonl`.
