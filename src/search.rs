@@ -5,7 +5,7 @@
 //! of truth for memory text.
 
 use crate::index::IndexEntry;
-use crate::note;
+use crate::{note, visibility};
 use std::error::Error;
 use std::fmt::{self, Display};
 use std::fs;
@@ -100,7 +100,7 @@ pub fn search(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
         if !scope_allowed(entry, input.scopes) {
             continue;
         }
-        if !audience_allowed(entry, input.agent_id) {
+        if !visibility::audience_allows(entry, input.agent_id) {
             continue;
         }
 
@@ -143,22 +143,6 @@ fn source_allowed(entry: &IndexEntry, include_inbox: bool) -> bool {
 
 fn scope_allowed(entry: &IndexEntry, scopes: &[String]) -> bool {
     scopes.is_empty() || scopes.iter().any(|scope| scope == &entry.scope)
-}
-
-fn audience_allowed(entry: &IndexEntry, agent_id: Option<&str>) -> bool {
-    if entry.scope != "agent-private" {
-        return true;
-    }
-
-    let Some(agent_id) = agent_id else {
-        return false;
-    };
-
-    if entry.audience.is_empty() {
-        return entry.agent_id == agent_id;
-    }
-
-    entry.audience.iter().any(|audience| audience == agent_id)
 }
 
 fn occurrence_count(body: &str, query: &str) -> usize {
