@@ -360,3 +360,205 @@ fn note_respects_never_sidecar_default() {
     assert!(note.contains("entry_kind = \"note\""));
     assert!(!stdout.contains("event:"));
 }
+
+#[test]
+fn search_finds_remembered_note() {
+    let dir = temp_dir("search");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Search should find TOML preferences.",
+        ])
+        .assert()
+        .success();
+
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "toml",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hits: 1"))
+        .stdout(predicate::str::contains(
+            "snippet: Search should find TOML preferences.",
+        ));
+}
+
+#[test]
+fn search_requires_include_inbox_for_raw_note() {
+    let dir = temp_dir("search-include-inbox");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "{}"
+
+            [stores.work]
+            root = "{}"
+
+            [defaults]
+            event_sidecar = "never"
+            "#,
+            personal.display(),
+            work.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    let mut note = cargo_bin_cmd!("hm");
+    note.args([
+        "--config",
+        config.to_str().expect("utf8 config"),
+        "note",
+        "--text",
+        "Raw note mentions TOML.",
+    ])
+    .assert()
+    .success();
+
+    let mut default_search = cargo_bin_cmd!("hm");
+    default_search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "toml",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hits: 0"));
+
+    let mut inbox_search = cargo_bin_cmd!("hm");
+    inbox_search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "toml",
+            "--include-inbox",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hits: 1"))
+        .stdout(predicate::str::contains("snippet: Raw note mentions TOML."));
+}
+
+#[test]
+fn search_uses_configured_default_scopes() {
+    let dir = temp_dir("search-default-scopes");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--scope",
+            "scratch",
+            "--text",
+            "Scratch TOML memory.",
+        ])
+        .assert()
+        .success();
+
+    let mut default_search = cargo_bin_cmd!("hm");
+    default_search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "toml",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hits: 0"));
+
+    let mut scoped_search = cargo_bin_cmd!("hm");
+    scoped_search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "toml",
+            "--scope",
+            "scratch",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hits: 1"));
+}
+
+#[test]
+fn search_enforces_agent_read_store_policy() {
+    let dir = temp_dir("search-agent-read-policy");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "{}"
+
+            [stores.work]
+            root = "{}"
+
+            [agents.codex]
+            default_store = "personal"
+            read_stores = ["personal"]
+            write_stores = ["personal"]
+            "#,
+            personal.display(),
+            work.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&work, "work");
+
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "--store",
+            "work",
+            "search",
+            "toml",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "agent codex may not read store work",
+        ));
+}

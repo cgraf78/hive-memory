@@ -7,7 +7,7 @@
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use hive_memory::config::{Config, ConfigPaths, EventSidecarPolicy, Sensitivity};
-use hive_memory::{memory, note, store, write};
+use hive_memory::{index, memory, note, search, store, write};
 use std::path::PathBuf;
 use std::str::FromStr;
 use time::OffsetDateTime;
@@ -51,6 +51,8 @@ enum Command {
     Remember(WriteMemoryArgs),
     /// Write a lower-confidence raw note.
     Note(WriteMemoryArgs),
+    /// Search remembered memory.
+    Search(SearchArgs),
 }
 
 /// Store lifecycle commands.
@@ -153,6 +155,22 @@ struct WriteMemoryArgs {
     no_event: bool,
 }
 
+/// Arguments for `hm search`.
+#[derive(Debug, Args)]
+struct SearchArgs {
+    /// Case-insensitive substring query.
+    query: String,
+    /// Maximum hits to show.
+    #[arg(long, default_value_t = 20)]
+    limit: usize,
+    /// Include lower-confidence raw `hm note` entries.
+    #[arg(long)]
+    include_inbox: bool,
+    /// Optional comma-separated scope filter.
+    #[arg(long, value_delimiter = ',')]
+    scope: Vec<String>,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let context = CliContext {
@@ -164,6 +182,7 @@ fn main() -> Result<()> {
         Some(Command::Stores(command)) => run_stores(command, context.config_path),
         Some(Command::Remember(args)) => run_write_memory(note::EntryKind::Remember, args, context),
         Some(Command::Note(args)) => run_write_memory(note::EntryKind::Note, args, context),
+        Some(Command::Search(args)) => run_search(args, context),
         None => Ok(()),
     }
 }
@@ -254,8 +273,12 @@ fn run_write_memory(
 ) -> Result<()> {
     let config = load_config(context.config_path.as_deref())?;
     let agent_id = resolve_agent_id(context.as_agent);
-    let resolved_store =
-        resolve_write_store(&config, context.store.as_deref(), agent_id.as_deref())?;
+    let resolved_store = resolve_store(
+        &config,
+        context.store.as_deref(),
+        agent_id.as_deref(),
+        StoreAccess::Write,
+    )?;
     let store_config = &config.stores[resolved_store.name.as_str()];
     let manifest = store::read_manifest(&store_config.root)?;
     let created_at = OffsetDateTime::now_utc();
@@ -306,6 +329,66 @@ fn run_write_memory(
     println!("note: {}", result.note_path.display());
     if let Some(path) = result.event_path {
         println!("event: {}", path.display());
+    }
+    Ok(())
+}
+
+fn run_search(args: SearchArgs, context: CliContext) -> Result<()> {
+    let config = load_config(context.config_path.as_deref())?;
+    let agent_id = resolve_agent_id(context.as_agent);
+    let resolved_store = resolve_store(
+        &config,
+        context.store.as_deref(),
+        agent_id.as_deref(),
+        StoreAccess::Read,
+    )?;
+    let store_config = &config.stores[resolved_store.name.as_str()];
+    let options = write::AtomicWriteOptions {
+        fsync: config.storage.fsync.into(),
+        ..write::AtomicWriteOptions::default()
+    };
+    // Rebuild before searching so this first read path is correct even when
+    // notes were edited by another process. A future lazy index can optimize
+    // this behind the same library boundary without changing the CLI contract.
+    let report = index::rebuild_index(index::RebuildIndexInput {
+        store_name: resolved_store.name.as_str(),
+        store_root: &store_config.root,
+        cache_dir: &config.cache_dir,
+        options,
+    })?;
+    for warning in &report.warnings {
+        eprintln!("warning: {}: {}", warning.path.display(), warning.message);
+    }
+
+    let scopes = if args.scope.is_empty() {
+        config.defaults.search_scopes.clone()
+    } else {
+        args.scope
+    };
+    let include_inbox = args.include_inbox
+        || config
+            .defaults
+            .context_sources
+            .iter()
+            .any(|source| source == "inbox" || source == "all");
+
+    let hits = search::search(search::SearchInput {
+        store_root: &store_config.root,
+        entries: &report.entries,
+        query: &args.query,
+        scopes: &scopes,
+        include_inbox,
+        agent_id: agent_id.as_deref(),
+        limit: args.limit,
+    })?;
+
+    println!("store: {}", resolved_store.name);
+    println!("hits: {}", hits.len());
+    for hit in hits {
+        println!("id: {}", hit.entry.id);
+        println!("score: {}", hit.score);
+        println!("note: {}", hit.entry.note_path);
+        println!("snippet: {}", hit.snippet);
     }
     Ok(())
 }
@@ -417,10 +500,22 @@ struct ResolvedStore {
     name: String,
 }
 
-fn resolve_write_store(
+enum StoreAccess {
+    Read,
+    Write,
+}
+
+/// Resolve the single store a CLI command should use and enforce agent policy.
+///
+/// All one-store commands share the same precedence: explicit `--store`, then
+/// `HIVE_MEMORY_STORE`, then the active agent's configured default store, then
+/// the global default. Centralizing that order keeps read and write commands
+/// from drifting as the command surface grows.
+fn resolve_store(
     config: &Config,
     explicit_store: Option<&str>,
     agent_id: Option<&str>,
+    access: StoreAccess,
 ) -> Result<ResolvedStore> {
     let name = if let Some(store) = explicit_store {
         store.to_owned()
@@ -438,10 +533,14 @@ fn resolve_write_store(
 
     if let Some(agent_id) = agent_id {
         let policy = config.effective_agent_policy(agent_id);
-        if !policy.write_stores.iter().any(|store| store == &name) {
+        let (allowed_stores, access_name) = match access {
+            StoreAccess::Read => (&policy.read_stores, "read"),
+            StoreAccess::Write => (&policy.write_stores, "write"),
+        };
+        if !allowed_stores.iter().any(|store| store == &name) {
             anyhow::bail!(
-                "agent {agent_id} may not write store {name}; configured write stores: {}",
-                policy.write_stores.join(",")
+                "agent {agent_id} may not {access_name} store {name}; configured {access_name} stores: {}",
+                allowed_stores.join(",")
             );
         }
     }
