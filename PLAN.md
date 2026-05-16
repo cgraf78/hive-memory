@@ -10,11 +10,11 @@ The project should avoid assumptions about one person, one agent, Claude Code,
 Google Drive, or any specific machine layout. Those are adapters/config, not core
 architecture.
 
-The primary binary should be `hm` for agent/human ergonomics. `hive-memory` may
-be installed as a compatibility alias/wrapper for discoverability, but docs and
-hooks should prefer `hm` once the command surface is stable. Local checks found
-no obvious `hm` binary collision on the current Linux host; release planning
-should still check Homebrew/Apt/common CLI namespaces before finalizing.
+The primary binary is `hm` for agent/human ergonomics. `hive-memory` may be
+installed as a compatibility alias/wrapper for discoverability, but docs and
+hooks should prefer `hm`. Local checks found no obvious `hm` binary collision on
+the current Linux host; release planning should still check
+Homebrew/Apt/common CLI namespaces before the first public release.
 
 ## Design Principles
 
@@ -50,8 +50,9 @@ crippling.
 - **Storage is configurable**: the backend memory root is a config value, not a
   hard-coded path. It may live in Google Drive, Dropbox, Syncthing, a network
   mount, a plain local directory, or a repo checkout.
-- **Plain files are the source of truth**: canonical memory is markdown/TOML/JSONL
-  in a normal directory tree. Indexes and generated views are rebuildable.
+- **Plain files are the source of truth**: canonical memory is Markdown plus
+  small TOML/JSON metadata files in a normal directory tree. Indexes and
+  generated views are rebuildable.
 - **Append-only writes first**: agents write new immutable event/note files rather
   than editing shared hot files. Curated memory is updated by explicit compaction.
 - **Adapters are edges**: Claude, Codex, OpenClaw, Gemini, etc. consume rendered
@@ -106,13 +107,13 @@ hm-x86_64-unknown-linux-gnu.tar.gz
 hm-aarch64-unknown-linux-gnu.tar.gz
 ```
 
-WSL should use the Linux binaries. If musl builds are practical, prefer adding
-`x86_64-unknown-linux-musl` for broad Linux compatibility; otherwise document the
-glibc expectation clearly.
+WSL should use the Linux binaries. Musl Linux binaries are a deferred release
+decision. If they are practical, add `x86_64-unknown-linux-musl` for broad Linux
+compatibility; otherwise document the glibc expectation clearly.
 
-## Implementation Language Recommendation
+## Implementation Language
 
-Rust is a strong fit for this project.
+Rust is the planned implementation language for this project.
 
 Why Rust fits:
 
@@ -125,15 +126,15 @@ Why Rust fits:
   user data
 - good learning opportunity without forcing a large app/runtime framework
 
-Recommended Rust stack:
+Planned Rust stack:
 
 - `clap` for CLI
 - `serde`, `serde_json`, `toml` for config/events
 - `anyhow` for app errors; consider `thiserror` for library modules
 - `time` or `chrono` for timestamps
 - `uuid`/random suffix or ULID-style IDs for write paths
-- `pulldown-cmark` or plain text handling initially; avoid over-parsing Markdown
-- `rusqlite` or `tantivy` later for local search/indexing; start simple
+- plain text/front-matter handling initially; add Markdown parsing only when needed
+- simple text search first; `rusqlite`/SQLite FTS later for local indexing
 - `assert_cmd`, `predicates`, `tempfile` for CLI tests
 
 Keep the architecture modular but not framework-heavy: storage, writer, index,
@@ -146,8 +147,8 @@ Default config path:
 
 ```toml
 # ~/.config/hive-memory/config.toml
-# TOML is preferred for hand-edited config. JSON may be supported later for
-# generated machine config, but TOML is the v1 human-facing format.
+# TOML is the v1 config format because it is human-editable, comment-friendly,
+# and Rust-native via serde. JSON is reserved for structured events/metadata.
 
 default_store = "personal"
 state_dir = "${XDG_STATE_HOME:-${HOME}/.local/state}/hive-memory"
@@ -209,8 +210,9 @@ Core env vars:
 
 ```bash
 HIVE_MEMORY_CONFIG=/path/to/config.toml       # config file path
-HIVE_MEMORY_ROOT=/path/to/root                # shorthand root for default store
+HIVE_MEMORY_ROOT=/path/to/root                # shorthand root override for active/default store
 HIVE_MEMORY_STORE=personal                    # active store if --store omitted
+HIVE_MEMORY_STORE_PERSONAL_ROOT=/path/to/root # per-store root override
 HIVE_MEMORY_STATE_DIR=/path/to/state
 HIVE_MEMORY_CACHE_DIR=/path/to/cache
 HIVE_MEMORY_HOST_ID=taylor
@@ -242,15 +244,15 @@ HIVE_MEMORY_LOG=warn                          # error|warn|info|debug|trace
 Examples:
 
 ```bash
-HIVE_MEMORY_ROOT=/path/to/memory hm --store personal search "..."
+HIVE_MEMORY_ROOT=/path/to/memory hm search "..."
 HIVE_MEMORY_CONFIG=/path/to/config.toml HIVE_MEMORY_STORE=work hm doctor
 HIVE_MEMORY_AGENT_ID=codex HIVE_MEMORY_SESSION_ID=abc123 hm remember --text "..."
 ```
 
 ## Multiple Stores
 
-`hive-memory` should support multiple named memory stores. There is always one
-configured default store, but commands may target another store explicitly.
+`hive-memory` supports multiple named memory stores. There is always one
+configured default store, and commands can target another store explicitly.
 
 Use cases:
 
@@ -280,7 +282,7 @@ Rules:
 - Adapters declare which stores they include, and the default should be
   conservative.
 - Cross-store search/context is opt-in via `--all-stores` or explicit
-  `--store a --store b`.
+  `--stores a,b`. The singular `--store` selects the active write/render store.
 - Notes/events record their `store_id` in front matter/JSON metadata.
 - Compaction and locks are per-store unless a future cross-store operation is
   explicitly requested.
@@ -329,19 +331,22 @@ personal store into a work/client context, must require explicit config.
 
   generated/
     .gitignore
-    # optional shared generated artifacts, but default generated output is local
+    # only explicit shared generated artifacts live here; default generated
+    # adapter output stays local and rebuildable
 ```
 
 ## Canonical Data Format
 
-Favor Markdown for durable human-readable memory. JSON is valuable for structured
-machine events, but should not become the only understandable source of truth.
+Markdown is the canonical durable human-readable memory format. JSON is used for
+structured machine events/metadata when it adds value, but should not become the
+only understandable source of truth.
 
-Recommended v1 approach:
+V1 format decisions:
 
-- Canonical human memory: `.md` files with small YAML/TOML-style front matter.
-- Structured event mirror: optional `.json` event files for reliable machine
-  processing, dedupe, and future indexing.
+- Canonical human memory: `.md` files with small front matter.
+- Config and manifests: `.toml`.
+- Structured machine events: `.json` files when useful for reliable processing,
+  dedupe, and future indexing.
 - Local indexes: SQLite/FTS or other index files in local state/cache only,
   rebuildable from canonical Markdown/events.
 
@@ -350,7 +355,7 @@ manage the hive safely.
 
 Raw memory must be durable and non-lossy: compaction creates summaries and
 curated updates, but does not delete raw notes/events by default. Retention or
-archival policy should be explicit and opt-in.
+archival policy is explicit and opt-in.
 
 ### Manifest
 
@@ -360,7 +365,7 @@ created_by = "hive-memory"
 
 [store]
 id = "<uuid>"
-name = "default"
+name = "personal"
 
 [policies]
 allow_direct_curated_edits = false
@@ -489,7 +494,8 @@ JSON for reliable machine processing:
 }
 ```
 
-The CLI may write both: a markdown note for humans and a JSON event for machines.
+The CLI writes the Markdown note as the canonical record. It may also write a
+JSON sidecar/event from the same operation when structured processing needs it.
 
 ## CLI Surface
 
@@ -499,7 +505,7 @@ Agent-optimized commands:
 hm context [--agent codex] [--project PATH] [--max-tokens N]
 hm remember --scope personal --text "..."
 hm note --scope project --project PATH --text "..."
-hm search "query" [--scope personal,project]
+hm search "query" [--scope personal,project] [--stores personal,work]
 hm render [claude|codex|openclaw|gemini|all]
 hm sync --quiet
 hm compact [--scope personal|project] [--dry-run]
@@ -567,7 +573,7 @@ Merge hook behavior:
 1. ensure `hm` CLI is installed or available
 2. materialize config from template + local overrides
 3. run `hm doctor --quick`
-4. run `hm render all --quiet`
+4. run `hm render --configured --quiet`
 
 ## Backend Flexibility
 
@@ -618,7 +624,7 @@ If final path exists, generate a new random suffix and retry. Log a warning.
 
 ### Cloud provider creates conflict copies
 
-`hive-memory doctor` detects names like:
+`hm doctor` detects names like:
 
 - `conflicted copy`
 - `Conflict`
@@ -644,8 +650,10 @@ or host is unreachable and timeout passed.
 
 ### Backend unavailable
 
-CLI writes to local outbox in `state_dir/outbox/`, then flushes when root returns.
-This is optional but important for laptop/offline ergonomics.
+CLI writes to local outbox in `state_dir/outbox/`, then flushes when the active
+store root returns. This is optional but important for laptop/offline ergonomics.
+`hm sync` means flush/reconcile local hive-memory state; filesystem/cloud-drive
+backends still rely on their own sync engine for cross-machine transport.
 
 ### Wrong-store writes
 
@@ -664,20 +672,35 @@ adapter target.
 Every note has scope metadata. Adapter render commands require explicit scope
 selection. Default should be conservative.
 
-## Recommendation for MVP
+## MVP Plan
 
 1. Build `hive-memory` as a standalone repo.
-2. Implement filesystem backend with configurable named stores and a required default store.
-3. Implement collision-safe `note`, `remember`, `search`, `context`, `stores`, `doctor`.
+2. Implement filesystem backend with configurable named stores and a required
+   default store.
+3. Implement collision-safe `note`, `remember`, `search`, `context`, `stores`,
+   and `doctor`.
 4. Implement Claude and Codex render adapters first.
 5. Wire through dotfiles hooks.
-6. Migrate existing Claude `memory-sync` data with `import-claude`.
+6. Add `hm import claude-memory` for existing Claude `memory-sync` data.
 7. Add OpenClaw adapter after Claude/Codex path is stable.
 
-## Open Questions
+## Settled Decisions
 
-- Final repo name: `hive-memory`; primary binary: `hm`.
-- Should `hive-memory` be a symlink to `hm`, a wrapper, or omitted after v1?
-- Implementation language: Rust is favored; validate release target ergonomics before implementation.
-- Should the default canonical store include JSON events, markdown notes, or both? Current preference: Markdown canonical plus optional JSON event mirror.
-- Should compaction be manual-only at first, or allowed from trusted agents?
+- Repo name: `hive-memory`.
+- Primary binary: `hm`.
+- Implementation language: Rust.
+- Config format: TOML.
+- Canonical human memory format: Markdown.
+- Structured machine event format: JSON where useful.
+- Local indexes/caches are rebuildable and not canonical.
+- Multiple named stores are supported, with one required default store.
+
+## Deferred Decisions
+
+- Whether `hive-memory` should be a symlink to `hm`, a wrapper, or omitted after
+  v1. `hm` remains the primary documented command either way.
+- Whether v1 releases should include musl Linux binaries in addition to glibc
+  binaries.
+- Exact local search/index implementation after the simple text-search MVP.
+- Default compaction policy: manual approval only, trusted-agent proposals, or
+  trusted-agent automatic compaction with review logs.
