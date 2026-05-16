@@ -17,6 +17,31 @@ fn temp_dir(name: &str) -> PathBuf {
     path
 }
 
+fn write_config(
+    path: &std::path::Path,
+    personal_root: &std::path::Path,
+    work_root: &std::path::Path,
+) {
+    fs::write(
+        path,
+        format!(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "{}"
+            description = "Personal memory"
+
+            [stores.work]
+            root = "{}"
+            "#,
+            personal_root.display(),
+            work_root.display()
+        ),
+    )
+    .expect("write config");
+}
+
 #[test]
 fn version_prints_binary_name() {
     let mut cmd = cargo_bin_cmd!("hm");
@@ -82,4 +107,85 @@ fn stores_init_rejects_unknown_sensitivity() {
     .stderr(predicate::str::contains(
         "expected one of: public, internal, private, secret",
     ));
+}
+
+#[test]
+fn stores_list_reads_configured_stores() {
+    let dir = temp_dir("stores-list");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    let mut cmd = cargo_bin_cmd!("hm");
+
+    cmd.args([
+        "--config",
+        config.to_str().expect("utf8 config"),
+        "stores",
+        "list",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains(format!(
+        "personal\t{}\tmissing",
+        personal.display()
+    )))
+    .stdout(predicate::str::contains(format!(
+        "work\t{}\tmissing",
+        work.display()
+    )));
+}
+
+#[test]
+fn stores_show_defaults_to_config_default_store() {
+    let dir = temp_dir("stores-show");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+
+    let mut init = cargo_bin_cmd!("hm");
+    init.args([
+        "stores",
+        "init",
+        "personal",
+        "--root",
+        personal.to_str().expect("utf8 path"),
+    ])
+    .assert()
+    .success();
+
+    let mut show = cargo_bin_cmd!("hm");
+    show.args([
+        "--config",
+        config.to_str().expect("utf8 config"),
+        "stores",
+        "show",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("name: personal"))
+    .stdout(predicate::str::contains("available: true"))
+    .stdout(predicate::str::contains("manifest_id: "));
+}
+
+#[test]
+fn stores_show_rejects_unknown_store() {
+    let dir = temp_dir("stores-show-unknown");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    let mut show = cargo_bin_cmd!("hm");
+
+    show.args([
+        "--config",
+        config.to_str().expect("utf8 config"),
+        "stores",
+        "show",
+        "missing",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("unknown store: missing"));
 }

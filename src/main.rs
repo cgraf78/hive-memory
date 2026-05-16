@@ -6,7 +6,7 @@
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
-use hive_memory::config::Sensitivity;
+use hive_memory::config::{Config, ConfigPaths, Sensitivity};
 use hive_memory::store;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -23,6 +23,9 @@ use std::str::FromStr;
 #[command(version)]
 #[command(about = "Vendor-neutral shared memory infrastructure for AI agents.")]
 struct Cli {
+    /// Main config file to load.
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
     /// Command to run.
     #[command(subcommand)]
     command: Option<Command>,
@@ -44,6 +47,10 @@ enum Command {
 enum StoresCommand {
     /// Initialize a store root with a manifest and canonical directories.
     Init(StoreInitArgs),
+    /// List configured stores and root availability.
+    List,
+    /// Show one configured store, defaulting to the global default store.
+    Show(StoreShowArgs),
 }
 
 /// Arguments for `hm stores init`.
@@ -65,15 +72,22 @@ struct StoreInitArgs {
     sensitivity: Sensitivity,
 }
 
+/// Arguments for `hm stores show`.
+#[derive(Debug, Args)]
+struct StoreShowArgs {
+    /// Store alias to show. Defaults to config.default_store.
+    name: Option<String>,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Some(Command::Stores(command)) => run_stores(command),
+        Some(Command::Stores(command)) => run_stores(command, cli.config),
         None => Ok(()),
     }
 }
 
-fn run_stores(command: StoresCommand) -> Result<()> {
+fn run_stores(command: StoresCommand, config_path: Option<PathBuf>) -> Result<()> {
     match command {
         StoresCommand::Init(args) => {
             let options = store::StoreInitOptions {
@@ -91,10 +105,63 @@ fn run_stores(command: StoresCommand) -> Result<()> {
             );
             Ok(())
         }
+        StoresCommand::List => {
+            let config = load_config(config_path.as_deref())?;
+            for (name, store) in &config.stores {
+                let available = if store.root.join("manifest.toml").is_file() {
+                    "available"
+                } else {
+                    "missing"
+                };
+                println!("{name}\t{}\t{available}", store.root.display());
+            }
+            Ok(())
+        }
+        StoresCommand::Show(args) => {
+            let config = load_config(config_path.as_deref())?;
+            show_store(&config, args.name.as_deref())?;
+            Ok(())
+        }
     }
 }
 
 fn parse_sensitivity(input: &str) -> std::result::Result<Sensitivity, String> {
     Sensitivity::from_str(input)
         .map_err(|_| "expected one of: public, internal, private, secret".to_owned())
+}
+
+/// Load CLI-selected config and report non-fatal warnings.
+///
+/// The path resolution policy lives in `ConfigPaths`; this function only
+/// connects that library contract to terminal diagnostics.
+fn load_config(config_path: Option<&std::path::Path>) -> Result<Config> {
+    let paths = ConfigPaths::resolve(config_path)?;
+    let loaded = paths.load()?;
+    for warning in &loaded.warnings {
+        eprintln!("warning: {warning}");
+    }
+    Ok(loaded.config)
+}
+
+fn show_store(config: &Config, name: Option<&str>) -> Result<()> {
+    let name = name.unwrap_or(&config.default_store);
+    let Some(store) = config.stores.get(name) else {
+        anyhow::bail!("unknown store: {name}");
+    };
+
+    println!("name: {name}");
+    println!("root: {}", store.root.display());
+    println!("sensitivity: {}", store.sensitivity);
+
+    let manifest_path = store.root.join("manifest.toml");
+    if manifest_path.is_file() {
+        let manifest = store::read_manifest(&store.root)?;
+        println!("available: true");
+        println!("manifest_id: {}", manifest.store.id);
+        println!("manifest_name: {}", manifest.store.name);
+    } else {
+        println!("available: false");
+    }
+
+    Ok(())
 }

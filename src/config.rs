@@ -97,6 +97,19 @@ pub struct LoadedConfig {
     pub warnings: Vec<ConfigWarning>,
 }
 
+/// Filesystem locations for layered `hm` config files.
+///
+/// Commands should use this type rather than hardcoding config paths. The
+/// default local override convention stays centralized here so launchers, hooks,
+/// and CLI commands all load the same files in the same order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigPaths {
+    /// Primary durable config file.
+    pub main: PathBuf,
+    /// Optional machine-local override file. Missing files are ignored.
+    pub local_override: Option<PathBuf>,
+}
+
 /// Effective `hm` configuration after defaults and validation.
 ///
 /// This is the shape command implementations should consume. It intentionally
@@ -172,6 +185,18 @@ impl FromStr for Sensitivity {
                 value: input.to_owned(),
             }),
         }
+    }
+}
+
+impl Display for Sensitivity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Public => "public",
+            Self::Internal => "internal",
+            Self::Private => "private",
+            Self::Secret => "secret",
+        };
+        write!(f, "{value}")
     }
 }
 
@@ -280,6 +305,15 @@ pub enum ConfigWarning {
     UnknownSubkey(String),
 }
 
+impl Display for ConfigWarning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownTopLevelKey(key) => write!(f, "unknown config key: {key}"),
+            Self::UnknownSubkey(key) => write!(f, "unknown config key: {key}"),
+        }
+    }
+}
+
 /// Fatal configuration failures.
 ///
 /// Errors here mean callers should not proceed with commands that rely on the
@@ -289,6 +323,9 @@ pub enum ConfigWarning {
 pub enum ConfigError {
     /// TOML parsing or deserialization failed.
     Parse(String),
+    /// Default config path could not be resolved because `HOME` is unset.
+    HomeNotSet,
+    /// Required config file could not be read.
     ReadConfig {
         /// Config path that failed to read.
         path: PathBuf,
@@ -349,6 +386,7 @@ impl Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Parse(message) => write!(f, "failed to parse config: {message}"),
+            Self::HomeNotSet => write!(f, "HOME is not set; cannot find default config path"),
             Self::ReadConfig { path, message } => {
                 write!(f, "failed to read config {}: {message}", path.display())
             }
@@ -393,6 +431,48 @@ impl Display for ConfigError {
 }
 
 impl Error for ConfigError {}
+
+impl ConfigPaths {
+    /// Build config paths from an explicit main config path.
+    ///
+    /// The local override is always `config.local.toml` beside the selected
+    /// main file. That keeps custom test/config roots predictable and matches
+    /// the default `~/.config/hive-memory` layout.
+    pub fn from_main_path(main: impl Into<PathBuf>) -> Self {
+        let main = main.into();
+        let local_override = main.parent().map(|parent| parent.join("config.local.toml"));
+        Self {
+            main,
+            local_override,
+        }
+    }
+
+    /// Resolve config paths using CLI override, env override, then defaults.
+    ///
+    /// `--config` should pass `explicit_main`; otherwise `HIVE_MEMORY_CONFIG`
+    /// wins over the standard `~/.config/hive-memory/config.toml` path.
+    pub fn resolve(explicit_main: Option<&Path>) -> Result<Self, ConfigError> {
+        if let Some(path) = explicit_main {
+            return Ok(Self::from_main_path(path));
+        }
+
+        if let Some(path) = std::env::var_os("HIVE_MEMORY_CONFIG") {
+            return Ok(Self::from_main_path(path));
+        }
+
+        let Some(home) = std::env::var_os("HOME") else {
+            return Err(ConfigError::HomeNotSet);
+        };
+        Ok(Self::from_main_path(
+            PathBuf::from(home).join(".config/hive-memory/config.toml"),
+        ))
+    }
+
+    /// Load and validate the config described by these paths.
+    pub fn load(&self) -> Result<LoadedConfig, ConfigError> {
+        LoadedConfig::from_files(&self.main, self.local_override.as_deref())
+    }
+}
 
 impl LoadedConfig {
     /// Parse, expand, and validate one TOML config document using process env.
