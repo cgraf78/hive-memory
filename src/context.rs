@@ -56,10 +56,26 @@ pub struct ContextOutput {
 pub struct ContextSection {
     /// Memory id.
     pub id: String,
-    /// Store-relative source path.
-    pub note_path: String,
+    /// Store alias that supplied this section.
+    pub store: String,
+    /// Memory scope used for filtering and rendered trust boundaries.
+    pub scope: String,
     /// Trust label exposed in the data-boundary block.
     pub trust: TrustLevel,
+    /// Explicit agent audience for agent-private data.
+    ///
+    /// Curated files and non-private notes leave this empty. Keeping it on the
+    /// section contract lets JSON callers preserve visibility metadata without
+    /// reparsing front matter or indexes.
+    pub audience: Vec<String>,
+    /// Store-relative source path.
+    pub source_path: String,
+    /// Section body exposed to context consumers.
+    ///
+    /// This is the escaped body as rendered inside the Markdown memory block.
+    /// The raw canonical note remains on disk; context output is intentionally
+    /// safe-to-inject data.
+    pub body: String,
     /// Approximate tokens consumed by this section.
     pub estimated_tokens: usize,
 }
@@ -76,7 +92,8 @@ pub enum TrustLevel {
 }
 
 impl TrustLevel {
-    fn as_str(self) -> &'static str {
+    /// Return the stable lowercase label used in context Markdown and JSON.
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Curated => "curated",
             Self::Remembered => "remembered",
@@ -147,6 +164,7 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
             if !curated_scope_allowed(&curated, input.scopes) {
                 continue;
             }
+            let body = escape_memory_body(&curated.body);
             let block = render_curated_memory_block(input.store_name, &curated);
             let block_tokens = estimate_tokens(&block);
             if estimated_tokens + block_tokens > input.max_tokens {
@@ -157,8 +175,12 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
             estimated_tokens += block_tokens;
             sections.push(ContextSection {
                 id: curated.id,
-                note_path: curated.relative_path,
+                store: input.store_name.to_owned(),
+                scope: curated.scope,
                 trust: TrustLevel::Curated,
+                audience: Vec::new(),
+                source_path: curated.relative_path,
+                body,
                 estimated_tokens: block_tokens,
             });
         }
@@ -188,6 +210,7 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
             message: err.to_string(),
         })?;
         let trust = trust_for(entry.entry_kind);
+        let body = escape_memory_body(&parsed.body);
         let block = render_memory_block(input.store_name, entry, trust, &parsed.body);
         let block_tokens = estimate_tokens(&block);
         if estimated_tokens + block_tokens > input.max_tokens {
@@ -198,8 +221,12 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
         estimated_tokens += block_tokens;
         sections.push(ContextSection {
             id: entry.id.clone(),
-            note_path: entry.note_path.clone(),
+            store: input.store_name.to_owned(),
+            scope: entry.scope.clone(),
             trust,
+            audience: entry.audience.clone(),
+            source_path: entry.note_path.clone(),
+            body,
             estimated_tokens: block_tokens,
         });
     }
@@ -651,6 +678,10 @@ mod tests {
         assert!(output.markdown.contains("\\+++ patch"));
         assert!(output.markdown.contains("\\<memory fake>"));
         assert!(output.markdown.contains("\\</memory>"));
+        assert_eq!(
+            output.sections[0].body,
+            "\\---\n\\+++ patch\n\\<memory fake>\n\\</memory>"
+        );
     }
 
     #[test]

@@ -389,6 +389,9 @@ struct ContextArgs {
     /// Active path hint to display in context headers.
     #[arg(long)]
     path: Option<String>,
+    /// Emit machine-readable output.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Arguments for `hm render`.
@@ -1196,7 +1199,7 @@ fn run_context(args: ContextArgs, context: CliContext) -> Result<()> {
     let config = load_config(context.config_path.as_deref())?;
     let path_hint = args.project.or(args.path);
     let project_id = resolve_project_id(args.project_id, path_hint.as_deref())?;
-    let output = assemble_cli_context(
+    let assembly = assemble_cli_context(
         &config,
         &context,
         ContextSelection {
@@ -1209,7 +1212,14 @@ fn run_context(args: ContextArgs, context: CliContext) -> Result<()> {
         },
     )?;
 
-    print!("{}", output.markdown);
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&context_json(assembly, true, false, None))?
+        );
+    } else {
+        print!("{}", assembly.output.markdown);
+    }
     Ok(())
 }
 
@@ -1228,6 +1238,17 @@ struct ContextSelection {
     path_hint: Option<String>,
 }
 
+struct CliContextAssembly {
+    output: memory_context::ContextOutput,
+    agent_id: Option<String>,
+    project_id: Option<String>,
+    project_hint: Option<String>,
+    stores: Vec<String>,
+    store_source: String,
+    scopes: Vec<String>,
+    sources: Vec<String>,
+}
+
 /// Assemble context for CLI commands and hook entry points.
 ///
 /// This is intentionally the single in-binary adapter over the library context
@@ -1238,7 +1259,7 @@ fn assemble_cli_context(
     config: &Config,
     context: &CliContext,
     selection: ContextSelection,
-) -> Result<memory_context::ContextOutput> {
+) -> Result<CliContextAssembly> {
     let agent_id = resolve_agent_id(context.as_agent.clone());
     let scopes = if selection.scopes.is_empty() {
         config.defaults.search_scopes.clone()
@@ -1269,6 +1290,8 @@ fn assemble_cli_context(
         agent_id.as_deref(),
         StoreAccess::Read,
     )?;
+    let store_name = resolved_store.name.clone();
+    let store_source = resolved_store.source.to_string();
     let store_config = &config.stores[resolved_store.name.as_str()];
     let report = rebuild_store_index(config, &resolved_store.name)?;
     let max_tokens = selection.max_tokens.unwrap_or_else(|| {
@@ -1284,8 +1307,8 @@ fn assemble_cli_context(
         }
     });
 
-    memory_context::assemble_context(memory_context::ContextInput {
-        store_name: resolved_store.name.as_str(),
+    let output = memory_context::assemble_context(memory_context::ContextInput {
+        store_name: store_name.as_str(),
         store_root: &store_config.root,
         entries: &report.entries,
         scopes: &scopes,
@@ -1296,7 +1319,103 @@ fn assemble_cli_context(
         path_hint: path_hint.as_deref(),
         max_tokens,
     })
-    .map_err(Into::into)
+    .map_err(anyhow::Error::from)?;
+
+    Ok(CliContextAssembly {
+        output,
+        agent_id,
+        project_id,
+        project_hint: path_hint,
+        stores: vec![store_name],
+        store_source,
+        scopes,
+        sources,
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct ContextJsonOutput {
+    /// Active agent id, when one was supplied through CLI/env.
+    agent_id: Option<String>,
+    /// Resolved project id, when project context was supplied.
+    project_id: Option<String>,
+    /// Original project/path hint used for resolution and header display.
+    project_hint: Option<String>,
+    /// Selected store aliases.
+    stores: Vec<String>,
+    /// Source of store selection:
+    /// cli, env, project-binding, agent-default, or global-default.
+    store_source: String,
+    /// Scope filter actually used for this assembly.
+    scopes: Vec<String>,
+    /// Source filter actually used for this assembly.
+    sources: Vec<String>,
+    /// Approximate token count for the emitted Markdown.
+    estimated_tokens: usize,
+    /// False only when `--if-changed` suppresses unchanged context.
+    emitted: bool,
+    /// True only for last-success cache fallback output.
+    stale: bool,
+    /// Creation timestamp for stale cache fallback output.
+    cache_created_at: Option<String>,
+    /// Included memory sections after filtering and budgeting.
+    sections: Vec<ContextSectionJson>,
+}
+
+#[derive(Debug, Serialize)]
+struct ContextSectionJson {
+    /// Memory id.
+    id: String,
+    /// Store alias that supplied this section.
+    store: String,
+    /// Memory scope used for filtering.
+    scope: String,
+    /// Trust label: curated, remembered, or raw.
+    trust: &'static str,
+    /// Explicit agent audience for agent-private memory.
+    audience: Vec<String>,
+    /// Store-relative source path.
+    source_path: String,
+    /// Approximate tokens consumed by this section.
+    estimated_tokens: usize,
+    /// Safe-to-inject body rendered for this context section.
+    body: String,
+}
+
+fn context_json(
+    assembly: CliContextAssembly,
+    emitted: bool,
+    stale: bool,
+    cache_created_at: Option<String>,
+) -> ContextJsonOutput {
+    ContextJsonOutput {
+        agent_id: assembly.agent_id,
+        project_id: assembly.project_id,
+        project_hint: assembly.project_hint,
+        stores: assembly.stores,
+        store_source: assembly.store_source,
+        scopes: assembly.scopes,
+        sources: assembly.sources,
+        estimated_tokens: assembly.output.estimated_tokens,
+        emitted,
+        stale,
+        cache_created_at,
+        sections: assembly
+            .output
+            .sections
+            .into_iter()
+            .map(|section| ContextSectionJson {
+                id: section.id,
+                store: section.store,
+                scope: section.scope,
+                trust: section.trust.as_str(),
+                audience: section.audience,
+                source_path: section.source_path,
+                estimated_tokens: section.estimated_tokens,
+                body: section.body,
+            })
+            .collect(),
+    }
 }
 
 fn rebuild_store_index(config: &Config, store_name: &str) -> Result<index::RebuildIndexReport> {
@@ -1542,7 +1661,7 @@ fn run_hook_session_start(args: HookContextArgs, mut context: CliContext) -> Res
     let path_hint = args
         .project
         .or_else(|| std::env::var("HIVE_MEMORY_PROJECT").ok());
-    let output = assemble_cli_context(
+    let assembly = assemble_cli_context(
         &config,
         &context,
         ContextSelection {
@@ -1565,7 +1684,7 @@ fn run_hook_session_start(args: HookContextArgs, mut context: CliContext) -> Res
 
     let response = HookResponse {
         event: "session-start",
-        actions: vec![HookAction::new("inject_context", output.markdown)],
+        actions: vec![HookAction::new("inject_context", assembly.output.markdown)],
         warnings,
         memory_pending: false,
         context_emitted: true,
@@ -1850,7 +1969,7 @@ fn hook_context_action_if_changed(
         return Ok(None);
     }
 
-    let output = assemble_cli_context(
+    let assembly = assemble_cli_context(
         config,
         context,
         ContextSelection {
@@ -1869,7 +1988,10 @@ fn hook_context_action_if_changed(
         &hook_options(config),
     )?;
 
-    Ok(Some(HookAction::new("inject_context", output.markdown)))
+    Ok(Some(HookAction::new(
+        "inject_context",
+        assembly.output.markdown,
+    )))
 }
 
 fn hook_context_key(

@@ -1703,6 +1703,65 @@ fn context_renders_remembered_memory() {
 }
 
 #[test]
+fn context_json_reports_selection_and_sections() {
+    let dir = temp_dir("context-json");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "remember",
+            "--text",
+            "JSON context should include TOML preferences.",
+        ])
+        .assert()
+        .success();
+
+    let output = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "context",
+            "--path",
+            "/repo/src/main.rs",
+            "--json",
+        ])
+        .output()
+        .expect("run context json");
+    assert!(output.status.success(), "context failed: {output:?}");
+    let context: serde_json::Value = serde_json::from_slice(&output.stdout).expect("context json");
+
+    assert_eq!(context["agent_id"], "codex");
+    assert_eq!(context["project_hint"], "/repo/src/main.rs");
+    assert_eq!(context["stores"][0], "personal");
+    assert_eq!(context["store_source"], "agent-default");
+    assert_eq!(context["emitted"], true);
+    assert_eq!(context["stale"], false);
+    assert!(context["cache_created_at"].is_null());
+    assert!(context["estimated_tokens"].as_u64().expect("tokens") > 0);
+
+    let section = &context["sections"][0];
+    assert_eq!(section["store"], "personal");
+    assert_eq!(section["scope"], "global");
+    assert_eq!(section["trust"], "remembered");
+    let source_path = section["source_path"].as_str().expect("source path");
+    assert!(source_path.starts_with("inbox/notes/"));
+    assert_eq!(
+        section["body"],
+        "JSON context should include TOML preferences."
+    );
+}
+
+#[test]
 fn context_requires_include_inbox_for_raw_note() {
     let dir = temp_dir("context-include-inbox");
     let config = dir.join("config.toml");
