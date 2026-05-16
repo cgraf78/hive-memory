@@ -1186,3 +1186,144 @@ fn hook_stop_reminds_when_memory_pending_remains() {
         ))
         .stdout(predicate::str::contains("\"memory_pending\": true"));
 }
+
+#[test]
+fn hook_tool_complete_clears_pending_after_session_write() {
+    let dir = temp_dir("hook-tool-complete");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let state = dir.join("state");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            state_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+            "#,
+            state.display(),
+            personal.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    let mut prompt = cargo_bin_cmd!("hm");
+    prompt
+        .env("HIVE_MEMORY_SESSION_ID", "session-3")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "hook",
+            "prompt-submit",
+            "--text",
+            "Please remember this project uses release trains.",
+        ])
+        .assert()
+        .success();
+
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .env("HIVE_MEMORY_SESSION_ID", "session-3")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "This project uses release trains.",
+        ])
+        .assert()
+        .success();
+
+    let mut tool = cargo_bin_cmd!("hm");
+    tool.env("HIVE_MEMORY_SESSION_ID", "session-3")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "hook",
+            "tool-complete",
+            "--status",
+            "0",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"event\": \"tool-complete\""))
+        .stdout(predicate::str::contains("\"memory_pending\": false"))
+        .stdout(predicate::str::contains("\"write_receipts\": 1"))
+        .stdout(predicate::str::contains("\"refreshed\": true"));
+
+    let state_file = state.join("runs/session-3/hook-state.json");
+    let state_json = fs::read_to_string(state_file).expect("hook state");
+    assert!(state_json.contains("\"memory_pending\": false"));
+    assert!(state_json.contains("\"refreshed_receipts\": 1"));
+}
+
+#[test]
+fn hook_tool_complete_nonzero_status_does_not_clear_pending() {
+    let dir = temp_dir("hook-tool-complete-fail");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let state = dir.join("state");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            state_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+            "#,
+            state.display(),
+            personal.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    let mut prompt = cargo_bin_cmd!("hm");
+    prompt
+        .env("HIVE_MEMORY_SESSION_ID", "session-4")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "hook",
+            "prompt-submit",
+            "--text",
+            "For future reference, failing tools should not clear memory debt.",
+        ])
+        .assert()
+        .success();
+
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .env("HIVE_MEMORY_SESSION_ID", "session-4")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "A failing tool wrote this, but completion status failed.",
+        ])
+        .assert()
+        .success();
+
+    let mut tool = cargo_bin_cmd!("hm");
+    tool.env("HIVE_MEMORY_SESSION_ID", "session-4")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "hook",
+            "tool-complete",
+            "--status",
+            "1",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"memory_pending\": true"))
+        .stdout(predicate::str::contains("\"refresh\": null"));
+}

@@ -267,6 +267,8 @@ enum HookCommand {
     SessionStart(HookContextArgs),
     /// Inspect a submitted prompt for context changes and memory intent.
     PromptSubmit(HookPromptSubmitArgs),
+    /// Handle a completed tool event.
+    ToolComplete(HookToolCompleteArgs),
     /// Emit an end-of-session reminder when memory intent remains pending.
     Stop(HookStopArgs),
 }
@@ -291,6 +293,20 @@ struct HookPromptSubmitArgs {
     /// Prompt text submitted to the agent.
     #[arg(long)]
     text: String,
+    /// Emit machine-readable hook actions.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Arguments for `hm hook tool-complete`.
+#[derive(Debug, Args)]
+struct HookToolCompleteArgs {
+    /// Active project path or file hint.
+    #[arg(long)]
+    project: Option<String>,
+    /// Tool exit/status code. Zero means success.
+    #[arg(long)]
+    status: i32,
     /// Emit machine-readable hook actions.
     #[arg(long)]
     json: bool,
@@ -425,6 +441,10 @@ fn run_write_memory(
         .scope
         .clone()
         .unwrap_or_else(|| config.defaults.write_scope.clone());
+    let project_id = args
+        .project_id
+        .clone()
+        .or_else(|| std::env::var("HIVE_MEMORY_PROJECT_ID").ok());
     let audience = resolve_audience(&args, &scope, &writer_agent_id)?;
     let should_write_event = match entry_kind {
         note::EntryKind::Remember => true,
@@ -446,12 +466,10 @@ fn run_write_memory(
         host_id,
         user_id: config.user_id.clone(),
         session_id: std::env::var("HIVE_MEMORY_SESSION_ID").ok(),
-        scope,
+        scope: scope.clone(),
         confidence: args.confidence,
         body: args.text,
-        project_id: args
-            .project_id
-            .or_else(|| std::env::var("HIVE_MEMORY_PROJECT_ID").ok()),
+        project_id: project_id.clone(),
         subject: args.subject,
         tags: args.tags,
         audience,
@@ -467,6 +485,13 @@ fn run_write_memory(
     if let Some(path) = result.event_path {
         println!("event: {}", path.display());
     }
+    append_session_write_receipt(
+        &config,
+        &resolved_store.name,
+        &scope,
+        project_id,
+        &result.id,
+    );
     Ok(())
 }
 
@@ -728,10 +753,27 @@ fn run_render(args: RenderArgs, context: CliContext) -> Result<()> {
 
 fn run_refresh(args: RefreshArgs, context: CliContext) -> Result<()> {
     let config = load_config(context.config_path.as_deref())?;
-    let mut indexes_refreshed = 0usize;
+    let report = perform_refresh(&config, &context, args.force)?;
+
+    if !args.quiet {
+        println!(
+            "refresh: indexes={} rendered={} written={} render_skipped={} forced={}",
+            report.indexes, report.rendered, report.written, report.render_skipped, report.forced
+        );
+    }
+
+    Ok(())
+}
+
+fn perform_refresh(
+    config: &Config,
+    context: &CliContext,
+    forced: bool,
+) -> Result<HookRefreshReport> {
+    let mut indexes = 0usize;
     for store_name in config.stores.keys() {
-        rebuild_store_index(&config, store_name)?;
-        indexes_refreshed += 1;
+        rebuild_store_index(config, store_name)?;
+        indexes += 1;
     }
 
     // Hooks may need fresh indexes without touching agent instruction files.
@@ -741,30 +783,25 @@ fn run_refresh(args: RefreshArgs, context: CliContext) -> Result<()> {
     let render_summary = if render_skipped {
         RenderRefreshSummary::default()
     } else {
-        refresh_render_outputs(&config, &context)?
+        refresh_render_outputs(config, context)?
     };
 
-    // `--force` is reserved for the receipt-aware refresh path. Recording it in
-    // output now keeps the CLI contract visible without using it to bypass
-    // render drift or privacy refusals.
-    if !args.quiet {
-        println!(
-            "refresh: indexes={} rendered={} written={} render_skipped={} forced={}",
-            indexes_refreshed,
-            render_summary.rendered,
-            render_summary.written,
-            render_skipped,
-            args.force
-        );
-    }
-
-    Ok(())
+    Ok(HookRefreshReport {
+        indexes,
+        rendered: render_summary.rendered,
+        written: render_summary.written,
+        render_skipped,
+        forced,
+        write_receipts: 0,
+        refreshed: true,
+    })
 }
 
 fn run_hook(command: HookCommand, context: CliContext) -> Result<()> {
     match command {
         HookCommand::SessionStart(args) => run_hook_session_start(args, context),
         HookCommand::PromptSubmit(args) => run_hook_prompt_submit(args, context),
+        HookCommand::ToolComplete(args) => run_hook_tool_complete(args, context),
         HookCommand::Stop(args) => run_hook_stop(args, context),
     }
 }
@@ -865,6 +902,75 @@ fn run_hook_prompt_submit(args: HookPromptSubmitArgs, context: CliContext) -> Re
     Ok(())
 }
 
+/// Consume session write receipts after a successful tool event.
+///
+/// Tool hooks are the first point where we can know whether the agent actually
+/// ran `hm remember`/`hm note` after a prompt reminder. Receipts provide that
+/// proof without parsing shell commands or trusting hook-side classifiers.
+fn run_hook_tool_complete(args: HookToolCompleteArgs, context: CliContext) -> Result<()> {
+    let config = load_config(context.config_path.as_deref())?;
+    let mut warnings = Vec::new();
+    let mut refresh = None;
+
+    let agent_id = resolve_agent_id(context.as_agent.clone());
+    resolve_store(
+        &config,
+        context.store.as_deref(),
+        agent_id.as_deref(),
+        StoreAccess::Read,
+    )?;
+    let _path_hint = args
+        .project
+        .or_else(|| std::env::var("HIVE_MEMORY_PROJECT").ok());
+
+    let session_id = hook_session_id(&mut warnings);
+    let mut memory_pending = if let Some(session_id) = session_id.as_deref() {
+        memory_hook::load_state(&config.state_dir, session_id)?.memory_pending
+    } else {
+        false
+    };
+
+    if args.status == 0
+        && let Some(session_id) = session_id.as_deref()
+    {
+        let receipts = memory_hook::load_write_receipts(&config.state_dir, session_id)?;
+        let mut state = memory_hook::load_state(&config.state_dir, session_id)?;
+        let unrefreshed_receipts = receipts.len().saturating_sub(state.refreshed_receipts);
+
+        if unrefreshed_receipts > 0 {
+            let mut report = perform_refresh(&config, &context, false)?;
+            report.write_receipts = unrefreshed_receipts;
+            refresh = Some(report);
+
+            let options = write::AtomicWriteOptions {
+                fsync: config.storage.fsync.into(),
+                ..write::AtomicWriteOptions::default()
+            };
+            state = memory_hook::mark_receipts_refreshed(
+                &config.state_dir,
+                session_id,
+                receipts.len(),
+                true,
+                &options,
+            )?;
+        }
+
+        memory_pending = state.memory_pending;
+    }
+
+    let response = HookResponse {
+        event: "tool-complete",
+        actions: Vec::new(),
+        warnings,
+        memory_pending,
+        context_emitted: false,
+        refresh,
+    };
+    emit_hook_response(&response, args.json)?;
+
+    Ok(())
+}
+
 /// Remind at session end if explicit memory intent has not been satisfied.
 fn run_hook_stop(args: HookStopArgs, context: CliContext) -> Result<()> {
     let config = load_config(context.config_path.as_deref())?;
@@ -905,8 +1011,19 @@ struct HookResponse {
     memory_pending: bool,
     /// Whether this response carries fresh context for prompt injection.
     context_emitted: bool,
-    /// Future refresh status once receipt-aware refresh is implemented.
-    refresh: Option<String>,
+    /// Refresh status when this hook ran post-write maintenance.
+    refresh: Option<HookRefreshReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct HookRefreshReport {
+    indexes: usize,
+    rendered: usize,
+    written: usize,
+    render_skipped: bool,
+    forced: bool,
+    write_receipts: usize,
+    refreshed: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -958,6 +1075,42 @@ fn hook_session_id(warnings: &mut Vec<String>) -> Option<String> {
             );
             None
         }
+    }
+}
+
+fn append_session_write_receipt(
+    config: &Config,
+    store: &str,
+    scope: &str,
+    project_id: Option<String>,
+    note_id: &str,
+) {
+    let Ok(session_id) = std::env::var("HIVE_MEMORY_SESSION_ID") else {
+        return;
+    };
+    if session_id.trim().is_empty() {
+        return;
+    }
+
+    let result = memory_hook::append_write_receipt(
+        &config.state_dir,
+        &session_id,
+        &memory_hook::WriteReceipt {
+            created_at: OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("RFC3339 formatting should not fail"),
+            store: store.to_owned(),
+            scope: scope.to_owned(),
+            project_id,
+            note_id: note_id.to_owned(),
+            created: true,
+        },
+    );
+    if let Err(err) = result {
+        // Receipts are ephemeral hook coordination state. The canonical memory
+        // write has already succeeded, so receipt loss should warn but never
+        // make a successful `hm remember`/`hm note` look failed.
+        eprintln!("warning: failed to write session receipt: {err}");
     }
 }
 
