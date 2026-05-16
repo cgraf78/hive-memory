@@ -861,3 +861,66 @@ fn render_install_adds_instruction_markers() {
     assert!(instructions.contains(&format!("@{}", output.display())));
     assert!(!instructions.contains("Installed render memory."));
 }
+
+#[test]
+fn render_uninstall_removes_adapter_marker() {
+    let dir = temp_dir("render-uninstall");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let output = dir.join("generated").join("codex.md");
+    let install_target = dir.join("AGENTS.md");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "{}"
+
+            [adapters.codex]
+            enabled = true
+            stores = ["personal"]
+            scopes = ["global"]
+            output = "{}"
+            install_target = "{}"
+            install_mode = "include"
+            "#,
+            personal.display(),
+            output.display(),
+            install_target.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    let mut install = cargo_bin_cmd!("hm");
+    install
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "render",
+            "codex",
+            "--install",
+        ])
+        .assert()
+        .success();
+
+    let mut uninstall = cargo_bin_cmd!("hm");
+    uninstall
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "render",
+            "codex",
+            "--uninstall",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("uninstalled: true"))
+        .stdout(predicate::str::contains("output:").not());
+
+    let instructions = fs::read_to_string(install_target).expect("read install target");
+    assert!(instructions.contains("# BEGIN hive-memory:policy"));
+    assert!(!instructions.contains("# BEGIN hive-memory:codex"));
+}

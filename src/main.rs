@@ -223,6 +223,12 @@ struct RenderArgs {
     /// Install adapter include markers into configured instruction files.
     #[arg(long)]
     install: bool,
+    /// Remove adapter include markers from configured instruction files.
+    #[arg(long, conflicts_with = "install")]
+    uninstall: bool,
+    /// With --uninstall, remove the shared Hive Memory policy block too.
+    #[arg(long, requires = "uninstall")]
+    all: bool,
     /// Overwrite a drifted generated output.
     #[arg(long)]
     force: bool,
@@ -535,17 +541,33 @@ fn run_render(args: RenderArgs, context: CliContext) -> Result<()> {
             anyhow::bail!("adapter {adapter_name} has no output configured");
         };
 
-        let report = if args.upgrade_marker {
-            render::upgrade_marker(output, options.clone())?
+        let report = if args.uninstall {
+            None
+        } else if args.upgrade_marker {
+            Some(render::upgrade_marker(output, options.clone())?)
         } else {
             let body = render_adapter_body(&config, adapter_name.as_str(), adapter, &context)?;
-            render::write_rendered_file(render::RenderFileInput {
+            Some(render::write_rendered_file(render::RenderFileInput {
                 output,
                 body: &body,
                 options: options.clone(),
                 force: args.force,
                 backup: args.backup,
-            })?
+            })?)
+        };
+
+        let uninstall_report = if args.uninstall {
+            let Some(install_target) = adapter.install_target.as_ref() else {
+                anyhow::bail!("adapter {adapter_name} has no install_target configured");
+            };
+            Some(render::uninstall_adapter(render::UninstallAdapterInput {
+                adapter: adapter_name.as_str(),
+                install_target,
+                all: args.all,
+                options: options.clone(),
+            })?)
+        } else {
+            None
         };
 
         let install_report = if args.install {
@@ -565,11 +587,20 @@ fn run_render(args: RenderArgs, context: CliContext) -> Result<()> {
 
         if !args.quiet {
             println!("adapter: {adapter_name}");
-            println!("output: {}", report.output.display());
-            println!("written: {}", report.written);
-            println!("sha256: {}", report.sha256);
-            if let Some(path) = report.backup_path {
-                println!("backup: {}", path.display());
+            if let Some(report) = report {
+                println!("output: {}", report.output.display());
+                println!("written: {}", report.written);
+                println!("sha256: {}", report.sha256);
+                if let Some(path) = report.backup_path {
+                    println!("backup: {}", path.display());
+                }
+            }
+            if let Some(uninstall) = uninstall_report {
+                println!("install_target: {}", uninstall.target.display());
+                println!("uninstalled: {}", uninstall.written);
+                if let Some(path) = uninstall.backup_path {
+                    println!("uninstall_backup: {}", path.display());
+                }
             }
             if let Some(install) = install_report {
                 println!("install_target: {}", install.target.display());
