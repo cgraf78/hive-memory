@@ -735,6 +735,183 @@ fn note_respects_never_sidecar_default() {
 }
 
 #[test]
+fn inbox_lists_shows_and_promotes_raw_notes_idempotently() {
+    let dir = temp_dir("inbox-promote");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+
+    let mut note = cargo_bin_cmd!("hm");
+    let output = note
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "note",
+            "--text",
+            "Raw curation note for later promotion.",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).expect("utf8 stdout");
+    let note_id = stdout_value(&stdout, "id:");
+
+    let mut list = cargo_bin_cmd!("hm");
+    list.args([
+        "--config",
+        config.to_str().expect("utf8 config"),
+        "inbox",
+        "list",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("items: 1"))
+    .stdout(predicate::str::contains(&note_id))
+    .stdout(predicate::str::contains("pending"));
+
+    let mut show = cargo_bin_cmd!("hm");
+    show.args([
+        "--config",
+        config.to_str().expect("utf8 config"),
+        "inbox",
+        "show",
+        &note_id,
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains(
+        "Raw curation note for later promotion.",
+    ));
+
+    let mut promote = cargo_bin_cmd!("hm");
+    let output = promote
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "promote",
+            &note_id,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("promoted: true"))
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).expect("utf8 stdout");
+    let target = PathBuf::from(stdout_value(&stdout, "target:"));
+    let event = PathBuf::from(stdout_value(&stdout, "event:"));
+    let curated = fs::read_to_string(&target).expect("read curated target");
+    let promotion_event = fs::read_to_string(&event).expect("read promotion event");
+    assert!(curated.contains("- Raw curation note for later promotion."));
+    assert!(curated.contains(&format!("hive-memory:promoted source=\"{note_id}\"")));
+    assert!(promotion_event.contains("\"type\": \"memory.promotion\""));
+    assert!(promotion_event.contains(&format!("\"ref\": \"{note_id}\"")));
+
+    fs::remove_file(&event).expect("remove promotion event to simulate interrupted run");
+    let mut heal_retry = cargo_bin_cmd!("hm");
+    heal_retry
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "promote",
+            &note_id,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("promoted: false"))
+        .stdout(predicate::str::contains("event:"));
+
+    let mut default_list = cargo_bin_cmd!("hm");
+    default_list
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "inbox",
+            "list",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("items: 0"));
+
+    let mut all_list = cargo_bin_cmd!("hm");
+    all_list
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "inbox",
+            "list",
+            "--all",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("items: 1"))
+        .stdout(predicate::str::contains("promoted"));
+
+    let mut retry = cargo_bin_cmd!("hm");
+    retry
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "promote",
+            &note_id,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("promoted: false"))
+        .stdout(predicate::str::contains("event:").not());
+    let curated_after_retry = fs::read_to_string(target).expect("read curated target again");
+    assert_eq!(
+        curated_after_retry.matches("hive-memory:promoted").count(),
+        1
+    );
+}
+
+#[test]
+fn promote_rejects_targets_outside_curated_areas() {
+    let dir = temp_dir("promote-invalid-target");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+
+    let mut note = cargo_bin_cmd!("hm");
+    let output = note
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "note",
+            "--text",
+            "Raw note for invalid target.",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).expect("utf8 stdout");
+    let note_id = stdout_value(&stdout, "id:");
+
+    let mut promote = cargo_bin_cmd!("hm");
+    promote
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "promote",
+            &note_id,
+            "--to",
+            "../outside.md",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid promotion target"));
+}
+
+#[test]
 fn search_finds_remembered_note() {
     let dir = temp_dir("search");
     let config = dir.join("config.toml");

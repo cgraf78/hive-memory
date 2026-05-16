@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod context;
+pub mod curation;
 pub mod doctor;
 pub mod event;
 pub mod hook;
