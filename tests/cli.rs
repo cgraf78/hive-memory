@@ -2172,6 +2172,78 @@ fn render_install_adds_instruction_markers() {
 }
 
 #[test]
+fn render_json_reports_output_install_and_visibility() {
+    let dir = temp_dir("render-json");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let output = dir.join("generated").join("codex.md");
+    let install_target = dir.join("AGENTS.md");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "{}"
+
+            [adapters.codex]
+            enabled = true
+            stores = ["personal"]
+            scopes = ["global"]
+            output = "{}"
+            install_target = "{}"
+            install_mode = "include"
+            "#,
+            personal.display(),
+            output.display(),
+            install_target.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Rendered JSON memory.",
+        ])
+        .assert()
+        .success();
+
+    let render = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "render",
+            "codex",
+            "--install",
+            "--json",
+        ])
+        .output()
+        .expect("run render json");
+    assert!(render.status.success(), "render failed: {render:?}");
+    let report: serde_json::Value = serde_json::from_slice(&render.stdout).expect("render json");
+
+    assert_eq!(report["adapter"], "codex");
+    assert_eq!(report["output_path"], output.display().to_string());
+    assert_eq!(report["written"], true);
+    assert!(report["sha256"].as_str().expect("sha256").len() >= 32);
+    assert_eq!(report["installed"], true);
+    assert_eq!(report["visible"], true);
+    assert_eq!(
+        report["install_targets"][0],
+        install_target.display().to_string()
+    );
+    let backup_paths = report["backup_paths"].as_array().expect("backups");
+    assert_eq!(backup_paths.len(), 1);
+    assert!(PathBuf::from(backup_paths[0].as_str().expect("backup path")).is_file());
+}
+
+#[test]
 fn render_uninstall_removes_adapter_marker() {
     let dir = temp_dir("render-uninstall");
     let config = dir.join("config.toml");

@@ -426,6 +426,9 @@ struct RenderArgs {
     /// Suppress per-adapter output.
     #[arg(long)]
     quiet: bool,
+    /// Emit machine-readable output.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Arguments for `hm refresh`.
@@ -1495,6 +1498,8 @@ fn run_render(args: RenderArgs, context: CliContext) -> Result<()> {
         fsync: config.storage.fsync.into(),
         ..write::AtomicWriteOptions::default()
     };
+    let configured = args.configured;
+    let mut json_outputs = Vec::new();
 
     for adapter_name in adapters {
         let adapter = &config.adapters[adapter_name.as_str()];
@@ -1546,34 +1551,131 @@ fn run_render(args: RenderArgs, context: CliContext) -> Result<()> {
             None
         };
 
-        if !args.quiet {
+        if args.json {
+            json_outputs.push(render_json_output(
+                adapter_name.as_str(),
+                output,
+                adapter.install_target.as_deref(),
+                report.as_ref(),
+                install_report.as_ref(),
+                uninstall_report.as_ref(),
+            )?);
+        } else if !args.quiet {
             println!("adapter: {adapter_name}");
-            if let Some(report) = report {
+            if let Some(report) = report.as_ref() {
                 println!("output: {}", report.output.display());
                 println!("written: {}", report.written);
                 println!("sha256: {}", report.sha256);
-                if let Some(path) = report.backup_path {
+                if let Some(path) = &report.backup_path {
                     println!("backup: {}", path.display());
                 }
             }
-            if let Some(uninstall) = uninstall_report {
+            if let Some(uninstall) = uninstall_report.as_ref() {
                 println!("install_target: {}", uninstall.target.display());
                 println!("uninstalled: {}", uninstall.written);
-                if let Some(path) = uninstall.backup_path {
+                if let Some(path) = &uninstall.backup_path {
                     println!("uninstall_backup: {}", path.display());
                 }
             }
-            if let Some(install) = install_report {
+            if let Some(install) = install_report.as_ref() {
                 println!("install_target: {}", install.target.display());
                 println!("installed: {}", install.written);
-                if let Some(path) = install.backup_path {
+                if let Some(path) = &install.backup_path {
                     println!("install_backup: {}", path.display());
                 }
             }
         }
     }
 
+    if args.json {
+        if configured {
+            println!("{}", serde_json::to_string_pretty(&json_outputs)?);
+        } else if let Some(output) = json_outputs.into_iter().next() {
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+    }
+
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct RenderJsonOutput {
+    /// Adapter id that was rendered or installed.
+    adapter: String,
+    /// Generated context include file for this adapter.
+    output_path: String,
+    /// Whether the generated output file changed.
+    written: bool,
+    /// SHA-256 of the generated body when rendering occurred.
+    sha256: String,
+    /// Whether the adapter marker is present in the install target.
+    installed: bool,
+    /// Whether the configured install target points at the configured output.
+    visible: bool,
+    /// Instruction files touched by install/uninstall operations.
+    install_targets: Vec<String>,
+    /// Backup files written by render/install/uninstall operations.
+    backup_paths: Vec<String>,
+}
+
+fn render_json_output(
+    adapter_name: &str,
+    output: &std::path::Path,
+    install_target: Option<&std::path::Path>,
+    report: Option<&render::RenderFileReport>,
+    install_report: Option<&render::InstallAdapterReport>,
+    uninstall_report: Option<&render::UninstallAdapterReport>,
+) -> Result<RenderJsonOutput> {
+    let inspection = match install_target {
+        Some(install_target) => Some(render::inspect_adapter_install(
+            render::InspectAdapterInstallInput {
+                adapter: adapter_name,
+                output,
+                install_target,
+            },
+        )?),
+        None => None,
+    };
+    let mut install_targets = Vec::new();
+    if let Some(report) = install_report {
+        install_targets.push(report.target.display().to_string());
+    }
+    if let Some(report) = uninstall_report {
+        install_targets.push(report.target.display().to_string());
+    }
+    let mut backup_paths = Vec::new();
+    if let Some(path) = report.and_then(|report| report.backup_path.as_ref()) {
+        backup_paths.push(path.display().to_string());
+    }
+    if let Some(path) = install_report.and_then(|report| report.backup_path.as_ref()) {
+        backup_paths.push(path.display().to_string());
+    }
+    if let Some(path) = uninstall_report.and_then(|report| report.backup_path.as_ref()) {
+        backup_paths.push(path.display().to_string());
+    }
+
+    Ok(RenderJsonOutput {
+        adapter: adapter_name.to_owned(),
+        output_path: report
+            .map(|report| report.output.display().to_string())
+            .unwrap_or_else(|| output.display().to_string()),
+        written: report.map(|report| report.written).unwrap_or(false),
+        sha256: report
+            .map(|report| report.sha256.clone())
+            .unwrap_or_default(),
+        installed: inspection
+            .as_ref()
+            .map(|inspection| inspection.installed)
+            .unwrap_or(false),
+        visible: inspection
+            .as_ref()
+            .map(|inspection| {
+                inspection.target_exists && inspection.installed && inspection.include_matches
+            })
+            .unwrap_or(false),
+        install_targets,
+        backup_paths,
+    })
 }
 
 fn run_refresh(args: RefreshArgs, context: CliContext) -> Result<()> {
