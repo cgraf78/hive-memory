@@ -851,6 +851,17 @@ fn inbox_lists_shows_and_promotes_raw_notes_idempotently() {
         .stdout(predicate::str::contains("items: 1"))
         .stdout(predicate::str::contains("promoted"));
 
+    let mut context = cargo_bin_cmd!("hm");
+    context
+        .args(["--config", config.to_str().expect("utf8 config"), "context"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("trust=\"curated\""))
+        .stdout(predicate::str::contains(
+            "Raw curation note for later promotion.",
+        ))
+        .stdout(predicate::str::contains("trust=\"raw\"").not());
+
     let mut retry = cargo_bin_cmd!("hm");
     retry
         .args([

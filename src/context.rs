@@ -23,9 +23,9 @@ pub struct ContextInput<'a> {
     pub entries: &'a [IndexEntry],
     /// Selected scopes. Empty means all indexed scopes are eligible.
     pub scopes: &'a [String],
-    /// Selected source classes: `remembered`, `inbox`, `all`, and later
-    /// `curated`. Empty means remembered memory only; raw inbox still requires
-    /// an explicit source or `include_inbox`.
+    /// Selected source classes: `curated`, `remembered`, `inbox`, and `all`.
+    /// Empty means remembered memory only; raw inbox still requires an explicit
+    /// source or `include_inbox`.
     pub sources: &'a [String],
     /// Whether raw `hm note` entries are explicitly included.
     pub include_inbox: bool,
@@ -55,7 +55,7 @@ pub struct ContextOutput {
 pub struct ContextSection {
     /// Memory id.
     pub id: String,
-    /// Store-relative canonical note path.
+    /// Store-relative source path.
     pub note_path: String,
     /// Trust label exposed in the data-boundary block.
     pub trust: TrustLevel,
@@ -66,6 +66,8 @@ pub struct ContextSection {
 /// Trust label for rendered memory data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrustLevel {
+    /// Human-reviewed or explicitly promoted curated Markdown.
+    Curated,
     /// Explicit durable memory written by `hm remember`.
     Remembered,
     /// Lower-confidence raw inbox note written by `hm note`.
@@ -75,6 +77,7 @@ pub enum TrustLevel {
 impl TrustLevel {
     fn as_str(self) -> &'static str {
         match self {
+            Self::Curated => "curated",
             Self::Remembered => "remembered",
             Self::Raw => "raw",
         }
@@ -115,17 +118,40 @@ impl Display for ContextError {
 
 impl Error for ContextError {}
 
-/// Assemble bounded Markdown context from canonical notes.
+/// Assemble bounded Markdown context from canonical memory.
 ///
-/// Filtering is driven by index metadata, but bodies are read from canonical
-/// Markdown files so the index remains a disposable cache. Each included body is
-/// wrapped as data and escaped so a note cannot forge or terminate the boundary
-/// block that tells agents how to treat memory content.
+/// Raw/remembered inbox filtering is driven by index metadata, but bodies are
+/// read from canonical Markdown files so the index remains a disposable cache.
+/// Curated files are read directly from `memories/`, `people/`, and `rules/`.
+/// Each included body is wrapped as data and escaped so memory content cannot
+/// forge or terminate the boundary block that tells agents how to treat it.
 pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, ContextError> {
     let header = render_header(&input);
     let mut markdown = header;
     let mut sections = Vec::new();
     let mut estimated_tokens = estimate_tokens(&markdown);
+
+    if curated_source_allowed(input.sources) {
+        for curated in curated_candidates(input.store_root, input.project_id)? {
+            if !curated_scope_allowed(&curated, input.scopes) {
+                continue;
+            }
+            let block = render_curated_memory_block(input.store_name, &curated);
+            let block_tokens = estimate_tokens(&block);
+            if estimated_tokens + block_tokens > input.max_tokens {
+                continue;
+            }
+
+            markdown.push_str(&block);
+            estimated_tokens += block_tokens;
+            sections.push(ContextSection {
+                id: curated.id,
+                note_path: curated.relative_path,
+                trust: TrustLevel::Curated,
+                estimated_tokens: block_tokens,
+            });
+        }
+    }
 
     for entry in sorted_candidates(input.entries) {
         if !source_allowed(entry, input.sources, input.include_inbox) {
@@ -229,6 +255,102 @@ fn source_allowed(entry: &IndexEntry, sources: &[String], include_inbox: bool) -
     }
 }
 
+struct CuratedCandidate {
+    id: String,
+    relative_path: String,
+    scope: String,
+    body: String,
+}
+
+fn curated_source_allowed(sources: &[String]) -> bool {
+    sources
+        .iter()
+        .any(|source| source == "curated" || source == "all")
+}
+
+fn curated_candidates(
+    store_root: &Path,
+    project_id: Option<&str>,
+) -> Result<Vec<CuratedCandidate>, ContextError> {
+    let mut files = Vec::new();
+    collect_curated_tree(store_root, Path::new("rules"), "global", &mut files)?;
+    collect_curated_tree(store_root, Path::new("people"), "global", &mut files)?;
+    collect_curated_tree(
+        store_root,
+        Path::new("memories/global"),
+        "global",
+        &mut files,
+    )?;
+    if let Some(project_id) = project_id {
+        collect_curated_tree(
+            store_root,
+            &Path::new("memories/projects").join(project_id),
+            "project",
+            &mut files,
+        )?;
+    }
+    files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok(files)
+}
+
+fn collect_curated_tree(
+    store_root: &Path,
+    relative_root: &Path,
+    scope: &str,
+    files: &mut Vec<CuratedCandidate>,
+) -> Result<(), ContextError> {
+    let root = store_root.join(relative_root);
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(ContextError::ReadNote {
+                path: root,
+                message: err.to_string(),
+            });
+        }
+    };
+
+    for entry in entries {
+        let entry = entry.map_err(|err| ContextError::ReadNote {
+            path: root.clone(),
+            message: err.to_string(),
+        })?;
+        let path = entry.path();
+        // Use the directory entry type so prompt assembly does not follow
+        // symlinked curated files/directories outside the store. Symlink drift
+        // belongs in doctor diagnostics, not in the context hot path.
+        let file_type = entry.file_type().map_err(|err| ContextError::ReadNote {
+            path: path.clone(),
+            message: err.to_string(),
+        })?;
+        if file_type.is_dir() {
+            let relative = path.strip_prefix(store_root).unwrap_or(&path);
+            collect_curated_tree(store_root, relative, scope, files)?;
+        } else if file_type.is_file()
+            && path.extension().and_then(|value| value.to_str()) == Some("md")
+        {
+            let body = fs::read_to_string(&path).map_err(|err| ContextError::ReadNote {
+                path: path.clone(),
+                message: err.to_string(),
+            })?;
+            let relative_path = path_string(path.strip_prefix(store_root).unwrap_or(&path));
+            files.push(CuratedCandidate {
+                id: format!("curated:{relative_path}"),
+                relative_path,
+                scope: scope.to_owned(),
+                body,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn curated_scope_allowed(candidate: &CuratedCandidate, scopes: &[String]) -> bool {
+    scopes.is_empty() || scopes.iter().any(|scope| scope == &candidate.scope)
+}
+
 fn scope_allowed(entry: &IndexEntry, scopes: &[String]) -> bool {
     scopes.is_empty() || scopes.iter().any(|scope| scope == &entry.scope)
 }
@@ -267,6 +389,27 @@ fn render_memory_block(
         trust.as_str(),
         escape_memory_body(body)
     )
+}
+
+fn render_curated_memory_block(store_name: &str, candidate: &CuratedCandidate) -> String {
+    format!(
+        "<memory id=\"{}\" agent=\"human\" store=\"{}\" scope=\"{}\" trust=\"{}\">\n{}\n</memory>\n\n",
+        escape_attr(&candidate.id),
+        escape_attr(store_name),
+        escape_attr(&candidate.scope),
+        TrustLevel::Curated.as_str(),
+        escape_memory_body(&candidate.body)
+    )
+}
+
+fn path_string(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn sanitize_header_value(value: &str) -> String {
@@ -475,6 +618,43 @@ mod tests {
             .markdown
             .contains("trust=\"remembered\">\nChris prefers TOML config.");
         assert!(has_memory_body);
+    }
+
+    #[test]
+    fn includes_curated_global_and_matching_project_memory() {
+        let dir = temp_dir("curated");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        fs::create_dir_all(root.join("memories/global")).expect("global dir");
+        fs::create_dir_all(root.join("memories/projects/proj-a")).expect("project dir");
+        fs::create_dir_all(root.join("memories/projects/proj-b")).expect("other project dir");
+        fs::write(
+            root.join("memories/global/MEMORY.md"),
+            "Global curated fact.\n",
+        )
+        .expect("global memory");
+        fs::write(
+            root.join("memories/projects/proj-a/MEMORY.md"),
+            "Project A curated fact.\n",
+        )
+        .expect("project memory");
+        fs::write(
+            root.join("memories/projects/proj-b/MEMORY.md"),
+            "Project B curated fact.\n",
+        )
+        .expect("other project memory");
+        let entries = entries(&root, &cache);
+        let sources = ["curated".to_owned()];
+        let mut request = input(&root, &entries, &[], &sources);
+        request.project_id = Some("proj-a");
+
+        let output = assemble_context(request).expect("context");
+
+        assert_eq!(output.sections.len(), 2);
+        assert!(output.markdown.contains("trust=\"curated\""));
+        assert!(output.markdown.contains("Global curated fact."));
+        assert!(output.markdown.contains("Project A curated fact."));
+        assert!(!output.markdown.contains("Project B curated fact."));
     }
 
     #[test]
