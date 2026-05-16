@@ -44,6 +44,28 @@ fn write_config(
     .expect("write config");
 }
 
+fn write_data_config(
+    path: &std::path::Path,
+    data_dir: &std::path::Path,
+    personal_root: &std::path::Path,
+) {
+    fs::write(
+        path,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+            "#,
+            data_dir.display(),
+            personal_root.display()
+        ),
+    )
+    .expect("write config");
+}
+
 fn init_store(root: &std::path::Path, name: &str) {
     let mut cmd = cargo_bin_cmd!("hm");
     cmd.args([
@@ -544,21 +566,7 @@ fn doctor_full_warns_for_likely_secret_in_private_note_without_echoing_value() {
     let config = dir.join("config.toml");
     let data = dir.join("data");
     let personal = dir.join("personal");
-    fs::write(
-        &config,
-        format!(
-            r#"
-            default_store = "personal"
-            data_dir = "{}"
-
-            [stores.personal]
-            root = "{}"
-            "#,
-            data.display(),
-            personal.display()
-        ),
-    )
-    .expect("write config");
+    write_data_config(&config, &data, &personal);
     init_store(&personal, "personal");
 
     let mut remember = cargo_bin_cmd!("hm");
@@ -744,21 +752,7 @@ fn remember_uses_cached_store_identity_for_offline_outbox() {
     let config = dir.join("config.toml");
     let data = dir.join("data");
     let personal = dir.join("personal");
-    fs::write(
-        &config,
-        format!(
-            r#"
-            default_store = "personal"
-            data_dir = "{}"
-
-            [stores.personal]
-            root = "{}"
-            "#,
-            data.display(),
-            personal.display()
-        ),
-    )
-    .expect("write config");
+    write_data_config(&config, &data, &personal);
     init_store(&personal, "personal");
     let manifest = store::read_manifest(&personal).expect("read manifest");
 
@@ -801,6 +795,153 @@ fn remember_uses_cached_store_identity_for_offline_outbox() {
     .expect("parse meta");
     assert_eq!(meta.expected_store_id, Some(manifest.store.id));
     assert_eq!(meta.state, outbox::OutboxState::Pending);
+}
+
+#[test]
+fn flush_bind_reconciles_unbound_outbox_item() {
+    let dir = temp_dir("flush-bind-unbound");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    write_data_config(&config, &data, &personal);
+
+    let output = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Unbound write should bind later.",
+            "--json",
+        ])
+        .output()
+        .expect("run unbound remember");
+    assert!(output.status.success(), "remember failed: {output:?}");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("remember json");
+    let id = json["id"].as_str().expect("id");
+    let item_dir = data.join("outbox/personal").join(id);
+    let meta: outbox::OutboxMeta =
+        toml::from_str(&fs::read_to_string(item_dir.join("meta.toml")).expect("read meta"))
+            .expect("parse meta");
+    assert_eq!(meta.expected_store_id.as_deref(), None);
+    assert_eq!(meta.state, outbox::OutboxState::Unbound);
+
+    init_store(&personal, "personal");
+    let manifest = store::read_manifest(&personal).expect("read manifest");
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--store",
+            "personal",
+            "flush",
+            "--bind",
+            id,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("flushed=1"));
+
+    assert!(!item_dir.exists());
+    let final_note =
+        fs::read_to_string(personal.join(&meta.final_note_path)).expect("read final note");
+    assert!(final_note.contains("Unbound write should bind later."));
+    assert!(final_note.contains(&manifest.store.id));
+}
+
+#[test]
+fn flush_bind_requires_explicit_store() {
+    let dir = temp_dir("flush-bind-store-required");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+            "#,
+            data.display(),
+            personal.display()
+        ),
+    )
+    .expect("write config");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "flush",
+            "--bind",
+            "some-id",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "hm flush --bind requires --store <name>",
+        ));
+}
+
+#[test]
+fn flush_bind_rejects_corrupt_outbox_id_mismatch() {
+    let dir = temp_dir("flush-bind-id-mismatch");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+            "#,
+            data.display(),
+            personal.display()
+        ),
+    )
+    .expect("write config");
+
+    let output = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Corrupt metadata should not bind.",
+            "--json",
+        ])
+        .output()
+        .expect("run unbound remember");
+    assert!(output.status.success(), "remember failed: {output:?}");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("remember json");
+    let id = json["id"].as_str().expect("id");
+    let meta_path = data.join("outbox/personal").join(id).join("meta.toml");
+    let mut meta: outbox::OutboxMeta =
+        toml::from_str(&fs::read_to_string(&meta_path).expect("read meta")).expect("parse meta");
+    meta.id = "different-id".to_owned();
+    fs::write(&meta_path, outbox::render_meta(&meta).expect("render meta")).expect("write meta");
+
+    init_store(&personal, "personal");
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--store",
+            "personal",
+            "flush",
+            "--bind",
+            id,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("outbox item id mismatch"));
 }
 
 #[test]

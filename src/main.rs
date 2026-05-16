@@ -451,6 +451,9 @@ struct FlushArgs {
     /// Suppress the human summary line.
     #[arg(long)]
     quiet: bool,
+    /// Bind one unbound outbox item id to the selected --store before flushing.
+    #[arg(long)]
+    bind: Option<String>,
     /// Emit machine-readable output.
     #[arg(long)]
     json: bool,
@@ -1073,23 +1076,13 @@ fn run_write_memory(
     // offline work.
     let outcome = match read_store_manifest(&config, &resolved_store.name, store_config) {
         Ok(manifest) => write_canonical_memory(&store_config.root, &manifest, write_input)?,
-        Err(store::StoreError::Io { .. }) => {
-            let Some(expected_store_id) =
-                known_store_identity(&config, &resolved_store.name, store_config)?
-            else {
-                anyhow::bail!(
-                    "store {} is unavailable and has no known identity for outbox fallback",
-                    resolved_store.name
-                );
-            };
-            enqueue_outbox_memory(
-                &config,
-                store_config,
-                &resolved_store.name,
-                expected_store_id,
-                write_input,
-            )?
-        }
+        Err(store::StoreError::Io { .. }) => enqueue_outbox_memory(
+            &config,
+            store_config,
+            &resolved_store.name,
+            known_store_identity(&config, &resolved_store.name, store_config)?,
+            write_input,
+        )?,
         Err(err) => return Err(err.into()),
     };
 
@@ -1200,7 +1193,7 @@ fn enqueue_outbox_memory(
     config: &Config,
     store_config: &StoreConfig,
     store_name: &str,
-    expected_store_id: String,
+    expected_store_id: Option<String>,
     input: MemoryWriteFields,
 ) -> Result<MemoryWriteOutcome> {
     let id = id::new_write_id(&id::WriteIdContext {
@@ -1208,11 +1201,23 @@ fn enqueue_outbox_memory(
         agent_id: input.agent_id.clone(),
     });
     let write_event = input.write_event;
+    let state = if expected_store_id.is_some() {
+        outbox::OutboxState::Pending
+    } else {
+        outbox::OutboxState::Unbound
+    };
+    let payload_store_id = expected_store_id
+        .clone()
+        .unwrap_or_else(|| "unbound".to_owned());
+    // Notes/events require a non-empty store id by schema. A never-seen
+    // offline store has no trustworthy manifest id yet, so use an explicit
+    // placeholder and keep the outbox state `unbound`; `hm flush --bind`
+    // rewrites the payload before anything can be published canonically.
     let note_relative_path = note::note_relative_path(&id, input.created_at);
     let event_relative_path = event::event_relative_path(&id, input.created_at);
     let note_input = note::NoteWriteInput {
         entry_kind: input.entry_kind,
-        store_id: expected_store_id.clone(),
+        store_id: payload_store_id.clone(),
         store_name: store_name.to_owned(),
         created_at: input.created_at,
         agent_id: input.agent_id.clone(),
@@ -1239,7 +1244,7 @@ fn enqueue_outbox_memory(
         Some(event::render_event(&event::MemoryEvent::observation(
             event::EventObservationInput {
                 id: id.clone(),
-                store_id: expected_store_id.clone(),
+                store_id: payload_store_id.clone(),
                 store_name: store_name.to_owned(),
                 created_at: input.created_at,
                 agent_id: input.agent_id,
@@ -1267,18 +1272,18 @@ fn enqueue_outbox_memory(
         data_dir: &config.data_dir,
         store: store_name,
         id: &id,
-        expected_store_id: Some(expected_store_id.clone()),
+        expected_store_id: expected_store_id.clone(),
         final_note_path: store_relative_path_string(&note_relative_path),
         note: note.into_bytes(),
         final_event_path: write_event.then(|| store_relative_path_string(&event_relative_path)),
         event: event.map(String::into_bytes),
-        state: outbox::OutboxState::Pending,
+        state,
         options: input.options,
     })?;
 
     Ok(MemoryWriteOutcome {
         id,
-        store_id: expected_store_id,
+        store_id: payload_store_id,
         note_path: store_config.root.join(note_relative_path),
         event_path: write_event.then(|| store_config.root.join(event_relative_path)),
         outbox_path: Some(report.item_dir),
@@ -1926,6 +1931,18 @@ fn run_refresh(args: RefreshArgs, context: CliContext) -> Result<()> {
 
 fn run_flush(args: FlushArgs, context: CliContext) -> Result<()> {
     let config = load_config(context.config_path.as_deref())?;
+    if let Some(item_id) = args.bind.as_deref() {
+        let Some(store) = context.store.as_deref() else {
+            anyhow::bail!("hm flush --bind requires --store <name>");
+        };
+        outbox::bind_item(outbox::BindInput {
+            data_dir: &config.data_dir,
+            stores: &config.stores,
+            item_id,
+            store,
+            options: hook_options(&config),
+        })?;
+    }
     let report = outbox::flush(outbox::FlushInput {
         data_dir: &config.data_dir,
         stores: &config.stores,

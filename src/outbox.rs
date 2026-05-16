@@ -8,7 +8,7 @@
 //! is the safety check that prevents a later alias/path change from publishing
 //! memory into the wrong hive.
 
-use crate::{config, store, write};
+use crate::{config, event, note, store, write};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -89,6 +89,42 @@ pub struct FlushInput<'a> {
     pub host_id: &'a str,
     /// Atomic writer options for final payload and archive writes.
     pub options: write::AtomicWriteOptions,
+}
+
+/// Request to bind one unbound outbox item to a reachable store.
+#[derive(Debug, Clone)]
+pub struct BindInput<'a> {
+    /// Durable tool data directory containing `outbox/`.
+    pub data_dir: &'a Path,
+    /// Configured stores keyed by local alias.
+    pub stores: &'a BTreeMap<String, config::StoreConfig>,
+    /// Outbox item id to bind.
+    pub item_id: &'a str,
+    /// Target store alias that should own the item.
+    ///
+    /// The alias selects local configuration only. The reachable manifest id is
+    /// copied into the item during binding and remains the durable ownership
+    /// check used by later automatic flushes.
+    pub store: &'a str,
+    /// Atomic writer options for payload and metadata rewrites.
+    pub options: write::AtomicWriteOptions,
+}
+
+/// Result of binding one unbound outbox item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindReport {
+    /// Outbox item id.
+    pub id: String,
+    /// Target store alias.
+    pub store: String,
+    /// Target manifest id recorded on the item.
+    pub expected_store_id: String,
+    /// Item directory after binding.
+    ///
+    /// Binding may move an item that was queued under an old alias into the
+    /// selected store alias. The metadata, not this directory name, remains the
+    /// source of truth for flush policy.
+    pub item_dir: PathBuf,
 }
 
 /// Request to enqueue one offline write for a later flush.
@@ -202,6 +238,8 @@ pub enum OutboxError {
     },
     /// Metadata TOML could not be rendered.
     RenderMeta(String),
+    /// Outbox item could not be bound safely.
+    Bind(String),
     /// Store identity cache TOML was malformed.
     ParseIdentityCache(String),
     /// Store identity cache TOML could not be rendered.
@@ -231,6 +269,7 @@ impl Display for OutboxError {
                 )
             }
             Self::RenderMeta(message) => write!(f, "failed to render outbox metadata: {message}"),
+            Self::Bind(message) => write!(f, "failed to bind outbox item: {message}"),
             Self::ParseIdentityCache(message) => {
                 write!(f, "failed to parse store identity cache: {message}")
             }
@@ -377,6 +416,82 @@ pub fn enqueue(input: EnqueueInput<'_>) -> Result<EnqueueReport, OutboxError> {
     Ok(EnqueueReport {
         item_dir,
         meta_path,
+    })
+}
+
+/// Bind one unbound outbox item to a reachable store manifest.
+///
+/// Binding rewrites the queued note/event metadata with the target manifest id
+/// before changing the item to `pending`. That avoids publishing placeholder
+/// identity data into canonical memory when an unbound item is later flushed.
+pub fn bind_item(input: BindInput<'_>) -> Result<BindReport, OutboxError> {
+    let original_item_dir = find_item_dir(input.data_dir, input.item_id)?
+        .ok_or_else(|| OutboxError::Bind(format!("outbox item not found: {}", input.item_id)))?;
+    let mut meta = read_meta(&original_item_dir.join("meta.toml"))?;
+    if meta.id != input.item_id {
+        return Err(OutboxError::Bind(format!(
+            "outbox item id mismatch: directory is {}, metadata is {}",
+            input.item_id, meta.id
+        )));
+    }
+    if meta.state != OutboxState::Unbound {
+        return Err(OutboxError::Bind(format!(
+            "outbox item {} is not unbound",
+            meta.id
+        )));
+    }
+    let store_config = input.stores.get(input.store).ok_or_else(|| {
+        OutboxError::Bind(format!("target store is not configured: {}", input.store))
+    })?;
+    let manifest = store::read_manifest(&store_config.root)
+        .map_err(|err| OutboxError::Bind(format!("target store is unavailable: {err}")))?;
+
+    let target_dir = input
+        .data_dir
+        .join("outbox")
+        .join(input.store)
+        .join(&meta.id);
+    let item_dir = if target_dir == original_item_dir {
+        original_item_dir
+    } else {
+        if target_dir.exists() {
+            return Err(OutboxError::Bind(format!(
+                "target outbox item already exists: {}",
+                target_dir.display()
+            )));
+        }
+        if let Some(parent) = target_dir.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| io_error("create target outbox parent", parent, err))?;
+        }
+        // Move first, then rewrite metadata. If the move fails, the item stays
+        // unbound and safe to retry; a failed semantic rewrite after the move
+        // still leaves automatic flush blocked by `state = "unbound"`.
+        fs::rename(&original_item_dir, &target_dir)
+            .map_err(|err| io_error("move bound outbox item", &target_dir, err))?;
+        target_dir
+    };
+
+    rewrite_payload_identity(
+        &item_dir,
+        &mut meta,
+        input.store,
+        &manifest.store.id,
+        &manifest.store.name,
+        &input.options,
+    )?;
+    record_store_identity(
+        input.data_dir,
+        input.store,
+        &manifest.store.id,
+        &input.options,
+    )?;
+
+    Ok(BindReport {
+        id: meta.id,
+        store: input.store.to_owned(),
+        expected_store_id: manifest.store.id,
+        item_dir,
     })
 }
 
@@ -628,6 +743,94 @@ fn collect_item_dirs(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     }
     dirs.sort();
     Ok(dirs)
+}
+
+fn find_item_dir(data_dir: &Path, item_id: &str) -> Result<Option<PathBuf>, OutboxError> {
+    let outbox_root = data_dir.join("outbox");
+    let item_dirs = match collect_item_dirs(&outbox_root) {
+        Ok(paths) => paths,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(io_error("scan outbox", &outbox_root, err)),
+    };
+    let mut matches = item_dirs
+        .into_iter()
+        .filter(|path| path.file_name().and_then(|name| name.to_str()) == Some(item_id));
+    let first = matches.next();
+    // Item ids are globally generated, but unbound recovery may have queued an
+    // item under a stale or placeholder alias. Binding by id is ergonomic only
+    // if ambiguity is refused rather than silently picking one store directory.
+    if matches.next().is_some() {
+        return Err(OutboxError::Bind(format!(
+            "outbox item id is ambiguous: {item_id}"
+        )));
+    }
+    Ok(first)
+}
+
+fn rewrite_payload_identity(
+    item_dir: &Path,
+    meta: &mut OutboxMeta,
+    store_name: &str,
+    store_id: &str,
+    manifest_store_name: &str,
+    options: &write::AtomicWriteOptions,
+) -> Result<(), OutboxError> {
+    // Binding changes ownership data embedded in the payloads, not just the
+    // sidecar metadata. Re-render through the note/event parsers so the hashes
+    // recorded below describe the exact bytes that a later flush will publish.
+    let note_path = item_dir.join("note.md");
+    let note_contents = fs::read_to_string(&note_path)
+        .map_err(|err| io_error("read outbox note", &note_path, err))?;
+    let mut parsed_note =
+        note::parse_note(&note_contents).map_err(|err| OutboxError::Bind(err.to_string()))?;
+    parsed_note.front_matter.store_id = store_id.to_owned();
+    parsed_note.front_matter.store_name = manifest_store_name.to_owned();
+    let rendered_note =
+        note::render_note(&parsed_note).map_err(|err| OutboxError::Bind(err.to_string()))?;
+    write::write_atomic(&note_path, rendered_note.as_bytes(), options).map_err(|err| {
+        OutboxError::Io {
+            action: "rewrite outbox note",
+            path: note_path.clone(),
+            message: err.to_string(),
+        }
+    })?;
+
+    let event_sha256 = if meta.final_event_path.is_some() {
+        let event_path = item_dir.join("event.json");
+        let event_contents = fs::read_to_string(&event_path)
+            .map_err(|err| io_error("read outbox event", &event_path, err))?;
+        let mut parsed_event = event::parse_event(&event_contents)
+            .map_err(|err| OutboxError::Bind(err.to_string()))?;
+        parsed_event.store_id = store_id.to_owned();
+        parsed_event.store_name = manifest_store_name.to_owned();
+        let rendered_event =
+            event::render_event(&parsed_event).map_err(|err| OutboxError::Bind(err.to_string()))?;
+        write::write_atomic(&event_path, rendered_event.as_bytes(), options).map_err(|err| {
+            OutboxError::Io {
+                action: "rewrite outbox event",
+                path: event_path.clone(),
+                message: err.to_string(),
+            }
+        })?;
+        Some(sha256(rendered_event.as_bytes()))
+    } else {
+        None
+    };
+
+    meta.store = store_name.to_owned();
+    meta.expected_store_id = Some(store_id.to_owned());
+    meta.note_sha256 = sha256(rendered_note.as_bytes());
+    meta.event_sha256 = event_sha256;
+    meta.state = OutboxState::Pending;
+    let meta_path = item_dir.join("meta.toml");
+    write::write_atomic(&meta_path, render_meta(meta)?.as_bytes(), options).map_err(|err| {
+        OutboxError::Io {
+            action: "rewrite outbox metadata",
+            path: meta_path,
+            message: err.to_string(),
+        }
+    })?;
+    Ok(())
 }
 
 fn read_meta(path: &Path) -> Result<OutboxMeta, OutboxError> {
