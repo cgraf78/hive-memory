@@ -15,10 +15,10 @@ conflict, prefer this file for v1 behavior and update both documents deliberatel
 | remember/note | yes | append-only Markdown notes |
 | JSON sidecars | yes | always for `remember`; configurable for `note` |
 | search | yes | simple deterministic text search backed by local index |
-| local triage index | yes | rebuildable jsonl index in data_dir; not full FTS |
+| local triage index | yes | rebuildable jsonl index in cache_dir; not full FTS |
 | context | yes | curated-only by default; raw inbox opt-in |
-| Claude render + `--install` | yes | generated file + `@import` line in `~/.claude/CLAUDE.md` |
-| Codex render | yes | generated file only |
+| Claude render + `--install` | yes | generated file + include marker in `~/.claude/CLAUDE.md` |
+| Codex render + `--install` | yes | generated file + include block through `~/.codex/AGENTS.md` |
 | local outbox/flush | yes | required for laptop/offline ergonomics; data_dir, not state_dir |
 | `hm promote` / `hm inbox` | yes | curation workflow that bridges raw inbox to curated memory |
 | trust-boundary rendering | yes | source-labeled blocks; raw notes excluded by default |
@@ -107,13 +107,16 @@ enabled = true
 stores = ["personal"]
 scopes = ["global", "project"]
 output = "${HOME}/.claude/hive-memory.generated.md"
-install_target = "${HOME}/.claude/CLAUDE.md"   # file to install @import into
+install_target = "${HOME}/.claude/CLAUDE.md"   # file to install include marker into
+install_mode = "include"
 
 [adapters.codex]
 enabled = true
 stores = ["personal"]
 scopes = ["global", "project"]
 output = "${HOME}/.codex/hive-memory.generated.md"
+install_target = "${HOME}/.codex/AGENTS.md"    # agent-loaded path; symlink or regular file
+install_mode = "include"
 ```
 
 Validation rules:
@@ -128,6 +131,9 @@ Validation rules:
 - `${VAR}` and `${VAR:-fallback}` expansion is supported in path-like fields.
 - unknown top-level keys should warn in v1, not fail, unless they are dangerous.
 - unknown subkeys under known tables should warn so typos are visible.
+- enabled adapters require `output`; `install_target` is required when dotfiles
+  update or `hm render --install` should make the adapter visible.
+- `adapters.<name>.install_mode` must be `include` in v1.
 - local override config may replace scalar values and merge tables.
 - CLI flags and environment variables override merged config, not source files.
 
@@ -259,7 +265,7 @@ Rules:
 
 - The Markdown body is the durable human-readable record.
 - Front matter must be parseable enough for `hm search`, `hm context`, and
-  `hm compact` to filter by store/scope/project/tags/audience.
+  future compaction/proposal workflows to filter by store/scope/project/tags/audience.
 - Agents should write concise, factual notes; promotion (`hm promote`) is the
   bridge into curated memory files.
 - Notes are immutable by convention once written. Corrections should be new
@@ -308,10 +314,16 @@ Aliases:
 #### Audience and agent-private
 
 Notes/events with `scope = "agent-private"` MUST include an `audience` field
-listing the permitted reading agents. Render/search/context filtering:
+listing the permitted reading agents. Valid v1 writes materialize this field
+explicitly; `hm remember`/`hm note` refuse agent-private writes without
+`--audience` unless `--audience-writer-only` is set, which records
+`audience = [agent_id]`.
 
-- `scope = "agent-private"` AND no `audience` field → only readable by an
-  `hm context --as-agent <id>` invocation matching the writing `agent_id`.
+Render/search/context filtering:
+
+- `scope = "agent-private"` AND no `audience` field → tolerated only for
+  legacy/manual notes; readable by an `hm context --as-agent <id>` invocation
+  matching the writing `agent_id`.
 - `scope = "agent-private"` AND `audience = ["a", "b"]` → readable only when
   the invoking adapter identifies itself as `a` or `b`.
 - Adapters MUST pass `--as-agent <id>` (or `HIVE_MEMORY_ADAPTER`) when rendering.
@@ -400,7 +412,7 @@ When to write JSON:
 - `hm remember`: write Markdown and JSON event sidecar by default.
 - `hm note`: write Markdown always; write JSON when `event_sidecar = "always"`.
 - `hm import`: write JSON to preserve import provenance and dedupe IDs.
-- `hm compact`: write JSON metadata describing inputs/outputs of compaction.
+- future `hm compact`: write JSON metadata describing inputs/outputs of compaction.
 - `hm doctor`: may write JSON diagnostic reports only under local state/cache,
   not the canonical store, unless explicitly asked.
 
@@ -477,6 +489,7 @@ Data dir contents (durable, treat as user memory):
 ```text
 outbox/                 # pending offline writes waiting for store root
 projects/               # local-only project bindings, when not committed
+store-identities.toml    # last-seen manifest identities for offline outbox binding
 ```
 
 State dir contents (ephemeral, OK to lose):
@@ -537,12 +550,15 @@ Rules:
   memory; deleting state may lose `runs/` history but not memory.
 - Deleting data MAY lose un-flushed outbox writes that never made it to a
   store's outbox-archive. Doctor warns aggressively when outbox is non-empty.
-- Offline writes require a known store manifest identity. If the active store
-  root is unavailable AND the store's expected manifest ID is unknown, the
-  write is enqueued in the outbox with `state = "unbound"`. Unbound items
-  NEVER auto-flush. `hm flush --bind <outbox-id> --store <name>` is the only
-  way to reconcile them. There is no `--force` escape hatch: unbound items
-  exist precisely to prevent orphaned writes from flushing into the wrong store.
+- Offline writes require a known store manifest identity. The identity can come
+  from `stores.<name>.expected_id` or from the local
+  `data/store-identities.toml` cache populated every time `hm` successfully
+  reads that store's manifest. If the active store root is unavailable AND no
+  manifest identity is known, the write is enqueued in the outbox with
+  `state = "unbound"`. Unbound items NEVER auto-flush.
+  `hm flush --bind <outbox-id> --store <name>` is the only way to reconcile
+  them. There is no `--force` escape hatch: unbound items exist precisely to
+  prevent orphaned writes from flushing into the wrong store.
 
 ## V1 Command Contracts
 
@@ -579,6 +595,37 @@ JSON error shape:
   "error": { "code": "privacy_refusal", "message": "...", "details": {} }
 }
 ```
+
+Stable `--json` success field sets. Fields are mandatory unless explicitly noted:
+
+- `hm remember` / `hm note`:
+  `{ "id", "store", "store_id", "note_path", "event_path" }`, where
+  `event_path` is `null` when no sidecar is written.
+- `hm search`:
+  `[ { "id", "store", "store_id", "scope", "trust", "audience", "path",
+  "title", "snippet", "score", "created_at" } ]`.
+- `hm context --json`:
+  `{ "stores", "scopes", "sources", "estimated_tokens", "sections" }`, where
+  each section contains `{ "id", "store", "scope", "trust", "audience",
+  "source_path", "estimated_tokens", "body" }`.
+- `hm render --json`:
+  `{ "adapter", "output_path", "written", "sha256", "installed", "visible",
+  "install_targets", "backup_paths" }`; install fields are empty arrays when the
+  adapter render did not run `--install` or `--uninstall`.
+- `hm flush --json`:
+  `{ "flushed", "skipped", "failed", "unbound", "pending", "items" }`, where
+  each item contains `{ "id", "store", "state", "result", "message" }`.
+- `hm stores list --json`:
+  `[ { "name", "store_id", "root", "available", "default", "sensitivity" } ]`.
+- `hm stores show --json`:
+  `{ "name", "config", "manifest", "available" }`.
+- `hm doctor --json`:
+  `{ "ok", "summary", "checks" }`, where `summary` contains
+  `{ "errors", "warnings" }` and each check contains
+  `{ "id", "severity", "status", "message", "paths" }`.
+
+Success JSON is command-specific and not wrapped in `{ "ok": true }`; errors
+always use the error shape above.
 
 Input rules:
 
@@ -618,8 +665,8 @@ Writes:
 Output:
 
 - human: created note ID and relative path.
-- JSON: `{ "id", "store", "note_path", "event_path" }`; `event_path` is
-  `null` when no sidecar is written.
+- JSON: `{ "id", "store", "store_id", "note_path", "event_path" }`;
+  `event_path` is `null` when no sidecar is written.
 
 Errors/refusals:
 
@@ -686,7 +733,7 @@ Purpose: assemble concise context for an agent/session.
 Examples:
 
 ```bash
-hm context --agent codex --project /repo --max-tokens 4000
+hm context --as-agent codex --project /repo --max-tokens 4000
 hm context --stores personal,work --scope global,project
 hm context --include-inbox --as-agent codex
 ```
@@ -708,9 +755,10 @@ Behavior:
 - refuses `--all-stores` when config disables broad reads.
 - audience filter: when `--as-agent <id>` is set, agent-private notes whose
   audience does not include `<id>` are filtered out.
-- escape rule: when rendering raw note bodies (under `--include-inbox`), the
-  CLI escapes lines that begin with `---`, `+++`, or `<memory`/`</memory` to
-  prevent inbox content from terminating the data-boundary block.
+- escape rule: when rendering any memory body, the CLI escapes lines that begin
+  with `---`, `+++`, or `<memory`/`</memory` to prevent source content from
+  terminating the data-boundary block. Raw inbox content remains excluded unless
+  `--include-inbox` is passed.
 
 Output:
 
@@ -728,6 +776,7 @@ Examples:
 hm render codex
 hm render claude --store personal
 hm render --configured --quiet
+hm render --configured --install --quiet
 hm render claude --install
 hm render claude --uninstall
 hm render --upgrade-marker     # re-bless after intentional template changes
@@ -741,6 +790,8 @@ Behavior:
 - `--configured` renders all enabled adapters from config.
 - render uses each adapter's explicit store/scope allowlist.
 - writes to temp file then atomic rename.
+- `--install` renders first, then links each selected adapter into every
+  configured instruction file the agent may load.
 - includes a generated-file header as the FIRST line of every rendered file:
 
   ```text
@@ -751,32 +802,67 @@ Behavior:
   terminating newline. `--upgrade-marker` re-blesses a renderer-template
   change by writing a fresh marker without contents-comparison.
 
-Adapter `--install` contract (Claude in v1; other adapters may opt in):
+Adapter `--install` contract:
 
-1. Read current `install_target` (e.g., `~/.claude/CLAUDE.md`); if missing,
-   create it with mode `0644`.
-2. Copy the target to `<install_target>.hive-memory.bak` (a single rolling
-   backup, overwritten on every install).
-3. Insert (or replace contents of) the marker block:
+1. Compute the install file set for the selected adapters from their
+   `install_target` paths. Each `install_target` is the instruction path that the
+   adapter's agent loads. Resolve symlinks before de-duping write targets, so
+   `~/.codex/AGENTS.md -> ../.claude/CLAUDE.md` and
+   `~/.claude/CLAUDE.md` become one resolved install file, while a regular
+   `~/.codex/AGENTS.md` remains its own install file. This makes install
+   idempotent whether AGENTS.md is a symlink or not.
+2. For each resolved install file, read the current contents; if missing, create
+   it with mode `0644`.
+3. Copy each file to `<path>.hive-memory.bak` (a single rolling backup,
+   overwritten on every install) and write `<path>.hive-memory.bak.toml` with
+   `backup_sha256`, `installed_sha256` (filled after install),
+   `pre_install_mtime`, and the exact marker blocks installed in that file.
+4. Insert (or replace contents of) the stable policy marker block in each
+   resolved install file. The policy block is shared across adapters, should be
+   committed once when the shared instruction file is tracked, and must not
+   contain rendered memory bodies:
 
    ```text
-   # BEGIN hive-memory
-   @hive-memory.generated.md
-   # END hive-memory
+   # BEGIN hive-memory:policy
+   ...stable Hive Memory read/write policy...
+   # END hive-memory:policy
    ```
 
+5. Insert (or replace contents of) the adapter-specific marker block for every
+   adapter whose `install_target` resolves to the install file being written. In
+   v1, the marker body is a native include of that adapter's generated output:
+
+   ```text
+   # BEGIN hive-memory:<adapter>
+   @<adapter-output-include-path>
+   # END hive-memory:<adapter>
+   ```
+
+   The include path MUST resolve to the selected adapter's configured `output`
+   from the resolved instruction file where the marker is installed. Use the
+   shortest native path that is unambiguous; when multiple adapters share one
+   resolved install file, or when the generated output is not in the same
+   directory as the install file, prefer an absolute or `~` path over a basename
+   so Claude and Codex cannot accidentally include each other's generated files.
+
    Append at end of file if the block is absent; replace contents in place
-   if the block exists (idempotent).
-4. Preserve the existing line-ending convention (LF or CRLF).
-5. Refuse to edit when ANY of the following is true:
-   - the install_target is a symlink
-   - the install_target is not owned by `$USER`
-   - the file's mode is not user-writable
-   - the existing file contains conflicting markers (e.g., `# BEGIN hive-memory`
-     with mismatched body)
-6. `--uninstall` removes the marker block and restores `<install_target>.hive-memory.bak`
-   when the bak file's mtime is newer than the install_target's mtime minus the
-   block's predicted byte count (cheap sanity check).
+   if the block exists (idempotent). When multiple enabled adapters share one
+   resolved install file, `--configured --install` updates all selected adapter
+   blocks in one write and preserves unselected adapter blocks.
+6. Preserve the existing line-ending convention (LF or CRLF) per install file.
+7. Refuse to edit when ANY of the following is true:
+   - an `install_target` is a broken symlink
+   - a resolved install file is not owned by `$USER`
+   - a resolved install file's mode is not user-writable
+   - the existing file contains conflicting markers (e.g.,
+     `# BEGIN hive-memory:<adapter>` with a mismatched end marker)
+8. `--uninstall` reads backup metadata for every install file and removes only
+   the selected adapter's marker block. The policy block remains unless
+   `--uninstall --all` is requested. If uninstalling every hive-memory marker
+   that was installed into a file and the current file sha256 matches
+   `installed_sha256`, restore that file's backup exactly. If the current file
+   was edited after install, remove only the selected marker blocks in place,
+   keep the backup, and report that automatic restore was skipped.
 
 Render-time safety:
 
@@ -787,6 +873,23 @@ Render-time safety:
 - Refuses to overwrite a target file that lacks the marker header at all,
   suggesting `hm render <adapter> --install` first.
 - Refuses to overwrite secret-store renders without `--include-secret`.
+
+Adapter visibility requirements:
+
+- Claude v1: `hm render claude --install` MUST install an include marker into
+  `~/.claude/CLAUDE.md` (or configured `install_target`) that references the
+  generated Claude output. A normal Claude startup must load that target and
+  therefore see the generated memory.
+- Codex v1: `hm render codex --install` MUST make the configured
+  `install_target` path (`~/.codex/AGENTS.md` by convention) contain or resolve
+  to a current Codex include marker. If `AGENTS.md` is a symlink to the shared
+  Claude file, editing the resolved shared file is sufficient. If it is a
+  regular file, install the same idempotent policy and Codex marker directly into
+  `AGENTS.md`.
+- Rendered output alone is not considered fully installed. An adapter is
+  "visible" only when doctor can prove its configured `install_target` contains,
+  or resolves to a file containing, a current `hive-memory:<adapter>` marker for
+  that adapter.
 
 ### `hm flush`
 
@@ -910,8 +1013,11 @@ Checks (all surfaces at default verbosity unless noted):
   "Conflict", "sync-conflict", duplicate temp files older than TTL).
 - adapter outputs have valid `<!-- hive-memory:generated -->` markers with
   matching sha256 (warns when drifted).
-- for adapters with `install_target` configured, verifies the `@import`
-  marker block is present and points at the configured output path.
+- for adapters with `install_target` configured, verifies the hive-memory marker
+  block is present in the file the agent actually loads.
+- verifies each marker points at the configured output path.
+- each configured `install_target` exists and contains, or resolves to a file
+  containing, its adapter's idempotently installed marker block.
 - sensitive stores are not broadly rendered.
 - local outbox has pending writes; aggressively warns when items are older
   than 7 days; reports unbound items as a separate error class.
@@ -942,11 +1048,13 @@ Modes:
 
 Purpose: propose or perform promotion of raw notes into curated memory.
 
-Deferred v1 recommendation: implement `--dry-run`/proposal flow after the core
-write/search/render path works. Automatic writes to curated memory can come
-later; v1 ships `hm promote` for manual single-note promotion instead.
+Deferred v1 feature. Core v1 does not require `hm compact` to ship, and no hook
+or adapter may depend on it. Implementations may reserve the command name with a
+"deferred" message, but the stable command contract starts only when the
+proposal workflow is implemented after the core write/search/render path works.
+V1 ships `hm promote` for manual single-note promotion instead.
 
-Behavior:
+Future behavior:
 
 - selects candidate notes/events by store/scope/project/age/tags.
 - writes proposal under `compactions/YYYY/MM/`.
@@ -967,6 +1075,86 @@ Behavior:
 - dedupes by content hash + source path.
 - dry-run default should show planned imports before first destructive-looking
   migration, even though raw import writes are append-only.
+
+## Agent Runtime Workflow
+
+V1 should make memory feel automatic without letting hooks write noisy or
+incorrect memories. The split is deliberate:
+
+- `hm` owns storage, search, context assembly, rendering, and flush semantics.
+- Dotfiles/agent hooks own lifecycle wiring for Claude, Codex, and later agents.
+  In this dotfiles environment, Hive Memory behavior is added to the existing
+  `agent-hook-*` scripts and shared hook-helper framework; v1 must not introduce
+  a parallel hook system.
+- Agents own judgment about what text is durable enough to remember.
+
+### Installed Policy Block
+
+`hm render --configured --install` installs stable adapter markers plus a stable
+Hive Memory policy block into the configured shared instruction file. For the
+current dotfiles layout this is `~/.claude/CLAUDE.md`; Codex reads the same file
+through `~/.codex/AGENTS.md -> ../.claude/CLAUDE.md`.
+
+The policy block is tracked and should change rarely. It MUST instruct agents:
+
+- treat hook-provided `hm context` as durable user/project memory.
+- write durable preferences, workflow rules, repo conventions, and repeated
+  corrections with `hm remember`.
+- write project-specific facts with
+  `hm remember --scope project --project "$PWD" --text "..."`.
+- use `hm note` only for lower-confidence observations worth later triage.
+- never store secrets, credentials, one-off task details, or noisy transcript
+  summaries by default.
+- prefer not writing when unsure; hooks may remind, but should not force memory
+  creation.
+
+### Hook Contract
+
+Agent hooks provide freshness and guardrails. They must be allowed to fail soft:
+memory hooks should warn and continue unless a command would cause privacy or
+store-identity leakage.
+
+Integration rule:
+
+- Implement the behaviors below as extensions to the existing dotfiles hook entry
+  points: `agent-hook-session-start`, `agent-hook-prompt-submit`,
+  `agent-hook-post-bash`, `agent-hook-post-edit`, and `agent-hook-stop`.
+- Reuse the existing hook state directory and helper APIs for context injection,
+  warnings, agent detection, and session-local state.
+- Agent-specific files such as `agent-hook-session-start-claude` may remain thin
+  extensions, but Hive Memory's common behavior should live in the shared hook
+  path so Claude and Codex stay consistent.
+
+Required hook behaviors:
+
+- **SessionStart**: inject fresh context by running `hm context --as-agent <id>
+  --project <cwd> --max-tokens <budget>` and passing the Markdown into the
+  agent's hook-provided additional context. This is the primary read path; the
+  generated include files are a stable fallback and bootstrap surface.
+- **UserPromptSubmit**: detect obvious durable-memory intent in the user's prompt
+  (for example "remember", "from now on", "always", "never", "note that",
+  "I prefer", "don't do X anymore"). When detected, record a session-local
+  `memory-pending` marker and inject a reminder that the agent should call
+  `hm remember` if the interpreted request is truly durable.
+- **PostToolUse**: when a tool command successfully runs `hm remember` or
+  `hm note`, clear `memory-pending`, then run `hm flush --quiet` and
+  `hm render --configured --quiet` best-effort so future sessions see the new
+  memory.
+- **Stop**: if `memory-pending` remains, emit a reminder that durable memory may
+  have been requested but no `hm remember`/`hm note` ran. Stop hooks MUST NOT
+  write new memories automatically.
+
+Hooks MAY run `hm flush --quiet` on Stop as best-effort maintenance. Hooks MUST
+NOT blindly summarize sessions, prompts, or transcripts into memory.
+
+### Prompt Intent Heuristic
+
+The prompt-intent detector is intentionally conservative and advisory. It should
+prefer false positives that become reminders over false negatives that silently
+miss explicit "remember this" requests, but it must not write memory itself.
+
+The pending marker should be session-local state, not canonical memory. It exists
+only to catch "the agent forgot to write" within the same session.
 
 ## Trust Boundary and Prompt Injection
 
@@ -994,10 +1182,11 @@ agent that reads context. The v1 trust boundary mitigates this:
    default. Curated memory is human-reviewed or has been explicitly promoted
    from inbox via `hm promote`.
 
-3. **Escape rules**. When `--include-inbox` IS used, lines in raw note bodies
-   that begin with `---`, `+++`, `<memory`, or `</memory` are escaped (prefixed
-   with a zero-width space) so an attacker cannot terminate the data-boundary
-   block or impersonate front matter.
+3. **Escape rules**. For every rendered body, lines that begin with `---`,
+   `+++`, `<memory`, or `</memory` are escaped (prefixed with a zero-width
+   space) so source content cannot terminate the data-boundary block or
+   impersonate front matter. This applies to curated memory too; promoted
+   content may still contain copied raw text.
 
 4. **Doctor patterns**. `hm doctor` flags raw inbox notes whose body exhibits
    instruction-language patterns (regex: `(?i)^(ignore|disregard|system|you must|now do)\b`)
@@ -1153,7 +1342,8 @@ Frozen at 1.0:
   `hm context --json`, `hm render --json`, `hm flush`, `hm stores list/show`,
   `hm doctor --json`).
 - The data-boundary block syntax used by `hm context`.
-- The adapter `@import` marker block syntax used by `hm render --install`.
+- The adapter install marker block syntax used by `hm render --install`,
+  including include-mode semantics and symlinked install targets.
 - The generated-file header syntax used by `hm render`.
 
 Free to evolve in 1.x:
@@ -1271,6 +1461,20 @@ Installer responsibilities:
 Why this matters: install should be reliable during machine bootstrap, before any
 agent-specific hook tries to call `hm`.
 
+Dotfiles update integration:
+
+- A normal dotfiles update MUST be sufficient to link enabled Claude and Codex
+  adapters into their agent-visible instruction files.
+- After installing or updating `hm`, the dotfiles merge hook runs
+  `hm doctor --quick`, then `hm render --configured --install --quiet`, then
+  `hm doctor --quick` again.
+- The second doctor pass is required so dotfiles update fails visibly when an
+  enabled adapter rendered successfully but is not visible from its configured
+  `install_target`.
+- Agent lifecycle hooks may refresh renders opportunistically, but v1 correctness
+  does not depend on a hook that runs after the agent has already loaded
+  instructions.
+
 ## Testing
 
 V1 ships with required test coverage organized by module. Each implementation
@@ -1313,6 +1517,8 @@ Test categories per module:
 - required-field enforcement.
 - paired `note_path` consistency with companion event.
 - `audience` field omission for non-agent-private notes.
+- agent-private writes require explicit audience or `--audience-writer-only`;
+  legacy/manual missing-audience notes warn in doctor.
 - normalization at write time (NFC, lowercase on case-insensitive FS).
 
 ### JSON event sidecar
@@ -1334,7 +1540,8 @@ Test categories per module:
 ### Context assembler
 
 - v1 default sources = curated only.
-- `--include-inbox` opens raw notes; escape rules applied.
+- `--include-inbox` opens raw notes; escape rules apply to every rendered body,
+  including curated content.
 - data-boundary block emitted with required attributes.
 - audience filter under `--as-agent`.
 - `--max-tokens` byte/4 approximation respected.
@@ -1348,16 +1555,43 @@ Test categories per module:
 - Refusal on drifted checksum without `--force --backup`.
 - Refusal on missing header.
 - `--upgrade-marker` re-blesses cleanly.
-- `--install` adds idempotent marker block; second call is no-op.
-- `--install` refusal on symlink, foreign owner, non-writable file.
-- `--uninstall` restores backup correctly.
+- `--install` adds idempotent policy and adapter marker blocks; second call is
+  no-op.
+- `--configured --install` renders and installs every enabled adapter.
+- include-mode install writes a native include pointing at the configured output.
+- install target checks cover both symlinked and regular files such as
+  `~/.codex/AGENTS.md`.
+- `--install` refusal on broken symlink, foreign owner, non-writable file.
+- `--uninstall` removes selected adapter blocks and restores backup only when all
+  installed hive-memory markers are being removed and the target still matches
+  install metadata; edited targets remove selected marker blocks in place.
 - Sensitive-store render refusal.
 - Generated `.gitignore` for `generated/` directory.
+
+### Agent runtime hooks
+
+- Installed policy block appears in the shared instruction file and remains
+  stable across repeated installs.
+- Hive Memory runtime behavior is implemented in the existing dotfiles
+  `agent-hook-*` scripts, not in a parallel hook stack.
+- SessionStart injects `hm context` additional context with the active adapter
+  identity and project path.
+- UserPromptSubmit detects explicit memory-intent prompts and records a
+  session-local `memory-pending` marker.
+- UserPromptSubmit reminder is advisory and does not write canonical memory.
+- PostToolUse clears `memory-pending` after successful `hm remember`/`hm note`.
+- PostToolUse runs best-effort `hm flush --quiet` and
+  `hm render --configured --quiet` after memory writes.
+- Stop emits a reminder when `memory-pending` remains.
+- Stop does not write memories automatically.
+- Hook failures warn and continue unless a privacy/store-identity refusal occurs.
 
 ### Outbox + flush
 
 - Outbox path uses XDG_DATA_HOME.
 - Write-to-outbox when active store root absent.
+- last-seen store identity cache lets offline writes bind after prior manifest
+  reads; never-seen stores become unbound.
 - Flush idempotency on same-hash collision (mark flushed).
 - Flush refuses on different-hash collision (report conflict).
 - Flush respects manifest identity check; no `--force` bypass.
@@ -1433,27 +1667,33 @@ When ready, create GitHub issues roughly in this order. Each carries a
 12. **Adapter render framework**: generated-file header + sha256 marker,
     atomic render writes, `--upgrade-marker`, refusal rules. Tests:
     Adapter render framework.
-13. **Claude adapter + `--install`**: configured render output, `@import`
-    installer with backup/idempotent markers/symlink refusal, `--uninstall`.
+13. **Claude adapter + `--install`**: configured render output, include-mode
+    installer with backup/idempotent markers/broken-symlink refusal,
+    `--uninstall`.
     Tests: Adapter render framework (install-target paths).
-14. **Codex adapter**: configured render output and hook expectations.
-15. **Local outbox and flush**: data_dir placement, unbound state, `--bind`
+14. **Codex adapter + `--install`**: configured render output, include-mode
+    installer into `~/.codex/AGENTS.md` whether it is a symlink or regular file,
+    plus hook expectations.
+15. **Agent runtime hooks**: installed memory policy block, SessionStart context
+    injection, prompt memory-intent reminders, memory-pending debt tracking,
+    post-write flush/render, Stop reminders. Tests: Agent runtime hooks.
+16. **Local outbox and flush**: data_dir placement, unbound state, `--bind`
     workflow, outbox-archive snapshots. Tests: Outbox + flush.
-16. **Promote / inbox**: `hm promote`, `hm inbox`, single-user fcntl lock,
+17. **Promote / inbox**: `hm promote`, `hm inbox`, single-user fcntl lock,
     promotion events. Tests: Promote / inbox.
-17. **Trust boundary**: data-boundary block rendering, doctor patterns for
+18. **Trust boundary**: data-boundary block rendering, doctor patterns for
     instruction-language detection and length spikes. Tests: shared with
     Context assembler.
-18. **Import Claude memory**: append-only migration with provenance/dedupe.
+19. **Import Claude memory**: append-only migration with provenance/dedupe.
     Tests: pairing + idempotent re-runs.
-19. **Cloud-sync simulation test harness**: synthetic delay/conflict/rename
+20. **Cloud-sync simulation test harness**: synthetic delay/conflict/rename
     test framework used by `cloud-sync-sim` CI job. Tests: Cloud-sync
     simulation harness.
-20. **Performance benchmark suite**: CI-enforced p95 budget for `hm context`,
+21. **Performance benchmark suite**: CI-enforced p95 budget for `hm context`,
     `hm search`, `hm flush` on synthetic stores. Tests: budget enforcement.
-21. **Release automation**: target builds, archives, checksums, smoke install.
-22. **Dotfiles integration PR**: shdeps install + hooks + config template.
-23. **Compaction proposals**: dry-run/proposal flow, local locks, provenance.
+22. **Release automation**: target builds, archives, checksums, smoke install.
+23. **Dotfiles integration PR**: shdeps install + hooks + config template.
+24. **Compaction proposals**: dry-run/proposal flow, local locks, provenance.
 
 Keep each issue small enough to review independently. The early issues should
 avoid model calls entirely; `hm` needs a deterministic foundation before agents

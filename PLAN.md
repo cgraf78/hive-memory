@@ -203,12 +203,16 @@ enabled = true
 stores = ["personal"]
 scopes = ["global", "project"]
 output = "${HOME}/.claude/hive-memory.generated.md"
+install_target = "${HOME}/.claude/CLAUDE.md"
+install_mode = "include"
 
 [adapters.codex]
 enabled = true
 stores = ["personal"]
 scopes = ["global", "project"]
 output = "${HOME}/.codex/hive-memory.generated.md"
+install_target = "${HOME}/.codex/AGENTS.md"
+install_mode = "include"
 ```
 
 Important: store roots are always configurable. Google Drive is just one good
@@ -271,7 +275,6 @@ Behavior toggles:
 ```bash
 HIVE_MEMORY_OFFLINE=1                         # write to local outbox only
 HIVE_MEMORY_NO_RENDER=1                       # skip render from hooks
-HIVE_MEMORY_NO_COMPACT=1                      # skip compaction/proposals
 HIVE_MEMORY_LOG=warn                          # error|warn|info|debug|trace
 ```
 
@@ -308,8 +311,9 @@ hm stores doctor
 
 Rules:
 
-- Every store has its own root, manifest, inbox, memories, locks, and generated
-  views.
+- Every store has its own root, manifest, inbox, memories, and generated views.
+  Local locks live in the user's state directory and are keyed by store identity;
+  the shared store root does not provide distributed locks.
 - Config store keys and CLI store names are local aliases. Prefer lowercase
   `[a-z0-9][a-z0-9_-]*`. The manifest `store.id` UUID is the durable store
   identity; `store.name` is the preferred human-readable name and should usually
@@ -320,8 +324,8 @@ Rules:
 - Cross-store search/context is opt-in via `--all-stores` or explicit
   `--stores a,b`. The singular `--store` selects the active write/render store.
 - Notes/events record their `store_id` in front matter/JSON metadata.
-- Compaction and locks are per-store unless a future cross-store operation is
-  explicitly requested.
+- Curated-write lock keys are per-store unless a future cross-store operation is
+  explicitly requested; the locks themselves remain local process locks.
 
 Avoid accidental leakage: rendering a work store into a personal agent config, or
 personal store into a work/client context, must require explicit config.
@@ -521,33 +525,18 @@ On cloud-sync folders, atomic rename is not a global distributed lock, but it is
 sufficient when final filenames are unique. Conflict files may still appear if a
 backend is strange; `doctor` should detect them.
 
-### Rule 3: compaction uses short-lived lock files
+### Rule 3: curated writes use local process locks only
 
-Curated files require coordination. The compactor uses advisory lock directories:
-
-```text
-<root>/.locks/compact-global.lock/
-  owner.json
-```
-
-Acquire by `mkdir`, release by removing. If lock owner heartbeat is stale, the
-next compactor may recover after a configurable TTL.
-
-Lock owner metadata:
-
-```json
-{
-  "host_id": "taylor",
-  "pid": 12345,
-  "agent_id": "codex",
-  "started_at": "2026-05-16T15:42:33Z",
-  "expires_at": "2026-05-16T15:47:33Z"
-}
-```
+Curated files require coordination, but cloud-drive lock directories are not
+reliable distributed locks. V1 therefore treats curated writes (`hm promote`,
+`hm edit`, future compaction apply) as SINGLE-USER per store. The process takes a
+local `fcntl`/`flock` lock in `state_dir`, reads the target hash before editing,
+and re-checks the hash before writing. Cross-host curated coordination is a
+post-v1 feature.
 
 ### Rule 4: local indexes are never shared locks
 
-Search indexes live in `state_dir` or `cache_dir`, not the shared root. Multiple
+Search indexes live in `cache_dir`, not the shared root. Multiple
 agents on the same host can coordinate with normal local file locks. Indexes can
 always be rebuilt from canonical files.
 
@@ -619,14 +608,13 @@ automation gets something wrong.
 Agent-optimized commands:
 
 ```bash
-hm context [--agent codex] [--project PATH] [--max-tokens N] [--include-inbox]
+hm context [--as-agent codex] [--project PATH] [--max-tokens N] [--include-inbox]
 hm remember --scope global --text "..." [--audience codex]
 hm note --scope project --project PATH --text "..."
 hm search "query" [--scope global,project] [--stores personal,work] [--include-inbox]
 hm render [claude|codex|openclaw|gemini|all]
-hm render claude --install        # add @import line to ~/.claude/CLAUDE.md
+hm render claude --install        # add include marker to ~/.claude/CLAUDE.md
 hm flush [--quiet] [--bind <id> --store <name>]
-hm compact [--scope global|project] [--dry-run]
 hm stores list
 hm stores migrate [--dry-run]
 hm projects list
@@ -655,20 +643,47 @@ Benefit: each agent gets native-feeling context files, but the canonical store
 stays vendor-neutral. Adding a new agent should mean writing a renderer, not
 changing how memory is stored.
 
-V1 renderers write generated include files only. They do not overwrite canonical
-agent config files such as `CLAUDE.md` or `AGENTS.md` unless a future
-adapter-specific migration command is added.
+Default v1 renders write generated files only. Adapter config files such as
+`CLAUDE.md` or `AGENTS.md` are modified only by an explicit adapter install
+command, e.g. `hm render claude --install` or
+`hm render --configured --install`, using the guarded install contract in
+SPEC.md. Dotfiles update should run the configured install path automatically so
+normal machine bootstrap keeps agent-visible memory linked.
 
 ### Claude
 
 - Render a generated include file such as `~/.claude/hive-memory.generated.md`.
+- Install an include marker into `~/.claude/CLAUDE.md` so Claude's normal
+  startup reads hive-memory context.
 - Optionally render project memories for Claude project directories.
 - Claude hooks call generic `hm`, not Claude-only sync code.
 
 ### Codex
 
 - Render a generated include file such as `~/.codex/hive-memory.generated.md`.
+- Install an include marker into the Codex-loaded `~/.codex/AGENTS.md` path. If
+  it is a symlink to the shared `~/.claude/CLAUDE.md` target, the shared file is
+  enough; if it is a regular file, install the same idempotent marker there too.
 - Use existing Codex lifecycle hooks to refresh context and write notes.
+
+### Runtime hooks
+
+Agent hooks make Hive Memory feel automatic without making memory writes
+magical:
+
+- Add Hive Memory behavior to the existing dotfiles `agent-hook-*` scripts and
+  shared hook helpers. Do not create a parallel Hive Memory hook stack.
+- SessionStart injects fresh `hm context` as additional context for the active
+  agent and project.
+- UserPromptSubmit detects explicit memory intent and records session-local
+  memory debt plus an advisory reminder.
+- PostToolUse clears the debt after `hm remember`/`hm note`, then best-effort
+  flushes and refreshes renders.
+- Stop reminds when memory debt remains, but never writes memory itself.
+
+The hooks are guardrails around agent judgment. The installed policy tells the
+agent when to write; hooks catch obvious misses and keep the store/render state
+fresh.
 
 ### OpenClaw
 
@@ -709,7 +724,9 @@ Merge hook behavior:
 1. ensure `hm` CLI is installed or available
 2. materialize config from template + local overrides
 3. run `hm doctor --quick`
-4. run `hm render --configured --quiet`
+4. run `hm render --configured --install --quiet`
+5. run `hm doctor --quick` again to verify enabled adapters are visible from
+   their configured agent-loaded instruction files
 
 ## Backend Flexibility
 
@@ -797,6 +814,9 @@ TTL.
 
 CLI writes to local outbox in `data_dir/outbox/` (XDG_DATA_HOME, not
 XDG_STATE_HOME — pending memory is durable user data, not ephemeral state).
+`hm` also keeps a local last-seen store identity cache in `data_dir` so a laptop
+can bind offline writes to a store it has previously opened even when the store
+root is temporarily unavailable.
 On successful flush, `hm flush` also writes a snapshot to
 `<store-root>/.outbox-archive/<host-id>/<date>/` as a safety net that survives
 local data-dir wipe. The filesystem/cloud-drive backend still relies on its
@@ -838,8 +858,12 @@ In scope for v1:
 - append-only Markdown notes with TOML front matter
 - JSON sidecar/event files for structured processing (paired with Markdown by ID)
 - simple text search over canonical files, backed by a local triage index
-- context rendering for Claude (with `--install` for `@import` line) and Codex
-- trust-boundary rendering: source-labeled blocks, raw inbox excluded by default
+- context rendering and install for Claude and Codex, with dotfiles update
+  keeping both linked into agent-visible instruction files
+- lifecycle hook workflow that injects fresh read context, tracks explicit
+  memory intent, and refreshes after memory writes
+- trust-boundary rendering: source-labeled blocks, escaped memory bodies, raw
+  inbox excluded by default
 - `hm promote` + `hm inbox` curation workflow (single-user per store)
 - doctor diagnostics for config, roots, temp files, conflicts, permissions,
   trust-boundary patterns, audience presence, secret-on-cloud refusal
@@ -900,14 +924,18 @@ issue order lives in SPEC.md; the broad sequencing here is:
 5. Implement the local triage index in `cache/indexes/` and doctor diagnostics.
 6. Implement `hm search` and `hm context` (curated-by-default, data-boundary
    blocks, performance budget).
-7. Implement adapter render framework (magic header + sha256 marker) and the
-   Claude `--install` flow (with backup, idempotent markers, symlink refusal).
-8. Implement Codex adapter, local outbox under XDG_DATA_HOME, `hm flush` with
-   unbound-state handling, `hm promote`, and `hm inbox`.
-9. Add trust-boundary doctor patterns, cloud-sync simulation harness, and
-   performance benchmark suite to CI.
-10. Wire dotfiles hooks; add release artifacts and shdeps install support.
-11. Defer `hm import claude-memory`, compaction proposals, OpenClaw adapter,
+7. Implement adapter render/install framework (magic header + sha256 marker,
+   backup, idempotent markers, broken-symlink refusal), including Claude/Codex
+   include-mode install into every configured agent-visible instruction file.
+8. Implement agent runtime hook integration inside the existing dotfiles
+   `agent-hook-*` scripts: SessionStart context injection, prompt memory-intent
+   reminders, post-write flush/render, and Stop reminders.
+9. Implement local outbox under XDG_DATA_HOME, `hm flush` with unbound-state
+   handling, `hm promote`, and `hm inbox`.
+10. Add trust-boundary doctor patterns, cloud-sync simulation harness, and
+    performance benchmark suite to CI.
+11. Wire dotfiles hooks; add release artifacts and shdeps install support.
+12. Defer `hm import claude-memory`, compaction proposals, OpenClaw adapter,
     cross-host curated writes, and at-rest encryption until core v1 stabilizes.
 
 ## Settled Decisions
@@ -932,11 +960,17 @@ issue order lives in SPEC.md; the broad sequencing here is:
   is deferred.
 - `hm context` default sources are `["curated"]`; raw inbox is opt-in
   (`--include-inbox`) under the trust-boundary model.
-- Agent-private scope is enforced via an explicit `audience` field; the writer
-  is the default audience when none is provided.
-- Adapter render uses a magic-header + sha256 generated-file marker; Claude
-  adapter installs an `@hive-memory.generated.md` line into `~/.claude/CLAUDE.md`
-  with backup and idempotent markers.
+- Agent-private scope is enforced via an explicit `audience` field. Valid v1
+  writes materialize the field; `--audience-writer-only` records the writer as
+  the only audience.
+- Adapter render uses a magic-header + sha256 generated-file marker. Claude and
+  Codex both install include markers into their configured agent-visible
+  instruction files. Codex works whether `~/.codex/AGENTS.md` is a symlink to
+  `~/.claude/CLAUDE.md` or a regular file. Dotfiles update runs
+  `hm render --configured --install --quiet` so both are linked automatically.
+- Runtime hooks provide the seamless path: SessionStart reads fresh context,
+  UserPromptSubmit records explicit memory intent, PostToolUse clears that debt
+  after `hm remember`/`hm note`, and Stop reminds without writing automatically.
 - `secret`-sensitivity stores refuse cloud-synced root paths by default.
 - v1 ships a CI-enforced performance budget for `hm context`/`hm search`/`hm flush`.
 - The 1.0 stability surface is explicitly scoped in SPEC.md "Stability Contracts"
