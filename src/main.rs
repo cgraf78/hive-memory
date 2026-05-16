@@ -10,8 +10,8 @@ use hive_memory::config::{
     AdapterConfig, Config, ConfigPaths, EventSidecarPolicy, Sensitivity, StoreConfig,
 };
 use hive_memory::{
-    context as memory_context, curation, doctor, hook as memory_hook, index, memory, note, project,
-    render, search, secret, store, write,
+    context as memory_context, curation, doctor, hook as memory_hook, index, memory, note, outbox,
+    project, render, search, secret, store, write,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -76,6 +76,11 @@ enum Command {
     Render(RenderArgs),
     /// Refresh indexes and configured adapter outputs.
     Refresh(RefreshArgs),
+    /// Flush local outbox writes to reachable stores.
+    Flush(FlushArgs),
+    /// Manage local outbox writes.
+    #[command(subcommand)]
+    Outbox(OutboxCommand),
     /// Resolve project identity and local project policy.
     #[command(subcommand)]
     Projects(ProjectsCommand),
@@ -115,6 +120,13 @@ enum ProjectsCommand {
     Bind(ProjectBindArgs),
     /// Remove a local project store binding.
     Unbind(ProjectUnbindArgs),
+}
+
+/// Local outbox commands.
+#[derive(Debug, Subcommand)]
+enum OutboxCommand {
+    /// Flush local outbox writes to reachable stores.
+    Flush(FlushArgs),
 }
 
 /// Raw inbox triage commands.
@@ -395,6 +407,17 @@ struct RefreshArgs {
     force: bool,
 }
 
+/// Arguments for `hm flush`.
+#[derive(Debug, Args)]
+struct FlushArgs {
+    /// Suppress the human summary line.
+    #[arg(long)]
+    quiet: bool,
+    /// Emit machine-readable output.
+    #[arg(long)]
+    json: bool,
+}
+
 /// Agent lifecycle hook events.
 #[derive(Debug, Subcommand)]
 enum HookCommand {
@@ -470,6 +493,8 @@ fn main() -> Result<()> {
         Some(Command::Context(args)) => run_context(args, context),
         Some(Command::Render(args)) => run_render(args, context),
         Some(Command::Refresh(args)) => run_refresh(args, context),
+        Some(Command::Flush(args)) => run_flush(args, context),
+        Some(Command::Outbox(OutboxCommand::Flush(args))) => run_flush(args, context),
         Some(Command::Projects(command)) => run_projects(command, context),
         Some(Command::Hook(command)) => run_hook(command, context),
         Some(Command::Doctor(args)) => run_doctor(args, context),
@@ -1259,11 +1284,53 @@ fn run_refresh(args: RefreshArgs, context: CliContext) -> Result<()> {
 
     if !args.quiet {
         println!(
-            "refresh: indexes={} rendered={} written={} render_skipped={} forced={}",
-            report.indexes, report.rendered, report.written, report.render_skipped, report.forced
+            "refresh: indexes={} flushed={} skipped={} failed={} unbound={} pending={} rendered={} written={} render_skipped={} forced={}",
+            report.indexes,
+            report.flushed,
+            report.skipped,
+            report.failed,
+            report.unbound,
+            report.pending,
+            report.rendered,
+            report.written,
+            report.render_skipped,
+            report.forced
         );
     }
 
+    Ok(())
+}
+
+fn run_flush(args: FlushArgs, context: CliContext) -> Result<()> {
+    let config = load_config(context.config_path.as_deref())?;
+    let report = outbox::flush(outbox::FlushInput {
+        data_dir: &config.data_dir,
+        stores: &config.stores,
+        host_id: &resolve_host_id(&config),
+        options: hook_options(&config),
+    })?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if !args.quiet {
+        println!(
+            "flush: flushed={} skipped={} failed={} unbound={} pending={}",
+            report.flushed, report.skipped, report.failed, report.unbound, report.pending
+        );
+        for item in &report.items {
+            if item.result == "flushed" || item.result == "skipped" {
+                continue;
+            }
+            println!(
+                "{}\t{}\t{}\t{}",
+                item.result, item.store, item.id, item.message
+            );
+        }
+    }
+
+    if report.failed > 0 {
+        anyhow::bail!("flush failed for {} item(s)", report.failed);
+    }
     Ok(())
 }
 
@@ -1272,6 +1339,19 @@ fn perform_refresh(
     context: &CliContext,
     forced: bool,
 ) -> Result<HookRefreshReport> {
+    // Refresh is the one maintenance command hooks need to call after writes.
+    // Flushing first makes any locally queued memory visible to the index/render
+    // path in the same cycle without teaching hook scripts outbox policy.
+    let flush = outbox::flush(outbox::FlushInput {
+        data_dir: &config.data_dir,
+        stores: &config.stores,
+        host_id: &resolve_host_id(config),
+        options: hook_options(config),
+    })?;
+    if flush.failed > 0 {
+        anyhow::bail!("flush failed for {} item(s)", flush.failed);
+    }
+
     let mut indexes = 0usize;
     for store_name in config.stores.keys() {
         rebuild_store_index(config, store_name)?;
@@ -1290,6 +1370,11 @@ fn perform_refresh(
 
     Ok(HookRefreshReport {
         indexes,
+        flushed: flush.flushed,
+        skipped: flush.skipped,
+        failed: flush.failed,
+        unbound: flush.unbound,
+        pending: flush.pending,
         rendered: render_summary.rendered,
         written: render_summary.written,
         render_skipped,
@@ -1533,12 +1618,29 @@ struct HookResponse {
 
 #[derive(Debug, Serialize)]
 struct HookRefreshReport {
+    /// Number of configured store indexes rebuilt.
     indexes: usize,
+    /// Outbox items newly published before indexing.
+    flushed: usize,
+    /// Outbox items removed because identical payloads were already present.
+    skipped: usize,
+    /// Outbox items that hit an unsafe consistency or policy problem.
+    failed: usize,
+    /// Outbox items left for explicit human/store binding.
+    unbound: usize,
+    /// Outbox items left for retry because their store root is unavailable.
+    pending: usize,
+    /// Enabled adapter outputs considered for refresh.
     rendered: usize,
+    /// Adapter outputs whose bytes changed.
     written: usize,
+    /// Whether hook policy disabled render refresh for this invocation.
     render_skipped: bool,
+    /// Whether the caller requested a force refresh.
     forced: bool,
+    /// New session write receipts consumed by this refresh.
     write_receipts: usize,
+    /// Stable boolean for hook adapters that only need success/failure state.
     refreshed: bool,
 }
 
@@ -1604,6 +1706,9 @@ fn hook_context_action_if_changed(
         return Ok(None);
     };
 
+    // Long-lived agents can move between projects while the process stays
+    // alive. Cache the resolved selection, not just "context was already sent",
+    // so hooks can reinject when path/project/store policy changes.
     let context_key = hook_context_key(config, context, path_hint)?;
     let state = memory_hook::load_state(&config.state_dir, session_id)?;
     if state.context_key.as_deref() == Some(context_key.as_str()) {

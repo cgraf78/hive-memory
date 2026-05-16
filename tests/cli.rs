@@ -1,4 +1,5 @@
 use assert_cmd::cargo::cargo_bin_cmd;
+use hive_memory::{outbox, store};
 use predicates::prelude::*;
 use std::fs;
 use std::path::PathBuf;
@@ -78,6 +79,39 @@ fn stdout_value(stdout: &str, key: &str) -> String {
         .expect("stdout key")
         .trim()
         .to_owned()
+}
+
+fn write_outbox_note_item(
+    data_dir: &std::path::Path,
+    store_name: &str,
+    item_id: &str,
+    expected_store_id: Option<String>,
+    final_note_path: &str,
+    note_body: &[u8],
+    state: outbox::OutboxState,
+) {
+    let item_dir = data_dir.join("outbox").join(store_name).join(item_id);
+    fs::create_dir_all(&item_dir).expect("create outbox item");
+    fs::write(item_dir.join("note.md"), note_body).expect("write outbox note");
+    let meta = outbox::OutboxMeta {
+        schema_version: outbox::OUTBOX_SCHEMA_VERSION,
+        id: item_id.to_owned(),
+        store: store_name.to_owned(),
+        expected_store_id,
+        final_note_path: final_note_path.to_owned(),
+        note_sha256: outbox::payload_sha256(note_body),
+        final_event_path: None,
+        event_sha256: None,
+        created_at: "2026-05-16T00:00:00Z".to_owned(),
+        attempt_count: 0,
+        last_error: None,
+        state,
+    };
+    fs::write(
+        item_dir.join("meta.toml"),
+        outbox::render_meta(&meta).expect("render outbox meta"),
+    )
+    .expect("write outbox meta");
 }
 
 #[test]
@@ -732,6 +766,224 @@ fn note_respects_never_sidecar_default() {
     let note = fs::read_to_string(note_path).expect("read note");
     assert!(note.contains("entry_kind = \"note\""));
     assert!(!stdout.contains("event:"));
+}
+
+#[test]
+fn flush_writes_pending_outbox_item_and_archives_payload() {
+    let dir = temp_dir("flush-pending");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+            "#,
+            data.display(),
+            personal.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+    let manifest = store::read_manifest(&personal).expect("read manifest");
+    let final_note_path = "inbox/notes/2026/05/16/offline-note.md";
+    let note_body = b"offline note body\n";
+    write_outbox_note_item(
+        &data,
+        "personal",
+        "offline-note",
+        Some(manifest.store.id),
+        final_note_path,
+        note_body,
+        outbox::OutboxState::Pending,
+    );
+
+    let mut flush = cargo_bin_cmd!("hm");
+    flush
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "flush",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"flushed\": 1"))
+        .stdout(predicate::str::contains("\"failed\": 0"));
+
+    assert_eq!(
+        fs::read(personal.join(final_note_path)).expect("read flushed note"),
+        note_body
+    );
+    assert!(!data.join("outbox/personal/offline-note").exists());
+    let archive_root = personal.join(".outbox-archive");
+    let archive_note = fs::read_dir(&archive_root)
+        .expect("archive host dirs")
+        .flat_map(|host| fs::read_dir(host.expect("host dir").path()).expect("archive dates"))
+        .map(|date| {
+            date.expect("date dir")
+                .path()
+                .join("offline-note")
+                .join("note.md")
+        })
+        .find(|path| path.is_file())
+        .expect("archive note");
+    assert_eq!(
+        fs::read(archive_note).expect("read archive note"),
+        note_body
+    );
+}
+
+#[test]
+fn flush_skips_unbound_outbox_items() {
+    let dir = temp_dir("flush-unbound");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+            "#,
+            data.display(),
+            personal.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+    write_outbox_note_item(
+        &data,
+        "personal",
+        "unbound-note",
+        None,
+        "inbox/notes/2026/05/16/unbound-note.md",
+        b"unbound note body\n",
+        outbox::OutboxState::Unbound,
+    );
+
+    let mut flush = cargo_bin_cmd!("hm");
+    flush
+        .args(["--config", config.to_str().expect("utf8 config"), "flush"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unbound=1"));
+
+    assert!(data.join("outbox/personal/unbound-note").is_dir());
+    let final_note = personal.join("inbox/notes/2026/05/16/unbound-note.md");
+    assert!(!final_note.exists());
+}
+
+#[test]
+fn outbox_flush_marks_same_hash_collision_as_skipped() {
+    let dir = temp_dir("flush-same-hash");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+            "#,
+            data.display(),
+            personal.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+    let manifest = store::read_manifest(&personal).expect("read manifest");
+    let final_note_path = "inbox/notes/2026/05/16/same-note.md";
+    let note_body = b"same note body\n";
+    let final_path = personal.join(final_note_path);
+    fs::create_dir_all(final_path.parent().expect("final parent")).expect("final dirs");
+    fs::write(&final_path, note_body).expect("write existing final");
+    write_outbox_note_item(
+        &data,
+        "personal",
+        "same-note",
+        Some(manifest.store.id),
+        final_note_path,
+        note_body,
+        outbox::OutboxState::Pending,
+    );
+
+    let mut flush = cargo_bin_cmd!("hm");
+    flush
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "outbox",
+            "flush",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"flushed\": 0"))
+        .stdout(predicate::str::contains("\"skipped\": 1"))
+        .stdout(predicate::str::contains("\"failed\": 0"));
+
+    assert!(!data.join("outbox/personal/same-note").exists());
+    assert_eq!(fs::read(final_path).expect("read final note"), note_body);
+}
+
+#[test]
+fn flush_refuses_different_hash_collision() {
+    let dir = temp_dir("flush-conflict");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+            "#,
+            data.display(),
+            personal.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+    let manifest = store::read_manifest(&personal).expect("read manifest");
+    let final_note_path = "inbox/notes/2026/05/16/conflict-note.md";
+    let final_path = personal.join(final_note_path);
+    fs::create_dir_all(final_path.parent().expect("final parent")).expect("final dirs");
+    fs::write(&final_path, "different body\n").expect("write conflicting final");
+    write_outbox_note_item(
+        &data,
+        "personal",
+        "conflict-note",
+        Some(manifest.store.id),
+        final_note_path,
+        b"outbox body\n",
+        outbox::OutboxState::Pending,
+    );
+
+    let mut flush = cargo_bin_cmd!("hm");
+    flush
+        .args(["--config", config.to_str().expect("utf8 config"), "flush"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("failed=1"))
+        .stderr(predicate::str::contains("flush failed for 1 item"));
 }
 
 #[test]

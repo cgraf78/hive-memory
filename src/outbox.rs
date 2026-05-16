@@ -1,0 +1,519 @@
+//! Durable local outbox and flush support.
+//!
+//! The outbox lives under `data_dir`, not `state_dir`, because an offline write
+//! is user data until it reaches a store root. Flush is deliberately local and
+//! identity-checked: cloud drives move bytes between machines, while `hm flush`
+//! only reconciles hive-memory's own pending payloads into a reachable store.
+//! Store aliases are convenience labels; the manifest id recorded in each item
+//! is the safety check that prevents a later alias/path change from publishing
+//! memory into the wrong hive.
+
+use crate::{config, store, write};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::error::Error;
+use std::fmt::{self, Display};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+use time::OffsetDateTime;
+
+/// Outbox metadata schema supported by this build.
+pub const OUTBOX_SCHEMA_VERSION: u32 = 1;
+
+/// Serialized state of one outbox item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OutboxState {
+    /// Store identity is known; auto-flush may attempt the item.
+    Pending,
+    /// Store identity was not known at enqueue time; requires explicit binding.
+    ///
+    /// Unbound items are intentionally ignored by automatic flush. A human or
+    /// higher-level repair command must decide which stable store identity owns
+    /// the payload before it can leave the local data directory.
+    Unbound,
+}
+
+/// Metadata stored at `data_dir/outbox/<store>/<id>/meta.toml`.
+///
+/// This file is the recovery contract for an offline write. Payload files hold
+/// the bytes, while metadata records exactly where those bytes may land and
+/// which store manifest id must be present before publishing is allowed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutboxMeta {
+    /// Outbox metadata schema version.
+    pub schema_version: u32,
+    /// Stable outbox item id.
+    pub id: String,
+    /// Target store alias.
+    pub store: String,
+    /// Expected store manifest id. Missing only for unbound items.
+    pub expected_store_id: Option<String>,
+    /// Store-relative final Markdown note path.
+    ///
+    /// Flush rejects absolute paths and parent components so outbox metadata
+    /// cannot write outside the target store root even if a file is corrupted.
+    pub final_note_path: String,
+    /// SHA-256 of `note.md`.
+    pub note_sha256: String,
+    /// Store-relative final JSON event path, when present.
+    pub final_event_path: Option<String>,
+    /// SHA-256 of `event.json`, when present.
+    pub event_sha256: Option<String>,
+    /// When this item was enqueued.
+    pub created_at: String,
+    /// Number of prior flush attempts.
+    pub attempt_count: u32,
+    /// Last flush error, if any.
+    pub last_error: Option<String>,
+    /// Current outbox state.
+    pub state: OutboxState,
+}
+
+/// Request to flush durable outbox data.
+#[derive(Debug, Clone)]
+pub struct FlushInput<'a> {
+    /// Durable tool data directory containing `outbox/`.
+    pub data_dir: &'a Path,
+    /// Configured stores keyed by local alias.
+    pub stores: &'a BTreeMap<String, config::StoreConfig>,
+    /// Host id used for the per-store archive path.
+    ///
+    /// This is not an authorization or ownership check. It only partitions
+    /// archive snapshots so multiple machines can keep their flush receipts
+    /// under the same synced store without clobbering each other.
+    pub host_id: &'a str,
+    /// Atomic writer options for final payload and archive writes.
+    pub options: write::AtomicWriteOptions,
+}
+
+/// Summary of one flush run.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct FlushReport {
+    /// Items whose payloads were newly written into the target store.
+    pub flushed: usize,
+    /// Items whose final paths already contained the same payload hash.
+    pub skipped: usize,
+    /// Items that could not be flushed because continuing would be unsafe.
+    ///
+    /// Failures are policy or consistency problems, such as identity mismatch or
+    /// different content already at the final path. They require attention.
+    pub failed: usize,
+    /// Items that require explicit store binding before flush.
+    pub unbound: usize,
+    /// Items left pending because the target store is currently unavailable.
+    ///
+    /// Pending is non-fatal. It usually means a removable disk or cloud folder
+    /// is not mounted yet, so the item should be retried later unchanged.
+    pub pending: usize,
+    /// Per-item results in deterministic scan order.
+    pub items: Vec<FlushItemReport>,
+}
+
+/// Result for one outbox item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FlushItemReport {
+    /// Outbox item id.
+    pub id: String,
+    /// Target store alias from metadata.
+    pub store: String,
+    /// Original outbox state: `pending` or `unbound`.
+    pub state: String,
+    /// Flush result: `flushed`, `skipped`, `failed`, `unbound`, or `pending`.
+    pub result: String,
+    /// Human-readable result detail.
+    pub message: String,
+}
+
+/// Outbox operation failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutboxError {
+    /// Filesystem operation failed.
+    Io {
+        /// Operation that failed.
+        action: &'static str,
+        /// Path involved in the failure.
+        path: PathBuf,
+        /// Original error rendered for CLI diagnostics.
+        message: String,
+    },
+    /// Metadata TOML was malformed.
+    ParseMeta {
+        /// Metadata path that failed to parse.
+        path: PathBuf,
+        /// TOML parse error.
+        message: String,
+    },
+    /// Metadata TOML could not be rendered.
+    RenderMeta(String),
+    /// Metadata schema is unsupported.
+    UnsupportedSchema {
+        /// Metadata path with the unsupported schema.
+        path: PathBuf,
+        /// Schema version found on disk.
+        version: u32,
+    },
+}
+
+impl Display for OutboxError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io {
+                action,
+                path,
+                message,
+            } => write!(f, "failed to {action} {}: {message}", path.display()),
+            Self::ParseMeta { path, message } => {
+                write!(
+                    f,
+                    "failed to parse outbox metadata {}: {message}",
+                    path.display()
+                )
+            }
+            Self::RenderMeta(message) => write!(f, "failed to render outbox metadata: {message}"),
+            Self::UnsupportedSchema { path, version } => write!(
+                f,
+                "unsupported outbox schema_version {version} in {}",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl Error for OutboxError {}
+
+/// Flush all auto-bindable pending outbox items.
+///
+/// Same-hash collisions are treated as already flushed and remove the outbox
+/// item after archiving. Different-hash collisions fail hard because continuing
+/// would overwrite unrelated canonical memory. Unbound items are counted and
+/// left untouched for a future explicit bind operation. Temporarily unreachable
+/// stores are reported as pending rather than failures so hook-time refresh can
+/// run safely when a user is away from one of their store locations.
+pub fn flush(input: FlushInput<'_>) -> Result<FlushReport, OutboxError> {
+    let mut report = FlushReport::default();
+    let outbox_root = input.data_dir.join("outbox");
+    let item_dirs = match collect_item_dirs(&outbox_root) {
+        Ok(paths) => paths,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(report),
+        Err(err) => return Err(io_error("scan outbox", &outbox_root, err)),
+    };
+
+    for item_dir in item_dirs {
+        let item = flush_item(&input, &item_dir)?;
+        match item.result.as_str() {
+            "flushed" => report.flushed += 1,
+            "skipped" => report.skipped += 1,
+            "failed" => report.failed += 1,
+            "unbound" => report.unbound += 1,
+            "pending" => report.pending += 1,
+            _ => {}
+        }
+        report.items.push(item);
+    }
+
+    Ok(report)
+}
+
+fn flush_item(input: &FlushInput<'_>, item_dir: &Path) -> Result<FlushItemReport, OutboxError> {
+    let meta_path = item_dir.join("meta.toml");
+    let meta = read_meta(&meta_path)?;
+    if meta.state == OutboxState::Unbound {
+        return Ok(item_report(
+            &meta,
+            "unbound",
+            "item requires explicit binding",
+        ));
+    }
+    let Some(expected_store_id) = meta.expected_store_id.as_deref() else {
+        return Ok(item_report(
+            &meta,
+            "unbound",
+            "item has no expected store id",
+        ));
+    };
+    let Some(store_config) = input.stores.get(&meta.store) else {
+        return Ok(item_report(
+            &meta,
+            "failed",
+            "target store is not configured",
+        ));
+    };
+    let manifest = match store::read_manifest(&store_config.root) {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            return Ok(item_report(
+                &meta,
+                "pending",
+                format!("target store is unavailable: {err}"),
+            ));
+        }
+    };
+    if manifest.store.id != expected_store_id {
+        return Ok(item_report(
+            &meta,
+            "failed",
+            "target store manifest id does not match outbox metadata",
+        ));
+    }
+
+    let event_payload = match (&meta.final_event_path, &meta.event_sha256) {
+        (Some(path), Some(hash)) => Some((path.as_str(), hash.as_str())),
+        (None, None) => None,
+        _ => {
+            return Ok(item_report(
+                &meta,
+                "failed",
+                "event path/hash metadata is incomplete",
+            ));
+        }
+    };
+
+    let note_source = item_dir.join("note.md");
+    // Publish both payloads before removing the local recovery copy. If either
+    // payload collides or fails validation, the item remains in the outbox so a
+    // later human repair can inspect the original bytes and metadata together.
+    let note_result = publish_payload(
+        &note_source,
+        &store_config.root,
+        &meta.final_note_path,
+        &meta.note_sha256,
+        &input.options,
+    )?;
+    let event_result = match event_payload {
+        Some((path, hash)) => Some(publish_payload(
+            &item_dir.join("event.json"),
+            &store_config.root,
+            path,
+            hash,
+            &input.options,
+        )?),
+        None => None,
+    };
+
+    if note_result == PublishResult::HashMismatch
+        || event_result == Some(PublishResult::HashMismatch)
+    {
+        return Ok(item_report(
+            &meta,
+            "failed",
+            "payload hash does not match outbox metadata",
+        ));
+    }
+    if note_result == PublishResult::Conflict || event_result == Some(PublishResult::Conflict) {
+        return Ok(item_report(
+            &meta,
+            "failed",
+            "final path exists with different content",
+        ));
+    }
+
+    write_archive(input, &store_config.root, item_dir, &meta)?;
+    fs::remove_dir_all(item_dir).map_err(|err| io_error("remove flushed item", item_dir, err))?;
+
+    if note_result == PublishResult::AlreadyPresent
+        && event_result
+            .map(|result| result == PublishResult::AlreadyPresent)
+            .unwrap_or(true)
+    {
+        Ok(item_report(&meta, "skipped", "payload already present"))
+    } else {
+        Ok(item_report(&meta, "flushed", "payload flushed"))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishResult {
+    Written,
+    AlreadyPresent,
+    HashMismatch,
+    Conflict,
+}
+
+fn publish_payload(
+    source: &Path,
+    store_root: &Path,
+    final_relative_path: &str,
+    expected_hash: &str,
+    options: &write::AtomicWriteOptions,
+) -> Result<PublishResult, OutboxError> {
+    let contents = fs::read(source).map_err(|err| io_error("read outbox payload", source, err))?;
+    let actual_hash = sha256(&contents);
+    if actual_hash != expected_hash {
+        return Ok(PublishResult::HashMismatch);
+    }
+    let relative = validate_relative_path(final_relative_path)?;
+    let final_path = store_root.join(relative);
+    // The payload hash check happens before the final-path collision check so a
+    // corrupted outbox file cannot be mistaken for "already present" just
+    // because the destination currently contains valid bytes from another run.
+    match fs::read(&final_path) {
+        Ok(existing) if sha256(&existing) == expected_hash => Ok(PublishResult::AlreadyPresent),
+        Ok(_) => Ok(PublishResult::Conflict),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            write::write_atomic_create_new(&final_path, &contents, options).map_err(|err| {
+                OutboxError::Io {
+                    action: "write final payload",
+                    path: final_path,
+                    message: err.to_string(),
+                }
+            })?;
+            Ok(PublishResult::Written)
+        }
+        Err(err) => Err(io_error("read final payload", &final_path, err)),
+    }
+}
+
+fn write_archive(
+    input: &FlushInput<'_>,
+    store_root: &Path,
+    item_dir: &Path,
+    meta: &OutboxMeta,
+) -> Result<(), OutboxError> {
+    let date = OffsetDateTime::now_utc().date();
+    let archive = store_root
+        .join(".outbox-archive")
+        .join(input.host_id)
+        .join(format!(
+            "{:04}-{:02}-{:02}",
+            date.year(),
+            u8::from(date.month()),
+            date.day()
+        ))
+        .join(&meta.id);
+    fs::create_dir_all(&archive).map_err(|err| io_error("create outbox archive", &archive, err))?;
+    // The archive is a post-flush recovery aid, not the canonical record. It is
+    // still written through the same atomic/durability policy so a successful
+    // flush does not leave behind a torn diagnostic snapshot.
+    archive_file(item_dir, &archive, "meta.toml", &input.options)?;
+    archive_file(item_dir, &archive, "note.md", &input.options)?;
+    if meta.final_event_path.is_some() {
+        archive_file(item_dir, &archive, "event.json", &input.options)?;
+    }
+    Ok(())
+}
+
+fn archive_file(
+    item_dir: &Path,
+    archive: &Path,
+    name: &str,
+    options: &write::AtomicWriteOptions,
+) -> Result<(), OutboxError> {
+    let source = item_dir.join(name);
+    if !source.is_file() {
+        return Ok(());
+    }
+    let contents =
+        fs::read(&source).map_err(|err| io_error("read archive source", &source, err))?;
+    let target = archive.join(name);
+    write::write_atomic(&target, &contents, options).map_err(|err| OutboxError::Io {
+        action: "write archive file",
+        path: target,
+        message: err.to_string(),
+    })?;
+    Ok(())
+}
+
+fn collect_item_dirs(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut dirs = Vec::new();
+    for store_entry in fs::read_dir(root)? {
+        let store_entry = store_entry?;
+        if !store_entry.file_type()?.is_dir() {
+            continue;
+        }
+        for item_entry in fs::read_dir(store_entry.path())? {
+            let item_entry = item_entry?;
+            if item_entry.file_type()?.is_dir() {
+                dirs.push(item_entry.path());
+            }
+        }
+    }
+    dirs.sort();
+    Ok(dirs)
+}
+
+fn read_meta(path: &Path) -> Result<OutboxMeta, OutboxError> {
+    let contents =
+        fs::read_to_string(path).map_err(|err| io_error("read outbox metadata", path, err))?;
+    let meta: OutboxMeta = toml::from_str(&contents).map_err(|err| OutboxError::ParseMeta {
+        path: path.to_path_buf(),
+        message: err.to_string(),
+    })?;
+    if meta.schema_version != OUTBOX_SCHEMA_VERSION {
+        return Err(OutboxError::UnsupportedSchema {
+            path: path.to_path_buf(),
+            version: meta.schema_version,
+        });
+    }
+    Ok(meta)
+}
+
+/// Render outbox metadata with stable TOML formatting.
+pub fn render_meta(meta: &OutboxMeta) -> Result<String, OutboxError> {
+    toml::to_string_pretty(meta).map_err(|err| OutboxError::RenderMeta(err.to_string()))
+}
+
+/// SHA-256 helper for tests and enqueue code.
+pub fn payload_sha256(contents: &[u8]) -> String {
+    sha256(contents)
+}
+
+fn validate_relative_path(path: &str) -> Result<PathBuf, OutboxError> {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        return Err(OutboxError::Io {
+            action: "validate final path",
+            path: path.to_path_buf(),
+            message: "path must be relative".to_owned(),
+        });
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(value) => normalized.push(value),
+            Component::CurDir => {}
+            _ => {
+                return Err(OutboxError::Io {
+                    action: "validate final path",
+                    path: path.to_path_buf(),
+                    message: "path must not contain parent or prefix components".to_owned(),
+                });
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err(OutboxError::Io {
+            action: "validate final path",
+            path: path.to_path_buf(),
+            message: "path must not be empty".to_owned(),
+        });
+    }
+    Ok(normalized)
+}
+
+fn item_report(meta: &OutboxMeta, result: &str, message: impl Into<String>) -> FlushItemReport {
+    FlushItemReport {
+        id: meta.id.clone(),
+        store: meta.store.clone(),
+        state: match meta.state {
+            OutboxState::Pending => "pending",
+            OutboxState::Unbound => "unbound",
+        }
+        .to_owned(),
+        result: result.to_owned(),
+        message: message.into(),
+    }
+}
+
+fn sha256(contents: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(contents))
+}
+
+fn io_error(action: &'static str, path: &Path, err: std::io::Error) -> OutboxError {
+    OutboxError::Io {
+        action,
+        path: path.to_path_buf(),
+        message: err.to_string(),
+    }
+}
