@@ -346,6 +346,9 @@ struct SearchArgs {
     /// Active project path or file hint.
     #[arg(long)]
     project: Option<String>,
+    /// Emit machine-readable output.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Arguments for `hm context`.
@@ -1037,6 +1040,7 @@ fn run_search(args: SearchArgs, context: CliContext) -> Result<()> {
         StoreAccess::Read,
     )?;
     let store_config = &config.stores[resolved_store.name.as_str()];
+    let manifest = store::read_manifest(&store_config.root)?;
     let report = rebuild_store_index(&config, &resolved_store.name)?;
 
     let scopes = if args.scope.is_empty() {
@@ -1066,6 +1070,15 @@ fn run_search(args: SearchArgs, context: CliContext) -> Result<()> {
         limit: args.limit,
     })?;
 
+    if args.json {
+        let output = hits
+            .iter()
+            .map(|hit| search_json_hit(&resolved_store.name, &manifest.store.id, hit))
+            .collect::<Vec<_>>();
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
+
     println!("store: {}", resolved_store.name);
     println!("hits: {}", hits.len());
     for hit in hits {
@@ -1075,6 +1088,59 @@ fn run_search(args: SearchArgs, context: CliContext) -> Result<()> {
         println!("snippet: {}", hit.snippet);
     }
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct SearchJsonHit {
+    id: String,
+    store: String,
+    store_id: String,
+    scope: String,
+    trust: &'static str,
+    audience: Vec<String>,
+    path: String,
+    title: String,
+    snippet: String,
+    score: usize,
+    created_at: String,
+}
+
+fn search_json_hit(
+    store_name: &str,
+    manifest_store_id: &str,
+    hit: &search::SearchHit,
+) -> SearchJsonHit {
+    let entry = &hit.entry;
+    SearchJsonHit {
+        id: entry.id.clone(),
+        store: store_name.to_owned(),
+        store_id: if entry.store_id.is_empty() {
+            manifest_store_id.to_owned()
+        } else {
+            entry.store_id.clone()
+        },
+        scope: entry.scope.clone(),
+        trust: search_trust(entry),
+        audience: entry.audience.clone(),
+        path: entry.note_path.clone(),
+        title: entry
+            .subject
+            .clone()
+            .unwrap_or_else(|| entry.note_path.clone()),
+        snippet: hit.snippet.clone(),
+        score: hit.score,
+        created_at: entry.created_at.clone(),
+    }
+}
+
+fn search_trust(entry: &index::IndexEntry) -> &'static str {
+    if entry.id.starts_with("curated:") {
+        return "curated";
+    }
+    match entry.entry_kind {
+        note::EntryKind::Remember => "remembered",
+        note::EntryKind::Note => "raw",
+    }
 }
 
 fn run_context(args: ContextArgs, context: CliContext) -> Result<()> {

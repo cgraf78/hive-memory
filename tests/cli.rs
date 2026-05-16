@@ -1244,6 +1244,53 @@ fn search_finds_curated_memory_from_default_sources() {
 }
 
 #[test]
+fn search_json_reports_stable_hit_fields() {
+    let dir = temp_dir("search-json");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    fs::create_dir_all(personal.join("rules")).expect("rules dir");
+    fs::write(
+        personal.join("rules/preferences.md"),
+        "JSON search should find curated TOML preferences.\n",
+    )
+    .expect("curated memory");
+
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "toml",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"id\": \"curated:rules/preferences.md\"",
+        ))
+        .stdout(predicate::str::contains("\"store\": \"personal\""))
+        .stdout(predicate::str::contains("\"store_id\": \""))
+        .stdout(predicate::str::contains("\"scope\": \"global\""))
+        .stdout(predicate::str::contains("\"trust\": \"curated\""))
+        .stdout(predicate::str::contains("\"audience\": []"))
+        .stdout(predicate::str::contains(
+            "\"path\": \"rules/preferences.md\"",
+        ))
+        .stdout(predicate::str::contains(
+            "\"title\": \"rules/preferences.md\"",
+        ))
+        .stdout(predicate::str::contains(
+            "\"snippet\": \"JSON search should find curated TOML preferences.\"",
+        ))
+        .stdout(predicate::str::contains("\"score\": 1"))
+        .stdout(predicate::str::contains("\"created_at\": \"\""));
+}
+
+#[test]
 fn search_requires_include_inbox_for_raw_note() {
     let dir = temp_dir("search-include-inbox");
     let config = dir.join("config.toml");
