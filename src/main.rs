@@ -6,10 +6,12 @@
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
-use hive_memory::config::{AdapterConfig, Config, ConfigPaths, EventSidecarPolicy, Sensitivity};
+use hive_memory::config::{
+    AdapterConfig, Config, ConfigPaths, EventSidecarPolicy, Sensitivity, StoreConfig,
+};
 use hive_memory::{
     context as memory_context, doctor, hook as memory_hook, index, memory, note, project, render,
-    search, store, write,
+    search, secret, store, write,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -237,6 +239,9 @@ struct WriteMemoryArgs {
     /// Skip the JSON sidecar for `hm note` regardless of config defaults.
     #[arg(long)]
     no_event: bool,
+    /// Permit detected secrets only when config and a secret store allow it.
+    #[arg(long)]
+    allow_secret_write: bool,
 }
 
 /// Arguments for `hm search`.
@@ -695,6 +700,7 @@ fn run_write_memory(
         StoreAccess::Write,
     )?;
     let store_config = &config.stores[resolved_store.name.as_str()];
+    validate_secret_write(&config, store_config, args.allow_secret_write, &args.text)?;
     let manifest = store::read_manifest(&store_config.root)?;
     let created_at = OffsetDateTime::now_utc();
     let host_id = resolve_host_id(&config);
@@ -1847,6 +1853,48 @@ fn resolve_host_id(config: &Config) -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .unwrap_or_else(|_| "unknown-host".to_owned())
+}
+
+fn validate_secret_write(
+    config: &Config,
+    store: &StoreConfig,
+    allow_secret_write: bool,
+    text: &str,
+) -> Result<()> {
+    let findings = secret::detect(text);
+    if findings.is_empty() {
+        return Ok(());
+    }
+
+    let detector_ids = findings
+        .iter()
+        .map(|finding| finding.detector_id.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    if !allow_secret_write {
+        anyhow::bail!(
+            "Hive Memory does not store likely secrets by default; detectors: {detector_ids}; rerun with --allow-secret-write only for intentional secret-store writes"
+        );
+    }
+    if store.sensitivity != Sensitivity::Secret {
+        anyhow::bail!(
+            "--allow-secret-write requires a resolved secret store; detectors: {detector_ids}"
+        );
+    }
+    if !config.privacy.allow_secret_writes {
+        anyhow::bail!(
+            "--allow-secret-write requires privacy.allow_secret_writes = true; detectors: {detector_ids}"
+        );
+    }
+    if std::env::var("HIVE_MEMORY_HOOK_ACTIVE").ok().as_deref() == Some("1")
+        && !config.privacy.allow_hook_secret_writes
+    {
+        anyhow::bail!(
+            "hook secret writes require privacy.allow_hook_secret_writes = true; detectors: {detector_ids}"
+        );
+    }
+
+    Ok(())
 }
 
 fn resolve_audience(

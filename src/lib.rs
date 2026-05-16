@@ -16,6 +16,7 @@ pub mod note;
 pub mod project;
 pub mod render;
 pub mod search;
+pub mod secret;
 pub mod store;
 pub mod visibility;
 pub mod write;

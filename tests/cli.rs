@@ -56,6 +56,21 @@ fn init_store(root: &std::path::Path, name: &str) {
     .success();
 }
 
+fn init_store_with_sensitivity(root: &std::path::Path, name: &str, sensitivity: &str) {
+    let mut cmd = cargo_bin_cmd!("hm");
+    cmd.args([
+        "stores",
+        "init",
+        name,
+        "--root",
+        root.to_str().expect("utf8 path"),
+        "--sensitivity",
+        sensitivity,
+    ])
+    .assert()
+    .success();
+}
+
 fn stdout_value(stdout: &str, key: &str) -> String {
     stdout
         .lines()
@@ -415,6 +430,195 @@ fn remember_writes_note_and_event() {
     assert!(note.contains("Chris prefers TOML config."));
     assert!(event.contains("\"type\": \"memory.observation\""));
     assert!(event.contains("\"note_path\": \"inbox/notes/"));
+}
+
+#[test]
+fn remember_refuses_likely_secret_without_echoing_value() {
+    let dir = temp_dir("remember-secret-refusal");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    let secret_value = "localvalueforsecretdetection";
+
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            &format!("api_key = \"{secret_value}\""),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("detectors: secret-assignment"))
+        .stderr(predicate::str::contains(secret_value).not());
+}
+
+#[test]
+fn allow_secret_write_requires_secret_store() {
+    let dir = temp_dir("remember-secret-private-store");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+
+            [privacy]
+            allow_secret_writes = true
+
+            [stores.personal]
+            root = "{}"
+
+            [stores.work]
+            root = "{}"
+            "#,
+            personal.display(),
+            work.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--allow-secret-write",
+            "--text",
+            "api_key = \"localvalueforsecretdetection\"",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--allow-secret-write requires a resolved secret store",
+        ));
+}
+
+#[test]
+fn allow_secret_write_requires_config_opt_in() {
+    let dir = temp_dir("remember-secret-config-opt-in");
+    let config = dir.join("config.toml");
+    let secret = dir.join("secret-store");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "secret"
+
+            [stores.secret]
+            root = "{}"
+            sensitivity = "secret"
+            "#,
+            secret.display()
+        ),
+    )
+    .expect("write config");
+    init_store_with_sensitivity(&secret, "secret", "secret");
+
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--allow-secret-write",
+            "--text",
+            "api_key = \"localvalueforsecretdetection\"",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--allow-secret-write requires privacy.allow_secret_writes = true",
+        ));
+}
+
+#[test]
+fn allow_secret_write_succeeds_in_opted_in_secret_store() {
+    let dir = temp_dir("remember-secret-store");
+    let config = dir.join("config.toml");
+    let secret = dir.join("secret-store");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "secret"
+
+            [privacy]
+            allow_secret_writes = true
+
+            [stores.secret]
+            root = "{}"
+            sensitivity = "secret"
+            "#,
+            secret.display()
+        ),
+    )
+    .expect("write config");
+    init_store_with_sensitivity(&secret, "secret", "secret");
+
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--allow-secret-write",
+            "--text",
+            "api_key = \"localvalueforsecretdetection\"",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("store: secret"));
+}
+
+#[test]
+fn hook_mode_secret_write_requires_extra_opt_in() {
+    let dir = temp_dir("remember-secret-hook");
+    let config = dir.join("config.toml");
+    let secret = dir.join("secret-store");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "secret"
+
+            [privacy]
+            allow_secret_writes = true
+
+            [stores.secret]
+            root = "{}"
+            sensitivity = "secret"
+            "#,
+            secret.display()
+        ),
+    )
+    .expect("write config");
+    init_store_with_sensitivity(&secret, "secret", "secret");
+
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .env("HIVE_MEMORY_HOOK_ACTIVE", "1")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--allow-secret-write",
+            "--text",
+            "api_key = \"localvalueforsecretdetection\"",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "hook secret writes require privacy.allow_hook_secret_writes = true",
+        ));
 }
 
 #[test]
