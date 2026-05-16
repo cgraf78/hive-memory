@@ -1,9 +1,11 @@
-//! Deterministic text search over the local triage index.
+//! Deterministic text search over curated files and the local triage index.
 //!
-//! The index narrows candidates by metadata. Search still reads the canonical
-//! Markdown files for body matching so the cache never becomes a second source
-//! of truth for memory text.
+//! Curated files are read directly because they are small human-maintained
+//! Markdown documents. Inbox records use the index to narrow candidates by
+//! metadata, then search still reads canonical Markdown for body matching so
+//! the cache never becomes a second source of truth for memory text.
 
+use crate::curated::CuratedFile;
 use crate::index::IndexEntry;
 use crate::{note, visibility};
 use std::error::Error;
@@ -15,7 +17,7 @@ use time::OffsetDateTime;
 /// Search request over one store's index entries.
 #[derive(Debug, Clone)]
 pub struct SearchInput<'a> {
-    /// Store root containing canonical note files.
+    /// Store root containing canonical note and curated files.
     pub store_root: &'a Path,
     /// Candidate metadata entries.
     pub entries: &'a [IndexEntry],
@@ -23,10 +25,17 @@ pub struct SearchInput<'a> {
     pub query: &'a str,
     /// Optional scope filter. Empty means all scopes allowed by source policy.
     pub scopes: &'a [String],
+    /// Selected source classes: `curated`, `remembered`, `inbox`, and `all`.
+    ///
+    /// Empty means remembered indexed entries only. CLI callers normally pass
+    /// config defaults so curated memory participates by default.
+    pub sources: &'a [String],
     /// Whether lower-confidence raw `hm note` entries are included.
     pub include_inbox: bool,
     /// Active agent identity for agent-private audience filtering.
     pub agent_id: Option<&'a str>,
+    /// Active project identity. Project-scoped records must match it.
+    pub project_id: Option<&'a str>,
     /// Maximum hits to return.
     pub limit: usize,
 }
@@ -34,7 +43,10 @@ pub struct SearchInput<'a> {
 /// One search hit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchHit {
-    /// Matched index metadata.
+    /// Matched metadata.
+    ///
+    /// Curated hits use a synthetic entry so existing callers can keep one
+    /// output shape while the canonical text remains the curated Markdown file.
     pub entry: IndexEntry,
     /// Simple occurrence count used for deterministic ranking.
     pub score: usize,
@@ -61,6 +73,13 @@ pub enum SearchError {
         /// Parse error.
         message: String,
     },
+    /// Curated file discovery failed.
+    Curated {
+        /// Path that failed.
+        path: PathBuf,
+        /// Original error rendered for diagnostics.
+        message: String,
+    },
 }
 
 impl Display for SearchError {
@@ -73,19 +92,36 @@ impl Display for SearchError {
             Self::ParseNote { path, message } => {
                 write!(f, "failed to parse note {}: {message}", path.display())
             }
+            Self::Curated { path, message } => {
+                write!(
+                    f,
+                    "failed to read curated memory {}: {message}",
+                    path.display()
+                )
+            }
         }
     }
 }
 
 impl Error for SearchError {}
 
-/// Search indexed notes by case-insensitive substring.
+impl From<crate::curated::CuratedError> for SearchError {
+    fn from(value: crate::curated::CuratedError) -> Self {
+        match value {
+            crate::curated::CuratedError::ReadFile { path, message } => {
+                Self::Curated { path, message }
+            }
+        }
+    }
+}
+
+/// Search curated files and indexed notes by case-insensitive substring.
 ///
 /// Ranking is intentionally simple and stable for v1: more occurrences first,
 /// then newer timestamps, then lexical note path. This keeps behavior easy to
-/// debug before any future scoring/index backend is introduced. The body is
-/// read from canonical Markdown, while metadata terms come from the rebuilt
-/// index so subject/tag searches do not need to parse every note twice.
+/// debug before any future scoring/index backend is introduced. Curated files
+/// score only body text; indexed entries also score subject/tags so metadata
+/// searches do not need to parse every note twice.
 pub fn search(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
     let query = input.query.trim().to_ascii_lowercase();
     if query.is_empty() {
@@ -93,11 +129,31 @@ pub fn search(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
     }
 
     let mut hits = Vec::new();
+    if curated_source_allowed(input.sources) {
+        for curated in crate::curated::collect(input.store_root, input.project_id)? {
+            if !curated_scope_allowed(&curated, input.scopes) {
+                continue;
+            }
+            let score = occurrence_count(&curated.body, &query);
+            if score == 0 {
+                continue;
+            }
+            hits.push(SearchHit {
+                entry: curated_entry(&curated, input.project_id),
+                score,
+                snippet: curated_snippet(&curated.body, &query),
+            });
+        }
+    }
+
     for entry in input.entries {
-        if !source_allowed(entry, input.include_inbox) {
+        if !source_allowed(entry, input.sources, input.include_inbox) {
             continue;
         }
         if !scope_allowed(entry, input.scopes) {
+            continue;
+        }
+        if !project_allowed(entry, input.project_id) {
             continue;
         }
         if !visibility::audience_allows(entry, input.agent_id) {
@@ -137,12 +193,43 @@ pub fn search(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
     Ok(hits)
 }
 
-fn source_allowed(entry: &IndexEntry, include_inbox: bool) -> bool {
-    include_inbox || entry.entry_kind == note::EntryKind::Remember
+fn curated_source_allowed(sources: &[String]) -> bool {
+    sources
+        .iter()
+        .any(|source| source == "curated" || source == "all")
+}
+
+fn source_allowed(entry: &IndexEntry, sources: &[String], include_inbox: bool) -> bool {
+    if sources.iter().any(|source| source == "all") {
+        return true;
+    }
+
+    match entry.entry_kind {
+        note::EntryKind::Remember => {
+            sources.is_empty() || sources.iter().any(|source| source == "remembered")
+        }
+        note::EntryKind::Note => include_inbox || sources.iter().any(|source| source == "inbox"),
+    }
 }
 
 fn scope_allowed(entry: &IndexEntry, scopes: &[String]) -> bool {
     scopes.is_empty() || scopes.iter().any(|scope| scope == &entry.scope)
+}
+
+fn curated_scope_allowed(candidate: &CuratedFile, scopes: &[String]) -> bool {
+    scopes.is_empty() || scopes.iter().any(|scope| scope == &candidate.scope)
+}
+
+fn project_allowed(entry: &IndexEntry, project_id: Option<&str>) -> bool {
+    if entry.scope != "project" {
+        return true;
+    }
+
+    let Some(project_id) = project_id else {
+        return false;
+    };
+
+    entry.project_id.as_deref() == Some(project_id)
 }
 
 fn occurrence_count(body: &str, query: &str) -> usize {
@@ -161,6 +248,24 @@ fn score_entry(entry: &IndexEntry, body: &str, query: &str) -> usize {
             .map(|tag| occurrence_count(tag, query))
             .sum::<usize>();
     occurrence_count(body, query) + metadata_score
+}
+
+fn curated_entry(curated: &CuratedFile, project_id: Option<&str>) -> IndexEntry {
+    IndexEntry {
+        id: curated.id.clone(),
+        store_id: String::new(),
+        entry_kind: note::EntryKind::Remember,
+        scope: curated.scope.clone(),
+        project_id: (curated.scope == "project").then(|| project_id.unwrap_or_default().to_owned()),
+        audience: Vec::new(),
+        tags: Vec::new(),
+        subject: None,
+        confidence: note::Confidence::High,
+        agent_id: "human".to_owned(),
+        created_at: String::new(),
+        note_path: curated.relative_path.clone(),
+        event_path: None,
+    }
 }
 
 fn snippet(entry: &IndexEntry, body: &str, query: &str) -> String {
@@ -182,6 +287,14 @@ fn snippet(entry: &IndexEntry, body: &str, query: &str) -> String {
     }
 
     body.trim().chars().take(160).collect()
+}
+
+fn curated_snippet(body: &str, query: &str) -> String {
+    matching_body_line(body, query)
+        .unwrap_or_else(|| body.trim())
+        .chars()
+        .take(160)
+        .collect()
 }
 
 fn matching_body_line<'a>(body: &'a str, query: &str) -> Option<&'a str> {
@@ -329,8 +442,10 @@ mod tests {
             entries: &entries(&root, &cache),
             query: "toml",
             scopes: &[],
+            sources: &[],
             include_inbox: false,
             agent_id: None,
+            project_id: None,
             limit: 20,
         })
         .expect("search");
@@ -362,8 +477,10 @@ mod tests {
             entries: &entries,
             query: "workflow",
             scopes: &[],
+            sources: &[],
             include_inbox: false,
             agent_id: None,
+            project_id: None,
             limit: 20,
         })
         .expect("search");
@@ -372,8 +489,10 @@ mod tests {
             entries: &entries,
             query: "toml",
             scopes: &[],
+            sources: &[],
             include_inbox: false,
             agent_id: None,
+            project_id: None,
             limit: 20,
         })
         .expect("search");
@@ -404,8 +523,10 @@ mod tests {
             entries: &entries,
             query: "toml",
             scopes: &[],
+            sources: &[],
             include_inbox: false,
             agent_id: None,
+            project_id: None,
             limit: 20,
         })
         .expect("search");
@@ -414,14 +535,105 @@ mod tests {
             entries: &entries,
             query: "toml",
             scopes: &[],
+            sources: &[],
             include_inbox: true,
             agent_id: None,
+            project_id: None,
             limit: 20,
         })
         .expect("search");
 
         assert!(default_hits.is_empty());
         assert_eq!(inbox_hits.len(), 1);
+    }
+
+    #[test]
+    fn search_includes_curated_files_when_source_allows_them() {
+        let dir = temp_dir("curated");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        fs::create_dir_all(root.join("rules")).expect("rules dir");
+        fs::write(
+            root.join("rules/preferences.md"),
+            "Use TOML for human-editable configuration.\n",
+        )
+        .expect("curated file");
+        let sources = vec!["curated".to_owned()];
+
+        let default_hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "toml",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+        let curated_hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "toml",
+            scopes: &[],
+            sources: &sources,
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+
+        assert!(default_hits.is_empty());
+        assert_eq!(curated_hits.len(), 1);
+        assert_eq!(curated_hits[0].entry.id, "curated:rules/preferences.md");
+        assert_eq!(curated_hits[0].entry.scope, "global");
+        assert_eq!(
+            curated_hits[0].snippet,
+            "Use TOML for human-editable configuration."
+        );
+    }
+
+    #[test]
+    fn search_filters_project_curated_files_to_active_project() {
+        let dir = temp_dir("curated-project");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        fs::create_dir_all(root.join("memories/projects/proj-a")).expect("project a dir");
+        fs::create_dir_all(root.join("memories/projects/proj-b")).expect("project b dir");
+        fs::write(
+            root.join("memories/projects/proj-a/MEMORY.md"),
+            "Project A release checklist uses TOML.\n",
+        )
+        .expect("project a memory");
+        fs::write(
+            root.join("memories/projects/proj-b/MEMORY.md"),
+            "Project B release checklist uses TOML.\n",
+        )
+        .expect("project b memory");
+        let sources = vec!["curated".to_owned()];
+        let scopes = vec!["project".to_owned()];
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "toml",
+            scopes: &scopes,
+            sources: &sources,
+            include_inbox: false,
+            agent_id: None,
+            project_id: Some("proj-a"),
+            limit: 20,
+        })
+        .expect("search");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].entry.note_path,
+            "memories/projects/proj-a/MEMORY.md"
+        );
+        assert_eq!(hits[0].entry.project_id.as_deref(), Some("proj-a"));
     }
 
     #[test]
@@ -444,8 +656,10 @@ mod tests {
             entries: &entries,
             query: "toml",
             scopes: &[],
+            sources: &[],
             include_inbox: false,
             agent_id: Some("codex"),
+            project_id: None,
             limit: 20,
         })
         .expect("search");
@@ -454,8 +668,10 @@ mod tests {
             entries: &entries,
             query: "toml",
             scopes: &[],
+            sources: &[],
             include_inbox: false,
             agent_id: Some("claude"),
+            project_id: None,
             limit: 20,
         })
         .expect("search");

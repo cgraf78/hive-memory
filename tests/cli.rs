@@ -1212,6 +1212,38 @@ fn search_finds_remembered_note() {
 }
 
 #[test]
+fn search_finds_curated_memory_from_default_sources() {
+    let dir = temp_dir("search-curated-default");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    fs::create_dir_all(personal.join("rules")).expect("rules dir");
+    fs::write(
+        personal.join("rules/preferences.md"),
+        "Search should find curated TOML preferences.\n",
+    )
+    .expect("curated memory");
+
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "toml",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hits: 1"))
+        .stdout(predicate::str::contains("id: curated:rules/preferences.md"))
+        .stdout(predicate::str::contains(
+            "snippet: Search should find curated TOML preferences.",
+        ));
+}
+
+#[test]
 fn search_requires_include_inbox_for_raw_note() {
     let dir = temp_dir("search-include-inbox");
     let config = dir.join("config.toml");

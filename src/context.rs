@@ -4,6 +4,7 @@
 //! canonical notes, designed to be safe to inject into an agent as data. The
 //! data-boundary blocks and escaping here are part of that trust boundary.
 
+use crate::curated::CuratedFile;
 use crate::index::IndexEntry;
 use crate::{note, visibility};
 use std::error::Error;
@@ -118,6 +119,16 @@ impl Display for ContextError {
 
 impl Error for ContextError {}
 
+impl From<crate::curated::CuratedError> for ContextError {
+    fn from(value: crate::curated::CuratedError) -> Self {
+        match value {
+            crate::curated::CuratedError::ReadFile { path, message } => {
+                Self::ReadNote { path, message }
+            }
+        }
+    }
+}
+
 /// Assemble bounded Markdown context from canonical memory.
 ///
 /// Raw/remembered inbox filtering is driven by index metadata, but bodies are
@@ -132,7 +143,7 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
     let mut estimated_tokens = estimate_tokens(&markdown);
 
     if curated_source_allowed(input.sources) {
-        for curated in curated_candidates(input.store_root, input.project_id)? {
+        for curated in crate::curated::collect(input.store_root, input.project_id)? {
             if !curated_scope_allowed(&curated, input.scopes) {
                 continue;
             }
@@ -255,99 +266,13 @@ fn source_allowed(entry: &IndexEntry, sources: &[String], include_inbox: bool) -
     }
 }
 
-struct CuratedCandidate {
-    id: String,
-    relative_path: String,
-    scope: String,
-    body: String,
-}
-
 fn curated_source_allowed(sources: &[String]) -> bool {
     sources
         .iter()
         .any(|source| source == "curated" || source == "all")
 }
 
-fn curated_candidates(
-    store_root: &Path,
-    project_id: Option<&str>,
-) -> Result<Vec<CuratedCandidate>, ContextError> {
-    let mut files = Vec::new();
-    collect_curated_tree(store_root, Path::new("rules"), "global", &mut files)?;
-    collect_curated_tree(store_root, Path::new("people"), "global", &mut files)?;
-    collect_curated_tree(
-        store_root,
-        Path::new("memories/global"),
-        "global",
-        &mut files,
-    )?;
-    if let Some(project_id) = project_id {
-        collect_curated_tree(
-            store_root,
-            &Path::new("memories/projects").join(project_id),
-            "project",
-            &mut files,
-        )?;
-    }
-    files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    Ok(files)
-}
-
-fn collect_curated_tree(
-    store_root: &Path,
-    relative_root: &Path,
-    scope: &str,
-    files: &mut Vec<CuratedCandidate>,
-) -> Result<(), ContextError> {
-    let root = store_root.join(relative_root);
-    let entries = match fs::read_dir(&root) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => {
-            return Err(ContextError::ReadNote {
-                path: root,
-                message: err.to_string(),
-            });
-        }
-    };
-
-    for entry in entries {
-        let entry = entry.map_err(|err| ContextError::ReadNote {
-            path: root.clone(),
-            message: err.to_string(),
-        })?;
-        let path = entry.path();
-        // Use the directory entry type so prompt assembly does not follow
-        // symlinked curated files/directories outside the store. Symlink drift
-        // belongs in doctor diagnostics, not in the context hot path.
-        let file_type = entry.file_type().map_err(|err| ContextError::ReadNote {
-            path: path.clone(),
-            message: err.to_string(),
-        })?;
-        if file_type.is_dir() {
-            let relative = path.strip_prefix(store_root).unwrap_or(&path);
-            collect_curated_tree(store_root, relative, scope, files)?;
-        } else if file_type.is_file()
-            && path.extension().and_then(|value| value.to_str()) == Some("md")
-        {
-            let body = fs::read_to_string(&path).map_err(|err| ContextError::ReadNote {
-                path: path.clone(),
-                message: err.to_string(),
-            })?;
-            let relative_path = path_string(path.strip_prefix(store_root).unwrap_or(&path));
-            files.push(CuratedCandidate {
-                id: format!("curated:{relative_path}"),
-                relative_path,
-                scope: scope.to_owned(),
-                body,
-            });
-        }
-    }
-
-    Ok(())
-}
-
-fn curated_scope_allowed(candidate: &CuratedCandidate, scopes: &[String]) -> bool {
+fn curated_scope_allowed(candidate: &CuratedFile, scopes: &[String]) -> bool {
     scopes.is_empty() || scopes.iter().any(|scope| scope == &candidate.scope)
 }
 
@@ -391,7 +316,7 @@ fn render_memory_block(
     )
 }
 
-fn render_curated_memory_block(store_name: &str, candidate: &CuratedCandidate) -> String {
+fn render_curated_memory_block(store_name: &str, candidate: &CuratedFile) -> String {
     format!(
         "<memory id=\"{}\" agent=\"human\" store=\"{}\" scope=\"{}\" trust=\"{}\">\n{}\n</memory>\n\n",
         escape_attr(&candidate.id),
@@ -400,16 +325,6 @@ fn render_curated_memory_block(store_name: &str, candidate: &CuratedCandidate) -
         TrustLevel::Curated.as_str(),
         escape_memory_body(&candidate.body)
     )
-}
-
-fn path_string(path: &Path) -> String {
-    path.components()
-        .filter_map(|component| match component {
-            std::path::Component::Normal(value) => value.to_str(),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 fn sanitize_header_value(value: &str) -> String {

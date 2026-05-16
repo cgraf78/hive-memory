@@ -337,6 +337,15 @@ struct SearchArgs {
     /// Optional comma-separated scope filter.
     #[arg(long, value_delimiter = ',')]
     scope: Vec<String>,
+    /// Optional comma-separated source filter.
+    #[arg(long, value_delimiter = ',')]
+    source: Vec<String>,
+    /// Active project id for project-scoped memory.
+    #[arg(long)]
+    project_id: Option<String>,
+    /// Active project path or file hint.
+    #[arg(long)]
+    project: Option<String>,
 }
 
 /// Arguments for `hm context`.
@@ -1019,6 +1028,7 @@ fn run_write_memory(
 fn run_search(args: SearchArgs, context: CliContext) -> Result<()> {
     let config = load_config(context.config_path.as_deref())?;
     let agent_id = resolve_agent_id(context.as_agent);
+    let project_id = resolve_project_id(args.project_id, args.project.as_deref())?;
     let resolved_store = resolve_store(
         &config,
         context.store.as_deref(),
@@ -1034,10 +1044,13 @@ fn run_search(args: SearchArgs, context: CliContext) -> Result<()> {
     } else {
         args.scope
     };
+    let sources = if args.source.is_empty() {
+        config.defaults.context_sources.clone()
+    } else {
+        args.source
+    };
     let include_inbox = args.include_inbox
-        || config
-            .defaults
-            .context_sources
+        || sources
             .iter()
             .any(|source| source == "inbox" || source == "all");
 
@@ -1046,8 +1059,10 @@ fn run_search(args: SearchArgs, context: CliContext) -> Result<()> {
         entries: &report.entries,
         query: &args.query,
         scopes: &scopes,
+        sources: &sources,
         include_inbox,
         agent_id: agent_id.as_deref(),
+        project_id: project_id.as_deref(),
         limit: args.limit,
     })?;
 
