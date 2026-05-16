@@ -5,7 +5,7 @@
 //! store-affinity and privacy decisions. Keep policy here instead of forcing
 //! hooks or adapters to rediscover context on their own.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display};
@@ -148,7 +148,7 @@ pub struct StoreConfig {
 ///
 /// V1 does not encrypt data at rest, so `Secret` is a policy flag that tightens
 /// write and location checks rather than a promise of cryptographic protection.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Sensitivity {
     Public,
