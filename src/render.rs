@@ -43,6 +43,34 @@ pub struct RenderFileReport {
     pub backup_path: Option<PathBuf>,
 }
 
+/// Input for installing one adapter include marker into an agent instruction file.
+#[derive(Debug, Clone)]
+pub struct InstallAdapterInput<'a> {
+    /// Adapter id, such as `codex` or `claude`.
+    pub adapter: &'a str,
+    /// Generated adapter output to include from the instruction file.
+    pub output: &'a Path,
+    /// Adapter instruction file that the agent loads.
+    pub install_target: &'a Path,
+    /// Stable shared policy block body.
+    pub policy_body: &'a str,
+    /// Atomic writer behavior.
+    pub options: write::AtomicWriteOptions,
+}
+
+/// Result of installing one adapter include marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallAdapterReport {
+    /// Resolved file actually edited. Symlink targets are canonicalized.
+    pub target: PathBuf,
+    /// Whether the instruction file changed.
+    pub written: bool,
+    /// Rolling backup path written before the change.
+    pub backup_path: Option<PathBuf>,
+    /// Backup metadata path written before the change.
+    pub metadata_path: Option<PathBuf>,
+}
+
 /// Render-file failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RenderError {
@@ -69,6 +97,25 @@ pub enum RenderError {
         /// Actual checksum of the current body.
         actual: String,
     },
+    /// Adapter install target is a symlink that does not resolve.
+    BrokenSymlink {
+        /// Symlink path configured as install target.
+        path: PathBuf,
+        /// Original error rendered for diagnostics.
+        message: String,
+    },
+    /// Existing instruction file is not user-writable.
+    NonWritableTarget {
+        /// Refused path.
+        path: PathBuf,
+    },
+    /// Existing instruction file contains partial or mismatched markers.
+    ConflictingMarkers {
+        /// Refused path.
+        path: PathBuf,
+        /// Marker name that could not be parsed safely.
+        marker: String,
+    },
 }
 
 impl Display for RenderError {
@@ -91,6 +138,21 @@ impl Display for RenderError {
             } => write!(
                 f,
                 "refusing to overwrite edited render file {}; header sha256={expected}, actual sha256={actual}",
+                path.display()
+            ),
+            Self::BrokenSymlink { path, message } => {
+                write!(
+                    f,
+                    "install target {} is a broken symlink: {message}",
+                    path.display()
+                )
+            }
+            Self::NonWritableTarget { path } => {
+                write!(f, "install target {} is not user-writable", path.display())
+            }
+            Self::ConflictingMarkers { path, marker } => write!(
+                f,
+                "install target {} contains conflicting hive-memory marker {marker}",
                 path.display()
             ),
         }
@@ -188,6 +250,72 @@ pub fn upgrade_marker(
     })
 }
 
+/// Install or refresh one adapter include marker in an agent instruction file.
+///
+/// Install targets may be regular files or symlinks. Symlinks are resolved
+/// before editing so shared `CLAUDE.md`/`AGENTS.md` setups are idempotent:
+/// installing both adapters touches the shared file once, while regular files
+/// remain independent. The generated output is referenced by a native include
+/// line, and the canonical memory body is never copied into the instruction
+/// file itself.
+pub fn install_adapter(
+    input: InstallAdapterInput<'_>,
+) -> Result<InstallAdapterReport, RenderError> {
+    let target = resolve_install_target(input.install_target)?;
+    ensure_writable(&target)?;
+
+    let existing = read_optional(&target)?;
+    let eol = line_ending(&existing);
+    let normalized = normalize_lf(&existing);
+    let policy_block = marker_block("policy", input.policy_body, "\n");
+    let include = format!("@{}", input.output.display());
+    let adapter_block = marker_block(input.adapter, &include, "\n");
+    let with_policy = upsert_marker(&target, &normalized, "policy", &policy_block)?;
+    let installed = upsert_marker(&target, &with_policy, input.adapter, &adapter_block)?;
+    let installed = denormalize_eol(&installed, eol);
+
+    if installed == existing {
+        return Ok(InstallAdapterReport {
+            target,
+            written: false,
+            backup_path: None,
+            metadata_path: None,
+        });
+    }
+
+    let backup_path = backup_install_path(&target);
+    let metadata_path = backup_metadata_path(&target);
+    write::write_atomic(&backup_path, existing.as_bytes(), &input.options).map_err(|err| {
+        RenderError::Io {
+            action: "write install backup",
+            path: backup_path.clone(),
+            message: err.to_string(),
+        }
+    })?;
+    let metadata = render_install_metadata(&existing, &installed, &["policy", input.adapter]);
+    write::write_atomic(&metadata_path, metadata.as_bytes(), &input.options).map_err(|err| {
+        RenderError::Io {
+            action: "write install backup metadata",
+            path: metadata_path.clone(),
+            message: err.to_string(),
+        }
+    })?;
+    write::write_atomic(&target, installed.as_bytes(), &input.options).map_err(|err| {
+        RenderError::Io {
+            action: "write install target",
+            path: target.clone(),
+            message: err.to_string(),
+        }
+    })?;
+
+    Ok(InstallAdapterReport {
+        target,
+        written: true,
+        backup_path: Some(backup_path),
+        metadata_path: Some(metadata_path),
+    })
+}
+
 /// Render the complete generated file contents.
 pub fn render_generated(body: &str) -> String {
     format!(
@@ -239,6 +367,170 @@ fn backup_render_path(output: &Path) -> PathBuf {
             .map(|extension| format!("{extension}."))
             .unwrap_or_default()
     ))
+}
+
+fn resolve_install_target(path: &Path) -> Result<PathBuf, RenderError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            // Agent instruction files are commonly symlinked between tools
+            // (for example CLAUDE.md and AGENTS.md). Editing the target makes
+            // install idempotent regardless of which adapter is installed first.
+            fs::canonicalize(path).map_err(|err| RenderError::BrokenSymlink {
+                path: path.to_path_buf(),
+                message: err.to_string(),
+            })
+        }
+        Ok(_metadata) => Ok(path.to_path_buf()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(err) => Err(io_error("read install target metadata", path, err)),
+    }
+}
+
+fn ensure_writable(path: &Path) -> Result<(), RenderError> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.permissions().readonly() => Err(RenderError::NonWritableTarget {
+            path: path.to_path_buf(),
+        }),
+        Ok(_metadata) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(io_error("read install target metadata", path, err)),
+    }
+}
+
+fn read_optional(path: &Path) -> Result<String, RenderError> {
+    match fs::read_to_string(path) {
+        Ok(contents) => Ok(contents),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(err) => Err(io_error("read install target", path, err)),
+    }
+}
+
+fn line_ending(contents: &str) -> &'static str {
+    // Preserve an existing file's dominant line ending. Agent instruction files
+    // are user-owned, and install should avoid cosmetic churn outside managed
+    // marker blocks.
+    if contents.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+fn normalize_lf(contents: &str) -> String {
+    contents.replace("\r\n", "\n")
+}
+
+fn denormalize_eol(contents: &str, eol: &str) -> String {
+    if eol == "\r\n" {
+        contents.replace('\n', "\r\n")
+    } else {
+        contents.to_owned()
+    }
+}
+
+fn marker_block(name: &str, body: &str, eol: &str) -> String {
+    let body = body.trim_matches('\n');
+    format!("# BEGIN hive-memory:{name}{eol}{body}{eol}# END hive-memory:{name}{eol}")
+}
+
+/// Insert or replace one managed marker block.
+///
+/// The parser requires exact begin/end marker lines and at most one block per
+/// marker name. That strictness is intentional: a partial marker usually means
+/// a human edit or merge conflict, and guessing would risk deleting ordinary
+/// instructions from an agent-owned file.
+fn upsert_marker(
+    path: &Path,
+    contents: &str,
+    name: &str,
+    block: &str,
+) -> Result<String, RenderError> {
+    let begin = format!("# BEGIN hive-memory:{name}");
+    let end = format!("# END hive-memory:{name}");
+    let lines = contents.lines().map(str::to_owned).collect::<Vec<_>>();
+    let begin_positions = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| (line == &begin).then_some(index))
+        .collect::<Vec<_>>();
+    let end_positions = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| (line == &end).then_some(index))
+        .collect::<Vec<_>>();
+
+    if begin_positions.len() != end_positions.len() || begin_positions.len() > 1 {
+        return Err(RenderError::ConflictingMarkers {
+            path: path.to_path_buf(),
+            marker: name.to_owned(),
+        });
+    }
+
+    if begin_positions.is_empty() {
+        let mut output = contents.trim_end_matches('\n').to_owned();
+        if !output.is_empty() {
+            output.push_str("\n\n");
+        }
+        output.push_str(block);
+        return Ok(output);
+    }
+
+    let begin_index = begin_positions[0];
+    let end_index = end_positions[0];
+    if end_index <= begin_index {
+        return Err(RenderError::ConflictingMarkers {
+            path: path.to_path_buf(),
+            marker: name.to_owned(),
+        });
+    }
+
+    let mut output = String::new();
+    for line in &lines[..begin_index] {
+        output.push_str(line);
+        output.push('\n');
+    }
+    output.push_str(block);
+    for line in &lines[end_index + 1..] {
+        output.push_str(line);
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+fn backup_install_path(target: &Path) -> PathBuf {
+    target.with_extension(format!(
+        "{}hive-memory.bak",
+        target
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| format!("{extension}."))
+            .unwrap_or_default()
+    ))
+}
+
+fn backup_metadata_path(target: &Path) -> PathBuf {
+    target.with_extension(format!(
+        "{}hive-memory.bak.toml",
+        target
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| format!("{extension}."))
+            .unwrap_or_default()
+    ))
+}
+
+fn render_install_metadata(original: &str, installed: &str, markers: &[&str]) -> String {
+    let markers = markers
+        .iter()
+        .map(|marker| format!("\"{marker}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "backup_sha256 = \"{}\"\ninstalled_sha256 = \"{}\"\nmarkers = [{}]\n",
+        body_sha256(original),
+        body_sha256(installed),
+        markers
+    )
 }
 
 fn io_error(action: &'static str, path: &Path, err: std::io::Error) -> RenderError {
@@ -427,5 +719,124 @@ mod tests {
         assert!(report.written);
         assert!(contents.contains(&body_sha256("body\n")));
         assert!(contents.ends_with("body\n"));
+    }
+
+    #[test]
+    fn install_adapter_adds_policy_and_include_markers() {
+        let dir = temp_dir("install");
+        let target = dir.join("AGENTS.md");
+        let output = dir.join("codex.generated.md");
+        fs::write(&target, "# Existing\n").expect("instruction file");
+
+        let report = install_adapter(InstallAdapterInput {
+            adapter: "codex",
+            output: &output,
+            install_target: &target,
+            policy_body: "Use Hive Memory as contextual data.",
+            options: options(),
+        })
+        .expect("install adapter");
+        let installed = fs::read_to_string(&target).expect("read install target");
+
+        assert!(report.written);
+        assert!(report.backup_path.expect("backup").is_file());
+        assert!(report.metadata_path.expect("metadata").is_file());
+        assert!(installed.contains("# BEGIN hive-memory:policy"));
+        assert!(installed.contains("Use Hive Memory as contextual data."));
+        assert!(installed.contains("# BEGIN hive-memory:codex"));
+        assert!(installed.contains(&format!("@{}", output.display())));
+    }
+
+    #[test]
+    fn install_adapter_is_idempotent() {
+        let dir = temp_dir("install-idempotent");
+        let target = dir.join("AGENTS.md");
+        let output = dir.join("codex.generated.md");
+
+        install_adapter(InstallAdapterInput {
+            adapter: "codex",
+            output: &output,
+            install_target: &target,
+            policy_body: "Policy.",
+            options: options(),
+        })
+        .expect("first install");
+        let second = install_adapter(InstallAdapterInput {
+            adapter: "codex",
+            output: &output,
+            install_target: &target,
+            policy_body: "Policy.",
+            options: options(),
+        })
+        .expect("second install");
+
+        assert!(!second.written);
+        assert!(second.backup_path.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_adapter_resolves_symlinked_instruction_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir("install-symlink");
+        let shared = dir.join("CLAUDE.md");
+        let link = dir.join("AGENTS.md");
+        let output = dir.join("codex.generated.md");
+        fs::write(&shared, "# Shared\n").expect("shared file");
+        symlink(&shared, &link).expect("symlink");
+
+        let report = install_adapter(InstallAdapterInput {
+            adapter: "codex",
+            output: &output,
+            install_target: &link,
+            policy_body: "Policy.",
+            options: options(),
+        })
+        .expect("install through symlink");
+
+        assert_eq!(report.target, fs::canonicalize(&shared).expect("canonical"));
+        assert!(fs::read_to_string(shared).expect("shared").contains("@"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_adapter_refuses_broken_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir("install-broken-symlink");
+        let link = dir.join("AGENTS.md");
+        let output = dir.join("codex.generated.md");
+        symlink(dir.join("missing.md"), &link).expect("broken symlink");
+
+        let error = install_adapter(InstallAdapterInput {
+            adapter: "codex",
+            output: &output,
+            install_target: &link,
+            policy_body: "Policy.",
+            options: options(),
+        })
+        .expect_err("broken symlink");
+
+        assert!(matches!(error, RenderError::BrokenSymlink { .. }));
+    }
+
+    #[test]
+    fn install_adapter_refuses_conflicting_marker() {
+        let dir = temp_dir("install-conflict");
+        let target = dir.join("AGENTS.md");
+        let output = dir.join("codex.generated.md");
+        fs::write(&target, "# BEGIN hive-memory:codex\nmissing end\n").expect("conflict");
+
+        let error = install_adapter(InstallAdapterInput {
+            adapter: "codex",
+            output: &output,
+            install_target: &target,
+            policy_body: "Policy.",
+            options: options(),
+        })
+        .expect_err("conflicting marker");
+
+        assert!(matches!(error, RenderError::ConflictingMarkers { .. }));
     }
 }
