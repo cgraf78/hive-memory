@@ -2118,6 +2118,33 @@ fn context_json_reports_selection_and_sections() {
 }
 
 #[test]
+fn hook_context_fails_when_store_unavailable_without_cache() {
+    let dir = temp_dir("context-no-cache");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_HOOK_ACTIVE", "1")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "context",
+            "--path",
+            "/repo/src/main.rs",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "store personal is unavailable and no valid context cache exists",
+        ));
+}
+
+#[test]
 fn context_if_changed_suppresses_unchanged_session_output() {
     let dir = temp_dir("context-if-changed");
     let config = dir.join("config.toml");

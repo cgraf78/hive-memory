@@ -1563,9 +1563,14 @@ fn assemble_cli_context(
     );
     if std::env::var("HIVE_MEMORY_HOOK_ACTIVE").ok().as_deref() == Some("1")
         && let Err(store::StoreError::Io { .. }) = store::read_manifest(&store_config.root)
-        && let Some(assembly) = load_context_cache(config, &context_key, store_source.clone())?
     {
-        return Ok(assembly);
+        if let Some(assembly) = load_context_cache(config, &context_key, store_source.clone())? {
+            return Ok(assembly);
+        }
+        anyhow::bail!(
+            "store {} is unavailable and no valid context cache exists",
+            resolved_store.name
+        );
     }
     let report = rebuild_store_index(config, &resolved_store.name)?;
     let max_tokens = selection.max_tokens.unwrap_or_else(|| {
