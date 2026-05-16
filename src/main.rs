@@ -68,6 +68,8 @@ enum Command {
     Context(ContextArgs),
     /// Render adapter memory include files.
     Render(RenderArgs),
+    /// Refresh indexes and configured adapter outputs.
+    Refresh(RefreshArgs),
 }
 
 /// Store lifecycle commands.
@@ -240,6 +242,17 @@ struct RenderArgs {
     quiet: bool,
 }
 
+/// Arguments for `hm refresh`.
+#[derive(Debug, Args)]
+struct RefreshArgs {
+    /// Suppress the summary line.
+    #[arg(long)]
+    quiet: bool,
+    /// Run even when future receipt tracking would otherwise skip work.
+    #[arg(long)]
+    force: bool,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let context = CliContext {
@@ -254,6 +267,7 @@ fn main() -> Result<()> {
         Some(Command::Search(args)) => run_search(args, context),
         Some(Command::Context(args)) => run_context(args, context),
         Some(Command::Render(args)) => run_render(args, context),
+        Some(Command::Refresh(args)) => run_refresh(args, context),
         None => Ok(()),
     }
 }
@@ -615,6 +629,89 @@ fn run_render(args: RenderArgs, context: CliContext) -> Result<()> {
     Ok(())
 }
 
+fn run_refresh(args: RefreshArgs, context: CliContext) -> Result<()> {
+    let config = load_config(context.config_path.as_deref())?;
+    let mut indexes_refreshed = 0usize;
+    for store_name in config.stores.keys() {
+        rebuild_store_index(&config, store_name)?;
+        indexes_refreshed += 1;
+    }
+
+    // Hooks may need fresh indexes without touching agent instruction files.
+    // The env switch gives dotfiles hooks a simple safety valve while keeping
+    // refresh policy centralized in `hm` instead of in shell glue.
+    let render_skipped = std::env::var("HIVE_MEMORY_NO_RENDER").ok().as_deref() == Some("1");
+    let render_summary = if render_skipped {
+        RenderRefreshSummary::default()
+    } else {
+        refresh_render_outputs(&config, &context)?
+    };
+
+    // `--force` is reserved for the receipt-aware refresh path. Recording it in
+    // output now keeps the CLI contract visible without using it to bypass
+    // render drift or privacy refusals.
+    if !args.quiet {
+        println!(
+            "refresh: indexes={} rendered={} written={} render_skipped={} forced={}",
+            indexes_refreshed,
+            render_summary.rendered,
+            render_summary.written,
+            render_skipped,
+            args.force
+        );
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct RenderRefreshSummary {
+    rendered: usize,
+    written: usize,
+}
+
+/// Refresh generated adapter outputs for all enabled adapters.
+///
+/// This uses the same render path as `hm render --configured`, but never forces
+/// drifted files. A refresh should keep agents current; it should not silently
+/// clobber user edits or turn hook-time work into install-time policy changes.
+fn refresh_render_outputs(config: &Config, context: &CliContext) -> Result<RenderRefreshSummary> {
+    let options = write::AtomicWriteOptions {
+        fsync: config.storage.fsync.into(),
+        ..write::AtomicWriteOptions::default()
+    };
+    let mut summary = RenderRefreshSummary::default();
+
+    for (adapter_name, adapter) in config
+        .adapters
+        .iter()
+        .filter(|(_name, adapter)| adapter.enabled)
+    {
+        let Some(output) = adapter.output.as_ref() else {
+            anyhow::bail!("adapter {adapter_name} has no output configured");
+        };
+        let body = render_adapter_body(config, adapter_name, adapter, context)?;
+        let report = render::write_rendered_file(render::RenderFileInput {
+            output,
+            body: &body,
+            options: options.clone(),
+            force: false,
+            backup: false,
+        })?;
+        summary.rendered += 1;
+        if report.written {
+            summary.written += 1;
+        }
+    }
+
+    Ok(summary)
+}
+
+/// Resolve the adapters targeted by one render command.
+///
+/// Explicit adapter renders may target disabled adapters for manual debugging.
+/// `--configured` intentionally narrows to enabled adapters because that path is
+/// used by refresh/update automation.
 fn selected_adapters(config: &Config, args: &RenderArgs) -> Result<Vec<String>> {
     if args.configured {
         let adapters = config

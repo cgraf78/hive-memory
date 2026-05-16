@@ -924,3 +924,96 @@ fn render_uninstall_removes_adapter_marker() {
     assert!(instructions.contains("# BEGIN hive-memory:policy"));
     assert!(!instructions.contains("# BEGIN hive-memory:codex"));
 }
+
+#[test]
+fn refresh_rebuilds_indexes_and_renders_enabled_adapters() {
+    let dir = temp_dir("refresh");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let output = dir.join("generated").join("codex.md");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "{}"
+
+            [adapters.codex]
+            enabled = true
+            stores = ["personal"]
+            scopes = ["global"]
+            output = "{}"
+            "#,
+            personal.display(),
+            output.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Refresh renders this memory.",
+        ])
+        .assert()
+        .success();
+
+    let mut refresh = cargo_bin_cmd!("hm");
+    refresh
+        .args(["--config", config.to_str().expect("utf8 config"), "refresh"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("refresh: indexes=1"))
+        .stdout(predicate::str::contains("rendered=1"))
+        .stdout(predicate::str::contains("written=1"));
+
+    let rendered = fs::read_to_string(output).expect("read render output");
+    assert!(rendered.contains("Refresh renders this memory."));
+}
+
+#[test]
+fn refresh_honors_no_render_env() {
+    let dir = temp_dir("refresh-no-render");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let output = dir.join("generated").join("codex.md");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "{}"
+
+            [adapters.codex]
+            enabled = true
+            stores = ["personal"]
+            scopes = ["global"]
+            output = "{}"
+            "#,
+            personal.display(),
+            output.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    let mut refresh = cargo_bin_cmd!("hm");
+    refresh
+        .env("HIVE_MEMORY_NO_RENDER", "1")
+        .args(["--config", config.to_str().expect("utf8 config"), "refresh"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("rendered=0"))
+        .stdout(predicate::str::contains("render_skipped=true"));
+
+    assert!(!output.exists());
+}
