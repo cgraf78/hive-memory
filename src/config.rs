@@ -9,6 +9,8 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 const TOP_LEVEL_KEYS: &[&str] = &[
@@ -251,6 +253,13 @@ pub enum ConfigWarning {
 pub enum ConfigError {
     /// TOML parsing or deserialization failed.
     Parse(String),
+    ReadConfig {
+        /// Config path that failed to read.
+        path: PathBuf,
+        /// Original I/O error rendered for CLI diagnostics.
+        message: String,
+    },
+    /// `default_store` was omitted.
     MissingDefaultStore,
     /// A configured store omitted `root`.
     MissingStoreRoot {
@@ -304,6 +313,9 @@ impl Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Parse(message) => write!(f, "failed to parse config: {message}"),
+            Self::ReadConfig { path, message } => {
+                write!(f, "failed to read config {}: {message}", path.display())
+            }
             Self::MissingDefaultStore => write!(f, "default_store is required"),
             Self::MissingStoreRoot { store } => {
                 write!(f, "stores.{store}.root is required")
@@ -357,6 +369,66 @@ impl LoadedConfig {
         Self::from_str_with_env(input, |name| std::env::var(name).ok())
     }
 
+    /// Parse and validate main config plus an optional local override document.
+    ///
+    /// Local override values replace scalars and arrays while recursively
+    /// merging tables. This mirrors the user-facing contract: durable shared
+    /// defaults live in `config.toml`, and machine/private adjustments live in
+    /// `config.local.toml` without forcing users to duplicate the whole file.
+    pub fn from_toml_layers(main: &str, local_override: Option<&str>) -> Result<Self, ConfigError> {
+        Self::from_toml_layers_with_env(main, local_override, |name| std::env::var(name).ok())
+    }
+
+    /// Parse and validate main config plus local override with injected env.
+    ///
+    /// This is the deterministic test seam for file layering. It intentionally
+    /// keeps env/CLI override policy out of the file merge path; those dynamic
+    /// overrides should be applied by command loading code before validation.
+    pub fn from_toml_layers_with_env<F>(
+        main: &str,
+        local_override: Option<&str>,
+        env: F,
+    ) -> Result<Self, ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let mut merged = parse_table(main)?;
+        if let Some(local_override) = local_override {
+            let local = parse_table(local_override)?;
+            merge_tables(&mut merged, local);
+        }
+
+        Self::from_table_with_env(merged, env)
+    }
+
+    /// Load, merge, and validate config files from explicit paths.
+    ///
+    /// A missing local override file is ignored because it is an optional
+    /// machine-local layer. The primary config file is required; if it is
+    /// absent, callers should surface the read error and guide the user toward
+    /// `hm init` or config creation.
+    pub fn from_files(main: &Path, local_override: Option<&Path>) -> Result<Self, ConfigError> {
+        Self::from_files_with_env(main, local_override, |name| std::env::var(name).ok())
+    }
+
+    /// Load, merge, and validate config files with injected env.
+    ///
+    /// This is the file-backed equivalent of
+    /// [`LoadedConfig::from_toml_layers_with_env`] and exists so tests can
+    /// exercise path expansion without mutating process-wide environment.
+    pub fn from_files_with_env<F>(
+        main: &Path,
+        local_override: Option<&Path>,
+        env: F,
+    ) -> Result<Self, ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let main_toml = read_required_config(main)?;
+        let local_toml = read_optional_config(local_override)?;
+        Self::from_toml_layers_with_env(&main_toml, local_toml.as_deref(), env)
+    }
+
     /// Parse, expand, and validate one TOML config document with injected env.
     ///
     /// This exists primarily for deterministic tests and future callers that
@@ -366,16 +438,65 @@ impl LoadedConfig {
     where
         F: Fn(&str) -> Option<String>,
     {
-        // Serde intentionally ignores unknown fields here; keep a separate
-        // table pass so config typos are visible without making v1 brittle.
-        let table = toml::from_str::<toml::Table>(input)
-            .map_err(|err| ConfigError::Parse(err.to_string()))?;
+        let table = parse_table(input)?;
+        Self::from_table_with_env(table, env)
+    }
+
+    fn from_table_with_env<F>(table: toml::Table, env: F) -> Result<Self, ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
         let warnings = collect_warnings(&table);
-        let raw = toml::from_str::<RawConfig>(input)
+        let value = toml::Value::Table(table);
+        let raw = value
+            .try_into()
             .map_err(|err: toml::de::Error| ConfigError::Parse(err.to_string()))?;
         let config = Config::from_raw(raw, &env)?;
 
         Ok(Self { config, warnings })
+    }
+}
+
+fn read_required_config(path: &Path) -> Result<String, ConfigError> {
+    fs::read_to_string(path).map_err(|err| ConfigError::ReadConfig {
+        path: path.to_path_buf(),
+        message: err.to_string(),
+    })
+}
+
+fn read_optional_config(path: Option<&Path>) -> Result<Option<String>, ConfigError> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+
+    match fs::read_to_string(path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(ConfigError::ReadConfig {
+            path: path.to_path_buf(),
+            message: err.to_string(),
+        }),
+    }
+}
+
+fn parse_table(input: &str) -> Result<toml::Table, ConfigError> {
+    toml::from_str::<toml::Table>(input).map_err(|err| ConfigError::Parse(err.to_string()))
+}
+
+fn merge_tables(base: &mut toml::Table, override_table: toml::Table) {
+    for (key, override_value) in override_table {
+        match (base.get_mut(&key), override_value) {
+            (Some(toml::Value::Table(base_table)), toml::Value::Table(override_table)) => {
+                // Tables merge recursively so a local file can override one
+                // nested store root without erasing sibling stores or policy.
+                merge_tables(base_table, override_table);
+            }
+            (_, override_value) => {
+                // Scalars and arrays replace by design. Appending arrays would
+                // make policy allowlists hard to reason about across layers.
+                base.insert(key, override_value);
+            }
+        }
     }
 }
 
@@ -829,6 +950,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn env(name: &str) -> Option<String> {
         match name {
@@ -838,6 +961,19 @@ mod tests {
             "XDG_CACHE_HOME" => Some("/tmp/cache".to_owned()),
             _ => None,
         }
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "hive-memory-config-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
     }
 
     #[test]
@@ -868,6 +1004,105 @@ mod tests {
             PathBuf::from("/tmp/cache/hive-memory")
         );
         assert!(loaded.warnings.is_empty());
+    }
+
+    #[test]
+    fn local_override_replaces_scalars_and_merges_tables() {
+        let loaded = LoadedConfig::from_toml_layers_with_env(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "/tmp/personal"
+            description = "shared"
+
+            [stores.work]
+            root = "/tmp/work"
+            "#,
+            Some(
+                r#"
+                default_store = "work"
+
+                [stores.personal]
+                root = "/private/personal"
+                "#,
+            ),
+            env,
+        )
+        .expect("config loads");
+
+        assert_eq!(loaded.config.default_store, "work");
+        assert_eq!(
+            loaded.config.stores["personal"].root,
+            PathBuf::from("/private/personal")
+        );
+        assert_eq!(
+            loaded.config.stores["personal"].description.as_deref(),
+            Some("shared")
+        );
+        assert!(loaded.config.stores.contains_key("work"));
+    }
+
+    #[test]
+    fn local_override_replaces_arrays_instead_of_appending() {
+        let loaded = LoadedConfig::from_toml_layers_with_env(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "/tmp/personal"
+
+            [stores.work]
+            root = "/tmp/work"
+
+            [agents.codex]
+            default_store = "personal"
+            read_stores = ["personal", "work"]
+            write_stores = ["personal"]
+            "#,
+            Some(
+                r#"
+                [agents.codex]
+                read_stores = ["work"]
+                "#,
+            ),
+            env,
+        )
+        .expect("config loads");
+
+        assert_eq!(loaded.config.agents["codex"].read_stores, vec!["work"]);
+        assert_eq!(loaded.config.agents["codex"].write_stores, vec!["personal"]);
+    }
+
+    #[test]
+    fn file_loader_ignores_missing_local_override() {
+        let dir = temp_dir("missing-local");
+        let main = dir.join("config.toml");
+        let local = dir.join("config.local.toml");
+        fs::write(
+            &main,
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "/tmp/personal"
+            "#,
+        )
+        .expect("write main config");
+
+        let loaded =
+            LoadedConfig::from_files_with_env(&main, Some(&local), env).expect("config loads");
+
+        assert_eq!(loaded.config.default_store, "personal");
+    }
+
+    #[test]
+    fn file_loader_requires_main_config() {
+        let dir = temp_dir("missing-main");
+        let main = dir.join("config.toml");
+        let err = LoadedConfig::from_files_with_env(&main, None, env).expect_err("config fails");
+
+        assert!(matches!(err, ConfigError::ReadConfig { path, .. } if path == main));
     }
 
     #[test]
