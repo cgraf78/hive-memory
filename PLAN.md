@@ -222,16 +222,12 @@ enabled = true
 stores = ["personal"]
 scopes = ["global", "project"]
 output = "${HOME}/.claude/hive-memory.generated.md"
-install_target = "${HOME}/.claude/CLAUDE.md"
-install_mode = "include"
 
 [adapters.codex]
 enabled = true
 stores = ["personal"]
 scopes = ["global", "project"]
 output = "${HOME}/.codex/hive-memory.generated.md"
-install_target = "${HOME}/.codex/AGENTS.md"
-install_mode = "include"
 ```
 
 Important: store roots are always configurable. Google Drive is just one good
@@ -677,10 +673,11 @@ Intended use by caller:
   hm status
   ```
 
-- **Install/update automation** renders and verifies adapter visibility:
+- **Install/update automation** verifies the local setup and may refresh
+  generated adapter outputs for file-based integrations:
 
   ```bash
-  hm render --configured --install --quiet
+  hm render --configured --quiet
   hm doctor --quick
   ```
 
@@ -705,27 +702,22 @@ Benefit: each agent gets native-feeling context files, but the canonical store
 stays vendor-neutral. Adding a new agent should mean writing a renderer, not
 changing how memory is stored.
 
-Default v1 renders write generated files only. Adapter config files such as
-`CLAUDE.md` or `AGENTS.md` are modified only by an explicit adapter install
-command, e.g. `hm render claude --install` or
-`hm render --configured --install`, using the guarded install contract in
-SPEC.md. Dotfiles update should run the configured install path automatically so
-normal machine bootstrap keeps agent-visible memory linked.
+Default v1 renders write generated files only. The generic `hm` binary does not
+edit adapter config files such as `CLAUDE.md` or `AGENTS.md`; those files are
+agent-host instructions owned by dotfiles or another integration. Dotfiles
+update should install static Hive Memory guidance and hook wiring so normal
+machine bootstrap keeps agent access automatic without baking dotfiles policy
+into `hm`.
 
 ### Claude
 
 - Render a generated include file such as `~/.claude/hive-memory.generated.md`.
-- Install an include marker into `~/.claude/CLAUDE.md` so Claude's normal
-  startup reads hive-memory context.
 - Optionally render project memories for Claude project directories.
 - Claude hooks call generic `hm`, not Claude-only sync code.
 
 ### Codex
 
 - Render a generated include file such as `~/.codex/hive-memory.generated.md`.
-- Install an include marker into the Codex-loaded `~/.codex/AGENTS.md` path. If
-  it is a symlink to the shared `~/.claude/CLAUDE.md` target, the shared file is
-  enough; if it is a regular file, install the same idempotent marker there too.
 - Use existing Codex lifecycle hooks to refresh context and write notes.
 
 ### Runtime hooks
@@ -770,9 +762,9 @@ magical:
   `HIVE_MEMORY_HOOK_ACTIVE=1`, and `hm refresh` coalesces overlapping hook
   refreshes for the same session.
 
-The hooks are guardrails around agent judgment. The installed policy tells the
-agent when to write; hooks catch obvious misses and keep the store/render state
-fresh.
+The hooks are guardrails around agent judgment. Static dotfiles-owned guidance
+tells the agent when to write; hooks catch obvious misses and keep the
+store/render state fresh.
 
 ### OpenClaw
 
@@ -813,9 +805,9 @@ Merge hook behavior:
 1. ensure `hm` CLI is installed or available
 2. materialize config from template + local overrides
 3. run `hm doctor --quick`
-4. run `hm render --configured --install --quiet`
-5. run `hm doctor --quick` again to verify enabled adapters are visible from
-   their configured agent-loaded instruction files
+4. optionally run `hm render --configured --quiet` for file-based integrations
+5. rely on dotfiles-managed instruction files and hooks for automatic agent
+   access
 
 ## Backend Flexibility
 
@@ -956,8 +948,8 @@ In scope for v1:
 - append-only Markdown notes with TOML front matter
 - JSON sidecar/event files for structured processing (paired with Markdown by ID)
 - simple text search over canonical files, backed by a local triage index
-- context rendering and install for Claude and Codex, with dotfiles update
-  keeping both linked into agent-visible instruction files
+- context rendering for Claude and Codex, with dotfiles update keeping static
+  guidance and hooks installed
 - lifecycle hook workflow through `hm hook <event>` that injects fresh read
   context, tracks explicit memory intent, and refreshes after memory writes
 - trust-boundary rendering: source-labeled blocks, escaped memory bodies,
@@ -992,9 +984,8 @@ Explicitly out of scope for v1:
 - trusted-writer enforcement (`[trust] allowed_writers` is post-v1)
 
 Why this cut line: the risky parts are filesystem safety, store selection,
-trust-boundary rendering, install ergonomics, and the 1.0 stability surface.
-Those should be solved before adding smarter search, compaction, or remote
-backends.
+trust-boundary rendering, hook ergonomics, and the 1.0 stability surface. Those
+should be solved before adding smarter search, compaction, or remote backends.
 
 ## V1 Specification
 
@@ -1022,9 +1013,8 @@ issue order lives in SPEC.md; the broad sequencing here is:
 5. Implement the local triage index in `cache/indexes/` and doctor diagnostics.
 6. Implement `hm search` and `hm context` (curated+remembered defaults,
    data-boundary blocks, performance budget).
-7. Implement adapter render/install framework (magic header + sha256 marker,
-   backup, idempotent markers, broken-symlink refusal), including Claude/Codex
-   include-mode install into every configured agent-visible instruction file.
+7. Implement adapter render framework (magic header + sha256 marker, backup, and
+   refusal rules), including Claude/Codex generated outputs.
 8. Implement agent runtime hook integration inside the existing dotfiles
    `agent-hook-*` scripts through `hm hook <event>`: SessionStart context
    injection, prompt memory-intent reminders, session write receipts,
@@ -1066,10 +1056,8 @@ issue order lives in SPEC.md; the broad sequencing here is:
   writes materialize the field; `--audience-writer-only` records the writer as
   the only audience.
 - Adapter render uses a magic-header + sha256 generated-file marker. Claude and
-  Codex both install include markers into their configured agent-visible
-  instruction files. Codex works whether `~/.codex/AGENTS.md` is a symlink to
-  `~/.claude/CLAUDE.md` or a regular file. Dotfiles update runs
-  `hm render --configured --install --quiet` so both are linked automatically.
+  Codex generated outputs are render-only; dotfiles owns the static guidance and
+  hook wiring that make agent access automatic.
 - Runtime hooks provide the seamless path: SessionStart reads fresh context,
   `hm hook` refreshes context when long-lived sessions move across projects,
   prompt-submit records explicit memory intent, `hm remember`/`hm note` write

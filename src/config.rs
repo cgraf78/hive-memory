@@ -63,14 +63,7 @@ const PERFORMANCE_KEYS: &[&str] = &[
     "context_cold_p95_ms",
     "context_store_size_target",
 ];
-const ADAPTER_KEYS: &[&str] = &[
-    "enabled",
-    "stores",
-    "scopes",
-    "output",
-    "install_target",
-    "install_mode",
-];
+const ADAPTER_KEYS: &[&str] = &["enabled", "stores", "scopes", "output"];
 
 const CLOUD_ROOT_PREFIXES: &[&str] = &[
     "${HOME}/gdrive",
@@ -145,7 +138,7 @@ pub struct Config {
     pub offline: OfflineConfig,
     /// Performance budgets used by benchmark and doctor tooling.
     pub performance: PerformanceConfig,
-    /// Render/install targets for agent-visible context files.
+    /// Render targets for agent-visible context files.
     pub adapters: BTreeMap<String, AdapterConfig>,
 }
 
@@ -410,14 +403,14 @@ pub struct PerformanceConfig {
     pub context_store_size_target: u32,
 }
 
-/// Render/install adapter configuration for an agent surface.
+/// Render adapter configuration for an agent surface.
 ///
 /// Adapters describe generated files such as Claude/Codex includes. They are
 /// separate from `AgentConfig` because rendering a context file and giving an
 /// agent write access to a store are related, but not identical, policy choices.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdapterConfig {
-    /// Whether this adapter participates in render/install operations.
+    /// Whether this adapter participates in render operations.
     pub enabled: bool,
     /// Store aliases this adapter may render from.
     pub stores: Vec<String>,
@@ -425,10 +418,6 @@ pub struct AdapterConfig {
     pub scopes: Vec<String>,
     /// Generated include file path.
     pub output: Option<PathBuf>,
-    /// Agent-owned file that should include or link to `output`.
-    pub install_target: Option<PathBuf>,
-    /// Install strategy. V1 supports `include` only.
-    pub install_mode: Option<String>,
 }
 
 /// Non-fatal configuration diagnostics.
@@ -502,13 +491,6 @@ pub enum ConfigError {
         /// Store alias the adapter attempted to render.
         store: String,
     },
-    /// Adapter requested an unsupported install mode.
-    InvalidAdapterInstallMode {
-        /// Adapter id owning the bad value.
-        adapter: String,
-        /// Unsupported install mode.
-        install_mode: String,
-    },
     /// Enabled adapter has nowhere to render its include file.
     EnabledAdapterMissingOutput {
         /// Adapter id missing output.
@@ -552,13 +534,6 @@ impl Display for ConfigError {
             Self::AdapterStoreOutsideAgentPolicy { adapter, store } => write!(
                 f,
                 "adapters.{adapter}.stores includes {store}, outside agents.{adapter}.read_stores"
-            ),
-            Self::InvalidAdapterInstallMode {
-                adapter,
-                install_mode,
-            } => write!(
-                f,
-                "adapters.{adapter}.install_mode must be include, got {install_mode}"
             ),
             Self::EnabledAdapterMissingOutput { adapter } => {
                 write!(f, "enabled adapter {adapter} requires output")
@@ -1004,11 +979,6 @@ impl AdapterConfig {
             stores: raw.stores.unwrap_or_default(),
             scopes: raw.scopes.unwrap_or_default(),
             output: raw.output.map(|path| expand_path(&path, env)).transpose()?,
-            install_target: raw
-                .install_target
-                .map(|path| expand_path(&path, env))
-                .transpose()?,
-            install_mode: raw.install_mode,
         })
     }
 }
@@ -1128,8 +1098,6 @@ struct RawAdapterConfig {
     stores: Option<Vec<String>>,
     scopes: Option<Vec<String>>,
     output: Option<String>,
-    install_target: Option<String>,
-    install_mode: Option<String>,
 }
 
 fn collect_warnings(table: &toml::Table) -> Vec<ConfigWarning> {
@@ -1236,15 +1204,6 @@ fn validate_adapter(
     if adapter.enabled && adapter.output.is_none() {
         return Err(ConfigError::EnabledAdapterMissingOutput {
             adapter: name.to_owned(),
-        });
-    }
-
-    if let Some(mode) = &adapter.install_mode
-        && mode != "include"
-    {
-        return Err(ConfigError::InvalidAdapterInstallMode {
-            adapter: name.to_owned(),
-            install_mode: mode.clone(),
         });
     }
 
@@ -1747,7 +1706,6 @@ mod tests {
             enabled = true
             stores = ["personal"]
             output = "${HOME}/.codex/hive-memory.generated.md"
-            install_mode = "include"
             "#,
             env,
         )
@@ -1871,32 +1829,6 @@ mod tests {
         .expect("config loads");
 
         assert_eq!(loaded.config.adapters["codex"].stores, vec!["work"]);
-    }
-
-    #[test]
-    fn rejects_adapter_install_mode_other_than_include() {
-        let err = LoadedConfig::from_str_with_env(
-            r#"
-            default_store = "personal"
-
-            [stores.personal]
-            root = "/tmp/personal"
-
-            [adapters.codex]
-            stores = ["personal"]
-            install_mode = "symlink"
-            "#,
-            env,
-        )
-        .expect_err("config fails");
-
-        assert_eq!(
-            err,
-            ConfigError::InvalidAdapterInstallMode {
-                adapter: "codex".to_owned(),
-                install_mode: "symlink".to_owned()
-            }
-        );
     }
 
     #[test]

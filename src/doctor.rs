@@ -1387,12 +1387,6 @@ fn check_adapters(config: &config::Config, _quick: bool, checks: &mut Vec<Doctor
             continue;
         };
         inspect_adapter_output(name, output, checks);
-
-        // Quick mode is the path used by dotfiles update and hooks, so adapter
-        // visibility belongs in the quick-safe set. Heavier future checks such
-        // as full secret scans can branch on `_quick` without weakening install
-        // validation.
-        inspect_adapter_install(name, output, adapter.install_target.as_deref(), checks);
     }
 }
 
@@ -1452,58 +1446,6 @@ fn inspect_adapter_output(name: &str, output: &Path, checks: &mut Vec<DoctorChec
             format!("adapter.{name}.output"),
             format!("adapter {name} output is not a valid generated file: {err}"),
             vec![output.display().to_string()],
-        )),
-    }
-}
-
-fn inspect_adapter_install(
-    name: &str,
-    output: &Path,
-    install_target: Option<&Path>,
-    checks: &mut Vec<DoctorCheck>,
-) {
-    let Some(install_target) = install_target else {
-        checks.push(warn(
-            format!("adapter.{name}.install"),
-            format!("enabled adapter {name} has no install_target configured"),
-            Vec::new(),
-        ));
-        return;
-    };
-
-    match render::inspect_adapter_install(render::InspectAdapterInstallInput {
-        adapter: name,
-        output,
-        install_target,
-    }) {
-        Ok(report) if report.installed && report.include_matches => checks.push(pass(
-            format!("adapter.{name}.install"),
-            format!("adapter {name} marker is installed"),
-            vec![report.target.display().to_string()],
-        )),
-        Ok(report) if !report.target_exists => checks.push(warn(
-            format!("adapter.{name}.install"),
-            format!("adapter {name} install target is missing; run `hm render {name} --install`"),
-            vec![report.target.display().to_string()],
-        )),
-        Ok(report) if !report.installed => checks.push(warn(
-            format!("adapter.{name}.install"),
-            format!("adapter {name} marker is not installed; run `hm render {name} --install`"),
-            vec![report.target.display().to_string()],
-        )),
-        Ok(report) => checks.push(error(
-            format!("adapter.{name}.install"),
-            format!(
-                "adapter {name} marker points at {}, expected @{}",
-                report.include.unwrap_or_default(),
-                output.display()
-            ),
-            vec![report.target.display().to_string()],
-        )),
-        Err(err) => checks.push(error(
-            format!("adapter.{name}.install"),
-            format!("adapter {name} install target cannot be inspected: {err}"),
-            vec![install_target.display().to_string()],
         )),
     }
 }

@@ -524,13 +524,12 @@ fn stores_migrate_reports_no_v1_migrations() {
 }
 
 #[test]
-fn doctor_quick_reports_clean_adapter_install() {
+fn doctor_quick_reports_clean_adapter_output() {
     let dir = temp_dir("doctor-clean-adapter");
     let config = dir.join("config.toml");
     let data = dir.join("data");
     let personal = dir.join("personal");
     let output = dir.join("generated").join("codex.md");
-    let target = dir.join("AGENTS.md");
     fs::write(
         &config,
         format!(
@@ -546,13 +545,10 @@ fn doctor_quick_reports_clean_adapter_install() {
             stores = ["personal"]
             scopes = ["global"]
             output = "{}"
-            install_target = "{}"
-            install_mode = "include"
             "#,
             data.display(),
             personal.display(),
-            output.display(),
-            target.display()
+            output.display()
         ),
     )
     .expect("write config");
@@ -565,7 +561,6 @@ fn doctor_quick_reports_clean_adapter_install() {
             config.to_str().expect("utf8 config"),
             "render",
             "--configured",
-            "--install",
             "--quiet",
         ])
         .assert()
@@ -591,7 +586,6 @@ fn doctor_warns_for_broad_sensitive_adapter_render() {
     let personal = dir.join("personal");
     let work = dir.join("work");
     let output = dir.join("generated").join("codex.md");
-    let install_target = dir.join("AGENTS.md");
     fs::write(
         &config,
         format!(
@@ -614,13 +608,10 @@ fn doctor_warns_for_broad_sensitive_adapter_render() {
             stores = ["personal", "work"]
             scopes = ["global"]
             output = "{}"
-            install_target = "{}"
-            install_mode = "include"
             "#,
             personal.display(),
             work.display(),
-            output.display(),
-            install_target.display()
+            output.display()
         ),
     )
     .expect("write config");
@@ -633,7 +624,6 @@ fn doctor_warns_for_broad_sensitive_adapter_render() {
             config.to_str().expect("utf8 config"),
             "render",
             "codex",
-            "--install",
         ])
         .assert()
         .success();
@@ -3450,77 +3440,11 @@ fn render_refuses_drifted_output_without_force_backup() {
 }
 
 #[test]
-fn render_install_adds_instruction_markers() {
-    let dir = temp_dir("render-install");
-    let config = dir.join("config.toml");
-    let personal = dir.join("personal");
-    let output = dir.join("generated").join("codex.md");
-    let install_target = dir.join("AGENTS.md");
-    fs::write(
-        &config,
-        format!(
-            r#"
-            default_store = "personal"
-
-            [stores.personal]
-            root = "{}"
-
-            [adapters.codex]
-            enabled = true
-            stores = ["personal"]
-            scopes = ["global"]
-            output = "{}"
-            install_target = "{}"
-            install_mode = "include"
-            "#,
-            personal.display(),
-            output.display(),
-            install_target.display()
-        ),
-    )
-    .expect("write config");
-    init_store(&personal, "personal");
-
-    let mut remember = cargo_bin_cmd!("hm");
-    remember
-        .args([
-            "--config",
-            config.to_str().expect("utf8 config"),
-            "remember",
-            "--text",
-            "Installed render memory.",
-        ])
-        .assert()
-        .success();
-
-    let mut render = cargo_bin_cmd!("hm");
-    render
-        .args([
-            "--config",
-            config.to_str().expect("utf8 config"),
-            "render",
-            "codex",
-            "--install",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("install_target: "))
-        .stdout(predicate::str::contains("installed: true"));
-
-    let instructions = fs::read_to_string(install_target).expect("read install target");
-    assert!(instructions.contains("<!-- BEGIN hive-memory:policy -->"));
-    assert!(instructions.contains("<!-- BEGIN hive-memory:codex -->"));
-    assert!(instructions.contains(&format!("@{}", output.display())));
-    assert!(!instructions.contains("Installed render memory."));
-}
-
-#[test]
-fn render_json_reports_output_install_and_visibility() {
+fn render_json_reports_output() {
     let dir = temp_dir("render-json");
     let config = dir.join("config.toml");
     let personal = dir.join("personal");
     let output = dir.join("generated").join("codex.md");
-    let install_target = dir.join("AGENTS.md");
     fs::write(
         &config,
         format!(
@@ -3535,12 +3459,9 @@ fn render_json_reports_output_install_and_visibility() {
             stores = ["personal"]
             scopes = ["global"]
             output = "{}"
-            install_target = "{}"
-            install_mode = "include"
             "#,
             personal.display(),
-            output.display(),
-            install_target.display()
+            output.display()
         ),
     )
     .expect("write config");
@@ -3563,7 +3484,6 @@ fn render_json_reports_output_install_and_visibility() {
             config.to_str().expect("utf8 config"),
             "render",
             "codex",
-            "--install",
             "--json",
         ])
         .output()
@@ -3575,78 +3495,10 @@ fn render_json_reports_output_install_and_visibility() {
     assert_eq!(report["output_path"], output.display().to_string());
     assert_eq!(report["written"], true);
     assert!(report["sha256"].as_str().expect("sha256").len() >= 32);
-    assert_eq!(report["installed"], true);
-    assert_eq!(report["visible"], true);
-    assert_eq!(
-        report["install_targets"][0],
-        install_target.display().to_string()
-    );
+    let object = report.as_object().expect("render json object");
+    assert_eq!(object.len(), 5);
     let backup_paths = report["backup_paths"].as_array().expect("backups");
-    assert_eq!(backup_paths.len(), 1);
-    assert!(PathBuf::from(backup_paths[0].as_str().expect("backup path")).is_file());
-}
-
-#[test]
-fn render_uninstall_removes_adapter_marker() {
-    let dir = temp_dir("render-uninstall");
-    let config = dir.join("config.toml");
-    let personal = dir.join("personal");
-    let output = dir.join("generated").join("codex.md");
-    let install_target = dir.join("AGENTS.md");
-    fs::write(
-        &config,
-        format!(
-            r#"
-            default_store = "personal"
-
-            [stores.personal]
-            root = "{}"
-
-            [adapters.codex]
-            enabled = true
-            stores = ["personal"]
-            scopes = ["global"]
-            output = "{}"
-            install_target = "{}"
-            install_mode = "include"
-            "#,
-            personal.display(),
-            output.display(),
-            install_target.display()
-        ),
-    )
-    .expect("write config");
-    init_store(&personal, "personal");
-
-    let mut install = cargo_bin_cmd!("hm");
-    install
-        .args([
-            "--config",
-            config.to_str().expect("utf8 config"),
-            "render",
-            "codex",
-            "--install",
-        ])
-        .assert()
-        .success();
-
-    let mut uninstall = cargo_bin_cmd!("hm");
-    uninstall
-        .args([
-            "--config",
-            config.to_str().expect("utf8 config"),
-            "render",
-            "codex",
-            "--uninstall",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("uninstalled: true"))
-        .stdout(predicate::str::contains("output:").not());
-
-    let instructions = fs::read_to_string(install_target).expect("read install target");
-    assert!(instructions.contains("<!-- BEGIN hive-memory:policy -->"));
-    assert!(!instructions.contains("<!-- BEGIN hive-memory:codex -->"));
+    assert!(backup_paths.is_empty());
 }
 
 #[test]

@@ -18,8 +18,8 @@ conflict, prefer this file for v1 behavior and update both documents deliberatel
 | search | yes | simple deterministic text search backed by local index |
 | local triage index | yes | rebuildable jsonl index in cache_dir; not full FTS |
 | context | yes | curated + remembered by default; raw inbox opt-in |
-| Claude render + `--install` | yes | generated file + include marker in `~/.claude/CLAUDE.md` |
-| Codex render + `--install` | yes | generated file + include block through `~/.codex/AGENTS.md` |
+| Claude render | yes | generated file for file-based integrations and debugging |
+| Codex render | yes | generated file for file-based integrations and debugging |
 | local outbox/flush | yes | required for laptop/offline ergonomics; data_dir, not state_dir |
 | `hm promote` / `hm inbox` | yes | curation workflow that bridges raw inbox to curated memory |
 | trust-boundary rendering | yes | source-labeled blocks; raw notes excluded by default |
@@ -124,16 +124,12 @@ enabled = true
 stores = ["personal"]
 scopes = ["global", "project"]
 output = "${HOME}/.claude/hive-memory.generated.md"
-install_target = "${HOME}/.claude/CLAUDE.md"   # file to install include marker into
-install_mode = "include"
 
 [adapters.codex]
 enabled = true
 stores = ["personal"]
 scopes = ["global", "project"]
 output = "${HOME}/.codex/hive-memory.generated.md"
-install_target = "${HOME}/.codex/AGENTS.md"    # agent-loaded path; symlink or regular file
-install_mode = "include"
 ```
 
 Validation rules:
@@ -156,9 +152,7 @@ Validation rules:
   configured store aliases. Missing agent entries resolve to the global
   `default_store` with `read_stores = [default_store]` and
   `write_stores = [default_store]`, which preserves simple single-store installs.
-- enabled adapters require `output`; `install_target` is required when dotfiles
-  update or `hm render --install` should make the adapter visible.
-- `adapters.<name>.install_mode` must be `include` in v1.
+- enabled adapters require `output`.
 - local override config may replace scalar values and merge tables.
 - CLI flags and environment variables override merged config, not source files.
 
@@ -635,8 +629,11 @@ results:
   returned actions into agent-specific context, warning, and reminder surfaces.
 - Humans use `hm inbox`, `hm promote`, `hm projects`, `hm stores`, and
   `hm doctor` to inspect and curate.
-- Install/update automation uses `hm render --configured --install --quiet` and
-  `hm doctor --quick` to keep adapter-visible memory linked.
+- Install/update automation installs `hm`, materializes config, installs static
+  agent guidance/hook wiring owned by dotfiles, and runs `hm doctor --quick`.
+  It may run `hm render --configured --quiet` for file-based integrations, but
+  agent instruction-file linkage is not a responsibility of the generic `hm`
+  binary.
 
 The lower-level commands `hm context --if-changed`, `hm refresh`, and `hm flush`
 remain stable for debugging, maintenance, and unusual integrations, but v1
@@ -757,9 +754,7 @@ Stable `--json` success field sets. Fields are mandatory unless explicitly noted
   `{ "id", "store", "scope", "trust", "audience", "source_path",
   "estimated_tokens", "body" }`.
 - `hm render --json`:
-  `{ "adapter", "output_path", "written", "sha256", "installed", "visible",
-  "install_targets", "backup_paths" }`; install fields are empty arrays when the
-  adapter render did not run `--install` or `--uninstall`.
+  `{ "adapter", "output_path", "written", "sha256", "backup_paths" }`.
 - `hm flush --json`:
   `{ "flushed", "skipped", "failed", "unbound", "pending", "items" }`, where
   each item contains `{ "id", "store", "state", "result", "message" }`.
@@ -1010,9 +1005,6 @@ Examples:
 hm render codex
 hm render claude --store personal
 hm render --configured --quiet
-hm render --configured --install --quiet
-hm render claude --install
-hm render claude --uninstall
 hm render --upgrade-marker     # re-bless after intentional template changes
 ```
 
@@ -1024,8 +1016,6 @@ Behavior:
 - `--configured` renders all enabled adapters from config.
 - render uses each adapter's explicit store/scope allowlist.
 - writes to temp file then atomic rename.
-- `--install` renders first, then links each selected adapter into every
-  configured instruction file the agent may load.
 - includes a generated-file header as the FIRST line of every rendered file:
 
   ```text
@@ -1036,99 +1026,22 @@ Behavior:
   terminating newline. `--upgrade-marker` re-blesses a renderer-template
   change by writing a fresh marker without contents-comparison.
 
-Adapter `--install` contract:
-
-1. Compute the install file set for the selected adapters from their
-   `install_target` paths. Each `install_target` is the instruction path that the
-   adapter's agent loads. Resolve symlinks before de-duping write targets, so
-   `~/.codex/AGENTS.md -> ../.claude/CLAUDE.md` and
-   `~/.claude/CLAUDE.md` become one resolved install file, while a regular
-   `~/.codex/AGENTS.md` remains its own install file. This makes install
-   idempotent whether AGENTS.md is a symlink or not.
-2. For each resolved install file, read the current contents; if missing, create
-   it with mode `0644`.
-3. Copy each file to `<path>.hive-memory.bak` (a single rolling backup,
-   overwritten on every install) and write `<path>.hive-memory.bak.toml` with
-   `backup_sha256`, `installed_sha256` (filled after install),
-   `pre_install_mtime`, and the exact marker blocks installed in that file.
-4. Insert (or replace contents of) the stable policy marker block in each
-   resolved install file. The policy block is shared across adapters, should be
-   committed once when the shared instruction file is tracked, and must not
-   contain rendered memory bodies:
-
-   ```text
-   <!-- BEGIN hive-memory:policy -->
-   ...stable Hive Memory read/write policy...
-   <!-- END hive-memory:policy -->
-   ```
-
-5. Insert (or replace contents of) the adapter-specific marker block for every
-   adapter whose `install_target` resolves to the install file being written. In
-   v1, the marker body is a native include of that adapter's generated output:
-
-   ```text
-   <!-- BEGIN hive-memory:<adapter> -->
-   @<adapter-output-include-path>
-   <!-- END hive-memory:<adapter> -->
-   ```
-
-   The include path MUST resolve to the selected adapter's configured `output`
-   from the resolved instruction file where the marker is installed. Use the
-   shortest native path that is unambiguous. When both the generated output and
-   install file are under `$HOME`, prefer a relative path from the instruction
-   file's directory back through `$HOME` (for example
-   `../.codex/hive-memory.generated.md`) so tracked dotfiles stay portable
-   across Linux/macOS home roots. Fall back to an absolute path only when a
-   portable home-relative path cannot represent the configured output. Never use
-   a bare basename when multiple adapters share one resolved install file,
-   because Claude and Codex could accidentally include each other's generated
-   files.
-
-   Append at end of file if the block is absent; replace contents in place
-   if the block exists (idempotent). When multiple enabled adapters share one
-   resolved install file, `--configured --install` updates all selected adapter
-   blocks in one write and preserves unselected adapter blocks.
-6. Preserve the existing line-ending convention (LF or CRLF) per install file.
-7. Refuse to edit when ANY of the following is true:
-   - an `install_target` is a broken symlink
-   - a resolved install file is not owned by `$USER`
-   - a resolved install file's mode is not user-writable
-   - the existing file contains conflicting markers (e.g.,
-     `<!-- BEGIN hive-memory:<adapter> -->` with a mismatched end marker)
-8. `--uninstall` reads backup metadata for every install file and removes only
-   the selected adapter's marker block. The policy block remains unless
-   `--uninstall --all` is requested. If uninstalling every hive-memory marker
-   that was installed into a file and the current file sha256 matches
-   `installed_sha256`, restore that file's backup exactly. If the current file
-   was edited after install, remove only the selected marker blocks in place,
-   keep the backup, and report that automatic restore was skipped.
-
 Render-time safety:
 
 - Refuses broad sensitive-store render unless explicitly configured.
 - Refuses to write to a target that has a marker header whose recorded
   sha256 does not match the file body (= a human edited the rendered file)
   unless `--force --backup` is used.
-- Refuses to overwrite a target file that lacks the marker header at all,
-  suggesting `hm render <adapter> --install` first.
+- Refuses to overwrite a target file that lacks the marker header at all.
 - Refuses to overwrite secret-store renders without `--include-secret`.
 
 Adapter visibility requirements:
 
-- Claude v1: `hm render claude --install` MUST install an include marker into
-  `~/.claude/CLAUDE.md` (or configured `install_target`) that references the
-  generated Claude output. A normal Claude startup must load that target and
-  therefore see the generated memory.
-- Codex v1: `hm render codex --install` MUST make the configured
-  `install_target` path (`~/.codex/AGENTS.md` by convention) contain or resolve
-  to a current Codex include marker. If `AGENTS.md` is a symlink to the shared
-  Claude file, editing the resolved shared file is sufficient. If it is a
-  regular file, install the same idempotent policy and Codex marker directly into
-  `AGENTS.md`.
-- Rendered output alone is not considered fully installed. An adapter is
-  "visible" only when doctor can prove its configured `install_target` contains,
-  or resolves to a file containing, a current `hive-memory:<adapter>` marker for
-  that adapter.
+- The generic `hm` binary does not modify Claude/Codex instruction files.
+- Dotfiles or another host integration owns the static guidance that tells
+  agents how to use `hm` and the hook wiring that injects runtime context.
+- Rendered files are still useful for integrations that natively include files
+  or for humans debugging the exact context body an adapter would see.
 
 ### `hm flush`
 
@@ -1377,11 +1290,6 @@ Checks (all surfaces at default verbosity unless noted):
   "Conflict", "sync-conflict", duplicate temp files older than TTL).
 - adapter outputs have valid `<!-- hive-memory:generated -->` markers with
   matching sha256 (warns when drifted).
-- for adapters with `install_target` configured, verifies the hive-memory marker
-  block is present in the file the agent actually loads.
-- verifies each marker points at the configured output path.
-- each configured `install_target` exists and contains, or resolves to a file
-  containing, its adapter's idempotently installed marker block.
 - sensitive stores are not broadly rendered.
 - agent policies do not give broad store access by accident, e.g. work/secret
   stores in an agent's defaults without an explicit config entry.
@@ -1457,14 +1365,12 @@ incorrect memories. The split is deliberate:
   a parallel hook system.
 - Agents own judgment about what text is durable enough to remember.
 
-### Installed Policy Block
+### Agent Guidance
 
-`hm render --configured --install` installs stable adapter markers plus a stable
-Hive Memory policy block into the configured shared instruction file. For the
-current dotfiles layout this is `~/.claude/CLAUDE.md`; Codex reads the same file
-through `~/.codex/AGENTS.md -> ../.claude/CLAUDE.md`.
-
-The policy block is tracked and should change rarely. It MUST instruct agents:
+The generic `hm` binary does not install or edit agent instruction files.
+Dotfiles owns the tracked top-level Claude/Codex guidance and keeps it installed
+through normal dotfiles update. That guidance should change rarely and MUST
+instruct agents:
 
 - treat hook-provided `hm context` as durable user/project memory.
 - trust the active store header in hook-provided context; use explicit
@@ -1504,7 +1410,7 @@ There are two related but separate environments:
   lifecycle hook maintenance.
 
 If a host integration cannot inject env vars into normal agent tool subprocesses,
-the installed policy must tell agents to include `--project <path>` on
+the static agent guidance must tell agents to include `--project <path>` on
 project-scoped writes. That is acceptable but less ergonomic; the preferred path
 is env-backed session context plus explicit `--project` only for cross-project
 writes.
@@ -1772,8 +1678,6 @@ Frozen at 1.0:
   `hm context --json`, `hm render --json`, `hm flush`, `hm stores list/show`,
   `hm doctor --json`).
 - The data-boundary block syntax used by `hm context`.
-- The adapter install marker block syntax used by `hm render --install`,
-  including include-mode semantics and symlinked install targets.
 - The generated-file header syntax used by `hm render`.
 
 Free to evolve in 1.x:
@@ -1893,17 +1797,15 @@ agent-specific hook tries to call `hm`.
 
 Dotfiles update integration:
 
-- A normal dotfiles update MUST be sufficient to link enabled Claude and Codex
-  adapters into their agent-visible instruction files.
+- A normal dotfiles update MUST be sufficient to install the `hm` binary,
+  materialize Hive Memory config, and keep Claude/Codex guidance plus hook
+  wiring in place.
 - After installing or updating `hm`, the dotfiles merge hook runs
-  `hm doctor --quick`, then `hm render --configured --install --quiet`, then
-  `hm doctor --quick` again.
-- The second doctor pass is required so dotfiles update fails visibly when an
-  enabled adapter rendered successfully but is not visible from its configured
-  `install_target`.
-- Agent lifecycle hooks may refresh renders opportunistically, but v1 correctness
-  does not depend on a hook that runs after the agent has already loaded
-  instructions.
+  `hm doctor --quick`. It may also run `hm render --configured --quiet` when a
+  file-based integration wants generated adapter outputs.
+- Agent lifecycle hooks may refresh renders opportunistically, but v1 runtime
+  correctness depends on hook-provided context and static agent guidance, not on
+  `hm` mutating instruction files.
 
 ## Testing
 
@@ -2030,23 +1932,13 @@ Test categories per module:
 - Refusal on drifted checksum without `--force --backup`.
 - Refusal on missing header.
 - `--upgrade-marker` re-blesses cleanly.
-- `--install` adds idempotent policy and adapter marker blocks; second call is
-  no-op.
-- `--configured --install` renders and installs every enabled adapter.
-- include-mode install writes a native include pointing at the configured output.
-- install target checks cover both symlinked and regular files such as
-  `~/.codex/AGENTS.md`.
-- `--install` refusal on broken symlink, foreign owner, non-writable file.
-- `--uninstall` removes selected adapter blocks and restores backup only when all
-  installed hive-memory markers are being removed and the target still matches
-  install metadata; edited targets remove selected marker blocks in place.
 - Sensitive-store render refusal.
 - Generated `.gitignore` for `generated/` directory.
 
 ### Agent runtime hooks
 
-- Installed policy block appears in the shared instruction file and remains
-  stable across repeated installs.
+- Static Hive Memory guidance appears in the shared instruction file and remains
+  stable across repeated dotfiles updates.
 - Agent/tool subprocesses receive `HIVE_MEMORY_AGENT_ID`,
   `HIVE_MEMORY_SESSION_ID`, and a best-available `HIVE_MEMORY_PROJECT` path hint
   when the host integration supports env injection.
@@ -2189,9 +2081,8 @@ Risks to watch during implementation:
   and project-switch context refresh should stay within the v1 latency budget.
 - Hook JSON action stability. `hm hook <event> --json` is an API for dotfiles and
   future adapters; action shapes should be versioned by tests before integration.
-- Render/install drift. Generated-file markers, symlinked install targets, and
-  adapter visibility checks must remain idempotent across repeated dotfiles
-  updates.
+- Render drift. Generated-file markers and adapter output checks must remain
+  idempotent across repeated dotfiles updates.
 
 When ready, create GitHub issues roughly in this order. Each carries a
 "Tests required" sub-list from the Testing catalog.
@@ -2221,8 +2112,8 @@ When ready, create GitHub issues roughly in this order. Each carries a
 8. **Local triage index**: jsonl per-store, rebuild on flush + lazy mtime
    refresh, cache_dir placement. Tests: shared with Search/Context.
 9. **Doctor diagnostics**: full checklist including normalization, cloud
-   conflict, marker validation, install-target presence, audience absence,
-   secret-on-cloud, fsync-on-FUSE. Tests: Doctor.
+   conflict, render marker validation, audience absence, secret-on-cloud,
+   fsync-on-FUSE. Tests: Doctor.
 10. **Simple search**: substring scan over index + matched-line snippet
     read; pair collapse. Tests: Search.
 11. **Context assembler**: scope/store selection, curated+remembered defaults,
@@ -2231,14 +2122,11 @@ When ready, create GitHub issues roughly in this order. Each carries a
 12. **Adapter render framework**: generated-file header + sha256 marker,
     atomic render writes, `--upgrade-marker`, refusal rules. Tests:
     Adapter render framework.
-13. **Claude adapter + `--install`**: configured render output, include-mode
-    installer with backup/idempotent markers/broken-symlink refusal,
-    `--uninstall`.
-    Tests: Adapter render framework (install-target paths).
-14. **Codex adapter + `--install`**: configured render output, include-mode
-    installer into `~/.codex/AGENTS.md` whether it is a symlink or regular file,
-    plus hook expectations.
-15. **Agent runtime hooks**: installed memory policy block, SessionStart context
+13. **Claude adapter render**: configured render output plus hook expectations.
+    Tests: Adapter render framework.
+14. **Codex adapter render**: configured render output plus hook expectations.
+    Tests: Adapter render framework.
+15. **Agent runtime hooks**: static memory guidance, SessionStart context
     injection, `hm hook <event>` actions, prompt memory-intent reminders,
     memory-pending debt tracking, receipt-aware refresh, Stop reminders. Tests:
     Agent runtime hooks.
