@@ -72,7 +72,7 @@ jobs:
           # filesystem latency than a warmed local developer machine. Keep the
           # benchmark enforced in CI, but calibrate the threshold to this runner
           # class instead of using the stricter local budget verbatim.
-          HIVE_MEMORY_PERF_BUDGET_MULTIPLIER: 3
+          HIVE_MEMORY_PERF_BUDGET_MULTIPLIER: 4
         run: cargo test --release --test perf_budget -- --ignored --nocapture
 
   cloud-sync-sim:

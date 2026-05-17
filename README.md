@@ -24,7 +24,8 @@ scripts/release.sh --push
 
 The script derives the `vX.Y.Z` tag from `Cargo.toml` and pushes it. GitHub
 Actions verifies the tag still matches the Cargo version before creating the
-draft release and building target archives.
+release draft, building target archives, uploading assets, and publishing the
+release.
 
 ## License
 
