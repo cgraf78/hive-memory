@@ -179,6 +179,7 @@ pub fn run(input: DoctorInput<'_>) -> DoctorReport {
 
     check_stores(input.config, &mut checks);
     check_store_root_symlinks(input.config, &mut checks);
+    check_fsync_mounts(input.config, &mut checks);
     check_required_dirs(input.config, &mut checks);
     check_generated_gitignore(input.config, &mut checks);
     check_sensitive_store_permissions(input.config, &mut checks);
@@ -278,6 +279,60 @@ fn check_store_root_symlinks(config: &config::Config, checks: &mut Vec<DoctorChe
                 format!("failed to inspect store root symlink status: {err}"),
                 vec![store_config.root.display().to_string()],
             )),
+        }
+    }
+}
+
+fn check_fsync_mounts(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
+    if config.storage.fsync != config::FsyncMode::Required {
+        return;
+    }
+
+    let mounts = match load_mounts() {
+        Ok(mounts) if !mounts.is_empty() => mounts,
+        // Mount inspection is advisory. Write-time fsync policy still enforces
+        // the configured behavior, so doctor should not fail just because the
+        // platform lacks Linux mountinfo or a container hides the table.
+        Ok(_) => return,
+        Err(err) => {
+            checks.push(warn(
+                "storage.fsync-mounts",
+                format!("failed to inspect mounted filesystems for fsync policy: {err}"),
+                Vec::new(),
+            ));
+            return;
+        }
+    };
+
+    for (store_name, store_config) in &config.stores {
+        if !store_config.root.exists() {
+            continue;
+        }
+        let Some(mount) = mount_for_path(&store_config.root, &mounts) else {
+            continue;
+        };
+        if mount_has_unreliable_parent_fsync(mount) {
+            checks.push(warn(
+                format!("store.{store_name}.fsync-mount"),
+                format!(
+                    "store {store_name} uses fsync = required on {} mount {}; parent directory fsync may be unreliable",
+                    mount.fs_type,
+                    mount.mount_point.display()
+                ),
+                vec![
+                    store_config.root.display().to_string(),
+                    mount.mount_point.display().to_string(),
+                ],
+            ));
+        } else {
+            checks.push(pass(
+                format!("store.{store_name}.fsync-mount"),
+                format!(
+                    "store {store_name} fsync policy is compatible with {} mount",
+                    mount.fs_type
+                ),
+                vec![store_config.root.display().to_string()],
+            ));
         }
     }
 }
@@ -1714,6 +1769,108 @@ fn archive_date_expired(date: Date, now: Date, retention_days: i64) -> bool {
     now.midnight() - date.midnight() > time::Duration::days(retention_days)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MountInfo {
+    mount_point: PathBuf,
+    fs_type: String,
+    source: String,
+}
+
+fn load_mounts() -> std::io::Result<Vec<MountInfo>> {
+    #[cfg(target_os = "linux")]
+    {
+        fs::read_to_string("/proc/self/mountinfo").map(|contents| parse_mountinfo(&contents))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(Vec::new())
+    }
+}
+
+fn parse_mountinfo(contents: &str) -> Vec<MountInfo> {
+    contents.lines().filter_map(parse_mountinfo_line).collect()
+}
+
+fn parse_mountinfo_line(line: &str) -> Option<MountInfo> {
+    // `/proc/*/mountinfo` has optional fields before the ` - ` separator; the
+    // stable fields we need are mount point on the left and filesystem/source
+    // on the right. Parsing only those keeps the advisory fsync check tolerant
+    // of kernel-specific optional data.
+    let (mount_fields, filesystem_fields) = line.split_once(" - ")?;
+    let fields = mount_fields.split_whitespace().collect::<Vec<_>>();
+    let mount_point = fields.get(4)?;
+    let mut filesystem_fields = filesystem_fields.split_whitespace();
+    let fs_type = filesystem_fields.next()?;
+    let source = filesystem_fields.next().unwrap_or("");
+    Some(MountInfo {
+        mount_point: PathBuf::from(unescape_mountinfo_field(mount_point)),
+        fs_type: unescape_mountinfo_field(fs_type),
+        source: unescape_mountinfo_field(source),
+    })
+}
+
+fn unescape_mountinfo_field(value: &str) -> String {
+    // Mountinfo escapes spaces and other bytes as octal sequences. Decode them
+    // before prefix matching so stores under paths like `/media/My Drive` map to
+    // the same mount point humans and config files use.
+    let mut output = String::new();
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            output.push(ch);
+            continue;
+        }
+
+        let mut digits = String::new();
+        for _ in 0..3 {
+            match chars.peek().copied() {
+                Some('0'..='7') => {
+                    digits.push(chars.next().expect("peeked digit exists"));
+                }
+                _ => break,
+            }
+        }
+
+        if digits.len() == 3
+            && let Ok(byte) = u8::from_str_radix(&digits, 8)
+        {
+            output.push(byte as char);
+            continue;
+        }
+
+        output.push('\\');
+        output.push_str(&digits);
+    }
+    output
+}
+
+fn mount_for_path<'a>(path: &Path, mounts: &'a [MountInfo]) -> Option<&'a MountInfo> {
+    mounts
+        .iter()
+        .filter(|mount| path.starts_with(&mount.mount_point))
+        .max_by_key(|mount| mount.mount_point.components().count())
+}
+
+fn mount_has_unreliable_parent_fsync(mount: &MountInfo) -> bool {
+    // Directory fsync is the durability bit that matters after atomic rename.
+    // FUSE/cloud-drive layers vary widely, and several acknowledge fsync without
+    // providing the same parent-directory guarantee as local filesystems. Warn
+    // only when the user asked for `required` durability so they can relax the
+    // policy or move the store to a filesystem with stronger semantics.
+    let fs_type = mount.fs_type.to_ascii_lowercase();
+    let source = mount.source.to_ascii_lowercase();
+    fs_type == "fuse"
+        || fs_type == "fuseblk"
+        || fs_type.starts_with("fuse.")
+        || fs_type.contains("rclone")
+        || fs_type.contains("sshfs")
+        || source.contains("rclone")
+        || source.contains("google")
+        || source.contains("onedrive")
+        || source.contains("dropbox")
+}
+
 fn collect_cloud_conflicts(root: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
     let mut paths = Vec::new();
     collect_cloud_conflicts_into(root, &mut paths)?;
@@ -2110,5 +2267,54 @@ mod tests {
         assert!(!archive_date_expired(boundary, now, 30));
         assert!(parse_archive_date("bad").is_none());
         assert!(parse_archive_date("2026-13-01").is_none());
+    }
+
+    #[test]
+    fn mountinfo_parser_decodes_mount_paths_and_sources() {
+        let mounts = parse_mountinfo(
+            "36 25 0:31 / /home/chris/Google\\040Drive rw,nosuid - fuse.rclone gdrive\\040remote rw\n",
+        );
+
+        assert_eq!(
+            mounts,
+            vec![MountInfo {
+                mount_point: PathBuf::from("/home/chris/Google Drive"),
+                fs_type: "fuse.rclone".to_owned(),
+                source: "gdrive remote".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn mount_for_path_uses_deepest_matching_mount() {
+        let mounts = vec![
+            MountInfo {
+                mount_point: PathBuf::from("/"),
+                fs_type: "ext4".to_owned(),
+                source: "/dev/root".to_owned(),
+            },
+            MountInfo {
+                mount_point: PathBuf::from("/home/chris/gdrive"),
+                fs_type: "fuse.rclone".to_owned(),
+                source: "gdrive".to_owned(),
+            },
+        ];
+
+        let mount = mount_for_path(Path::new("/home/chris/gdrive/memory/personal"), &mounts)
+            .expect("matching mount");
+
+        assert_eq!(mount.mount_point, PathBuf::from("/home/chris/gdrive"));
+        assert!(mount_has_unreliable_parent_fsync(mount));
+    }
+
+    #[test]
+    fn local_mounts_are_not_marked_as_weak_fsync() {
+        let mount = MountInfo {
+            mount_point: PathBuf::from("/home"),
+            fs_type: "ext4".to_owned(),
+            source: "/dev/nvme0n1p2".to_owned(),
+        };
+
+        assert!(!mount_has_unreliable_parent_fsync(&mount));
     }
 }
