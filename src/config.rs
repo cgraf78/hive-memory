@@ -478,6 +478,13 @@ pub enum ConfigError {
         /// Missing store alias.
         store: String,
     },
+    /// Adapter render policy exceeds the same-name agent read policy.
+    AdapterStoreOutsideAgentPolicy {
+        /// Adapter id that also names an agent policy.
+        adapter: String,
+        /// Store alias the adapter attempted to render.
+        store: String,
+    },
     /// Adapter requested an unsupported install mode.
     InvalidAdapterInstallMode {
         /// Adapter id owning the bad value.
@@ -525,6 +532,10 @@ impl Display for ConfigError {
             Self::UnknownAdapterStore { adapter, store } => {
                 write!(f, "adapters.{adapter} references unknown store: {store}")
             }
+            Self::AdapterStoreOutsideAgentPolicy { adapter, store } => write!(
+                f,
+                "adapters.{adapter}.stores includes {store}, outside agents.{adapter}.read_stores"
+            ),
             Self::InvalidAdapterInstallMode {
                 adapter,
                 install_mode,
@@ -836,7 +847,7 @@ impl Config {
             .into_iter()
             .map(|(name, adapter)| {
                 let adapter = AdapterConfig::from_raw(adapter, env)?;
-                validate_adapter(&name, &adapter, &stores)?;
+                validate_adapter(&name, &adapter, &stores, &agents)?;
                 Ok((name, adapter))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
@@ -1160,6 +1171,7 @@ fn validate_adapter(
     name: &str,
     adapter: &AdapterConfig,
     stores: &BTreeMap<String, StoreConfig>,
+    agents: &BTreeMap<String, AgentConfig>,
 ) -> Result<(), ConfigError> {
     validate_store_refs(adapter.stores.iter().map(String::as_str), stores, |store| {
         ConfigError::UnknownAdapterStore {
@@ -1167,6 +1179,21 @@ fn validate_adapter(
             store: store.to_owned(),
         }
     })?;
+
+    if let Some(agent) = agents.get(name) {
+        // Adapter render policy is only an exposure policy. The same-name agent
+        // read policy remains the authority, so a generated Claude/Codex file
+        // cannot expose stores that the corresponding agent would be refused by
+        // `hm context` or hook startup.
+        for store in &adapter.stores {
+            if !agent.read_stores.iter().any(|allowed| allowed == store) {
+                return Err(ConfigError::AdapterStoreOutsideAgentPolicy {
+                    adapter: name.to_owned(),
+                    store: store.clone(),
+                });
+            }
+        }
+    }
 
     if adapter.enabled && adapter.output.is_none() {
         return Err(ConfigError::EnabledAdapterMissingOutput {
@@ -1725,6 +1752,66 @@ mod tests {
                 store: "work".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn rejects_adapter_store_outside_same_name_agent_read_policy() {
+        let err = LoadedConfig::from_str_with_env(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "/tmp/personal"
+
+            [stores.work]
+            root = "/tmp/work"
+
+            [agents.codex]
+            default_store = "personal"
+            read_stores = ["personal"]
+            write_stores = ["personal"]
+
+            [adapters.codex]
+            stores = ["work"]
+            "#,
+            env,
+        )
+        .expect_err("config fails");
+
+        assert_eq!(
+            err,
+            ConfigError::AdapterStoreOutsideAgentPolicy {
+                adapter: "codex".to_owned(),
+                store: "work".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn allows_adapter_store_inside_same_name_agent_read_policy() {
+        let loaded = LoadedConfig::from_str_with_env(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "/tmp/personal"
+
+            [stores.work]
+            root = "/tmp/work"
+
+            [agents.codex]
+            default_store = "personal"
+            read_stores = ["personal", "work"]
+            write_stores = ["personal"]
+
+            [adapters.codex]
+            stores = ["work"]
+            "#,
+            env,
+        )
+        .expect("config loads");
+
+        assert_eq!(loaded.config.adapters["codex"].stores, vec!["work"]);
     }
 
     #[test]
