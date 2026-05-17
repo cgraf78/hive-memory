@@ -4584,6 +4584,37 @@ fn projects_bind_and_unbind_local_store_affinity() {
 }
 
 #[test]
+fn projects_alias_writes_store_alias_file() {
+    let dir = temp_dir("projects-alias");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    write_data_config(&config, &data, &personal);
+    init_store(&personal, "personal");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "projects",
+            "alias",
+            "old-project",
+            "new-project",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"old_id\": \"old-project\""))
+        .stdout(predicate::str::contains("\"new_id\": \"new-project\""))
+        .stdout(predicate::str::contains("\"store\": \"personal\""));
+
+    let aliases = fs::read_to_string(personal.join("memories/projects/new-project/aliases.toml"))
+        .expect("aliases");
+    assert!(aliases.contains("project_id = \"new-project\""));
+    assert!(aliases.contains("\"old-project\""));
+}
+
+#[test]
 fn project_binding_cannot_bypass_agent_affinity() {
     let dir = temp_dir("projects-bind-affinity");
     let config = dir.join("config.toml");

@@ -123,6 +123,8 @@ enum ProjectsCommand {
     Bind(ProjectBindArgs),
     /// Remove a local project store binding.
     Unbind(ProjectUnbindArgs),
+    /// Record that an old project id now maps to a new project id.
+    Alias(ProjectAliasArgs),
 }
 
 /// Local outbox commands.
@@ -222,6 +224,18 @@ struct ProjectBindArgs {
 struct ProjectUnbindArgs {
     /// Path, file, or directory hint for the project to unbind.
     path: PathBuf,
+}
+
+/// Arguments for `hm projects alias`.
+#[derive(Debug, Args)]
+struct ProjectAliasArgs {
+    /// Prior project id to preserve.
+    old_id: String,
+    /// Canonical/current project id.
+    new_id: String,
+    /// Emit machine-readable output.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Arguments for `hm stores init`.
@@ -820,6 +834,7 @@ fn run_projects(command: ProjectsCommand, context: CliContext) -> Result<()> {
         ProjectsCommand::Resolve(args) => run_project_resolve(args, context),
         ProjectsCommand::Bind(args) => run_project_bind(args, context),
         ProjectsCommand::Unbind(args) => run_project_unbind(args, context),
+        ProjectsCommand::Alias(args) => run_project_alias(args, context),
     }
 }
 
@@ -920,6 +935,48 @@ fn run_project_unbind(args: ProjectUnbindArgs, context: CliContext) -> Result<()
     Ok(())
 }
 
+fn run_project_alias(args: ProjectAliasArgs, context: CliContext) -> Result<()> {
+    if args.old_id == args.new_id {
+        anyhow::bail!("old and new project ids must differ");
+    }
+    let config = load_config(context.config_path.as_deref())?;
+    let agent_id = resolve_agent_id(context.as_agent);
+    let store = resolve_store(
+        &config,
+        context.store.as_deref(),
+        None,
+        agent_id.as_deref(),
+        StoreAccess::Write,
+    )?;
+    let store_config = &config.stores[store.name.as_str()];
+    read_store_manifest(&config, &store.name, store_config)?;
+    let path = project::add_alias(
+        &store_config.root,
+        &args.old_id,
+        &args.new_id,
+        &hook_options(&config),
+    )?;
+
+    if args.json {
+        let output = ProjectAliasOutput {
+            old_id: args.old_id,
+            new_id: args.new_id,
+            store: store.name,
+            store_source: store.source.to_string(),
+            path: path.display().to_string(),
+        };
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("old_id: {}", args.old_id);
+        println!("new_id: {}", args.new_id);
+        println!("store: {}", store.name);
+        println!("store_source: {}", store.source);
+        println!("aliases: {}", path.display());
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Serialize)]
 struct ProjectResolveOutput {
     project_id: String,
@@ -928,6 +985,15 @@ struct ProjectResolveOutput {
     project_source: String,
     store: String,
     store_source: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ProjectAliasOutput {
+    old_id: String,
+    new_id: String,
+    store: String,
+    store_source: String,
+    path: String,
 }
 
 #[derive(Debug, Serialize)]
