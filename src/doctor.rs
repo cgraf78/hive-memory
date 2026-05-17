@@ -213,6 +213,7 @@ pub fn fix(input: DoctorFixInput<'_>) -> DoctorFixReport {
     fix_required_dirs(input.config, &mut actions);
     fix_generated_gitignore(input.config, &mut actions);
     fix_stale_temp_files(input.config, &mut actions);
+    fix_expired_outbox_archives(input.config, &mut actions);
     summarize_fixes(actions)
 }
 
@@ -836,6 +837,47 @@ fn check_outbox_archives(config: &config::Config, checks: &mut Vec<DoctorCheck>)
                     .map(|path| path.display().to_string())
                     .collect(),
             ));
+        }
+    }
+}
+
+fn fix_expired_outbox_archives(config: &config::Config, actions: &mut Vec<DoctorFixAction>) {
+    let now = OffsetDateTime::now_utc().date();
+    let retention_days = i64::from(config.offline.archive_retention_days);
+    for (store_name, store_config) in &config.stores {
+        let root = store_config.root.join(".outbox-archive");
+        let expired = match collect_expired_outbox_archives(&root, now, retention_days) {
+            Ok(expired) => expired,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                actions.push(fix_failed(
+                    "outbox-archive",
+                    store_name,
+                    &root,
+                    format!("failed to scan expired outbox archives: {err}"),
+                ));
+                continue;
+            }
+        };
+
+        for path in expired {
+            // Archive entries are post-flush recovery snapshots, not canonical
+            // notes. Once they exceed configured retention, removing the whole
+            // archive item is the expected cleanup contract.
+            match fs::remove_dir_all(&path) {
+                Ok(()) => actions.push(fix_fixed(
+                    "outbox-archive",
+                    store_name,
+                    &path,
+                    format!("removed expired outbox archive older than {retention_days} days"),
+                )),
+                Err(err) => actions.push(fix_failed(
+                    "outbox-archive",
+                    store_name,
+                    &path,
+                    format!("failed to remove expired outbox archive: {err}"),
+                )),
+            }
         }
     }
 }

@@ -1202,6 +1202,37 @@ fn doctor_uses_manifest_sensitivity_for_permission_warnings() {
 }
 
 #[test]
+fn doctor_fix_removes_expired_outbox_archives() {
+    let dir = temp_dir("doctor-fix-expired-archive");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    write_data_config(&config, &data, &personal);
+    init_store(&personal, "personal");
+    let archive = personal.join(".outbox-archive/test-host/2000-01-01/old-item");
+    fs::create_dir_all(&archive).expect("create old archive");
+    fs::write(archive.join("note.md"), "archived note").expect("write archive note");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "doctor",
+            "--fix",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"fixed\": 1"))
+        .stdout(predicate::str::contains("\"warnings\": 0"));
+
+    assert!(
+        !archive.exists(),
+        "expired archive item should be removed after retention"
+    );
+}
+
+#[test]
 fn doctor_full_warns_for_note_declaring_missing_event() {
     let dir = temp_dir("doctor-missing-event-pair");
     let config = dir.join("config.toml");
