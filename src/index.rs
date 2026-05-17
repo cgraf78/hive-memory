@@ -6,7 +6,7 @@
 //! paired JSON events in the store root.
 
 use crate::note;
-use crate::{event, write};
+use crate::{event, path as memory_path, write};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt::{self, Display};
@@ -56,6 +56,8 @@ pub struct RebuildIndexInput<'a> {
     pub cache_dir: &'a Path,
     /// Atomic writer options for publishing the JSONL file.
     pub options: write::AtomicWriteOptions,
+    /// Case behavior for store-relative metadata paths.
+    pub path_case: memory_path::PathCase,
 }
 
 /// Result of rebuilding one store index.
@@ -130,7 +132,7 @@ pub fn rebuild_index(input: RebuildIndexInput<'_>) -> Result<RebuildIndexReport,
     let mut warnings = Vec::new();
     let notes_root = input.store_root.join("inbox/notes");
     for note_path in note_paths(&notes_root)? {
-        let relative_note_path = relative_path(input.store_root, &note_path);
+        let relative_note_path = relative_path(input.store_root, &note_path, input.path_case);
         let contents =
             fs::read_to_string(&note_path).map_err(|err| io_error("read note", &note_path, err))?;
         let parsed = match note::parse_note(&contents) {
@@ -149,7 +151,8 @@ pub fn rebuild_index(input: RebuildIndexInput<'_>) -> Result<RebuildIndexReport,
             &parsed.front_matter.id,
             created_at,
         ));
-        let relative_event_path = relative_path(input.store_root, &expected_event_path);
+        let relative_event_path =
+            relative_path(input.store_root, &expected_event_path, input.path_case);
         let event = read_paired_event(&expected_event_path, &parsed.front_matter.id, &mut warnings);
         entries.push(entry_from_note(
             &parsed.front_matter,
@@ -310,11 +313,8 @@ fn collect_note_paths(root: &Path, paths: &mut Vec<PathBuf>) -> Result<(), Index
     Ok(())
 }
 
-fn relative_path(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
+fn relative_path(root: &Path, path: &Path, path_case: memory_path::PathCase) -> String {
+    memory_path::relative_string(path.strip_prefix(root).unwrap_or(path), path_case)
 }
 
 fn parse_rfc3339(path: &str, value: &str) -> Result<OffsetDateTime, IndexError> {
@@ -417,6 +417,7 @@ mod tests {
             store_root: &root,
             cache_dir: &cache,
             options: options(),
+            path_case: memory_path::PathCase::Sensitive,
         })
         .expect("rebuild index");
 
@@ -425,11 +426,18 @@ mod tests {
         assert_eq!(report.path, cache.join("indexes/personal.jsonl"));
         assert_eq!(
             report.entries[0].note_path,
-            relative_path(&root, &written.note_path)
+            relative_path(&root, &written.note_path, memory_path::PathCase::Sensitive)
         );
         assert_eq!(
             report.entries[0].event_path.as_deref(),
-            Some(relative_path(&root, &written.event_path.expect("event")).as_str())
+            Some(
+                relative_path(
+                    &root,
+                    &written.event_path.expect("event"),
+                    memory_path::PathCase::Sensitive
+                )
+                .as_str()
+            )
         );
         let read = read_index(&report.path).expect("read index");
         assert_eq!(read, report.entries);
@@ -448,6 +456,7 @@ mod tests {
             store_root: &root,
             cache_dir: &cache,
             options: options(),
+            path_case: memory_path::PathCase::Sensitive,
         })
         .expect("rebuild index");
 
@@ -458,6 +467,28 @@ mod tests {
         );
         assert!(report.entries[0].event_path.is_none());
         assert_eq!(report.warnings.len(), 1);
+    }
+
+    #[test]
+    fn index_lowercases_paths_when_store_is_case_insensitive() {
+        let dir = temp_dir("case-insensitive-paths");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        let written = write_record(&root, false);
+        let renamed = written.note_path.with_file_name("RENAMED.md");
+        fs::rename(&written.note_path, &renamed).expect("rename note");
+
+        let report = rebuild_index(RebuildIndexInput {
+            store_name: "personal",
+            store_root: &root,
+            cache_dir: &cache,
+            options: options(),
+            path_case: memory_path::PathCase::Insensitive,
+        })
+        .expect("rebuild index");
+
+        assert_eq!(report.entries.len(), 1);
+        assert!(report.entries[0].note_path.ends_with("/renamed.md"));
     }
 
     #[test]
@@ -474,6 +505,7 @@ mod tests {
             store_root: &root,
             cache_dir: &cache,
             options: options(),
+            path_case: memory_path::PathCase::Sensitive,
         })
         .expect("rebuild index");
 

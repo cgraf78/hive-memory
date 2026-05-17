@@ -491,6 +491,7 @@ mod tests {
             store_root: root,
             cache_dir: cache,
             options: options(),
+            path_case: crate::path::PathCase::Sensitive,
         })
         .expect("rebuild index")
         .entries

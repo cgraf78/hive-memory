@@ -11,7 +11,7 @@ use hive_memory::config::{
 };
 use hive_memory::{
     config, context as memory_context, curation, doctor, event, hook as memory_hook, id, index,
-    memory, note, outbox, project, render, search, secret, store, write,
+    memory, note, outbox, path as memory_path, project, render, search, secret, store, write,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1478,6 +1478,10 @@ fn enqueue_outbox_memory(
     // offline store has no trustworthy manifest id yet, so use an explicit
     // placeholder and keep the outbox state `unbound`; `hm flush --bind`
     // rewrites the payload before anything can be published canonically.
+    // Outbox metadata is read before payloads are committed to the store, so it
+    // must use the same store-relative path contract as canonical events and
+    // indexes instead of relying on later filesystem discovery to normalize it.
+    let path_case = memory_path::resolve_case(&config.storage.case_sensitive, &store_config.root);
     let note_relative_path = note::note_relative_path(&id, input.created_at);
     let event_relative_path = event::event_relative_path(&id, input.created_at);
     let note_input = note::NoteWriteInput {
@@ -1538,9 +1542,10 @@ fn enqueue_outbox_memory(
         store: store_name,
         id: &id,
         expected_store_id: expected_store_id.clone(),
-        final_note_path: store_relative_path_string(&note_relative_path),
+        final_note_path: store_relative_path_string(&note_relative_path, path_case),
         note: note.into_bytes(),
-        final_event_path: write_event.then(|| store_relative_path_string(&event_relative_path)),
+        final_event_path: write_event
+            .then(|| store_relative_path_string(&event_relative_path, path_case)),
         event: event.map(String::into_bytes),
         state,
         options: input.options,
@@ -1555,8 +1560,8 @@ fn enqueue_outbox_memory(
     })
 }
 
-fn store_relative_path_string(path: &std::path::Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+fn store_relative_path_string(path: &std::path::Path, path_case: memory_path::PathCase) -> String {
+    memory_path::relative_string(path, path_case)
 }
 
 #[derive(Debug, Serialize)]
@@ -2218,6 +2223,7 @@ fn rebuild_store_index(config: &Config, store_name: &str) -> Result<index::Rebui
         store_root: &store_config.root,
         cache_dir: &config.cache_dir,
         options,
+        path_case: memory_path::resolve_case(&config.storage.case_sensitive, &store_config.root),
     })?;
     for warning in &report.warnings {
         eprintln!("warning: {}: {}", warning.path.display(), warning.message);

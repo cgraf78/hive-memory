@@ -16,6 +16,7 @@ pub mod index;
 pub mod memory;
 pub mod note;
 pub mod outbox;
+pub mod path;
 pub mod project;
 pub mod render;
 pub mod search;

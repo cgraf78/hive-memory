@@ -7,6 +7,7 @@
 //! share one id.
 
 use crate::note::Confidence;
+use crate::path as memory_path;
 use crate::write;
 use crate::write::AtomicWriteOptions;
 use serde::{Deserialize, Serialize};
@@ -365,6 +366,12 @@ fn validate_relative_path(field: &'static str, value: &str) -> Result<(), EventE
     {
         return Err(invalid_relative_path(field, value));
     }
+    // Event JSONL is the long-lived audit surface. Reject alternate serialized
+    // spellings here so readers, search indexes, and generated context all see
+    // one canonical path form instead of normalizing divergent history forever.
+    if memory_path::relative_str(value, memory_path::PathCase::Sensitive) != value {
+        return Err(invalid_relative_path(field, value));
+    }
     Ok(())
 }
 
@@ -505,6 +512,22 @@ mod tests {
             EventError::InvalidRelativePath {
                 field: "note_path",
                 value: "inbox/notes/../bad.md".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_non_nfc_note_path() {
+        let mut input = input();
+        input.note_path = Some(PathBuf::from("inbox/notes/Cafe\u{301}.md"));
+
+        let err = MemoryEvent::observation(input).expect_err("event rejected");
+
+        assert_eq!(
+            err,
+            EventError::InvalidRelativePath {
+                field: "note_path",
+                value: "inbox/notes/Cafe\u{301}.md".to_owned()
             }
         );
     }
