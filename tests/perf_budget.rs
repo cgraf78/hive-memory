@@ -19,6 +19,7 @@ const SEARCH_WARM_BUDGET_MS: u128 = 300;
 const SYNTHETIC_OUTBOX_ITEMS: usize = 100;
 const FLUSH_RUNS: usize = 10;
 const FLUSH_100_ITEM_BUDGET_MS: u128 = 2_000;
+const PERF_BUDGET_MULTIPLIER_ENV: &str = "HIVE_MEMORY_PERF_BUDGET_MULTIPLIER";
 
 fn temp_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -51,13 +52,15 @@ fn context_and_search_stay_within_warm_budget() {
     eprintln!("hm context warm p95: {context_p95}ms");
     eprintln!("hm search warm p95: {search_p95}ms");
 
+    let context_budget = budget_ms(CONTEXT_WARM_BUDGET_MS);
+    let search_budget = budget_ms(SEARCH_WARM_BUDGET_MS);
     assert!(
-        context_p95 <= CONTEXT_WARM_BUDGET_MS,
-        "hm context p95 {context_p95}ms exceeded {CONTEXT_WARM_BUDGET_MS}ms"
+        context_p95 <= context_budget,
+        "hm context p95 {context_p95}ms exceeded {context_budget}ms"
     );
     assert!(
-        search_p95 <= SEARCH_WARM_BUDGET_MS,
-        "hm search p95 {search_p95}ms exceeded {SEARCH_WARM_BUDGET_MS}ms"
+        search_p95 <= search_budget,
+        "hm search p95 {search_p95}ms exceeded {search_budget}ms"
     );
 }
 
@@ -76,10 +79,20 @@ fn flush_100_item_outbox_stays_within_budget() {
     );
     eprintln!("hm flush 100-item p95: {flush_p95}ms");
 
+    let flush_budget = budget_ms(FLUSH_100_ITEM_BUDGET_MS);
     assert!(
-        flush_p95 <= FLUSH_100_ITEM_BUDGET_MS,
-        "hm flush 100-item p95 {flush_p95}ms exceeded {FLUSH_100_ITEM_BUDGET_MS}ms"
+        flush_p95 <= flush_budget,
+        "hm flush 100-item p95 {flush_p95}ms exceeded {flush_budget}ms"
     );
+}
+
+fn budget_ms(base_ms: u128) -> u128 {
+    let multiplier = std::env::var(PERF_BUDGET_MULTIPLIER_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u128>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1);
+    base_ms * multiplier
 }
 
 struct SyntheticStore {

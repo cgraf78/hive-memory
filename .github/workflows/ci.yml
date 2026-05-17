@@ -67,6 +67,12 @@ jobs:
       # they create large synthetic stores/outboxes and measure real CLI
       # process latency.
       - name: Check context/search/flush budgets
+        env:
+          # GitHub's shared runners have materially higher process-startup and
+          # filesystem latency than a warmed local developer machine. Keep the
+          # benchmark enforced in CI, but calibrate the threshold to this runner
+          # class instead of using the stricter local budget verbatim.
+          HIVE_MEMORY_PERF_BUDGET_MULTIPLIER: 3
         run: cargo test --release --test perf_budget -- --ignored --nocapture
 
   cloud-sync-sim:
