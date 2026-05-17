@@ -10,8 +10,10 @@ use serde::Serialize;
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
+use time::OffsetDateTime;
 
 const STALE_TEMP_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const OLD_OUTBOX_ITEM_DAYS: i64 = 7;
 
 /// Input for one top-level doctor run.
 #[derive(Debug, Clone)]
@@ -418,6 +420,8 @@ fn check_outbox(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
     let mut unbound = 0usize;
     let mut unreadable = 0usize;
     let mut paths = Vec::new();
+    let mut old_paths = Vec::new();
+    let now = OffsetDateTime::now_utc();
     for store_entry in entries {
         let Ok(store_entry) = store_entry else {
             unreadable += 1;
@@ -440,6 +444,16 @@ fn check_outbox(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
                 });
             match meta {
                 Ok(meta) => {
+                    // Age is part of the recovery contract for local outbox
+                    // debt. If it cannot be parsed, count the item as
+                    // unreadable rather than silently treating it as fresh.
+                    let Some(is_old) = outbox_item_is_old(&meta.created_at, now) else {
+                        unreadable += 1;
+                        continue;
+                    };
+                    if is_old {
+                        old_paths.push(meta_path.display().to_string());
+                    }
                     total += 1;
                     paths.push(meta_path.display().to_string());
                     match meta.state {
@@ -478,6 +492,22 @@ fn check_outbox(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
             vec![root.display().to_string()],
         ));
     }
+    if !old_paths.is_empty() {
+        checks.push(warn(
+            "outbox.old",
+            format!(
+                "{} outbox item(s) are older than {OLD_OUTBOX_ITEM_DAYS} days",
+                old_paths.len()
+            ),
+            old_paths,
+        ));
+    }
+}
+
+fn outbox_item_is_old(created_at: &str, now: OffsetDateTime) -> Option<bool> {
+    let created_at =
+        OffsetDateTime::parse(created_at, &time::format_description::well_known::Rfc3339).ok()?;
+    Some(now - created_at > time::Duration::days(OLD_OUTBOX_ITEM_DAYS))
 }
 
 fn check_project_bindings(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
@@ -923,5 +953,18 @@ mod tests {
             now + Duration::from_secs(1),
             now,
         ));
+    }
+
+    #[test]
+    fn old_outbox_age_uses_strict_ttl() {
+        let now = OffsetDateTime::parse(
+            "2026-05-16T00:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("parse now");
+
+        assert_eq!(outbox_item_is_old("2026-05-08T23:59:59Z", now), Some(true));
+        assert_eq!(outbox_item_is_old("2026-05-09T00:00:00Z", now), Some(false));
+        assert_eq!(outbox_item_is_old("bad", now), None);
     }
 }

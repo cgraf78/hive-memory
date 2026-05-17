@@ -144,6 +144,27 @@ fn write_outbox_note_item(
     .expect("write outbox meta");
 }
 
+fn set_outbox_item_created_at(
+    data_dir: &std::path::Path,
+    store_name: &str,
+    item_id: &str,
+    created_at: &str,
+) {
+    let meta_path = data_dir
+        .join("outbox")
+        .join(store_name)
+        .join(item_id)
+        .join("meta.toml");
+    let contents = fs::read_to_string(&meta_path).expect("read outbox meta");
+    let mut meta: outbox::OutboxMeta = toml::from_str(&contents).expect("parse outbox meta");
+    meta.created_at = created_at.to_owned();
+    fs::write(
+        meta_path,
+        outbox::render_meta(&meta).expect("render outbox meta"),
+    )
+    .expect("write outbox meta");
+}
+
 #[test]
 fn version_prints_binary_name() {
     let mut cmd = cargo_bin_cmd!("hm");
@@ -640,6 +661,48 @@ fn doctor_warns_for_pending_and_unbound_outbox_items() {
         ))
         .stdout(predicate::str::contains(
             "1 outbox item(s) require explicit store binding",
+        ));
+}
+
+#[test]
+fn doctor_warns_for_old_outbox_items() {
+    let dir = temp_dir("doctor-old-outbox");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    write_data_config(&config, &data, &personal);
+    init_store(&personal, "personal");
+    write_outbox_note_item(
+        &data,
+        "personal",
+        "old-note",
+        Some("known-store".to_owned()),
+        "inbox/notes/old-note.md",
+        b"old\n",
+        outbox::OutboxState::Pending,
+    );
+    set_outbox_item_created_at(&data, "personal", "old-note", "2000-01-01T00:00:00Z");
+
+    let meta_path = data.join("outbox/personal/old-note/meta.toml");
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "doctor",
+            "--quick",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"warnings\": 2"))
+        .stdout(predicate::str::contains(
+            "local outbox has 1 item(s): pending=1 unbound=0 unreadable=0",
+        ))
+        .stdout(predicate::str::contains(
+            "1 outbox item(s) are older than 7 days",
+        ))
+        .stdout(predicate::str::contains(
+            meta_path.to_str().expect("utf8 meta path"),
         ));
 }
 
