@@ -122,6 +122,7 @@ pub fn run(input: DoctorInput<'_>) -> DoctorReport {
     // audit walks note content and is intended for explicit human review.
     if !input.quick {
         check_outbox_archives(input.config, &mut checks);
+        check_agent_private_audience(input.config, &mut checks);
         check_note_secrets(input.config, &mut checks);
         check_note_prompt_risks(input.config, &mut checks);
     }
@@ -561,6 +562,61 @@ fn check_outbox_archives(config: &config::Config, checks: &mut Vec<DoctorCheck>)
     }
 }
 
+fn check_agent_private_audience(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
+    for (store_name, store_config) in &config.stores {
+        let notes_root = store_config.root.join("inbox/notes");
+        let note_paths = match collect_markdown_files(&notes_root) {
+            Ok(paths) => paths,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                checks.push(pass(
+                    format!("store.{store_name}.agent-private-audience"),
+                    format!("store {store_name} has no notes to scan for agent-private audience"),
+                    vec![notes_root.display().to_string()],
+                ));
+                continue;
+            }
+            Err(err) => {
+                checks.push(error(
+                    format!("store.{store_name}.agent-private-audience"),
+                    format!("failed to scan notes for agent-private audience: {err}"),
+                    vec![notes_root.display().to_string()],
+                ));
+                continue;
+            }
+        };
+
+        let mut issues = 0usize;
+        for path in note_paths {
+            match read_note_front_matter_lenient(&path) {
+                Ok(front_matter)
+                    if front_matter.scope == "agent-private"
+                        && front_matter.audience.is_empty() =>
+                {
+                    issues += 1;
+                    checks.push(warn(
+                        format!("store.{store_name}.agent-private-audience"),
+                        "agent-private note is missing explicit audience",
+                        vec![path.display().to_string()],
+                    ));
+                }
+                Ok(_) => {}
+                // Strict parse/content scans already report malformed notes.
+                // This check exists only for the legacy/manual note shape that
+                // can be decoded but violates current audience policy.
+                Err(_) => {}
+            }
+        }
+
+        if issues == 0 {
+            checks.push(pass(
+                format!("store.{store_name}.agent-private-audience"),
+                format!("store {store_name} agent-private notes declare audience"),
+                vec![notes_root.display().to_string()],
+            ));
+        }
+    }
+}
+
 fn check_project_bindings(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
     let dir = config.data_dir.join("projects");
     let entries = match fs::read_dir(&dir) {
@@ -783,6 +839,12 @@ fn check_note_secrets(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
                     ));
                 }
                 Err(message) => {
+                    // Audience drift has a dedicated check above. Suppress the
+                    // generic strict-parser warning here so one legacy
+                    // agent-private note produces one actionable diagnostic.
+                    if note_parse_error_is_missing_audience(&message) {
+                        continue;
+                    }
                     issues += 1;
                     checks.push(warn(
                         format!("store.{store_name}.note-secrets"),
@@ -813,6 +875,23 @@ fn scan_note_for_secrets(path: &Path) -> Result<Vec<String>, String> {
         .into_iter()
         .map(|finding| finding.detector_id)
         .collect())
+}
+
+fn read_note_front_matter_lenient(path: &Path) -> Result<note::NoteFrontMatter, String> {
+    let contents = fs::read_to_string(path).map_err(|err| err.to_string())?;
+    let front_matter = note_front_matter_block(&contents)
+        .ok_or_else(|| "note is missing TOML front matter".to_owned())?;
+    toml::from_str::<note::NoteFrontMatter>(front_matter).map_err(|err| err.to_string())
+}
+
+fn note_front_matter_block(input: &str) -> Option<&str> {
+    let rest = input.strip_prefix("+++\n")?;
+    if let Some((front_matter, _body)) = rest.split_once("\n+++\n\n") {
+        Some(front_matter)
+    } else {
+        rest.split_once("\n+++\n")
+            .map(|(front_matter, _body)| front_matter)
+    }
 }
 
 fn check_note_prompt_risks(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
@@ -854,6 +933,12 @@ fn check_note_prompt_risks(config: &config::Config, checks: &mut Vec<DoctorCheck
                     ));
                 }
                 Err(message) => {
+                    // Audience drift has a dedicated check above. Suppress the
+                    // generic strict-parser warning here so one legacy
+                    // agent-private note produces one actionable diagnostic.
+                    if note_parse_error_is_missing_audience(&message) {
+                        continue;
+                    }
                     issues += 1;
                     checks.push(warn(
                         format!("store.{store_name}.prompt-risks"),
@@ -878,6 +963,10 @@ fn scan_note_for_prompt_risks(path: &Path) -> Result<Vec<&'static str>, String> 
     let contents = fs::read_to_string(path).map_err(|err| err.to_string())?;
     let parsed = note::parse_note(&contents).map_err(|err| err.to_string())?;
     Ok(prompt_risk_detectors(&parsed.body))
+}
+
+fn note_parse_error_is_missing_audience(message: &str) -> bool {
+    message == "agent-private notes require an explicit audience"
 }
 
 fn prompt_risk_detectors(body: &str) -> Vec<&'static str> {

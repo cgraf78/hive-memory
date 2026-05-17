@@ -737,6 +737,57 @@ fn doctor_full_warns_for_expired_outbox_archives() {
 }
 
 #[test]
+fn doctor_full_warns_for_agent_private_note_without_audience() {
+    let dir = temp_dir("doctor-agent-private-audience");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    write_data_config(&config, &data, &personal);
+    init_store(&personal, "personal");
+    let note_path = personal.join("inbox/notes/2026/05/16/legacy-private.md");
+    fs::create_dir_all(note_path.parent().expect("note parent")).expect("note parent");
+    fs::write(
+        &note_path,
+        r#"+++
+schema_version = 1
+type = "note"
+entry_kind = "remember"
+id = "legacy-private"
+store_id = "store-id"
+store_name = "personal"
+created_at = "2026-05-16T00:00:00Z"
+agent_id = "legacy"
+host_id = "host"
+scope = "agent-private"
+confidence = "medium"
++++
+
+legacy private memory
+"#,
+    )
+    .expect("write legacy note");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "doctor",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"warnings\": 1"))
+        .stdout(predicate::str::contains(
+            "agent-private note is missing explicit audience",
+        ))
+        .stdout(predicate::str::contains("failed to parse note during secret scan").not())
+        .stdout(predicate::str::contains("failed to parse note during prompt-risk scan").not())
+        .stdout(predicate::str::contains(
+            note_path.to_str().expect("utf8 note path"),
+        ));
+}
+
+#[test]
 fn doctor_warns_for_cloud_sync_conflict_files() {
     let dir = temp_dir("doctor-cloud-conflict");
     let config = dir.join("config.toml");
