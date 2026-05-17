@@ -5,7 +5,7 @@ use predicates::prelude::*;
 use std::fs::{self, OpenOptions};
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn temp_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -85,6 +85,17 @@ fn init_store(root: &std::path::Path, name: &str) {
     ])
     .assert()
     .success();
+}
+
+fn make_file_stale(path: &std::path::Path) {
+    let old = SystemTime::now()
+        .checked_sub(Duration::from_secs(25 * 60 * 60))
+        .expect("stale timestamp before now");
+    let times = fs::FileTimes::new().set_modified(old);
+    fs::File::open(path)
+        .expect("open stale file")
+        .set_times(times)
+        .expect("set stale mtime");
 }
 
 fn init_store_with_sensitivity(root: &std::path::Path, name: &str, sensitivity: &str) {
@@ -1025,6 +1036,60 @@ fn doctor_warns_for_drifted_generated_gitignore() {
         .stdout(predicate::str::contains(
             path.to_str().expect("utf8 gitignore path"),
         ));
+}
+
+#[test]
+fn doctor_fix_repairs_safe_store_layout_issues() {
+    let dir = temp_dir("doctor-fix-layout");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    write_data_config(&config, &data, &personal);
+    init_store(&personal, "personal");
+
+    let missing = personal.join("memories/projects");
+    fs::remove_dir_all(&missing).expect("remove required dir");
+    let gitignore = personal.join("generated/.gitignore");
+    fs::write(&gitignore, "!*\n").expect("drift generated gitignore");
+    let temp_dir = personal.join("inbox/notes/2026/05/16");
+    fs::create_dir_all(&temp_dir).expect("temp dir");
+    let stale_temp = temp_dir.join(".tmp.orphaned");
+    fs::write(&stale_temp, "partial write").expect("stale temp");
+    make_file_stale(&stale_temp);
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "doctor",
+            "--quick",
+            "--fix",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"fixed\": 3"))
+        .stdout(predicate::str::contains("\"warnings\": 0"));
+
+    assert!(
+        missing.is_dir(),
+        "missing canonical dir should be recreated"
+    );
+    assert_eq!(
+        fs::read_to_string(&gitignore).expect("read generated gitignore"),
+        store::GENERATED_GITIGNORE
+    );
+    assert!(
+        !stale_temp.exists(),
+        "stale temp should move out of the canonical write path"
+    );
+    assert!(
+        fs::read_dir(personal.join(".quarantine/stale-temps"))
+            .expect("quarantine root")
+            .next()
+            .is_some(),
+        "stale temp should be recoverable from quarantine"
+    );
 }
 
 #[cfg(unix)]

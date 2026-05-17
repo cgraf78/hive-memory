@@ -274,9 +274,21 @@ struct DoctorArgs {
     /// Run the hook/update-safe subset.
     #[arg(long)]
     quick: bool,
+    /// Perform safe layout repairs before reporting diagnostics.
+    #[arg(long)]
+    fix: bool,
     /// Emit machine-readable output.
     #[arg(long)]
     json: bool,
+}
+
+/// JSON envelope used only when `hm doctor --fix --json` is requested.
+#[derive(Debug, Serialize)]
+struct DoctorFixOutput<'a> {
+    /// Mutations performed or deliberately skipped by the fix pass.
+    fixes: &'a doctor::DoctorFixReport,
+    /// Diagnostic report after repairs have been attempted.
+    doctor: &'a doctor::DoctorReport,
 }
 
 /// Arguments for `hm stores migrate`.
@@ -696,14 +708,42 @@ struct CliContext {
 
 fn run_doctor(args: DoctorArgs, context: CliContext) -> Result<()> {
     let config = load_config(context.config_path.as_deref())?;
+    let fix_report = if args.fix {
+        Some(doctor::fix(doctor::DoctorFixInput { config: &config }))
+    } else {
+        None
+    };
     let report = doctor::run(doctor::DoctorInput {
         config: &config,
         quick: args.quick,
     });
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        if let Some(fixes) = fix_report.as_ref() {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&DoctorFixOutput {
+                    fixes,
+                    doctor: &report
+                })?
+            );
+        } else {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
     } else {
+        if let Some(fixes) = fix_report.as_ref() {
+            println!(
+                "doctor fix: {} (fixed={} skipped={} failed={})",
+                if fixes.ok { "ok" } else { "fail" },
+                fixes.summary.fixed,
+                fixes.summary.skipped,
+                fixes.summary.failed
+            );
+            for action in &fixes.actions {
+                println!("{}: {}", action.status, action.message);
+                println!("  path: {}", action.path);
+            }
+        }
         println!(
             "doctor: {} (errors={} warnings={})",
             if report.ok { "ok" } else { "fail" },
@@ -723,6 +763,11 @@ fn run_doctor(args: DoctorArgs, context: CliContext) -> Result<()> {
 
     if !report.ok {
         anyhow::bail!("doctor found errors");
+    }
+    if let Some(fixes) = fix_report
+        && !fixes.ok
+    {
+        anyhow::bail!("doctor fix failed");
     }
     Ok(())
 }

@@ -5,12 +5,12 @@
 //! the configured stores, local project bindings, and adapter links be trusted
 //! before an agent relies on them?
 
-use crate::{config, note, outbox, project, render, secret, store};
+use crate::{config, note, outbox, project, render, secret, store, write};
 use serde::Serialize;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
-use time::{Date, Month, OffsetDateTime};
+use time::{Date, Month, OffsetDateTime, format_description::well_known::Rfc3339};
 
 const STALE_TEMP_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const OLD_OUTBOX_ITEM_DAYS: i64 = 7;
@@ -22,6 +22,13 @@ pub struct DoctorInput<'a> {
     pub config: &'a config::Config,
     /// Run the hook/update-safe subset.
     pub quick: bool,
+}
+
+/// Input for the explicit doctor repair path.
+#[derive(Debug, Clone)]
+pub struct DoctorFixInput<'a> {
+    /// Effective config after normal config loading/validation.
+    pub config: &'a config::Config,
 }
 
 /// Top-level diagnostic report.
@@ -42,6 +49,67 @@ pub struct DoctorSummary {
     pub errors: usize,
     /// Number of warning-severity checks. Warnings do not make `ok` false.
     pub warnings: usize,
+}
+
+/// Result of an explicit `hm doctor --fix` run.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct DoctorFixReport {
+    /// Whether every attempted repair succeeded.
+    pub ok: bool,
+    /// Count summary for human and JSON callers.
+    pub summary: DoctorFixSummary,
+    /// Individual repairs or skipped unsafe repairs.
+    pub actions: Vec<DoctorFixAction>,
+}
+
+/// Count summary for a doctor repair run.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct DoctorFixSummary {
+    /// Number of successful repair actions.
+    pub fixed: usize,
+    /// Number of repairs intentionally skipped for safety.
+    pub skipped: usize,
+    /// Number of repairs that were attempted but failed.
+    pub failed: usize,
+}
+
+/// One repair action from `hm doctor --fix`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DoctorFixAction {
+    /// Stable repair kind for tests and JSON callers.
+    pub kind: String,
+    /// Configured store alias involved in the repair.
+    pub store: String,
+    /// Filesystem path involved in the repair.
+    pub path: String,
+    /// Repair result.
+    pub status: DoctorFixStatus,
+    /// Human diagnostic.
+    pub message: String,
+}
+
+/// Status for one doctor repair action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DoctorFixStatus {
+    /// Repair was performed successfully.
+    Fixed,
+    /// Repair was deliberately skipped because automated mutation would be
+    /// unsafe or out of scope.
+    Skipped,
+    /// Repair was attempted but failed.
+    Failed,
+}
+
+impl std::fmt::Display for DoctorFixStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Fixed => "fixed",
+            Self::Skipped => "skipped",
+            Self::Failed => "failed",
+        };
+        f.write_str(value)
+    }
 }
 
 /// One doctor check result.
@@ -129,6 +197,21 @@ pub fn run(input: DoctorInput<'_>) -> DoctorReport {
     }
 
     summarize(checks)
+}
+
+/// Run the explicit doctor repair path.
+///
+/// Repairs are deliberately narrower than diagnostics. `hm doctor --fix` may
+/// recreate tool-owned layout, restore the managed generated `.gitignore`, and
+/// quarantine stale atomic-write residue, but it must not initialize missing
+/// stores, rewrite canonical notes, or delete user memory. Those higher-risk
+/// decisions stay visible in diagnostics for a human to resolve.
+pub fn fix(input: DoctorFixInput<'_>) -> DoctorFixReport {
+    let mut actions = Vec::new();
+    fix_required_dirs(input.config, &mut actions);
+    fix_generated_gitignore(input.config, &mut actions);
+    fix_stale_temp_files(input.config, &mut actions);
+    summarize_fixes(actions)
 }
 
 fn check_stores(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
@@ -237,6 +320,41 @@ fn check_required_dirs(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
     }
 }
 
+fn fix_required_dirs(config: &config::Config, actions: &mut Vec<DoctorFixAction>) {
+    for (store_name, store_config) in &config.stores {
+        if !store_config.root.exists() {
+            actions.push(fix_skipped(
+                "required-dirs",
+                store_name,
+                &store_config.root,
+                "store root is missing; use `hm stores init` or fix config before creating layout",
+            ));
+            continue;
+        }
+
+        for relative in store::CANONICAL_DIRS {
+            let path = store_config.root.join(relative);
+            if path.is_dir() {
+                continue;
+            }
+            match fs::create_dir_all(&path) {
+                Ok(()) => actions.push(fix_fixed(
+                    "required-dirs",
+                    store_name,
+                    &path,
+                    "created missing required directory",
+                )),
+                Err(err) => actions.push(fix_failed(
+                    "required-dirs",
+                    store_name,
+                    &path,
+                    format!("failed to create required directory: {err}"),
+                )),
+            }
+        }
+    }
+}
+
 fn check_generated_gitignore(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
     for (store_name, store_config) in &config.stores {
         if !store_config.root.exists() {
@@ -274,6 +392,72 @@ fn check_generated_gitignore(config: &config::Config, checks: &mut Vec<DoctorChe
                 vec![path.display().to_string()],
             )),
         }
+    }
+}
+
+fn fix_generated_gitignore(config: &config::Config, actions: &mut Vec<DoctorFixAction>) {
+    let options = write::AtomicWriteOptions {
+        fsync: config.storage.fsync.into(),
+        ..write::AtomicWriteOptions::default()
+    };
+    for (store_name, store_config) in &config.stores {
+        if !store_config.root.exists() {
+            actions.push(fix_skipped(
+                "generated-gitignore",
+                store_name,
+                &store_config.root,
+                "store root is missing; skipped generated .gitignore repair",
+            ));
+            continue;
+        }
+
+        let path = store_config.root.join("generated/.gitignore");
+        match fs::read_to_string(&path) {
+            Ok(contents) if contents == store::GENERATED_GITIGNORE => continue,
+            Ok(_) => fix_generated_gitignore_path(
+                store_name,
+                &path,
+                &options,
+                "restored managed generated .gitignore",
+                "failed to restore managed generated .gitignore",
+                actions,
+            ),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                fix_generated_gitignore_path(
+                    store_name,
+                    &path,
+                    &options,
+                    "created managed generated .gitignore",
+                    "failed to create managed generated .gitignore",
+                    actions,
+                );
+            }
+            Err(err) => actions.push(fix_failed(
+                "generated-gitignore",
+                store_name,
+                &path,
+                format!("failed to inspect generated .gitignore before repair: {err}"),
+            )),
+        }
+    }
+}
+
+fn fix_generated_gitignore_path(
+    store_name: &str,
+    path: &Path,
+    options: &write::AtomicWriteOptions,
+    success: &'static str,
+    failure: &'static str,
+    actions: &mut Vec<DoctorFixAction>,
+) {
+    match write::write_atomic(path, store::GENERATED_GITIGNORE.as_bytes(), options) {
+        Ok(_) => actions.push(fix_fixed("generated-gitignore", store_name, path, success)),
+        Err(err) => actions.push(fix_failed(
+            "generated-gitignore",
+            store_name,
+            path,
+            format!("{failure}: {err}"),
+        )),
     }
 }
 
@@ -393,6 +577,68 @@ fn check_stale_temp_files(config: &config::Config, checks: &mut Vec<DoctorCheck>
                     .map(|path| path.display().to_string())
                     .collect(),
             ));
+        }
+    }
+}
+
+fn fix_stale_temp_files(config: &config::Config, actions: &mut Vec<DoctorFixAction>) {
+    let now = SystemTime::now();
+    let quarantine_id = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "now".to_owned())
+        .replace(':', "");
+    for (store_name, store_config) in &config.stores {
+        let stale = match collect_stale_temp_files(&store_config.root, now) {
+            Ok(stale) => stale,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                actions.push(fix_skipped(
+                    "stale-temps",
+                    store_name,
+                    &store_config.root,
+                    "store root is missing; skipped stale temp quarantine",
+                ));
+                continue;
+            }
+            Err(err) => {
+                actions.push(fix_failed(
+                    "stale-temps",
+                    store_name,
+                    &store_config.root,
+                    format!("failed to scan stale temp files: {err}"),
+                ));
+                continue;
+            }
+        };
+
+        for path in stale {
+            let destination =
+                quarantine_destination(&store_config.root, &path, "stale-temps", &quarantine_id);
+            if let Some(parent) = destination.parent()
+                && let Err(err) = fs::create_dir_all(parent)
+            {
+                actions.push(fix_failed(
+                    "stale-temps",
+                    store_name,
+                    &path,
+                    format!("failed to create quarantine directory: {err}"),
+                ));
+                continue;
+            }
+
+            match fs::rename(&path, &destination) {
+                Ok(()) => actions.push(fix_fixed(
+                    "stale-temps",
+                    store_name,
+                    &path,
+                    format!("quarantined stale temp file at {}", destination.display()),
+                )),
+                Err(err) => actions.push(fix_failed(
+                    "stale-temps",
+                    store_name,
+                    &path,
+                    format!("failed to quarantine stale temp file: {err}"),
+                )),
+            }
         }
     }
 }
@@ -1143,6 +1389,9 @@ fn collect_cloud_conflicts_into(
         let path = entry.path();
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
+            if is_quarantine_dir(&path) {
+                continue;
+            }
             collect_cloud_conflicts_into(&path, paths)?;
         } else if file_type.is_file()
             && path
@@ -1186,6 +1435,9 @@ fn collect_stale_temp_files_into(
         let path = entry.path();
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
+            if is_quarantine_dir(&path) {
+                continue;
+            }
             collect_stale_temp_files_into(&path, now, paths)?;
             continue;
         }
@@ -1209,6 +1461,12 @@ fn collect_stale_temp_files_into(
     Ok(())
 }
 
+fn is_quarantine_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == ".quarantine")
+}
+
 fn is_atomic_temp_name(name: &str) -> bool {
     name.starts_with(".tmp.")
 }
@@ -1216,6 +1474,49 @@ fn is_atomic_temp_name(name: &str) -> bool {
 fn is_stale_temp_modified_at(modified: SystemTime, now: SystemTime) -> bool {
     now.duration_since(modified)
         .is_ok_and(|age| age > STALE_TEMP_TTL)
+}
+
+fn quarantine_destination(
+    store_root: &Path,
+    source: &Path,
+    category: &str,
+    quarantine_id: &str,
+) -> PathBuf {
+    // Preserve the store-relative path under `.quarantine` so manual recovery
+    // can see exactly where residue came from, but keep the quarantine rooted
+    // inside the store so repair never moves data across trust boundaries.
+    let relative = source
+        .strip_prefix(store_root)
+        .unwrap_or_else(|_| source.file_name().map(Path::new).unwrap_or(source));
+    let base = store_root
+        .join(".quarantine")
+        .join(category)
+        .join(quarantine_id)
+        .join(relative);
+    unique_destination(base)
+}
+
+fn unique_destination(path: PathBuf) -> PathBuf {
+    if !path.exists() {
+        return path;
+    }
+    let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("file");
+    let extension = path.extension().and_then(|value| value.to_str());
+    for index in 1.. {
+        let file_name = match extension {
+            Some(extension) => format!("{stem}.{index}.{extension}"),
+            None => format!("{stem}.{index}"),
+        };
+        let candidate = parent.join(file_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded destination search returns once a free path is found")
 }
 
 fn collect_markdown_files(root: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
@@ -1258,6 +1559,22 @@ fn summarize(checks: Vec<DoctorCheck>) -> DoctorReport {
     }
 }
 
+fn summarize_fixes(actions: Vec<DoctorFixAction>) -> DoctorFixReport {
+    let mut summary = DoctorFixSummary::default();
+    for action in &actions {
+        match action.status {
+            DoctorFixStatus::Fixed => summary.fixed += 1,
+            DoctorFixStatus::Skipped => summary.skipped += 1,
+            DoctorFixStatus::Failed => summary.failed += 1,
+        }
+    }
+    DoctorFixReport {
+        ok: summary.failed == 0,
+        summary,
+        actions,
+    }
+}
+
 fn pass(id: impl Into<String>, message: impl Into<String>, paths: Vec<String>) -> DoctorCheck {
     DoctorCheck {
         id: id.into(),
@@ -1265,6 +1582,51 @@ fn pass(id: impl Into<String>, message: impl Into<String>, paths: Vec<String>) -
         status: DoctorStatus::Pass,
         message: message.into(),
         paths,
+    }
+}
+
+fn fix_fixed(
+    kind: impl Into<String>,
+    store: impl Into<String>,
+    path: &Path,
+    message: impl Into<String>,
+) -> DoctorFixAction {
+    DoctorFixAction {
+        kind: kind.into(),
+        store: store.into(),
+        path: path.display().to_string(),
+        status: DoctorFixStatus::Fixed,
+        message: message.into(),
+    }
+}
+
+fn fix_skipped(
+    kind: impl Into<String>,
+    store: impl Into<String>,
+    path: &Path,
+    message: impl Into<String>,
+) -> DoctorFixAction {
+    DoctorFixAction {
+        kind: kind.into(),
+        store: store.into(),
+        path: path.display().to_string(),
+        status: DoctorFixStatus::Skipped,
+        message: message.into(),
+    }
+}
+
+fn fix_failed(
+    kind: impl Into<String>,
+    store: impl Into<String>,
+    path: &Path,
+    message: impl Into<String>,
+) -> DoctorFixAction {
+    DoctorFixAction {
+        kind: kind.into(),
+        store: store.into(),
+        path: path.display().to_string(),
+        status: DoctorFixStatus::Failed,
+        message: message.into(),
     }
 }
 
