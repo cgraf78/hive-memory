@@ -4363,9 +4363,11 @@ fn hook_prompt_submit_does_not_emit_initial_context() {
     let stdout = String::from_utf8(output).expect("utf8 stdout");
     assert!(stdout.contains("\"context_emitted\": false"));
     assert!(!stdout.contains("\"kind\": \"inject_context\""));
-    assert!(!state
-        .join("runs/session-no-initial/hook-state.json")
-        .exists());
+    assert!(
+        !state
+            .join("runs/session-no-initial/hook-state.json")
+            .exists()
+    );
 }
 
 #[test]
@@ -4625,6 +4627,11 @@ fn projects_resolve_uses_git_root_from_file_hint() {
         .expect("git remote");
     assert!(remote.status.success());
 
+    // The resolver reports canonical project roots. On macOS, temp paths can
+    // enter the test as /var/... while std/fs and Git resolve them through
+    // /private/var/..., so the assertion should follow the API contract rather
+    // than the platform-specific spelling returned by temp_dir().
+    let canonical_repo = repo.canonicalize().expect("canonical repo");
     let mut resolve = cargo_bin_cmd!("hm");
     resolve
         .args([
@@ -4645,7 +4652,7 @@ fn projects_resolve_uses_git_root_from_file_hint() {
         ))
         .stdout(predicate::str::contains(format!(
             "\"project_root\": \"{}\"",
-            repo.canonicalize().expect("canonical repo").display()
+            canonical_repo.display()
         )))
         .stdout(predicate::str::contains(
             "\"store_source\": \"global-default\"",
