@@ -22,7 +22,8 @@ pub struct SearchInput<'a> {
     pub store_root: &'a Path,
     /// Candidate metadata entries.
     pub entries: &'a [IndexEntry],
-    /// Case-insensitive substring query.
+    /// Case-insensitive text query. Exact substring matches rank highest; when
+    /// no exact phrase match exists, every query term must be present.
     pub query: &'a str,
     /// Optional scope filter. Empty means all scopes allowed by source policy.
     pub scopes: &'a [String],
@@ -133,18 +134,17 @@ impl From<crate::curated::CuratedError> for SearchError {
     }
 }
 
-/// Search curated files and indexed notes by case-insensitive substring.
+/// Search curated files and indexed notes by deterministic text matching.
 ///
-/// Ranking is intentionally simple and stable for v1: more occurrences first,
-/// then newer timestamps, then lexical note path. This keeps behavior easy to
-/// debug before any future scoring/index backend is introduced. Curated files
-/// score only body text; indexed entries also score subject/tags so metadata
-/// searches do not need to parse every note twice.
+/// Ranking is intentionally simple and stable for v1: exact phrase occurrences
+/// outrank all-term matches, then newer timestamps, then lexical note path.
+/// This keeps behavior easy to debug before any future scoring/index backend is
+/// introduced while still supporting the loose keyword queries agents naturally
+/// issue during recall. Curated files score only body text; indexed entries also
+/// score subject/tags so metadata searches do not need to parse every note
+/// twice.
 pub fn search(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
-    let query = input.query.trim().to_ascii_lowercase();
-    if query.is_empty() {
-        return Err(SearchError::EmptyQuery);
-    }
+    let query = SearchQuery::parse(input.query)?;
     let project_ids = project_filter_ids(input.store_root, input.project_id)?;
 
     let mut hits = Vec::new();
@@ -153,7 +153,7 @@ pub fn search(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
             if !curated_scope_allowed(&curated, input.scopes) {
                 continue;
             }
-            let score = occurrence_count(&curated.body, &query);
+            let score = score_text(&curated.body, &query);
             if score == 0 {
                 continue;
             }
@@ -280,22 +280,70 @@ fn project_allowed(entry: &IndexEntry, project_ids: Option<&BTreeSet<String>>) -
         .is_some_and(|project_id| project_ids.contains(project_id))
 }
 
-fn occurrence_count(body: &str, query: &str) -> usize {
-    body.to_ascii_lowercase().matches(query).count()
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchQuery {
+    phrase: String,
+    terms: Vec<String>,
 }
 
-fn score_entry(entry: &IndexEntry, body: &str, query: &str) -> usize {
-    let metadata_score = entry
+impl SearchQuery {
+    fn parse(input: &str) -> Result<Self, SearchError> {
+        let phrase = input.trim().to_ascii_lowercase();
+        if phrase.is_empty() {
+            return Err(SearchError::EmptyQuery);
+        }
+
+        let terms = phrase
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+
+        Ok(Self { phrase, terms })
+    }
+}
+
+fn score_text(body: &str, query: &SearchQuery) -> usize {
+    let lower = body.to_ascii_lowercase();
+    let exact = lower.matches(&query.phrase).count();
+    if exact > 0 {
+        // Keep phrase hits clearly above keyword-only hits without making the
+        // scoring model clever. Exact recall should remain the most predictable
+        // path for humans, while agents can still use natural token queries.
+        return exact * 10;
+    }
+
+    if query.terms.iter().all(|term| lower.contains(term)) {
+        return query
+            .terms
+            .iter()
+            .map(|term| lower.matches(term).count())
+            .sum::<usize>()
+            .max(1);
+    }
+
+    0
+}
+
+fn score_entry(entry: &IndexEntry, body: &str, query: &SearchQuery) -> usize {
+    let metadata = entry
         .subject
         .as_deref()
-        .map(|subject| occurrence_count(subject, query))
-        .unwrap_or_default()
-        + entry
-            .tags
-            .iter()
-            .map(|tag| occurrence_count(tag, query))
-            .sum::<usize>();
-    occurrence_count(body, query) + metadata_score
+        .into_iter()
+        .chain(entry.tags.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let body_score = score_text(body, query);
+    let metadata_score = score_text(&metadata, query);
+    // Natural recall queries can span metadata and body text, for example a
+    // subject naming the workflow and a body naming the concrete preference.
+    // Only use the combined view as a fallback so ordinary body/metadata hits
+    // are not double-counted.
+    let combined_score = if body_score == 0 && metadata_score == 0 {
+        score_text(&format!("{metadata} {body}"), query)
+    } else {
+        0
+    };
+    body_score + metadata_score + combined_score
 }
 
 fn curated_entry(curated: &CuratedFile, project_id: Option<&str>) -> IndexEntry {
@@ -316,7 +364,7 @@ fn curated_entry(curated: &CuratedFile, project_id: Option<&str>) -> IndexEntry 
     }
 }
 
-fn snippet(entry: &IndexEntry, body: &str, query: &str) -> String {
+fn snippet(entry: &IndexEntry, body: &str, query: &SearchQuery) -> String {
     if let Some(line) = matching_body_line(body, query) {
         return line.chars().take(160).collect();
     }
@@ -324,20 +372,20 @@ fn snippet(entry: &IndexEntry, body: &str, query: &str) -> String {
     if let Some(subject) = entry
         .subject
         .as_deref()
-        .filter(|subject| occurrence_count(subject, query) > 0)
+        .filter(|subject| score_text(subject, query) > 0)
     {
         return format!("subject: {subject}");
     }
 
     let tags = entry.tags.join(",");
-    if occurrence_count(&tags, query) > 0 {
+    if score_text(&tags, query) > 0 {
         return format!("tags: {tags}");
     }
 
     body.trim().chars().take(160).collect()
 }
 
-fn curated_snippet(body: &str, query: &str) -> String {
+fn curated_snippet(body: &str, query: &SearchQuery) -> String {
     matching_body_line(body, query)
         .unwrap_or_else(|| body.trim())
         .chars()
@@ -345,9 +393,15 @@ fn curated_snippet(body: &str, query: &str) -> String {
         .collect()
 }
 
-fn matching_body_line<'a>(body: &'a str, query: &str) -> Option<&'a str> {
+fn matching_body_line<'a>(body: &'a str, query: &SearchQuery) -> Option<&'a str> {
     body.lines()
-        .find(|line| line.to_ascii_lowercase().contains(query))
+        .find(|line| line.to_ascii_lowercase().contains(&query.phrase))
+        .or_else(|| {
+            body.lines().find(|line| {
+                let lower = line.to_ascii_lowercase();
+                query.terms.iter().all(|term| lower.contains(term))
+            })
+        })
         .map(str::trim)
 }
 
@@ -525,8 +579,72 @@ mod tests {
         .expect("search");
 
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].score, 1);
+        assert!(hits[0].score > 0);
         assert_eq!(hits[0].snippet, "TOML config is preferred.");
+    }
+
+    #[test]
+    fn search_matches_all_query_terms_without_exact_phrase() {
+        let dir = temp_dir("keyword-terms");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "For Hive Memory agent ergonomics, plain `hm` commands should work as the normal path.",
+            timestamp(1_778_946_153),
+            Vec::new(),
+        );
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "agent ergonomics plain hm",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].snippet,
+            "For Hive Memory agent ergonomics, plain `hm` commands should work as the normal path."
+        );
+    }
+
+    #[test]
+    fn search_keyword_fallback_requires_all_terms() {
+        let dir = temp_dir("keyword-all-terms");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "Plain `hm` commands are the normal path for agent ergonomics.",
+            timestamp(1_778_946_153),
+            Vec::new(),
+        );
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "agent ergonomics missing",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+
+        assert!(hits.is_empty());
     }
 
     #[test]

@@ -872,8 +872,9 @@ hm search "Chris prefers" --json --include-inbox
 
 V1 behavior:
 
-- simple case-insensitive substring search over Markdown bodies and the
-  indexed JSON fields (`subject`, `tags`, `body`).
+- simple deterministic text search over Markdown bodies and indexed metadata
+  fields (`subject`, `tags`). Exact case-insensitive phrase matches rank
+  highest; otherwise every query term must be present.
 - backed by the local triage index for filtering; matched lines are read from
   canonical files for snippets.
 - collapses note/event pairs (same `id`) into a single hit; the Markdown body
@@ -885,7 +886,7 @@ V1 behavior:
   (`curated` and `remembered` unless overridden).
 - returns path, score/rank, title/snippet, store, scope, audience, and
   timestamp.
-- deterministic ordering: substring/exactness score, newer timestamp, then
+- deterministic ordering: exactness/term score, newer timestamp, then
   lexical path.
 - default result limit: 20 unless `--limit` is provided.
 
@@ -894,7 +895,7 @@ Output:
 - human: compact list of matches with snippets.
 - JSON: array of match objects.
 
-Future: post-v1, the simple substring path can be replaced by SQLite/FTS without
+Future: post-v1, the simple text path can be replaced by SQLite/FTS without
 changing output contracts.
 
 ### `hm context`
@@ -1463,7 +1464,7 @@ v1 budget:
 - `hm context` p95 ≤ 200ms warm (OS page cache hot, local triage index hot)
   on a 5000-note store.
 - `hm context` p95 ≤ 500ms cold on the same store.
-- `hm search` p95 ≤ 300ms warm on a 5000-note store with substring filter.
+- `hm search` p95 ≤ 300ms warm on a 5000-note store with text filter.
 - `hm flush` of a 100-item outbox p95 ≤ 2s on a local filesystem.
 
 How v1 hits the budget:
@@ -1809,7 +1810,7 @@ Test categories per module:
 
 ### Search
 
-- case-insensitive substring match.
+- case-insensitive exact phrase match, with all-term fallback.
 - `--stores` / `--scope` filters.
 - agent policy constrains default and explicit read stores.
 - `--include-inbox` opt-in.
@@ -2027,8 +2028,8 @@ When ready, create GitHub issues roughly in this order. Each carries a
 9. **Doctor diagnostics**: full checklist including normalization, cloud
    conflict, audience absence, secret-on-cloud,
    fsync-on-FUSE. Tests: Doctor.
-10. **Simple search**: substring scan over index + matched-line snippet
-    read; pair collapse. Tests: Search.
+10. **Simple search**: deterministic text scan over index candidates plus
+    matched-line snippet read; pair collapse. Tests: Search.
 11. **Context assembler**: scope/store selection, curated+remembered defaults,
     data-boundary blocks, escape rules, byte/4 token approx, performance budget.
     Tests: Context assembler.

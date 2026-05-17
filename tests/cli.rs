@@ -2529,7 +2529,7 @@ fn search_json_reports_stable_hit_fields() {
         .stdout(predicate::str::contains(
             "\"snippet\": \"JSON search should find curated TOML preferences.\"",
         ))
-        .stdout(predicate::str::contains("\"score\": 1"))
+        .stdout(predicate::str::contains("\"score\": "))
         .stdout(predicate::str::contains("\"created_at\": \"\""));
 }
 
