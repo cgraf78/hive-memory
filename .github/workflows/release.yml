@@ -1,0 +1,84 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - v*.*.*
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  create-release:
+    name: Create draft release
+    runs-on: ubuntu-24.04
+    # Keep the workflow default read-only; only release creation/upload jobs need
+    # write credentials, and checkout itself runs with persisted credentials off.
+    permissions:
+      contents: write
+    steps:
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            exit 0
+          fi
+          gh release create "$TAG" --draft --title "$TAG" --notes "Automated Hive Memory release."
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    # Asset upload is the only write operation in this job. Keeping that
+    # permission job-scoped avoids granting release credentials to unrelated CI.
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      # Build native archives on hosted runners for every v1 release target.
+      # Keeping packaging in a script makes the release contract locally
+      # reproducible and gives dotfiles/shdeps one stable archive shape.
+      - name: Package archive
+        env:
+          HM_RELEASE_VERSION: ${{ github.ref_name }}
+        run: scripts/package-release.sh "${{ matrix.target }}"
+
+      - name: Smoke install
+        env:
+          VERSION: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          archive="dist/hm-${VERSION}-${TARGET}.tar.gz"
+          mkdir -p smoke
+          tar -xzf "$archive" -C smoke
+          ./smoke/hm --version
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release upload "$TAG" dist/*.tar.gz dist/*.sha256 --clobber
