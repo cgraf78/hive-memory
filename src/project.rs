@@ -85,6 +85,13 @@ pub enum ProjectError {
         /// Original error rendered for diagnostics.
         message: String,
     },
+    /// Project alias file could not be read, written, or parsed.
+    Alias {
+        /// Alias file path.
+        path: PathBuf,
+        /// Original error rendered for diagnostics.
+        message: String,
+    },
 }
 
 impl Display for ProjectError {
@@ -107,6 +114,13 @@ impl Display for ProjectError {
                     path.display()
                 )
             }
+            Self::Alias { path, message } => {
+                write!(
+                    f,
+                    "failed to access project aliases {}: {message}",
+                    path.display()
+                )
+            }
         }
     }
 }
@@ -125,6 +139,23 @@ pub struct ProjectBinding {
     pub project_id: String,
     /// Configured store alias preferred for this project.
     pub store: String,
+}
+
+/// Canonical project alias file stored with curated project memory.
+///
+/// The file lives at `memories/projects/<canonical-id>/aliases.toml` inside a
+/// memory store. Aliases are durable shared memory metadata, unlike local store
+/// bindings under `data_dir`, because every machine needs the same old-id to
+/// new-id mapping after a repo rename or remote URL migration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectAliases {
+    /// Alias schema version.
+    pub schema_version: u32,
+    /// Canonical/current project id represented by this directory.
+    pub project_id: String,
+    /// Prior project ids that should resolve to `project_id`.
+    #[serde(default)]
+    pub aliases: Vec<String>,
 }
 
 /// Resolve a stable project id from a path hint and optional explicit IDs.
@@ -330,6 +361,83 @@ fn starting_dir(path: &Path) -> PathBuf {
     }
 }
 
+/// Return the store-relative alias file path for one canonical project id.
+pub fn aliases_relative_path(project_id: &str) -> PathBuf {
+    Path::new("memories/projects")
+        .join(id::sanitize_component(project_id))
+        .join("aliases.toml")
+}
+
+/// Return the absolute alias file path for one canonical project id.
+pub fn aliases_path(store_root: &Path, project_id: &str) -> PathBuf {
+    store_root.join(aliases_relative_path(project_id))
+}
+
+/// Load a canonical project's alias file.
+///
+/// Missing means the canonical id has no declared historical ids. Malformed
+/// alias files are surfaced because silently ignoring them would make old
+/// project memory disappear from context/search after a move.
+pub fn load_aliases(
+    store_root: &Path,
+    project_id: &str,
+) -> Result<Option<ProjectAliases>, ProjectError> {
+    let path = aliases_path(store_root, project_id);
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(ProjectError::Alias {
+                path,
+                message: err.to_string(),
+            });
+        }
+    };
+    let aliases =
+        toml::from_str::<ProjectAliases>(&contents).map_err(|err| ProjectError::Alias {
+            path: path.clone(),
+            message: err.to_string(),
+        })?;
+    Ok(Some(aliases))
+}
+
+/// Add one prior project id to a canonical project's alias file.
+///
+/// The operation is idempotent and keeps aliases sorted so repeated `hm
+/// projects alias` runs produce stable diffs. It does not move curated files;
+/// users can keep memory under the old id, the new id, or both while
+/// search/context follow the alias relationship.
+pub fn add_alias(
+    store_root: &Path,
+    old_project_id: &str,
+    new_project_id: &str,
+    options: &write::AtomicWriteOptions,
+) -> Result<PathBuf, ProjectError> {
+    let path = aliases_path(store_root, new_project_id);
+    let mut aliases = load_aliases(store_root, new_project_id)?.unwrap_or(ProjectAliases {
+        schema_version: 1,
+        project_id: new_project_id.to_owned(),
+        aliases: Vec::new(),
+    });
+    aliases.project_id = new_project_id.to_owned();
+    if !aliases.aliases.iter().any(|alias| alias == old_project_id) {
+        aliases.aliases.push(old_project_id.to_owned());
+    }
+    aliases.aliases.sort();
+    aliases.aliases.dedup();
+    let contents = toml::to_string_pretty(&aliases).map_err(|err| ProjectError::Alias {
+        path: path.clone(),
+        message: err.to_string(),
+    })?;
+    write::write_atomic(&path, contents.as_bytes(), options).map_err(|err| {
+        ProjectError::Alias {
+            path: path.clone(),
+            message: err.to_string(),
+        }
+    })?;
+    Ok(path)
+}
+
 struct Marker {
     root: PathBuf,
     project_id: String,
@@ -484,6 +592,28 @@ mod tests {
         assert_eq!(loaded, Some(binding));
         assert_eq!(removed, Some(path));
         assert_eq!(missing, None);
+    }
+
+    #[test]
+    fn project_aliases_are_idempotent_and_sorted() {
+        let dir = temp_dir("aliases");
+        let options = write::AtomicWriteOptions {
+            fsync: write::FsyncPolicy::Never,
+            ..write::AtomicWriteOptions::default()
+        };
+
+        let first = add_alias(&dir, "old-z", "new-project", &options).expect("add alias");
+        let second = add_alias(&dir, "old-a", "new-project", &options).expect("add alias");
+        let third = add_alias(&dir, "old-z", "new-project", &options).expect("add alias");
+        let loaded = load_aliases(&dir, "new-project")
+            .expect("load aliases")
+            .expect("aliases exist");
+
+        assert_eq!(first, aliases_path(&dir, "new-project"));
+        assert_eq!(second, first);
+        assert_eq!(third, first);
+        assert_eq!(loaded.project_id, "new-project");
+        assert_eq!(loaded.aliases, vec!["old-a", "old-z"]);
     }
 
     #[test]
