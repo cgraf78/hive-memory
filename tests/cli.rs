@@ -4363,11 +4363,9 @@ fn hook_prompt_submit_does_not_emit_initial_context() {
     let stdout = String::from_utf8(output).expect("utf8 stdout");
     assert!(stdout.contains("\"context_emitted\": false"));
     assert!(!stdout.contains("\"kind\": \"inject_context\""));
-    assert!(
-        !state
-            .join("runs/session-no-initial/hook-state.json")
-            .exists()
-    );
+    assert!(!state
+        .join("runs/session-no-initial/hook-state.json")
+        .exists());
 }
 
 #[test]
@@ -4647,7 +4645,7 @@ fn projects_resolve_uses_git_root_from_file_hint() {
         ))
         .stdout(predicate::str::contains(format!(
             "\"project_root\": \"{}\"",
-            repo.display()
+            repo.canonicalize().expect("canonical repo").display()
         )))
         .stdout(predicate::str::contains(
             "\"store_source\": \"global-default\"",
