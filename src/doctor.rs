@@ -701,6 +701,8 @@ fn check_adapters(config: &config::Config, _quick: bool, checks: &mut Vec<Doctor
         .iter()
         .filter(|(_name, adapter)| adapter.enabled)
     {
+        inspect_adapter_sensitive_render(config, name, adapter, checks);
+
         let Some(output) = adapter.output.as_ref() else {
             checks.push(error(
                 format!("adapter.{name}.output"),
@@ -716,6 +718,46 @@ fn check_adapters(config: &config::Config, _quick: bool, checks: &mut Vec<Doctor
         // as full secret scans can branch on `_quick` without weakening install
         // validation.
         inspect_adapter_install(name, output, adapter.install_target.as_deref(), checks);
+    }
+}
+
+fn inspect_adapter_sensitive_render(
+    config: &config::Config,
+    name: &str,
+    adapter: &config::AdapterConfig,
+    checks: &mut Vec<DoctorCheck>,
+) {
+    // Single-store personal renders are the normal v1 setup. Treat a render as
+    // broad only when one adapter combines multiple stores into one agent
+    // include, because that is where sensitive context can cross store
+    // boundaries by accident.
+    if !config.privacy.warn_sensitive_broad_render || adapter.stores.len() <= 1 {
+        return;
+    }
+
+    let sensitive = adapter
+        .stores
+        .iter()
+        .filter_map(|store| {
+            let store_config = config.stores.get(store)?;
+            is_sensitive(effective_store_sensitivity(store_config)).then_some(store.as_str())
+        })
+        .collect::<Vec<_>>();
+    if sensitive.is_empty() {
+        checks.push(pass(
+            format!("adapter.{name}.sensitive-render"),
+            format!("adapter {name} broad render includes no sensitive stores"),
+            Vec::new(),
+        ));
+    } else {
+        checks.push(warn(
+            format!("adapter.{name}.sensitive-render"),
+            format!(
+                "adapter {name} broadly renders sensitive store(s): {}",
+                sensitive.join(",")
+            ),
+            Vec::new(),
+        ));
     }
 }
 

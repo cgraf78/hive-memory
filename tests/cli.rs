@@ -573,6 +573,76 @@ fn doctor_quick_reports_clean_adapter_install() {
 }
 
 #[test]
+fn doctor_warns_for_broad_sensitive_adapter_render() {
+    let dir = temp_dir("doctor-sensitive-render");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    let output = dir.join("generated").join("codex.md");
+    let install_target = dir.join("AGENTS.md");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "{}"
+
+            [stores.work]
+            root = "{}"
+
+            [agents.codex]
+            default_store = "personal"
+            read_stores = ["personal", "work"]
+            write_stores = ["personal"]
+
+            [adapters.codex]
+            enabled = true
+            stores = ["personal", "work"]
+            scopes = ["global"]
+            output = "{}"
+            install_target = "{}"
+            install_mode = "include"
+            "#,
+            personal.display(),
+            work.display(),
+            output.display(),
+            install_target.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+    init_store(&work, "work");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "render",
+            "codex",
+            "--install",
+        ])
+        .assert()
+        .success();
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "doctor",
+            "--quick",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"warnings\": 1"))
+        .stdout(predicate::str::contains(
+            "adapter codex broadly renders sensitive store(s): personal,work",
+        ));
+}
+
+#[test]
 fn doctor_warns_for_unknown_project_binding_store() {
     let dir = temp_dir("doctor-project-binding");
     let config = dir.join("config.toml");
