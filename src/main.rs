@@ -1120,7 +1120,7 @@ fn run_promote(args: PromoteArgs, context: CliContext) -> Result<()> {
 fn inbox_context(
     context: &CliContext,
     access: StoreAccess,
-) -> Result<(String, PathBuf, index::RebuildIndexReport)> {
+) -> Result<(String, PathBuf, index::LoadIndexReport)> {
     let config = load_config(context.config_path.as_deref())?;
     let agent_id = resolve_agent_id(context.as_agent.clone());
     let resolved_store = resolve_store(
@@ -2209,16 +2209,17 @@ fn context_json_suppressed(
     }
 }
 
-fn rebuild_store_index(config: &Config, store_name: &str) -> Result<index::RebuildIndexReport> {
+fn rebuild_store_index(config: &Config, store_name: &str) -> Result<index::LoadIndexReport> {
     let store_config = &config.stores[store_name];
     let options = write::AtomicWriteOptions {
         fsync: config.storage.fsync.into(),
         ..write::AtomicWriteOptions::default()
     };
-    // Read commands rebuild for correctness in this first implementation, so
-    // direct file edits and writes from other processes are visible immediately.
-    // A later lazy mtime/inode check can live behind this helper.
-    let report = index::rebuild_index(index::RebuildIndexInput {
+    // Read commands share one hot-path loader. It validates a cheap canonical
+    // file fingerprint before reusing JSONL so hooks do not parse thousands of
+    // notes on every session boundary, while file create/delete/rename changes
+    // still invalidate the cache on the next read.
+    let report = index::load_or_rebuild_index(index::LoadIndexInput {
         store_name,
         store_root: &store_config.root,
         cache_dir: &config.cache_dir,
