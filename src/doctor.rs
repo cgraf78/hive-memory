@@ -1105,7 +1105,7 @@ fn check_events_with_declared_notes(
             .map_err(|err| err.to_string())
             .and_then(|contents| note::parse_note(&contents).map_err(|err| err.to_string()))
         {
-            Ok(note) if note.front_matter.id == parsed.id => {}
+            Ok(note) if event_declares_note(&parsed, &note) => {}
             Ok(note) => {
                 issues += 1;
                 checks.push(warn(
@@ -1128,6 +1128,27 @@ fn check_events_with_declared_notes(
         }
     }
     issues
+}
+
+fn event_declares_note(event: &event::MemoryEvent, note: &note::MarkdownNote) -> bool {
+    if note.front_matter.id == event.id {
+        return true;
+    }
+
+    if event.event_type != event::EventType::Promotion {
+        return false;
+    }
+
+    // Promotion events are audit records about an existing raw note, not the
+    // paired JSON sidecar for that note. They intentionally get their own event
+    // id while `source.ref` records the note being promoted. Treat that source
+    // reference as the pair contract so doctor does not flag healthy promotions
+    // as id drift.
+    event
+        .source
+        .as_ref()
+        .and_then(|source| source.r#ref.as_deref())
+        == Some(note.front_matter.id.as_str())
 }
 
 fn parse_note_created_at(value: &str) -> Option<OffsetDateTime> {

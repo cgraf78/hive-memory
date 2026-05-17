@@ -2355,6 +2355,17 @@ fn inbox_lists_shows_and_promotes_raw_notes_idempotently() {
     assert!(promotion_event.contains("\"type\": \"memory.promotion\""));
     assert!(promotion_event.contains(&format!("\"ref\": \"{note_id}\"")));
 
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "doctor",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("different id").not());
+
     fs::remove_file(&event).expect("remove promotion event to simulate interrupted run");
     let mut heal_retry = cargo_bin_cmd!("hm");
     heal_retry
