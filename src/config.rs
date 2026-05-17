@@ -143,6 +143,8 @@ pub struct Config {
     pub privacy: PrivacyConfig,
     /// Offline write and local outbox policy.
     pub offline: OfflineConfig,
+    /// Performance budgets used by benchmark and doctor tooling.
+    pub performance: PerformanceConfig,
     /// Render/install targets for agent-visible context files.
     pub adapters: BTreeMap<String, AdapterConfig>,
 }
@@ -391,6 +393,21 @@ pub enum OfflineMode {
     Always,
     /// Refuse unavailable-store writes instead of queueing them locally.
     Never,
+}
+
+/// V1 performance budget configuration.
+///
+/// Commands do not branch on these values in the hot path. They are exposed as
+/// config so benchmark/doctor tooling and future CI can enforce the same
+/// user-visible latency contract that the spec documents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PerformanceConfig {
+    /// Warm-cache p95 budget for `hm context`, in milliseconds.
+    pub context_warm_p95_ms: u32,
+    /// Cold-cache p95 budget for `hm context`, in milliseconds.
+    pub context_cold_p95_ms: u32,
+    /// Synthetic note count used to calibrate the context budget.
+    pub context_store_size_target: u32,
 }
 
 /// Render/install adapter configuration for an agent surface.
@@ -881,6 +898,7 @@ impl Config {
             agents,
             privacy,
             offline: OfflineConfig::from_raw(raw.offline),
+            performance: PerformanceConfig::from_raw(raw.performance),
             adapters,
         })
     }
@@ -966,6 +984,16 @@ impl OfflineConfig {
     }
 }
 
+impl PerformanceConfig {
+    fn from_raw(raw: RawPerformanceConfig) -> Self {
+        Self {
+            context_warm_p95_ms: raw.context_warm_p95_ms.unwrap_or(200),
+            context_cold_p95_ms: raw.context_cold_p95_ms.unwrap_or(500),
+            context_store_size_target: raw.context_store_size_target.unwrap_or(5000),
+        }
+    }
+}
+
 impl AdapterConfig {
     fn from_raw<F>(raw: RawAdapterConfig, env: &F) -> Result<Self, ConfigError>
     where
@@ -1001,6 +1029,7 @@ struct RawConfig {
     agents: BTreeMap<String, RawAgentConfig>,
     privacy: RawPrivacyConfig,
     offline: RawOfflineConfig,
+    performance: RawPerformanceConfig,
     adapters: BTreeMap<String, RawAdapterConfig>,
 }
 
@@ -1020,6 +1049,7 @@ impl Default for RawConfig {
             agents: BTreeMap::new(),
             privacy: RawPrivacyConfig::default(),
             offline: RawOfflineConfig::default(),
+            performance: RawPerformanceConfig::default(),
             adapters: BTreeMap::new(),
         }
     }
@@ -1081,6 +1111,14 @@ struct RawOfflineConfig {
     enabled: Option<bool>,
     mode: Option<OfflineMode>,
     archive_retention_days: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawPerformanceConfig {
+    context_warm_p95_ms: Option<u32>,
+    context_cold_p95_ms: Option<u32>,
+    context_store_size_target: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1366,6 +1404,14 @@ mod tests {
             }
         );
         assert!(loaded.config.offline.write_fallback_enabled());
+        assert_eq!(
+            loaded.config.performance,
+            PerformanceConfig {
+                context_warm_p95_ms: 200,
+                context_cold_p95_ms: 500,
+                context_store_size_target: 5000,
+            }
+        );
         assert!(loaded.warnings.is_empty());
     }
 
@@ -1394,6 +1440,11 @@ mod tests {
             enabled = false
             mode = "never"
             archive_retention_days = 14
+
+            [performance]
+            context_warm_p95_ms = 111
+            context_cold_p95_ms = 333
+            context_store_size_target = 42
             "#,
             env,
         )
@@ -1419,6 +1470,14 @@ mod tests {
             }
         );
         assert!(!loaded.config.offline.write_fallback_enabled());
+        assert_eq!(
+            loaded.config.performance,
+            PerformanceConfig {
+                context_warm_p95_ms: 111,
+                context_cold_p95_ms: 333,
+                context_store_size_target: 42,
+            }
+        );
     }
 
     #[test]
