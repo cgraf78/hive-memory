@@ -104,6 +104,7 @@ pub fn run(input: DoctorInput<'_>) -> DoctorReport {
     ));
 
     check_stores(input.config, &mut checks);
+    check_cloud_conflicts(input.config, &mut checks);
     check_project_bindings(input.config, &mut checks);
     check_outbox(input.config, &mut checks);
     check_adapters(input.config, input.quick, &mut checks);
@@ -145,6 +146,43 @@ fn check_stores(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
                     paths,
                 )),
             }
+        }
+    }
+}
+
+fn check_cloud_conflicts(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
+    for (store_name, store_config) in &config.stores {
+        let conflicts = match collect_cloud_conflicts(&store_config.root) {
+            Ok(conflicts) => conflicts,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                checks.push(warn(
+                    format!("store.{store_name}.cloud-conflicts"),
+                    format!("failed to scan store for cloud sync conflicts: {err}"),
+                    vec![store_config.root.display().to_string()],
+                ));
+                continue;
+            }
+        };
+
+        if conflicts.is_empty() {
+            checks.push(pass(
+                format!("store.{store_name}.cloud-conflicts"),
+                format!("store {store_name} has no obvious cloud sync conflicts"),
+                vec![store_config.root.display().to_string()],
+            ));
+        } else {
+            checks.push(warn(
+                format!("store.{store_name}.cloud-conflicts"),
+                format!(
+                    "store {store_name} has {} possible cloud sync conflict file(s)",
+                    conflicts.len()
+                ),
+                conflicts
+                    .into_iter()
+                    .map(|path| path.display().to_string())
+                    .collect(),
+            ));
         }
     }
 }
@@ -490,6 +528,45 @@ fn scan_note_for_secrets(path: &Path) -> Result<Vec<String>, String> {
         .into_iter()
         .map(|finding| finding.detector_id)
         .collect())
+}
+
+fn collect_cloud_conflicts(root: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
+    let mut paths = Vec::new();
+    collect_cloud_conflicts_into(root, &mut paths)?;
+    paths.sort();
+    Ok(paths)
+}
+
+fn collect_cloud_conflicts_into(
+    root: &Path,
+    paths: &mut Vec<std::path::PathBuf>,
+) -> std::io::Result<()> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_cloud_conflicts_into(&path, paths)?;
+        } else if file_type.is_file()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_cloud_conflict_name)
+        {
+            paths.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn is_cloud_conflict_name(name: &str) -> bool {
+    // Different sync tools use slightly different wording and capitalization.
+    // Match only the filename, not contents, so doctor can stay cheap and avoid
+    // echoing potentially sensitive memory text into diagnostics.
+    let lower = name.to_ascii_lowercase();
+    lower.contains("conflicted copy")
+        || name.contains("Conflict")
+        || lower.contains("sync-conflict")
 }
 
 fn collect_markdown_files(root: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {

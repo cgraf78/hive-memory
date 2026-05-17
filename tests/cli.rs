@@ -615,6 +615,38 @@ fn doctor_warns_for_pending_and_unbound_outbox_items() {
 }
 
 #[test]
+fn doctor_warns_for_cloud_sync_conflict_files() {
+    let dir = temp_dir("doctor-cloud-conflict");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    write_data_config(&config, &data, &personal);
+    init_store(&personal, "personal");
+    let conflict_dir = personal.join("inbox/notes/2026/05/16");
+    fs::create_dir_all(&conflict_dir).expect("conflict dir");
+    let conflict = conflict_dir.join("remembered sync-conflict.md");
+    fs::write(&conflict, "conflicting memory copy").expect("conflict file");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "doctor",
+            "--quick",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"warnings\": 1"))
+        .stdout(predicate::str::contains(
+            "store personal has 1 possible cloud sync conflict file(s)",
+        ))
+        .stdout(predicate::str::contains(
+            conflict.to_str().expect("utf8 conflict path"),
+        ));
+}
+
+#[test]
 fn doctor_full_warns_for_likely_secret_in_private_note_without_echoing_value() {
     let dir = temp_dir("doctor-note-secret");
     let config = dir.join("config.toml");
