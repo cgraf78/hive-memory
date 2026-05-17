@@ -3691,18 +3691,42 @@ fn resolve_agent_id(explicit: Option<String>) -> Option<String> {
     explicit.or_else(|| std::env::var("HIVE_MEMORY_AGENT_ID").ok())
 }
 
+/// Query the OS for the current machine's hostname via syscall.
+///
+/// On Unix this calls `gethostname(2)` directly. On other platforms it falls
+/// back to the `COMPUTERNAME` environment variable, which Windows sets as a
+/// genuine system variable (not shell-specific).
+#[cfg(unix)]
+fn system_hostname() -> Option<String> {
+    // POSIX requires HOST_NAME_MAX >= 255; 256 bytes covers the null terminator.
+    let mut buf = vec![0u8; 256];
+    // SAFETY: buf is valid for buf.len() bytes and outlives this call.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8(buf[..end].to_vec())
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+#[cfg(not(unix))]
+fn system_hostname() -> Option<String> {
+    std::env::var("COMPUTERNAME").ok()
+}
+
 /// Resolve the host label written into memory metadata.
 ///
-/// `auto` intentionally stays lightweight here. A richer machine identity can
-/// be configured explicitly without making every hook pay for hostname probes.
+/// When `host_id` is `"auto"` the OS hostname is queried directly via
+/// `gethostname(2)` on Unix, avoiding reliance on shell-exported variables
+/// like `$HOSTNAME` that are not guaranteed to be present in subprocess
+/// environments.
 fn resolve_host_id(config: &Config) -> String {
     if config.host_id != "auto" {
         return config.host_id.clone();
     }
-
-    std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "unknown-host".to_owned())
+    system_hostname().unwrap_or_else(|| "unknown-host".to_owned())
 }
 
 fn validate_secret_write(

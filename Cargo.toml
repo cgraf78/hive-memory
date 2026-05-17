@@ -12,6 +12,9 @@ warnings = "deny"
 name = "hm"
 path = "src/main.rs"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dependencies]
 anyhow = "1.0.100"
 clap = { version = "4.5.53", features = ["derive"] }
