@@ -1307,6 +1307,84 @@ fn doctor_full_warns_for_event_declaring_missing_note() {
 }
 
 #[test]
+fn doctor_full_warns_for_unclaimed_project_memory() {
+    let dir = temp_dir("doctor-unclaimed-project");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    write_data_config(&config, &data, &personal);
+    init_store(&personal, "personal");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--project-id",
+            "orphan-project",
+            "--text",
+            "Project-specific memory.",
+        ])
+        .assert()
+        .success();
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "doctor",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"warnings\": 1"))
+        .stdout(predicate::str::contains(
+            "project memory references unclaimed project_id orphan-project",
+        ));
+}
+
+#[test]
+fn doctor_full_accepts_project_memory_claimed_by_alias() {
+    let dir = temp_dir("doctor-claimed-project");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    write_data_config(&config, &data, &personal);
+    init_store(&personal, "personal");
+    let project_dir = personal.join("memories/projects/current-project");
+    fs::create_dir_all(&project_dir).expect("project dir");
+    fs::write(
+        project_dir.join("aliases.toml"),
+        "schema_version = 1\nproject_id = \"current-project\"\naliases = [\"old-project\"]\n",
+    )
+    .expect("aliases");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--project-id",
+            "old-project",
+            "--text",
+            "Migrated project memory.",
+        ])
+        .assert()
+        .success();
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "doctor",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"warnings\": 0"));
+}
+
+#[test]
 fn doctor_full_warns_for_likely_secret_in_private_note_without_echoing_value() {
     let dir = temp_dir("doctor-note-secret");
     let config = dir.join("config.toml");

@@ -7,7 +7,8 @@
 
 use crate::curated::CuratedFile;
 use crate::index::IndexEntry;
-use crate::{note, visibility};
+use crate::{note, project, visibility};
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{self, Display};
 use std::fs;
@@ -80,6 +81,13 @@ pub enum SearchError {
         /// Original error rendered for diagnostics.
         message: String,
     },
+    /// Project alias metadata could not be read.
+    ProjectAlias {
+        /// Alias file or directory path that failed.
+        path: PathBuf,
+        /// Original error rendered for diagnostics.
+        message: String,
+    },
 }
 
 impl Display for SearchError {
@@ -99,6 +107,13 @@ impl Display for SearchError {
                     path.display()
                 )
             }
+            Self::ProjectAlias { path, message } => {
+                write!(
+                    f,
+                    "failed to read project aliases {}: {message}",
+                    path.display()
+                )
+            }
         }
     }
 }
@@ -112,7 +127,7 @@ impl From<crate::curated::CuratedError> for SearchError {
                 Self::Curated { path, message }
             }
             crate::curated::CuratedError::ProjectAlias { path, message } => {
-                Self::Curated { path, message }
+                Self::ProjectAlias { path, message }
             }
         }
     }
@@ -130,6 +145,7 @@ pub fn search(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
     if query.is_empty() {
         return Err(SearchError::EmptyQuery);
     }
+    let project_ids = project_filter_ids(input.store_root, input.project_id)?;
 
     let mut hits = Vec::new();
     if curated_source_allowed(input.sources) {
@@ -156,7 +172,7 @@ pub fn search(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
         if !scope_allowed(entry, input.scopes) {
             continue;
         }
-        if !project_allowed(entry, input.project_id) {
+        if !project_allowed(entry, project_ids.as_ref()) {
             continue;
         }
         if !visibility::audience_allows(entry, input.agent_id) {
@@ -223,16 +239,45 @@ fn curated_scope_allowed(candidate: &CuratedFile, scopes: &[String]) -> bool {
     scopes.is_empty() || scopes.iter().any(|scope| scope == &candidate.scope)
 }
 
-fn project_allowed(entry: &IndexEntry, project_id: Option<&str>) -> bool {
+fn project_filter_ids(
+    store_root: &Path,
+    project_id: Option<&str>,
+) -> Result<Option<BTreeSet<String>>, SearchError> {
+    // Search needs the same project-identity continuity as prompt context:
+    // indexed notes keep their original project_id, while aliases declare that
+    // old and current ids should be queried as one logical project.
+    project_id
+        .map(|project_id| {
+            project::related_project_ids(store_root, project_id).map_err(project_alias_error)
+        })
+        .transpose()
+}
+
+fn project_alias_error(err: project::ProjectError) -> SearchError {
+    match err {
+        project::ProjectError::Alias { path, message } => {
+            SearchError::ProjectAlias { path, message }
+        }
+        other => SearchError::ProjectAlias {
+            path: PathBuf::new(),
+            message: other.to_string(),
+        },
+    }
+}
+
+fn project_allowed(entry: &IndexEntry, project_ids: Option<&BTreeSet<String>>) -> bool {
     if entry.scope != "project" {
         return true;
     }
 
-    let Some(project_id) = project_id else {
+    let Some(project_ids) = project_ids else {
         return false;
     };
 
-    entry.project_id.as_deref() == Some(project_id)
+    entry
+        .project_id
+        .as_deref()
+        .is_some_and(|project_id| project_ids.contains(project_id))
 }
 
 fn occurrence_count(body: &str, query: &str) -> usize {
@@ -413,6 +458,31 @@ mod tests {
             options: options(),
         })
         .expect("write memory");
+    }
+
+    fn write_project_record(root: &Path, body: &str, project_id: &str) {
+        memory::write_record(memory::WriteRecordInput {
+            root,
+            manifest: &manifest(),
+            entry_kind: note::EntryKind::Remember,
+            created_at: timestamp(1_778_946_153),
+            agent_id: "codex".to_owned(),
+            host_id: "taylor".to_owned(),
+            user_id: "chris".to_owned(),
+            session_id: None,
+            scope: "project".to_owned(),
+            confidence: note::Confidence::High,
+            body: body.to_owned(),
+            project_id: Some(project_id.to_owned()),
+            subject: None,
+            tags: Vec::new(),
+            audience: Vec::new(),
+            source_kind: None,
+            source_ref: None,
+            write_event: true,
+            options: options(),
+        })
+        .expect("write project memory");
     }
 
     fn entries(root: &Path, cache: &Path) -> Vec<IndexEntry> {
@@ -688,6 +758,38 @@ mod tests {
                 "memories/projects/proj-old/MEMORY.md"
             ]
         );
+    }
+
+    #[test]
+    fn search_follows_project_aliases_for_indexed_notes() {
+        let dir = temp_dir("indexed-project-alias");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        fs::create_dir_all(root.join("memories/projects/proj-current")).expect("current dir");
+        fs::write(
+            root.join("memories/projects/proj-current/aliases.toml"),
+            "schema_version = 1\nproject_id = \"proj-current\"\naliases = [\"proj-old\"]\n",
+        )
+        .expect("aliases");
+        write_project_record(&root, "Old project remembered TOML.", "proj-old");
+        let sources = vec!["remembered".to_owned()];
+        let scopes = vec!["project".to_owned()];
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "toml",
+            scopes: &scopes,
+            sources: &sources,
+            include_inbox: false,
+            agent_id: None,
+            project_id: Some("proj-current"),
+            limit: 20,
+        })
+        .expect("search");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entry.project_id.as_deref(), Some("proj-old"));
     }
 
     #[test]

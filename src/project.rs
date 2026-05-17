@@ -8,6 +8,7 @@
 use crate::{id, write};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{self, Display};
 use std::fs;
@@ -438,6 +439,88 @@ pub fn add_alias(
     Ok(path)
 }
 
+/// Return every project id claimed by curated project metadata in one store.
+///
+/// A project directory claims its directory name even before an alias file
+/// exists. When `aliases.toml` exists, it also claims the canonical id inside
+/// the file plus every historical id listed there. Doctor uses this as the
+/// authoritative set for deciding whether project-scoped inbox notes are
+/// attached to a durable project identity or were produced from stale hints.
+pub fn claimed_project_ids(store_root: &Path) -> Result<BTreeSet<String>, ProjectError> {
+    let mut ids = BTreeSet::new();
+    for directory_id in project_directories(store_root)? {
+        ids.insert(directory_id.clone());
+        if let Some(aliases) = load_aliases(store_root, &directory_id)? {
+            ids.insert(aliases.project_id);
+            ids.extend(aliases.aliases);
+        }
+    }
+    Ok(ids)
+}
+
+/// Return all project ids related to an active project id by aliases.
+///
+/// Alias files model identity continuity, not a one-way redirect. Context and
+/// search therefore include both old and current ids when either side is
+/// active, so long-lived project memory survives repository renames while
+/// humans decide whether to move files or rewrite old note metadata.
+pub fn related_project_ids(
+    store_root: &Path,
+    project_id: &str,
+) -> Result<BTreeSet<String>, ProjectError> {
+    let mut ids = BTreeSet::from([project_id.to_owned()]);
+    for directory_id in project_directories(store_root)? {
+        let Some(aliases) = load_aliases(store_root, &directory_id)? else {
+            continue;
+        };
+        if aliases.project_id == project_id
+            || directory_id == project_id
+            || aliases.aliases.iter().any(|alias| alias == project_id)
+        {
+            ids.insert(directory_id);
+            ids.insert(aliases.project_id);
+            ids.extend(aliases.aliases);
+        }
+    }
+    Ok(ids)
+}
+
+fn project_directories(store_root: &Path) -> Result<Vec<String>, ProjectError> {
+    let root = store_root.join("memories/projects");
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(ProjectError::Alias {
+                path: root,
+                message: err.to_string(),
+            });
+        }
+    };
+
+    let mut ids = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| ProjectError::Alias {
+            path: root.clone(),
+            message: err.to_string(),
+        })?;
+        if !entry
+            .file_type()
+            .map_err(|err| ProjectError::Alias {
+                path: entry.path(),
+                message: err.to_string(),
+            })?
+            .is_dir()
+        {
+            continue;
+        }
+        if let Some(id) = entry.file_name().to_str() {
+            ids.push(id.to_owned());
+        }
+    }
+    Ok(ids)
+}
+
 struct Marker {
     root: PathBuf,
     project_id: String,
@@ -614,6 +697,38 @@ mod tests {
         assert_eq!(third, first);
         assert_eq!(loaded.project_id, "new-project");
         assert_eq!(loaded.aliases, vec!["old-a", "old-z"]);
+    }
+
+    #[test]
+    fn claimed_project_ids_include_directory_canonical_and_alias_ids() {
+        let dir = temp_dir("claimed-aliases");
+        let options = write::AtomicWriteOptions {
+            fsync: write::FsyncPolicy::Never,
+            ..write::AtomicWriteOptions::default()
+        };
+        add_alias(&dir, "old-project", "current-project", &options).expect("add alias");
+
+        let ids = claimed_project_ids(&dir).expect("claimed ids");
+
+        assert!(ids.contains("current-project"));
+        assert!(ids.contains("old-project"));
+    }
+
+    #[test]
+    fn related_project_ids_link_current_directory_and_old_ids() {
+        let dir = temp_dir("related-aliases");
+        let options = write::AtomicWriteOptions {
+            fsync: write::FsyncPolicy::Never,
+            ..write::AtomicWriteOptions::default()
+        };
+        add_alias(&dir, "old-project", "current-project", &options).expect("add alias");
+
+        let from_current = related_project_ids(&dir, "current-project").expect("related ids");
+        let from_old = related_project_ids(&dir, "old-project").expect("related ids");
+
+        assert_eq!(from_current, from_old);
+        assert!(from_current.contains("current-project"));
+        assert!(from_current.contains("old-project"));
     }
 
     #[test]

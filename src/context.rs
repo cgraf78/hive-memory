@@ -6,7 +6,8 @@
 
 use crate::curated::CuratedFile;
 use crate::index::IndexEntry;
-use crate::{note, visibility};
+use crate::{note, project, visibility};
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{self, Display};
 use std::fs;
@@ -119,6 +120,13 @@ pub enum ContextError {
         /// Parse error.
         message: String,
     },
+    /// Project alias metadata could not be read.
+    ProjectAlias {
+        /// Alias file or directory path that failed.
+        path: PathBuf,
+        /// Original error rendered for diagnostics.
+        message: String,
+    },
 }
 
 impl Display for ContextError {
@@ -129,6 +137,13 @@ impl Display for ContextError {
             }
             Self::ParseNote { path, message } => {
                 write!(f, "failed to parse note {}: {message}", path.display())
+            }
+            Self::ProjectAlias { path, message } => {
+                write!(
+                    f,
+                    "failed to read project aliases {}: {message}",
+                    path.display()
+                )
             }
         }
     }
@@ -143,7 +158,7 @@ impl From<crate::curated::CuratedError> for ContextError {
                 Self::ReadNote { path, message }
             }
             crate::curated::CuratedError::ProjectAlias { path, message } => {
-                Self::ReadNote { path, message }
+                Self::ProjectAlias { path, message }
             }
         }
     }
@@ -161,6 +176,7 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
     let mut markdown = header;
     let mut sections = Vec::new();
     let mut estimated_tokens = estimate_tokens(&markdown);
+    let project_ids = project_filter_ids(input.store_root, input.project_id)?;
 
     if curated_source_allowed(input.sources) {
         for curated in crate::curated::collect(input.store_root, input.project_id)? {
@@ -196,7 +212,7 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
         if !scope_allowed(entry, input.scopes) {
             continue;
         }
-        if !project_allowed(entry, input.project_id) {
+        if !project_allowed(entry, project_ids.as_ref()) {
             continue;
         }
         if !visibility::audience_allows(entry, input.agent_id) {
@@ -310,16 +326,45 @@ fn scope_allowed(entry: &IndexEntry, scopes: &[String]) -> bool {
     scopes.is_empty() || scopes.iter().any(|scope| scope == &entry.scope)
 }
 
-fn project_allowed(entry: &IndexEntry, project_id: Option<&str>) -> bool {
+fn project_filter_ids(
+    store_root: &Path,
+    project_id: Option<&str>,
+) -> Result<Option<BTreeSet<String>>, ContextError> {
+    // Project-scoped remembered notes use the id that was active at write time.
+    // Resolve the alias family once per assembly so old notes stay visible
+    // after repo renames without making each filter path reread metadata.
+    project_id
+        .map(|project_id| {
+            project::related_project_ids(store_root, project_id).map_err(project_alias_error)
+        })
+        .transpose()
+}
+
+fn project_alias_error(err: project::ProjectError) -> ContextError {
+    match err {
+        project::ProjectError::Alias { path, message } => {
+            ContextError::ProjectAlias { path, message }
+        }
+        other => ContextError::ProjectAlias {
+            path: PathBuf::new(),
+            message: other.to_string(),
+        },
+    }
+}
+
+fn project_allowed(entry: &IndexEntry, project_ids: Option<&BTreeSet<String>>) -> bool {
     if entry.scope != "project" {
         return true;
     }
 
-    let Some(project_id) = project_id else {
+    let Some(project_ids) = project_ids else {
         return false;
     };
 
-    entry.project_id.as_deref() == Some(project_id)
+    entry
+        .project_id
+        .as_deref()
+        .is_some_and(|project_id| project_ids.contains(project_id))
 }
 
 fn trust_for(entry_kind: note::EntryKind) -> TrustLevel {
@@ -689,6 +734,40 @@ mod tests {
             assemble_context(request).expect("context").sections.len(),
             1
         );
+    }
+
+    #[test]
+    fn context_follows_project_aliases_for_indexed_notes() {
+        let dir = temp_dir("indexed-project-alias");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        fs::create_dir_all(root.join("memories/projects/repo-current")).expect("project dir");
+        fs::write(
+            root.join("memories/projects/repo-current/aliases.toml"),
+            "schema_version = 1\nproject_id = \"repo-current\"\naliases = [\"repo-old\"]\n",
+        )
+        .expect("aliases");
+        write_record(TestRecord {
+            root: &root,
+            entry_kind: note::EntryKind::Remember,
+            scope: "project",
+            body: "Remembered before the repo rename.",
+            created_at: timestamp(1_778_946_153),
+            project_id: Some("repo-old"),
+            audience: Vec::new(),
+        });
+        let entries = entries(&root, &cache);
+        let scopes = vec!["project".to_owned()];
+        let sources = vec!["remembered".to_owned()];
+        let mut request = input(&root, &entries, &scopes, &sources);
+        request.project_id = Some("repo-current");
+
+        let output = assemble_context(request).expect("context");
+
+        assert_eq!(output.sections.len(), 1);
+        assert!(output
+            .markdown
+            .contains("Remembered before the repo rename."));
     }
 
     #[test]
