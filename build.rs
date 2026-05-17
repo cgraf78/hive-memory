@@ -3,6 +3,10 @@ use std::process::Command;
 const SCHEMA_VERSION: u32 = 1;
 
 fn main() {
+    // `hm --version` doubles as a support/debug artifact for agents. Include the
+    // store schema every time, and include a git revision when the binary is
+    // built from a checkout; packaged/source builds should still work without
+    // requiring `.git` to exist.
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs");
 

@@ -1855,6 +1855,9 @@ fn quarantine_file(
         fs::create_dir_all(parent)
             .map_err(|err| format!("failed to create quarantine directory: {err}"))?;
     }
+    // Keep repairs local and reversible: a rename inside the same store avoids
+    // copying memory contents through user-space buffers, while the destination
+    // path preserves enough original context for later manual recovery.
     fs::rename(path, &destination).map_err(|err| format!("failed to quarantine file: {err}"))?;
     Ok(destination)
 }
