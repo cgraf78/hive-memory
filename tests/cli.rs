@@ -190,6 +190,31 @@ fn stores_init_creates_manifest() {
     assert!(root.join("inbox/notes").is_dir());
 }
 
+#[cfg(unix)]
+#[test]
+fn stores_init_protects_private_root_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = temp_dir("stores-init-private-permissions").join("personal");
+    let mut cmd = cargo_bin_cmd!("hm");
+
+    cmd.args([
+        "stores",
+        "init",
+        "personal",
+        "--root",
+        root.to_str().expect("utf8 temp path"),
+    ])
+    .assert()
+    .success();
+
+    let mode = fs::metadata(&root)
+        .expect("store root metadata")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o700);
+}
+
 #[test]
 fn stores_init_rejects_unknown_sensitivity() {
     let root = temp_dir("stores-init-bad-sensitivity").join("personal");
@@ -673,6 +698,84 @@ fn doctor_warns_for_missing_required_store_dirs() {
         ))
         .stdout(predicate::str::contains(
             missing.to_str().expect("utf8 missing path"),
+        ));
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_warns_for_broad_private_store_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_dir("doctor-broad-permissions");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    write_data_config(&config, &data, &personal);
+    init_store(&personal, "personal");
+    fs::set_permissions(&personal, fs::Permissions::from_mode(0o755))
+        .expect("widen store root permissions");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "doctor",
+            "--quick",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"warnings\": 1"))
+        .stdout(predicate::str::contains(
+            "store personal root is accessible by group/other",
+        ))
+        .stdout(predicate::str::contains(
+            personal.to_str().expect("utf8 personal path"),
+        ));
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_uses_manifest_sensitivity_for_permission_warnings() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_dir("doctor-manifest-permissions");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+            sensitivity = "public"
+            "#,
+            data.display(),
+            personal.display()
+        ),
+    )
+    .expect("write config");
+    init_store_with_sensitivity(&personal, "personal", "secret");
+    fs::set_permissions(&personal, fs::Permissions::from_mode(0o755))
+        .expect("widen store root permissions");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "doctor",
+            "--quick",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("effective=secret"))
+        .stdout(predicate::str::contains(
+            "store personal root is accessible by group/other",
         ));
 }
 

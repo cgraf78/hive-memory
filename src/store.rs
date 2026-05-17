@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt::{self, Display};
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -350,7 +352,7 @@ pub fn init_store(options: &StoreInitOptions) -> Result<StoreManifest, StoreErro
         options.description.clone(),
         options.sensitivity,
     );
-    create_store_root(&options.root)?;
+    create_store_root(&options.root, options.sensitivity)?;
     write_readme(&options.root, &manifest)?;
     write_manifest_atomic(&options.root, &manifest)?;
     Ok(manifest)
@@ -482,12 +484,13 @@ fn sensitivity_rank(sensitivity: Sensitivity) -> u8 {
     }
 }
 
-fn create_store_root(root: &Path) -> Result<(), StoreError> {
+fn create_store_root(root: &Path, sensitivity: Sensitivity) -> Result<(), StoreError> {
     fs::create_dir_all(root).map_err(|err| StoreError::Io {
         action: "create store root",
         path: root.to_path_buf(),
         message: err.to_string(),
     })?;
+    protect_sensitive_root(root, sensitivity)?;
 
     for relative in CANONICAL_DIRS {
         let path = root.join(relative);
@@ -498,6 +501,27 @@ fn create_store_root(root: &Path) -> Result<(), StoreError> {
         })?;
     }
 
+    Ok(())
+}
+
+#[cfg(unix)]
+fn protect_sensitive_root(root: &Path, sensitivity: Sensitivity) -> Result<(), StoreError> {
+    if !matches!(sensitivity, Sensitivity::Private | Sensitivity::Secret) {
+        return Ok(());
+    }
+
+    // The root directory is the practical access boundary for the store. Set it
+    // explicitly instead of trusting umask so a freshly initialized private or
+    // secret hive does not immediately fail doctor on permissive systems.
+    fs::set_permissions(root, fs::Permissions::from_mode(0o700)).map_err(|err| StoreError::Io {
+        action: "set store root permissions",
+        path: root.to_path_buf(),
+        message: err.to_string(),
+    })
+}
+
+#[cfg(not(unix))]
+fn protect_sensitive_root(_root: &Path, _sensitivity: Sensitivity) -> Result<(), StoreError> {
     Ok(())
 }
 
@@ -707,7 +731,7 @@ mod tests {
             "018f5f57-bd9b-7d33-9e21-1f44f0c5a013".to_owned(),
             "2026-05-16T00:00:00Z".to_owned(),
         );
-        create_store_root(&root).expect("create root");
+        create_store_root(&root, Sensitivity::Secret).expect("create root");
         write_manifest_atomic(&root, &manifest).expect("write manifest");
         let config = StoreConfig {
             root: root.clone(),
@@ -747,7 +771,7 @@ mod tests {
             "018f5f57-bd9b-7d33-9e21-1f44f0c5a013".to_owned(),
             "2026-05-16T00:00:00Z".to_owned(),
         );
-        create_store_root(&root).expect("create root");
+        create_store_root(&root, Sensitivity::Private).expect("create root");
         write_manifest_atomic(&root, &manifest).expect("write manifest");
         let config = StoreConfig {
             root,

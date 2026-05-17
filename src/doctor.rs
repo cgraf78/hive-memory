@@ -108,6 +108,7 @@ pub fn run(input: DoctorInput<'_>) -> DoctorReport {
 
     check_stores(input.config, &mut checks);
     check_required_dirs(input.config, &mut checks);
+    check_sensitive_store_permissions(input.config, &mut checks);
     check_cloud_conflicts(input.config, &mut checks);
     check_stale_temp_files(input.config, &mut checks);
     check_project_bindings(input.config, &mut checks);
@@ -227,6 +228,86 @@ fn check_required_dirs(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
             ));
         }
     }
+}
+
+fn check_sensitive_store_permissions(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
+    for (store_name, store_config) in &config.stores {
+        if !is_sensitive(effective_store_sensitivity(store_config)) {
+            continue;
+        }
+
+        inspect_sensitive_store_permissions(store_name, store_config, checks);
+    }
+}
+
+fn effective_store_sensitivity(store_config: &config::StoreConfig) -> config::Sensitivity {
+    // Config can be stale while the manifest is still the store's own durable
+    // metadata. Use the stricter value so a misconfigured alias cannot suppress
+    // private/secret filesystem checks.
+    match store::read_manifest(&store_config.root) {
+        Ok(manifest) => {
+            store::stricter_sensitivity(store_config.sensitivity, manifest.store.sensitivity)
+        }
+        Err(_) => store_config.sensitivity,
+    }
+}
+
+fn is_sensitive(sensitivity: config::Sensitivity) -> bool {
+    matches!(
+        sensitivity,
+        config::Sensitivity::Private | config::Sensitivity::Secret
+    )
+}
+
+#[cfg(unix)]
+fn inspect_sensitive_store_permissions(
+    store_name: &str,
+    store_config: &config::StoreConfig,
+    checks: &mut Vec<DoctorCheck>,
+) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = &store_config.root;
+    let metadata = match fs::metadata(root) {
+        Ok(metadata) if metadata.is_dir() => metadata,
+        Ok(_) => return,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(err) => {
+            checks.push(warn(
+                format!("store.{store_name}.permissions"),
+                format!("failed to inspect store root permissions: {err}"),
+                vec![root.display().to_string()],
+            ));
+            return;
+        }
+    };
+
+    // Private/secret stores are not encrypted in v1. Owner-only root
+    // permissions are a basic local boundary that prevents accidental exposure
+    // through permissive umasks or copied directories.
+    if metadata.permissions().mode() & 0o077 == 0 {
+        checks.push(pass(
+            format!("store.{store_name}.permissions"),
+            format!("store {store_name} root is owner-only"),
+            vec![root.display().to_string()],
+        ));
+    } else {
+        checks.push(warn(
+            format!("store.{store_name}.permissions"),
+            format!(
+                "store {store_name} root is accessible by group/other; expected private/secret roots to be owner-only"
+            ),
+            vec![root.display().to_string()],
+        ));
+    }
+}
+
+#[cfg(not(unix))]
+fn inspect_sensitive_store_permissions(
+    _store_name: &str,
+    _store_config: &config::StoreConfig,
+    _checks: &mut Vec<DoctorCheck>,
+) {
 }
 
 fn check_stale_temp_files(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
