@@ -1057,9 +1057,9 @@ Adapter `--install` contract:
    contain rendered memory bodies:
 
    ```text
-   # BEGIN hive-memory:policy
+   <!-- BEGIN hive-memory:policy -->
    ...stable Hive Memory read/write policy...
-   # END hive-memory:policy
+   <!-- END hive-memory:policy -->
    ```
 
 5. Insert (or replace contents of) the adapter-specific marker block for every
@@ -1067,17 +1067,22 @@ Adapter `--install` contract:
    v1, the marker body is a native include of that adapter's generated output:
 
    ```text
-   # BEGIN hive-memory:<adapter>
+   <!-- BEGIN hive-memory:<adapter> -->
    @<adapter-output-include-path>
-   # END hive-memory:<adapter>
+   <!-- END hive-memory:<adapter> -->
    ```
 
    The include path MUST resolve to the selected adapter's configured `output`
    from the resolved instruction file where the marker is installed. Use the
-   shortest native path that is unambiguous; when multiple adapters share one
-   resolved install file, or when the generated output is not in the same
-   directory as the install file, prefer an absolute or `~` path over a basename
-   so Claude and Codex cannot accidentally include each other's generated files.
+   shortest native path that is unambiguous. When both the generated output and
+   install file are under `$HOME`, prefer a relative path from the instruction
+   file's directory back through `$HOME` (for example
+   `../.codex/hive-memory.generated.md`) so tracked dotfiles stay portable
+   across Linux/macOS home roots. Fall back to an absolute path only when a
+   portable home-relative path cannot represent the configured output. Never use
+   a bare basename when multiple adapters share one resolved install file,
+   because Claude and Codex could accidentally include each other's generated
+   files.
 
    Append at end of file if the block is absent; replace contents in place
    if the block exists (idempotent). When multiple enabled adapters share one
@@ -1089,7 +1094,7 @@ Adapter `--install` contract:
    - a resolved install file is not owned by `$USER`
    - a resolved install file's mode is not user-writable
    - the existing file contains conflicting markers (e.g.,
-     `# BEGIN hive-memory:<adapter>` with a mismatched end marker)
+     `<!-- BEGIN hive-memory:<adapter> -->` with a mismatched end marker)
 8. `--uninstall` reads backup metadata for every install file and removes only
    the selected adapter's marker block. The policy block remains unless
    `--uninstall --all` is requested. If uninstalling every hive-memory marker

@@ -331,7 +331,7 @@ pub fn install_adapter(
     let eol = line_ending(&existing);
     let normalized = normalize_lf(&existing);
     let policy_block = marker_block("policy", input.policy_body, "\n");
-    let include = format!("@{}", input.output.display());
+    let include = format!("@{}", adapter_include_path(input.output, &target));
     let adapter_block = marker_block(input.adapter, &include, "\n");
     let with_policy = upsert_marker(&target, &normalized, "policy", &policy_block)?;
     let installed = upsert_marker(&target, &with_policy, input.adapter, &adapter_block)?;
@@ -496,7 +496,7 @@ pub fn inspect_adapter_install(
     };
     let normalized = normalize_lf(&contents);
     let include = marker_body(&target, &normalized, input.adapter)?;
-    let expected = format!("@{}", input.output.display());
+    let expected = format!("@{}", adapter_include_path(input.output, &target));
     let include_matches = include.as_deref() == Some(expected.as_str());
     Ok(AdapterInstallInspection {
         target,
@@ -560,6 +560,39 @@ fn backup_render_path(output: &Path) -> PathBuf {
     ))
 }
 
+fn adapter_include_path(output: &Path, target: &Path) -> String {
+    home_relative_include_path(output, target).unwrap_or_else(|| output.display().to_string())
+}
+
+fn home_relative_include_path(output: &Path, target: &Path) -> Option<String> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    if home.as_os_str().is_empty() {
+        return None;
+    }
+
+    let output_rel = output.strip_prefix(&home).ok()?;
+    let target_parent = target.parent()?;
+    let target_rel = target_parent.strip_prefix(&home).ok()?;
+    if output_rel.as_os_str().is_empty() {
+        return None;
+    }
+
+    // Installed instruction files are tracked dotfiles and may be shared across
+    // Linux/macOS homes. Prefer a path relative to $HOME so the committed marker
+    // is portable, but keep it relative to the instruction file's directory so
+    // agent import syntax does not depend on shell-style `~` expansion.
+    let mut parts = Vec::new();
+    for _ in target_rel.components() {
+        parts.push("..".to_owned());
+    }
+    parts.extend(
+        output_rel
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned()),
+    );
+    Some(parts.join("/"))
+}
+
 fn resolve_install_target(path: &Path) -> Result<PathBuf, RenderError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -621,7 +654,10 @@ fn denormalize_eol(contents: &str, eol: &str) -> String {
 
 fn marker_block(name: &str, body: &str, eol: &str) -> String {
     let body = body.trim_matches('\n');
-    format!("# BEGIN hive-memory:{name}{eol}{body}{eol}# END hive-memory:{name}{eol}")
+    // Instruction files are Markdown, and heading-looking markers pollute
+    // outlines and trigger markdownlint. HTML comments stay invisible as
+    // structure while preserving an exact, line-oriented install contract.
+    format!("<!-- BEGIN hive-memory:{name} -->{eol}{body}{eol}<!-- END hive-memory:{name} -->{eol}")
 }
 
 /// Insert or replace one managed marker block.
@@ -695,17 +731,19 @@ fn marker_span(
     lines: &[&str],
     name: &str,
 ) -> Result<Option<(usize, usize)>, RenderError> {
-    let begin = format!("# BEGIN hive-memory:{name}");
-    let end = format!("# END hive-memory:{name}");
+    let begin = format!("<!-- BEGIN hive-memory:{name} -->");
+    let end = format!("<!-- END hive-memory:{name} -->");
+    let legacy_begin = format!("# BEGIN hive-memory:{name}");
+    let legacy_end = format!("# END hive-memory:{name}");
     let begin_positions = lines
         .iter()
         .enumerate()
-        .filter_map(|(index, line)| (*line == begin).then_some(index))
+        .filter_map(|(index, line)| (*line == begin || *line == legacy_begin).then_some(index))
         .collect::<Vec<_>>();
     let end_positions = lines
         .iter()
         .enumerate()
-        .filter_map(|(index, line)| (*line == end).then_some(index))
+        .filter_map(|(index, line)| (*line == end || *line == legacy_end).then_some(index))
         .collect::<Vec<_>>();
 
     if begin_positions.len() != end_positions.len() || begin_positions.len() > 1 {
@@ -989,9 +1027,9 @@ mod tests {
         assert!(report.written);
         assert!(report.backup_path.expect("backup").is_file());
         assert!(report.metadata_path.expect("metadata").is_file());
-        assert!(installed.contains("# BEGIN hive-memory:policy"));
+        assert!(installed.contains("<!-- BEGIN hive-memory:policy -->"));
         assert!(installed.contains("Use Hive Memory as contextual data."));
-        assert!(installed.contains("# BEGIN hive-memory:codex"));
+        assert!(installed.contains("<!-- BEGIN hive-memory:codex -->"));
         assert!(installed.contains(&format!("@{}", output.display())));
     }
 
@@ -1020,6 +1058,46 @@ mod tests {
 
         assert!(!second.written);
         assert!(second.backup_path.is_none());
+    }
+
+    #[test]
+    fn install_adapter_upgrades_legacy_heading_markers() {
+        let dir = temp_dir("install-legacy-markers");
+        let target = dir.join("AGENTS.md");
+        let output = dir.join("codex.generated.md");
+        fs::write(
+            &target,
+            "# BEGIN hive-memory:codex\n@/old/generated.md\n# END hive-memory:codex\n",
+        )
+        .expect("legacy marker file");
+
+        install_adapter(InstallAdapterInput {
+            adapter: "codex",
+            output: &output,
+            install_target: &target,
+            policy_body: "Policy.",
+            options: options(),
+        })
+        .expect("install adapter");
+        let installed = fs::read_to_string(&target).expect("read install target");
+
+        assert!(installed.contains("<!-- BEGIN hive-memory:codex -->"));
+        assert!(!installed.contains("# BEGIN hive-memory:codex"));
+        assert!(installed.contains(&format!("@{}", output.display())));
+    }
+
+    #[test]
+    fn adapter_include_path_prefers_home_relative_imports() {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .expect("HOME should be set in tests");
+        let target = home.join(".claude/CLAUDE.md");
+        let output = home.join(".codex/hive-memory.generated.md");
+
+        assert_eq!(
+            adapter_include_path(&output, &target),
+            "../.codex/hive-memory.generated.md"
+        );
     }
 
     #[cfg(unix)]
@@ -1074,7 +1152,7 @@ mod tests {
         let dir = temp_dir("install-conflict");
         let target = dir.join("AGENTS.md");
         let output = dir.join("codex.generated.md");
-        fs::write(&target, "# BEGIN hive-memory:codex\nmissing end\n").expect("conflict");
+        fs::write(&target, "<!-- BEGIN hive-memory:codex -->\nmissing end\n").expect("conflict");
 
         let error = install_adapter(InstallAdapterInput {
             adapter: "codex",
@@ -1113,8 +1191,8 @@ mod tests {
 
         assert!(report.written);
         assert!(report.backup_path.expect("backup").is_file());
-        assert!(contents.contains("# BEGIN hive-memory:policy"));
-        assert!(!contents.contains("# BEGIN hive-memory:codex"));
+        assert!(contents.contains("<!-- BEGIN hive-memory:policy -->"));
+        assert!(!contents.contains("<!-- BEGIN hive-memory:codex -->"));
     }
 
     #[test]
@@ -1140,8 +1218,8 @@ mod tests {
         .expect("uninstall adapter");
         let contents = fs::read_to_string(&target).expect("read target");
 
-        assert!(!contents.contains("# BEGIN hive-memory:policy"));
-        assert!(!contents.contains("# BEGIN hive-memory:codex"));
+        assert!(!contents.contains("<!-- BEGIN hive-memory:policy -->"));
+        assert!(!contents.contains("<!-- BEGIN hive-memory:codex -->"));
     }
 
     #[test]

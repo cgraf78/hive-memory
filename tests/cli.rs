@@ -3508,8 +3508,8 @@ fn render_install_adds_instruction_markers() {
         .stdout(predicate::str::contains("installed: true"));
 
     let instructions = fs::read_to_string(install_target).expect("read install target");
-    assert!(instructions.contains("# BEGIN hive-memory:policy"));
-    assert!(instructions.contains("# BEGIN hive-memory:codex"));
+    assert!(instructions.contains("<!-- BEGIN hive-memory:policy -->"));
+    assert!(instructions.contains("<!-- BEGIN hive-memory:codex -->"));
     assert!(instructions.contains(&format!("@{}", output.display())));
     assert!(!instructions.contains("Installed render memory."));
 }
@@ -3645,8 +3645,8 @@ fn render_uninstall_removes_adapter_marker() {
         .stdout(predicate::str::contains("output:").not());
 
     let instructions = fs::read_to_string(install_target).expect("read install target");
-    assert!(instructions.contains("# BEGIN hive-memory:policy"));
-    assert!(!instructions.contains("# BEGIN hive-memory:codex"));
+    assert!(instructions.contains("<!-- BEGIN hive-memory:policy -->"));
+    assert!(!instructions.contains("<!-- BEGIN hive-memory:codex -->"));
 }
 
 #[test]
