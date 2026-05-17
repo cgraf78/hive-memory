@@ -18,8 +18,6 @@ conflict, prefer this file for v1 behavior and update both documents deliberatel
 | search | yes | simple deterministic text search backed by local index |
 | local triage index | yes | rebuildable jsonl index in cache_dir; not full FTS |
 | context | yes | curated + remembered by default; raw inbox opt-in |
-| Claude render | yes | generated file for file-based integrations and debugging |
-| Codex render | yes | generated file for file-based integrations and debugging |
 | local outbox/flush | yes | required for laptop/offline ergonomics; data_dir, not state_dir |
 | `hm promote` / `hm inbox` | yes | curation workflow that bridges raw inbox to curated memory |
 | trust-boundary rendering | yes | source-labeled blocks; raw notes excluded by default |
@@ -28,7 +26,7 @@ conflict, prefer this file for v1 behavior and update both documents deliberatel
 | import claude-memory | deferred | useful migration, not core write path |
 | compact proposals | deferred | proposal-only after core commands work |
 | cross-host curated writes | deferred | v1 curation is single-user per store |
-| OpenClaw / Gemini adapters | deferred | after Claude/Codex stabilize |
+| OpenClaw / Gemini hooks | deferred | after Claude/Codex stabilize |
 | at-rest encryption | deferred | v1 documents the threat model honestly |
 | release artifacts/shdeps | required for v1 release | not required for first code milestone |
 
@@ -85,14 +83,13 @@ fsync = "best-effort"   # never|best-effort|required
 write_scope = "global"
 search_scopes = ["global", "project"]
 context_sources = ["curated", "remembered"] # curated|remembered|inbox|all
-render_scopes = ["global", "project"]
 event_sidecar = "always" # never|always
 hook_context_max_tokens = 4000
 context_cache_max_age = "7d"
 
 [agents.codex]
 default_store = "personal"
-read_stores = ["personal"]  # stores usable by search/context/render hooks
+read_stores = ["personal"]  # stores usable by search/context/hooks
 write_stores = ["personal"] # stores usable by remember/note
 allow_all_stores = false
 
@@ -103,9 +100,7 @@ write_stores = ["personal"]
 allow_all_stores = false
 
 [privacy]
-default_render_policy = "conservative" # conservative|configured-only
 allow_all_stores_flag = true
-warn_sensitive_broad_render = true
 secret_refuses_cloud_roots = true       # see Security and Privacy Model
 allow_secret_writes = false             # requires secret store + --allow-secret-write
 allow_hook_secret_writes = false        # non-interactive hooks stay safer by default
@@ -119,17 +114,6 @@ context_warm_p95_ms = 200
 context_cold_p95_ms = 500
 context_store_size_target = 5000  # notes; budget is calibrated against this size
 
-[adapters.claude]
-enabled = true
-stores = ["personal"]
-scopes = ["global", "project"]
-output = "${HOME}/.claude/hive-memory.generated.md"
-
-[adapters.codex]
-enabled = true
-stores = ["personal"]
-scopes = ["global", "project"]
-output = "${HOME}/.codex/hive-memory.generated.md"
 ```
 
 Validation rules:
@@ -152,13 +136,12 @@ Validation rules:
   configured store aliases. Missing agent entries resolve to the global
   `default_store` with `read_stores = [default_store]` and
   `write_stores = [default_store]`, which preserves simple single-store installs.
-- enabled adapters require `output`.
 - local override config may replace scalar values and merge tables.
 - CLI flags and environment variables override merged config, not source files.
 
 Why this shape: humans get one readable TOML file; launchers get deterministic
-overrides; agents get explicit store affinity; adapters get explicit render
-allowlists; and future schema migration has an obvious version field.
+overrides; agents get explicit store affinity; and future schema migration has
+an obvious version field.
 
 ### Store Manifest Schema
 
@@ -523,10 +506,10 @@ Comparison (search, context filtering, alias matching) MUST normalize both
 sides. `hm doctor --fix` rewrites non-normalized paths in a safe quarantine
 step rather than mutating canonical files.
 
-Absolute paths to user code (e.g. `project_path`) are sensitive metadata and
-are excluded from `hm render` output by default. Adapters MUST set the explicit
-`include_paths = true` capability if they want absolute paths rendered (none
-do in v1).
+Absolute paths to user code (e.g. `project_path`) are sensitive metadata.
+Context output includes only the path hints needed for project disambiguation
+and should keep raw absolute paths out of durable memory unless explicitly
+written by the user/agent.
 
 ### Local State, Cache, and Data
 
@@ -550,7 +533,7 @@ State dir contents (ephemeral, OK to lose):
 
 ```text
 locks/                  # local process locks (fcntl/flock)
-runs/                   # last render/flush/doctor metadata and session receipts
+runs/                   # last flush/doctor metadata and session receipts
 context-cache/           # last successful hook context per agent/project/store
 quarantine/             # safe quarantine for stale temps/conflicts
 ```
@@ -560,7 +543,6 @@ Cache dir contents (rebuildable, safe to delete):
 ```text
 indexes/                # local triage index (see below)
 search/                 # search index workspace
-renders/                # temporary render assembly
 ```
 
 Outbox item shape:
@@ -632,8 +614,7 @@ results:
   `hm doctor` to inspect and curate.
 - Install/update automation installs `hm`, materializes config, installs static
   agent guidance/hook wiring owned by dotfiles, and runs `hm doctor --quick`.
-  It may run `hm render --configured --quiet` for file-based integrations, but
-  agent instruction-file linkage is not a responsibility of the generic `hm`
+  Agent instruction-file linkage is not a responsibility of the generic `hm`
   binary.
 
 The lower-level commands `hm context --if-changed`, `hm refresh`, and `hm flush`
@@ -663,16 +644,13 @@ Store selection is a privacy boundary, not just a convenience default.
 - `--all-stores` is read-only. For humans, it expands to all configured stores
   allowed by privacy flags. For agents, it expands only to `read_stores` and is
   refused unless `agents.<id>.allow_all_stores = true`.
-- `adapters.<name>.stores` is a render allowlist, not the source of agent access
-  authority. When an adapter name matches an agent ID, its render stores MUST be
-  a subset of that agent's `read_stores`.
 - A named-store request outside the effective policy is exit `4`
   (`privacy_refusal`) rather than silently falling back to another store.
 
 General CLI behavior:
 
 - `--config PATH` selects config path.
-- `--store NAME` selects one active store for write/render commands and is a
+- `--store NAME` selects one active store for write commands and is a
   single-store shorthand for read/search/context commands.
 - `--stores a,b` selects multiple explicit store aliases for read/search/context
   commands.
@@ -696,8 +674,8 @@ General CLI behavior:
   detected secrets into public/internal/private stores.
 - `--include-inbox` opts read commands into raw inbox notes (excluded by default
   under the Trust Boundary model).
-- `--as-agent ID` declares the invoking adapter's agent identity for audience
-  filtering and write metadata. Launchers and hook adapters may provide
+- `--as-agent ID` declares the invoking agent identity for audience filtering
+  and write metadata. Launchers and hook adapters may provide
   `HIVE_MEMORY_AGENT_ID`; `--as-agent` wins when both are present.
 - `--project PATH` provides the project path hint for project-scoped commands.
   Launchers and hook adapters should provide the best available active file,
@@ -722,7 +700,7 @@ receipt-aware refresh, and memory-pending state. Low-level primitives such as
 debugging and direct agent commands, but hook scripts should not orchestrate
 them by default. Any design that requires hooks to parse config, inspect store
 manifests, compute project IDs, manage cache files, detect prompt intent, or
-sequence flush/render manually belongs in `hm` instead.
+sequence flush/index refresh manually belongs in `hm` instead.
 
 JSON error shape:
 
@@ -754,14 +732,12 @@ Stable `--json` success field sets. Fields are mandatory unless explicitly noted
   `cache_created_at` is `null` for fresh context, and each section contains
   `{ "id", "store", "scope", "trust", "audience", "source_path",
   "estimated_tokens", "body" }`.
-- `hm render --json`:
-  `{ "adapter", "output_path", "written", "sha256", "backup_paths" }`.
 - `hm flush --json`:
   `{ "flushed", "skipped", "failed", "unbound", "pending", "items" }`, where
   each item contains `{ "id", "store", "state", "result", "message" }`.
 - `hm refresh --json`:
-  `{ "flushed", "skipped", "failed", "unbound", "pending", "rendered",
-  "render_skipped", "coalesced", "write_receipts", "refreshed" }`, where
+  `{ "indexes", "flushed", "skipped", "failed", "unbound", "pending",
+  "coalesced", "write_receipts", "refreshed" }`, where
   `refreshed = false` means no unrefreshed session writes were present and the
   command skipped expensive work.
 - `hm hook <event> --json`:
@@ -996,54 +972,6 @@ Output:
 - `--json` returns sections with source paths, audience, trust level, and
   estimated tokens, plus `emitted`.
 
-### `hm render`
-
-Purpose: render canonical memory into adapter-specific files.
-
-Examples:
-
-```bash
-hm render codex
-hm render claude --store personal
-hm render --configured --quiet
-hm render --upgrade-marker     # re-bless after intentional template changes
-```
-
-Behavior:
-
-- without adapter argument, render the active/default configured adapter only
-  if an adapter hint is present; otherwise require explicit adapter or
-  `--configured`.
-- `--configured` renders all enabled adapters from config.
-- render uses each adapter's explicit store/scope allowlist.
-- writes to temp file then atomic rename.
-- includes a generated-file header as the FIRST line of every rendered file:
-
-  ```text
-  <!-- hive-memory:generated v=1 sha256=<sha256-of-body-minus-header> -->
-  ```
-
-  The sha256 covers the body bytes after the header line, including the
-  terminating newline. `--upgrade-marker` re-blesses a renderer-template
-  change by writing a fresh marker without contents-comparison.
-
-Render-time safety:
-
-- Refuses broad sensitive-store render unless explicitly configured.
-- Refuses to write to a target that has a marker header whose recorded
-  sha256 does not match the file body (= a human edited the rendered file)
-  unless `--force --backup` is used.
-- Refuses to overwrite a target file that lacks the marker header at all.
-- Refuses to overwrite secret-store renders without `--include-secret`.
-
-Adapter visibility requirements:
-
-- The generic `hm` binary does not modify Claude/Codex instruction files.
-- Dotfiles or another host integration owns the static guidance that tells
-  agents how to use `hm` and the hook wiring that injects runtime context.
-- Rendered files are still useful for integrations that natively include files
-  or for humans debugging the exact context body an adapter would see.
-
 ### `hm flush`
 
 Purpose: flush and reconcile local hive-memory state.
@@ -1082,12 +1010,11 @@ HIVE_MEMORY_HOOK_ACTIVE=1 HIVE_MEMORY_AGENT_ID=codex hm refresh --quiet
 
 Behavior:
 
-- runs the post-write maintenance sequence hooks need: flush local outbox writes,
-  refresh affected indexes, then render configured adapters.
-- honors `HIVE_MEMORY_NO_RENDER=1` by skipping the render phase.
+- runs the post-write maintenance sequence hooks need: flush local outbox writes
+  and refresh affected indexes.
 - when `HIVE_MEMORY_HOOK_ACTIVE=1` and `HIVE_MEMORY_SESSION_ID` are set, reads
   session write receipts from `state_dir/runs/<session-id>/writes.jsonl` and
-  skips expensive flush/render work when no unrefreshed writes are present,
+  skips expensive flush/index work when no unrefreshed writes are present,
   unless `--force` is passed. This makes low-level integrations safe to call
   `hm refresh --quiet` broadly without implementing a fragile shell-command
   classifier; normal hooks should use `hm hook tool-complete`.
@@ -1096,18 +1023,18 @@ Behavior:
 - uses a local per-session/per-agent coalescing lock when
   `HIVE_MEMORY_HOOK_ACTIVE=1`; if another refresh is already running for the
   same session, returns success with `coalesced = true` instead of queueing more
-  work. Callers should not implement their own flush/render orchestration.
+  work. Callers should not implement their own flush/index orchestration.
 - treats temporarily unavailable store roots as non-fatal when outbox fallback is
   enabled and no privacy/store-identity refusal occurred. Pending or unbound
   items are reported in output and by `hm doctor`, not hidden.
 - returns non-zero for config errors, privacy refusals, manifest identity
-  conflicts, generated-file marker drift, or other conditions where continuing
-  could leak memory or overwrite user edits.
+  conflicts, or other conditions where continuing could leak memory or overwrite
+  user edits.
 
 Output:
 
 - human: compact one-line summary unless `--quiet`.
-- JSON: combined flush/render/coalescing summary.
+- JSON: combined flush/index/coalescing summary.
 
 ### `hm hook`
 
@@ -1280,8 +1207,7 @@ Checks (all surfaces at default verbosity unless noted):
 - default store exists.
 - store roots are reachable or outbox is enabled.
 - every configured agent has a valid `default_store`, `read_stores`, and
-  `write_stores`, and every adapter render store is within the matching agent's
-  read policy when an agent with the same ID exists.
+  `write_stores`.
 - local project store bindings point at configured stores.
 - manifests are present and schema-compatible; schema drift surfaces the
   exact `hm stores migrate` command.
@@ -1289,9 +1215,6 @@ Checks (all surfaces at default verbosity unless noted):
 - temp files older than TTL exist.
 - cloud conflict files exist (filename patterns: "conflicted copy",
   "Conflict", "sync-conflict", duplicate temp files older than TTL).
-- adapter outputs have valid `<!-- hive-memory:generated -->` markers with
-  matching sha256 (warns when drifted).
-- sensitive stores are not broadly rendered.
 - agent policies do not give broad store access by accident, e.g. work/secret
   stores in an agent's defaults without an explicit config entry.
 - remembered/note bodies do not contain likely secrets according to the current
@@ -1329,7 +1252,7 @@ Purpose: propose or perform promotion of raw notes into curated memory.
 Deferred v1 feature. Core v1 does not require `hm compact` to ship, and no hook
 or adapter may depend on it. Implementations may reserve the command name with a
 "deferred" message, but the stable command contract starts only when the
-proposal workflow is implemented after the core write/search/render path works.
+proposal workflow is implemented after the core write/search/context path works.
 V1 ships `hm promote` for manual single-note promotion instead.
 
 Future behavior:
@@ -1341,7 +1264,7 @@ Future behavior:
 ### `hm import claude-memory`
 
 Purpose: import existing Claude memory-sync content without making Claude the
-canonical architecture. This is deferred until the core write/search/render path
+canonical architecture. This is deferred until the core write/search/context path
 is stable.
 
 Behavior:
@@ -1580,31 +1503,32 @@ Principles:
 - Reads across stores are opt-in.
 - Agent/hook reads and writes are bounded by `[agents.<id>]` store affinity; an
   agent cannot silently hop into a named store outside its read/write policy.
-- Renders are configured allowlists, not global dumps.
+- Read/context commands are scoped by store policy, source filters, and memory
+  scope; they are not global dumps.
 - Store sensitivity is metadata used for warnings/refusals.
 - Write commands refuse likely secrets before writing canonical notes or durable
   outbox items. Secret-looking content may be written only with
   `--allow-secret-write` into a configured `secret` store whose config enables
   secret writes; agent hooks cannot bypass this by default.
 - Agent-private scope is enforced via the `audience` field (see Markdown Note
-  Schema). Default rendering excludes agent-private notes whose audience
-  does not include the active agent identity.
+  Schema). Context/search exclude agent-private notes whose audience does not
+  include the active agent identity.
 - Group/chat contexts should not receive personal memory unless explicitly
   configured for that surface.
-- `doctor` warns about broad render policies and unknown adapter outputs.
+- `doctor` warns about broad store policies and unknown/missing project claims.
 - `hm context` prints active store/scope/sources metadata so mistakes are
   visible.
 - `hm stores list --as-agent <id>` exposes the effective readable/writable store
   set so hooks and agents can debug affinity without parsing config.
-- Absolute paths, host IDs, and session IDs are sensitive; renderers omit
-  them by default unless an adapter opts in.
+- Absolute paths, host IDs, and session IDs are sensitive; context output should
+  omit them unless they are required for the selected command output.
 
 Recommended sensitivity levels:
 
-- `public`: safe to render broadly.
+- `public`: safe to read broadly.
 - `internal`: safe within a trusted team/family context.
 - `private`: default personal/work private memory.
-- `secret`: never rendered automatically; explicit search/read only; refuses
+- `secret`: never read automatically; explicit search/read only; refuses
   cloud-synced root paths.
 
 Cloud-sync refusal for `secret`:
@@ -1620,23 +1544,20 @@ Cloud-sync refusal for `secret`:
   override and produces a startup warning every time `hm` runs.
 
 Encryption note: v1 does NOT provide at-rest encryption. The `secret`
-sensitivity level relies on filesystem permissions, exclusion from cloud
-roots, and exclusion from adapter renders by default. Anyone with shell
-access on the host can still read these stores. Encryption is deferred to
-v2; the spec is honest about this rather than implying otherwise.
+sensitivity level relies on filesystem permissions, exclusion from cloud roots,
+and explicit opt-in for reads/writes. Anyone with shell access on the host can
+still read these stores. Encryption is deferred to v2; the spec is honest about
+this rather than implying otherwise.
 
 Refusal cases:
 
 - `--all-stores` with a `secret` store unless `--include-secret` is passed
   and config allows it.
-- rendering a `private`/`secret` store to an adapter without explicit allowlist.
 - writing to a store whose manifest identity conflicts with config unless
   `--force` is used. `--force` does NOT bypass identity checks on outbox
   flush; unbound outbox items require `hm flush --bind`.
 - if config and manifest sensitivity disagree, use the stricter sensitivity
   and emit a doctor warning.
-- overwriting a non-generated adapter output file (see `hm render` safety).
-
 Why this matters: memory tools are only helpful if users trust that context
 will not bleed across personal/work/client/public boundaries.
 
@@ -1669,17 +1590,15 @@ else may evolve in 1.x with changelog notes.
 Frozen at 1.0:
 
 - Config schema (every documented field, including `[stores]`, `[storage]`,
-  `[defaults]`, `[privacy]`, `[offline]`, `[performance]`, `[adapters.*]`).
+  `[defaults]`, `[privacy]`, `[offline]`, `[performance]`).
 - Manifest schema.
 - Markdown front matter schema (TOML, every required and optional field).
 - JSON event schema.
 - Outbox `meta.toml` schema.
 - Exit codes (`0` through `5`).
 - `--json` output shape per command (`hm remember`, `hm note`, `hm search`,
-  `hm context --json`, `hm render --json`, `hm flush`, `hm stores list/show`,
-  `hm doctor --json`).
+  `hm context --json`, `hm flush`, `hm stores list/show`, `hm doctor --json`).
 - The data-boundary block syntax used by `hm context`.
-- The generated-file header syntax used by `hm render`.
 
 Free to evolve in 1.x:
 
@@ -1693,8 +1612,8 @@ Free to evolve in 1.x:
   not "the budget is exactly 200ms").
 
 This narrow surface means v1 can ship before every implementation detail is
-settled, while still giving downstream consumers (hooks, dotfiles integrations,
-future adapters) something they can build against.
+settled, while still giving downstream consumers (hooks and dotfiles
+integrations) something they can build against.
 
 ## Release and CI Plan
 
@@ -1802,11 +1721,9 @@ Dotfiles update integration:
   materialize Hive Memory config, and keep Claude/Codex guidance plus hook
   wiring in place.
 - After installing or updating `hm`, the dotfiles merge hook runs
-  `hm doctor --quick`. It may also run `hm render --configured --quiet` when a
-  file-based integration wants generated adapter outputs.
-- Agent lifecycle hooks may refresh renders opportunistically, but v1 runtime
-  correctness depends on hook-provided context and static agent guidance, not on
-  `hm` mutating instruction files.
+  `hm doctor --quick`.
+- V1 runtime correctness depends on hook-provided context and static agent
+  guidance, not on `hm` mutating instruction files.
 
 ## Testing
 
@@ -1827,7 +1744,6 @@ Test categories per module:
 - secret-sensitivity + cloud-sync root path = exit-3 refusal.
 - missing `[agents.<id>]` resolves to conservative default-store-only policy.
 - invalid agent default/read/write store aliases fail validation.
-- adapter render stores must be within same-name agent read policy.
 
 ### Store affinity / projects
 
@@ -1981,7 +1897,7 @@ Test categories per module:
 - Hook entry points skip Hive Memory behavior when `HIVE_MEMORY_HOOK_ACTIVE=1`
   is already present from a parent hook process.
 - `hm hook tool-complete` / `hm refresh` coalesce overlapping refreshes for the
-  same session instead of queueing duplicate flush/render work.
+  same session instead of queueing duplicate flush/index work.
 - `hm hook stop` emits a reminder when `memory-pending` remains.
 - Stop does not write memories automatically.
 - Hook failures warn and continue unless a privacy/store-identity refusal occurs.
@@ -1995,9 +1911,7 @@ Test categories per module:
 - Flush idempotency on same-hash collision (mark flushed).
 - Flush refuses on different-hash collision (report conflict).
 - Flush respects manifest identity check; no `--force` bypass.
-- `hm refresh` runs flush, affected-index refresh, and configured render in that
-  order.
-- `hm refresh` honors `HIVE_MEMORY_NO_RENDER=1`.
+- `hm refresh` runs flush and affected-index refresh in that order.
 - `hm refresh` skips expensive work when hook/session write receipts have not
   advanced.
 - `hm refresh --force` runs maintenance even without unrefreshed receipts.
@@ -2072,7 +1986,7 @@ Risks to watch during implementation:
 - Project resolution drift. File, subdirectory, repo-root, monorepo subtree,
   no-git directory, symlink, and long-lived multi-project session cases all need
   dedicated tests.
-- Store-affinity bypasses. Every read/write/render path must call the shared
+- Store-affinity bypasses. Every read/write path must call the shared
   resolver and enforce agent read/write policy; no command should reimplement
   store selection.
 - Secret detector noise. The default detector should catch obvious credentials
@@ -2082,8 +1996,6 @@ Risks to watch during implementation:
   and project-switch context refresh should stay within the v1 latency budget.
 - Hook JSON action stability. `hm hook <event> --json` is an API for dotfiles and
   future adapters; action shapes should be versioned by tests before integration.
-- Render drift. Generated-file markers and adapter output checks must remain
-  idempotent across repeated dotfiles updates.
 
 When ready, create GitHub issues roughly in this order. Each carries a
 "Tests required" sub-list from the Testing catalog.
@@ -2113,41 +2025,34 @@ When ready, create GitHub issues roughly in this order. Each carries a
 8. **Local triage index**: jsonl per-store, rebuild on flush + lazy mtime
    refresh, cache_dir placement. Tests: shared with Search/Context.
 9. **Doctor diagnostics**: full checklist including normalization, cloud
-   conflict, render marker validation, audience absence, secret-on-cloud,
+   conflict, audience absence, secret-on-cloud,
    fsync-on-FUSE. Tests: Doctor.
 10. **Simple search**: substring scan over index + matched-line snippet
     read; pair collapse. Tests: Search.
 11. **Context assembler**: scope/store selection, curated+remembered defaults,
     data-boundary blocks, escape rules, byte/4 token approx, performance budget.
     Tests: Context assembler.
-12. **Adapter render framework**: generated-file header + sha256 marker,
-    atomic render writes, `--upgrade-marker`, refusal rules. Tests:
-    Adapter render framework.
-13. **Claude adapter render**: configured render output plus hook expectations.
-    Tests: Adapter render framework.
-14. **Codex adapter render**: configured render output plus hook expectations.
-    Tests: Adapter render framework.
-15. **Agent runtime hooks**: static memory guidance, SessionStart context
+12. **Agent runtime hooks**: static memory guidance, SessionStart context
     injection, `hm hook <event>` actions, prompt memory-intent reminders,
     memory-pending debt tracking, receipt-aware refresh, Stop reminders. Tests:
     Agent runtime hooks.
-16. **Local outbox and flush**: data_dir placement, unbound state, `--bind`
+13. **Local outbox and flush**: data_dir placement, unbound state, `--bind`
     workflow, outbox-archive snapshots. Tests: Outbox + flush.
-17. **Promote / inbox**: `hm promote`, `hm inbox`, single-user fcntl lock,
+14. **Promote / inbox**: `hm promote`, `hm inbox`, single-user fcntl lock,
     promotion events. Tests: Promote / inbox.
-18. **Trust boundary**: data-boundary block rendering, doctor patterns for
+15. **Trust boundary**: data-boundary block rendering, doctor patterns for
     instruction-language detection and length spikes. Tests: shared with
     Context assembler.
-19. **Import Claude memory**: append-only migration with provenance/dedupe.
+16. **Import Claude memory**: append-only migration with provenance/dedupe.
     Tests: pairing + idempotent re-runs.
-20. **Cloud-sync simulation test harness**: synthetic delay/conflict/rename
+17. **Cloud-sync simulation test harness**: synthetic delay/conflict/rename
     test framework used by `cloud-sync-sim` CI job. Tests: Cloud-sync
     simulation harness.
-21. **Performance benchmark suite**: CI-enforced p95 budget for `hm context`,
+18. **Performance benchmark suite**: CI-enforced p95 budget for `hm context`,
     `hm search`, `hm flush` on synthetic stores. Tests: budget enforcement.
-22. **Release automation**: target builds, archives, checksums, smoke install.
-23. **Dotfiles integration PR**: shdeps install + hooks + config template.
-24. **Compaction proposals**: dry-run/proposal flow, local locks, provenance.
+19. **Release automation**: target builds, archives, checksums, smoke install.
+20. **Dotfiles integration PR**: shdeps install + hooks + config template.
+21. **Compaction proposals**: dry-run/proposal flow, local locks, provenance.
 
 Keep each issue small enough to review independently. The early issues should
 avoid model calls entirely; `hm` needs a deterministic foundation before agents

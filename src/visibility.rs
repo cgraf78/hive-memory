@@ -1,7 +1,7 @@
 //! Shared visibility rules for indexed memory records.
 //!
-//! Search, context assembly, renderers, and hooks must agree on what an agent
-//! may see. Keeping the audience rule here prevents subtle drift where one path
+//! Search, context assembly, and hooks must agree on what an agent may see.
+//! Keeping the audience rule here prevents subtle drift where one path
 //! accidentally exposes an agent-private note another path would hide.
 
 use crate::index::IndexEntry;

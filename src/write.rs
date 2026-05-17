@@ -2,8 +2,8 @@
 //!
 //! Agent writes should create unique files and publish them with a final rename
 //! instead of appending to shared hot files. This module owns that write path so
-//! notes, JSON sidecars, rendered adapter files, and future importers share the
-//! same durability and collision behavior.
+//! notes, JSON sidecars, and future importers share the same durability and
+//! collision behavior.
 
 use crate::id::WriteIdContext;
 use std::error::Error;
@@ -134,9 +134,9 @@ pub fn write_unique(
 
 /// Atomically write bytes to a caller-selected final path, replacing it.
 ///
-/// This is for singleton files like manifests or rendered adapter outputs. It
-/// shares the same temp/write/fsync/rename behavior as unique inbox writes, but
-/// does not retry because the final path is part of the caller's contract.
+/// This is for singleton files like manifests. It shares the same
+/// temp/write/fsync/rename behavior as unique inbox writes, but does not retry
+/// because the final path is part of the caller's contract.
 pub fn write_atomic(
     final_path: &Path,
     contents: &[u8],

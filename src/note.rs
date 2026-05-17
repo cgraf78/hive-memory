@@ -258,7 +258,7 @@ impl NoteWriteInput {
 /// Render a Markdown note with TOML front matter.
 ///
 /// Rendering validates the front matter before producing bytes so callers do
-/// not accidentally persist malformed notes that future search/render commands
+/// not accidentally persist malformed notes that future search/context commands
 /// would have to special-case.
 pub fn render_note(note: &MarkdownNote) -> Result<String, NoteError> {
     validate_front_matter(&note.front_matter)?;

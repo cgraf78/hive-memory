@@ -524,127 +524,6 @@ fn stores_migrate_reports_no_v1_migrations() {
 }
 
 #[test]
-fn doctor_quick_reports_clean_adapter_output() {
-    let dir = temp_dir("doctor-clean-adapter");
-    let config = dir.join("config.toml");
-    let data = dir.join("data");
-    let personal = dir.join("personal");
-    let output = dir.join("generated").join("codex.md");
-    fs::write(
-        &config,
-        format!(
-            r#"
-            default_store = "personal"
-            data_dir = "{}"
-
-            [stores.personal]
-            root = "{}"
-
-            [adapters.codex]
-            enabled = true
-            stores = ["personal"]
-            scopes = ["global"]
-            output = "{}"
-            "#,
-            data.display(),
-            personal.display(),
-            output.display()
-        ),
-    )
-    .expect("write config");
-    init_store(&personal, "personal");
-
-    let mut render = cargo_bin_cmd!("hm");
-    render
-        .args([
-            "--config",
-            config.to_str().expect("utf8 config"),
-            "render",
-            "--configured",
-            "--quiet",
-        ])
-        .assert()
-        .success();
-
-    let mut doctor = cargo_bin_cmd!("hm");
-    doctor
-        .args([
-            "--config",
-            config.to_str().expect("utf8 config"),
-            "doctor",
-            "--quick",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("doctor: ok (errors=0 warnings=0)"));
-}
-
-#[test]
-fn doctor_warns_for_broad_sensitive_adapter_render() {
-    let dir = temp_dir("doctor-sensitive-render");
-    let config = dir.join("config.toml");
-    let personal = dir.join("personal");
-    let work = dir.join("work");
-    let output = dir.join("generated").join("codex.md");
-    fs::write(
-        &config,
-        format!(
-            r#"
-            default_store = "personal"
-
-            [stores.personal]
-            root = "{}"
-
-            [stores.work]
-            root = "{}"
-
-            [agents.codex]
-            default_store = "personal"
-            read_stores = ["personal", "work"]
-            write_stores = ["personal"]
-
-            [adapters.codex]
-            enabled = true
-            stores = ["personal", "work"]
-            scopes = ["global"]
-            output = "{}"
-            "#,
-            personal.display(),
-            work.display(),
-            output.display()
-        ),
-    )
-    .expect("write config");
-    init_store(&personal, "personal");
-    init_store(&work, "work");
-
-    cargo_bin_cmd!("hm")
-        .args([
-            "--config",
-            config.to_str().expect("utf8 config"),
-            "render",
-            "codex",
-        ])
-        .assert()
-        .success();
-
-    cargo_bin_cmd!("hm")
-        .args([
-            "--config",
-            config.to_str().expect("utf8 config"),
-            "doctor",
-            "--quick",
-            "--json",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("\"warnings\": 1"))
-        .stdout(predicate::str::contains(
-            "adapter codex broadly renders sensitive store(s): personal,work",
-        ));
-}
-
-#[test]
 fn doctor_warns_for_agent_all_store_access_with_sensitive_stores() {
     let dir = temp_dir("doctor-agent-broad-access");
     let config = dir.join("config.toml");
@@ -3311,202 +3190,10 @@ fn remember_project_hint_feeds_project_context() {
 }
 
 #[test]
-fn render_writes_adapter_output() {
-    let dir = temp_dir("render");
-    let config = dir.join("config.toml");
-    let personal = dir.join("personal");
-    let output = dir.join("generated").join("codex.md");
-    fs::write(
-        &config,
-        format!(
-            r#"
-            default_store = "personal"
-
-            [stores.personal]
-            root = "{}"
-
-            [adapters.codex]
-            enabled = true
-            stores = ["personal"]
-            scopes = ["global"]
-            output = "{}"
-            "#,
-            personal.display(),
-            output.display()
-        ),
-    )
-    .expect("write config");
-    init_store(&personal, "personal");
-
-    let mut remember = cargo_bin_cmd!("hm");
-    remember
-        .args([
-            "--config",
-            config.to_str().expect("utf8 config"),
-            "remember",
-            "--text",
-            "Rendered context includes TOML memory.",
-        ])
-        .assert()
-        .success();
-
-    let mut render = cargo_bin_cmd!("hm");
-    render
-        .args([
-            "--config",
-            config.to_str().expect("utf8 config"),
-            "render",
-            "codex",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("adapter: codex"))
-        .stdout(predicate::str::contains("written: true"));
-
-    let rendered = fs::read_to_string(output).expect("read render output");
-    assert!(rendered.starts_with("<!-- hive-memory:generated v=1 sha256="));
-    assert!(rendered.contains("Rendered context includes TOML memory."));
-}
-
-#[test]
-fn render_refuses_drifted_output_without_force_backup() {
-    let dir = temp_dir("render-drift");
-    let config = dir.join("config.toml");
-    let personal = dir.join("personal");
-    let output = dir.join("generated").join("codex.md");
-    fs::write(
-        &config,
-        format!(
-            r#"
-            default_store = "personal"
-
-            [stores.personal]
-            root = "{}"
-
-            [adapters.codex]
-            enabled = true
-            stores = ["personal"]
-            scopes = ["global"]
-            output = "{}"
-            "#,
-            personal.display(),
-            output.display()
-        ),
-    )
-    .expect("write config");
-    init_store(&personal, "personal");
-
-    let mut remember = cargo_bin_cmd!("hm");
-    remember
-        .args([
-            "--config",
-            config.to_str().expect("utf8 config"),
-            "remember",
-            "--text",
-            "Rendered drift memory.",
-        ])
-        .assert()
-        .success();
-
-    let mut first_render = cargo_bin_cmd!("hm");
-    first_render
-        .args([
-            "--config",
-            config.to_str().expect("utf8 config"),
-            "render",
-            "codex",
-        ])
-        .assert()
-        .success();
-    fs::write(
-        &output,
-        fs::read_to_string(&output).expect("read render") + "manual edit\n",
-    )
-    .expect("drift render output");
-
-    let mut second_render = cargo_bin_cmd!("hm");
-    second_render
-        .args([
-            "--config",
-            config.to_str().expect("utf8 config"),
-            "render",
-            "codex",
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "refusing to overwrite edited render file",
-        ));
-}
-
-#[test]
-fn render_json_reports_output() {
-    let dir = temp_dir("render-json");
-    let config = dir.join("config.toml");
-    let personal = dir.join("personal");
-    let output = dir.join("generated").join("codex.md");
-    fs::write(
-        &config,
-        format!(
-            r#"
-            default_store = "personal"
-
-            [stores.personal]
-            root = "{}"
-
-            [adapters.codex]
-            enabled = true
-            stores = ["personal"]
-            scopes = ["global"]
-            output = "{}"
-            "#,
-            personal.display(),
-            output.display()
-        ),
-    )
-    .expect("write config");
-    init_store(&personal, "personal");
-
-    cargo_bin_cmd!("hm")
-        .args([
-            "--config",
-            config.to_str().expect("utf8 config"),
-            "remember",
-            "--text",
-            "Rendered JSON memory.",
-        ])
-        .assert()
-        .success();
-
-    let render = cargo_bin_cmd!("hm")
-        .args([
-            "--config",
-            config.to_str().expect("utf8 config"),
-            "render",
-            "codex",
-            "--json",
-        ])
-        .output()
-        .expect("run render json");
-    assert!(render.status.success(), "render failed: {render:?}");
-    let report: serde_json::Value = serde_json::from_slice(&render.stdout).expect("render json");
-
-    assert_eq!(report["adapter"], "codex");
-    assert_eq!(report["output_path"], output.display().to_string());
-    assert_eq!(report["written"], true);
-    assert!(report["sha256"].as_str().expect("sha256").len() >= 32);
-    let object = report.as_object().expect("render json object");
-    assert_eq!(object.len(), 5);
-    let backup_paths = report["backup_paths"].as_array().expect("backups");
-    assert!(backup_paths.is_empty());
-}
-
-#[test]
-fn refresh_rebuilds_indexes_and_renders_enabled_adapters() {
+fn refresh_rebuilds_indexes() {
     let dir = temp_dir("refresh");
     let config = dir.join("config.toml");
     let personal = dir.join("personal");
-    let output = dir.join("generated").join("codex.md");
     fs::write(
         &config,
         format!(
@@ -3515,15 +3202,8 @@ fn refresh_rebuilds_indexes_and_renders_enabled_adapters() {
 
             [stores.personal]
             root = "{}"
-
-            [adapters.codex]
-            enabled = true
-            stores = ["personal"]
-            scopes = ["global"]
-            output = "{}"
             "#,
-            personal.display(),
-            output.display()
+            personal.display()
         ),
     )
     .expect("write config");
@@ -3536,7 +3216,7 @@ fn refresh_rebuilds_indexes_and_renders_enabled_adapters() {
             config.to_str().expect("utf8 config"),
             "remember",
             "--text",
-            "Refresh renders this memory.",
+            "Refresh indexes this memory.",
         ])
         .assert()
         .success();
@@ -3546,12 +3226,7 @@ fn refresh_rebuilds_indexes_and_renders_enabled_adapters() {
         .args(["--config", config.to_str().expect("utf8 config"), "refresh"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("refresh: indexes=1"))
-        .stdout(predicate::str::contains("rendered=1"))
-        .stdout(predicate::str::contains("written=1"));
-
-    let rendered = fs::read_to_string(output).expect("read render output");
-    assert!(rendered.contains("Refresh renders this memory."));
+        .stdout(predicate::str::contains("refresh: indexes=1"));
 }
 
 #[test]
@@ -3559,7 +3234,6 @@ fn refresh_json_reports_maintenance_summary() {
     let dir = temp_dir("refresh-json");
     let config = dir.join("config.toml");
     let personal = dir.join("personal");
-    let output = dir.join("generated").join("codex.md");
     fs::write(
         &config,
         format!(
@@ -3568,15 +3242,8 @@ fn refresh_json_reports_maintenance_summary() {
 
             [stores.personal]
             root = "{}"
-
-            [adapters.codex]
-            enabled = true
-            stores = ["personal"]
-            scopes = ["global"]
-            output = "{}"
             "#,
-            personal.display(),
-            output.display()
+            personal.display()
         ),
     )
     .expect("write config");
@@ -3598,51 +3265,8 @@ fn refresh_json_reports_maintenance_summary() {
         .stdout(predicate::str::contains("\"failed\": 0"))
         .stdout(predicate::str::contains("\"unbound\": 0"))
         .stdout(predicate::str::contains("\"pending\": 0"))
-        .stdout(predicate::str::contains("\"rendered\": 1"))
-        .stdout(predicate::str::contains("\"written\": 1"))
-        .stdout(predicate::str::contains("\"render_skipped\": false"))
         .stdout(predicate::str::contains("\"forced\": false"))
         .stdout(predicate::str::contains("\"refreshed\": true"));
-}
-
-#[test]
-fn refresh_honors_no_render_env() {
-    let dir = temp_dir("refresh-no-render");
-    let config = dir.join("config.toml");
-    let personal = dir.join("personal");
-    let output = dir.join("generated").join("codex.md");
-    fs::write(
-        &config,
-        format!(
-            r#"
-            default_store = "personal"
-
-            [stores.personal]
-            root = "{}"
-
-            [adapters.codex]
-            enabled = true
-            stores = ["personal"]
-            scopes = ["global"]
-            output = "{}"
-            "#,
-            personal.display(),
-            output.display()
-        ),
-    )
-    .expect("write config");
-    init_store(&personal, "personal");
-
-    let mut refresh = cargo_bin_cmd!("hm");
-    refresh
-        .env("HIVE_MEMORY_NO_RENDER", "1")
-        .args(["--config", config.to_str().expect("utf8 config"), "refresh"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("rendered=0"))
-        .stdout(predicate::str::contains("render_skipped=true"));
-
-    assert!(!output.exists());
 }
 
 #[test]
@@ -3651,7 +3275,6 @@ fn refresh_hook_mode_skips_without_unrefreshed_receipts() {
     let config = dir.join("config.toml");
     let personal = dir.join("personal");
     let state = dir.join("state");
-    let output = dir.join("generated").join("codex.md");
     fs::write(
         &config,
         format!(
@@ -3661,16 +3284,9 @@ fn refresh_hook_mode_skips_without_unrefreshed_receipts() {
 
             [stores.personal]
             root = "{}"
-
-            [adapters.codex]
-            enabled = true
-            stores = ["personal"]
-            scopes = ["global"]
-            output = "{}"
             "#,
             state.display(),
-            personal.display(),
-            output.display()
+            personal.display()
         ),
     )
     .expect("write config");
@@ -3688,13 +3304,9 @@ fn refresh_hook_mode_skips_without_unrefreshed_receipts() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"indexes\": 0"))
-        .stdout(predicate::str::contains("\"rendered\": 0"))
-        .stdout(predicate::str::contains("\"written\": 0"))
         .stdout(predicate::str::contains("\"write_receipts\": 0"))
         .stdout(predicate::str::contains("\"refreshed\": false"))
         .stdout(predicate::str::contains("\"coalesced\": false"));
-
-    assert!(!output.exists());
 }
 
 #[test]
@@ -3703,7 +3315,6 @@ fn refresh_force_ignores_hook_receipt_skip() {
     let config = dir.join("config.toml");
     let personal = dir.join("personal");
     let state = dir.join("state");
-    let output = dir.join("generated").join("codex.md");
     fs::write(
         &config,
         format!(
@@ -3713,16 +3324,9 @@ fn refresh_force_ignores_hook_receipt_skip() {
 
             [stores.personal]
             root = "{}"
-
-            [adapters.codex]
-            enabled = true
-            stores = ["personal"]
-            scopes = ["global"]
-            output = "{}"
             "#,
             state.display(),
-            personal.display(),
-            output.display()
+            personal.display()
         ),
     )
     .expect("write config");
@@ -3743,8 +3347,6 @@ fn refresh_force_ignores_hook_receipt_skip() {
         .stdout(predicate::str::contains("\"indexes\": 1"))
         .stdout(predicate::str::contains("\"forced\": true"))
         .stdout(predicate::str::contains("\"refreshed\": true"));
-
-    assert!(output.exists());
 }
 
 #[test]
@@ -3753,7 +3355,6 @@ fn refresh_hook_mode_consumes_unrefreshed_receipts() {
     let config = dir.join("config.toml");
     let personal = dir.join("personal");
     let state = dir.join("state");
-    let output = dir.join("generated").join("codex.md");
     fs::write(
         &config,
         format!(
@@ -3763,16 +3364,9 @@ fn refresh_hook_mode_consumes_unrefreshed_receipts() {
 
             [stores.personal]
             root = "{}"
-
-            [adapters.codex]
-            enabled = true
-            stores = ["personal"]
-            scopes = ["global"]
-            output = "{}"
             "#,
             state.display(),
-            personal.display(),
-            output.display()
+            personal.display()
         ),
     )
     .expect("write config");
@@ -3785,7 +3379,7 @@ fn refresh_hook_mode_consumes_unrefreshed_receipts() {
             config.to_str().expect("utf8 config"),
             "remember",
             "--text",
-            "Receipt-aware refresh should render this memory.",
+            "Receipt-aware refresh should index this memory.",
         ])
         .assert()
         .success();
@@ -3802,13 +3396,10 @@ fn refresh_hook_mode_consumes_unrefreshed_receipts() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"indexes\": 1"))
-        .stdout(predicate::str::contains("\"rendered\": 1"))
         .stdout(predicate::str::contains("\"write_receipts\": 1"))
         .stdout(predicate::str::contains("\"refreshed\": true"))
         .stdout(predicate::str::contains("\"coalesced\": false"));
 
-    let rendered = fs::read_to_string(output).expect("read render output");
-    assert!(rendered.contains("Receipt-aware refresh should render this memory."));
     let state_json =
         fs::read_to_string(state.join("runs/refresh-session/hook-state.json")).expect("state");
     assert!(state_json.contains("\"refreshed_receipts\": 1"));
@@ -3835,7 +3426,6 @@ fn refresh_hook_mode_coalesces_when_refresh_lock_is_held() {
     let config = dir.join("config.toml");
     let personal = dir.join("personal");
     let state = dir.join("state");
-    let output = dir.join("generated").join("codex.md");
     fs::write(
         &config,
         format!(
@@ -3845,16 +3435,9 @@ fn refresh_hook_mode_coalesces_when_refresh_lock_is_held() {
 
             [stores.personal]
             root = "{}"
-
-            [adapters.codex]
-            enabled = true
-            stores = ["personal"]
-            scopes = ["global"]
-            output = "{}"
             "#,
             state.display(),
-            personal.display(),
-            output.display()
+            personal.display()
         ),
     )
     .expect("write config");
@@ -3900,7 +3483,6 @@ fn refresh_hook_mode_coalesces_when_refresh_lock_is_held() {
         .stdout(predicate::str::contains("\"refreshed\": false"))
         .stdout(predicate::str::contains("\"coalesced\": true"));
 
-    assert!(!output.exists());
     assert!(!state.join("runs/refresh-session/hook-state.json").exists());
     lock.unlock().expect("unlock refresh lock");
 }

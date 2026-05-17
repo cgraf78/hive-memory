@@ -1,17 +1,15 @@
 //! `hm` command-line entry point.
 //!
 //! Keep this binary thin: the CLI is the user-facing shell contract, while
-//! reusable policy and data handling live in the library so hooks, adapters,
-//! and future embedded callers do not need to shell out to themselves.
+//! reusable policy and data handling live in the library so hooks and future
+//! embedded callers do not need to shell out to themselves.
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
-use hive_memory::config::{
-    AdapterConfig, Config, ConfigPaths, EventSidecarPolicy, Sensitivity, StoreConfig,
-};
+use hive_memory::config::{Config, ConfigPaths, EventSidecarPolicy, Sensitivity, StoreConfig};
 use hive_memory::{
     config, context as memory_context, curation, doctor, event, hook as memory_hook, id, index,
-    memory, note, outbox, path as memory_path, project, render, search, secret, store, write,
+    memory, note, outbox, path as memory_path, project, search, secret, store, write,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -64,9 +62,7 @@ enum Command {
     Search(SearchArgs),
     /// Assemble agent-readable memory context.
     Context(ContextArgs),
-    /// Render adapter memory include files.
-    Render(RenderArgs),
-    /// Refresh indexes and configured adapter outputs.
+    /// Refresh local outbox and indexes.
     Refresh(RefreshArgs),
     /// Flush local outbox writes to reachable stores.
     Flush(FlushArgs),
@@ -444,31 +440,6 @@ struct ContextArgs {
     json: bool,
 }
 
-/// Arguments for `hm render`.
-#[derive(Debug, Args)]
-struct RenderArgs {
-    /// Adapter id to render, such as codex or claude.
-    adapter: Option<String>,
-    /// Render every enabled configured adapter.
-    #[arg(long)]
-    configured: bool,
-    /// Refresh only the generated marker checksum for existing outputs.
-    #[arg(long)]
-    upgrade_marker: bool,
-    /// Overwrite a drifted generated output.
-    #[arg(long)]
-    force: bool,
-    /// Write a backup when forcing a drifted generated output.
-    #[arg(long)]
-    backup: bool,
-    /// Suppress per-adapter output.
-    #[arg(long)]
-    quiet: bool,
-    /// Emit machine-readable output.
-    #[arg(long)]
-    json: bool,
-}
-
 /// Arguments for `hm refresh`.
 #[derive(Debug, Args)]
 struct RefreshArgs {
@@ -578,7 +549,6 @@ fn run(cli: Cli) -> Result<()> {
         Some(Command::Note(args)) => run_write_memory(note::EntryKind::Note, args, context),
         Some(Command::Search(args)) => run_search(args, context),
         Some(Command::Context(args)) => run_context(args, context),
-        Some(Command::Render(args)) => run_render(args, context),
         Some(Command::Refresh(args)) => run_refresh(args, context),
         Some(Command::Flush(args)) => run_flush(args, context),
         Some(Command::Outbox(OutboxCommand::Flush(args))) => run_flush(args, context),
@@ -605,7 +575,6 @@ impl Cli {
             Some(Command::Remember(args)) | Some(Command::Note(args)) => args.json,
             Some(Command::Search(args)) => args.json,
             Some(Command::Context(args)) => args.json,
-            Some(Command::Render(args)) => args.json,
             Some(Command::Refresh(args)) => args.json,
             Some(Command::Flush(args)) | Some(Command::Outbox(OutboxCommand::Flush(args))) => {
                 args.json
@@ -646,9 +615,9 @@ impl Error for BackendUnavailable {}
 
 /// Privacy or safety policy refusal.
 ///
-/// These errors mean `hm` deliberately refused to read, write, or render data
-/// because doing so could cross an agent/store boundary, expose secret material,
-/// or create memory with unclear audience. Callers should not retry unchanged.
+/// These errors mean `hm` deliberately refused to read or write data because
+/// doing so could cross an agent/store boundary, expose secret material, or
+/// create memory with unclear audience. Callers should not retry unchanged.
 #[derive(Debug)]
 struct PrivacyRefusal {
     message: String,
@@ -2341,88 +2310,6 @@ fn rebuild_store_index(config: &Config, store_name: &str) -> Result<index::LoadI
     Ok(report)
 }
 
-fn run_render(args: RenderArgs, context: CliContext) -> Result<()> {
-    let config = load_config(context.config_path.as_deref())?;
-    let adapters = selected_adapters(&config, &args)?;
-    let options = write::AtomicWriteOptions {
-        fsync: config.storage.fsync.into(),
-        ..write::AtomicWriteOptions::default()
-    };
-    let configured = args.configured;
-    let mut json_outputs = Vec::new();
-
-    for adapter_name in adapters {
-        let adapter = &config.adapters[adapter_name.as_str()];
-        let Some(output) = adapter.output.as_ref() else {
-            anyhow::bail!("adapter {adapter_name} has no output configured");
-        };
-
-        let report = if args.upgrade_marker {
-            render::upgrade_marker(output, options.clone())?
-        } else {
-            let body = render_adapter_body(&config, adapter_name.as_str(), adapter, &context)?;
-            render::write_rendered_file(render::RenderFileInput {
-                output,
-                body: &body,
-                options: options.clone(),
-                force: args.force,
-                backup: args.backup,
-            })?
-        };
-
-        if args.json {
-            json_outputs.push(render_json_output(adapter_name.as_str(), &report));
-        } else if !args.quiet {
-            println!("adapter: {adapter_name}");
-            println!("output: {}", report.output.display());
-            println!("written: {}", report.written);
-            println!("sha256: {}", report.sha256);
-            if let Some(path) = &report.backup_path {
-                println!("backup: {}", path.display());
-            }
-        }
-    }
-
-    if args.json {
-        if configured {
-            println!("{}", serde_json::to_string_pretty(&json_outputs)?);
-        } else if let Some(output) = json_outputs.into_iter().next() {
-            println!("{}", serde_json::to_string_pretty(&output)?);
-        }
-    }
-
-    Ok(())
-}
-
-#[derive(Debug, Serialize)]
-struct RenderJsonOutput {
-    /// Adapter id that was rendered.
-    adapter: String,
-    /// Generated context include file for this adapter.
-    output_path: String,
-    /// Whether the generated output file changed.
-    written: bool,
-    /// SHA-256 of the generated body when rendering occurred.
-    sha256: String,
-    /// Backup files written by render operations.
-    backup_paths: Vec<String>,
-}
-
-fn render_json_output(adapter_name: &str, report: &render::RenderFileReport) -> RenderJsonOutput {
-    let mut backup_paths = Vec::new();
-    if let Some(path) = report.backup_path.as_ref() {
-        backup_paths.push(path.display().to_string());
-    }
-
-    RenderJsonOutput {
-        adapter: adapter_name.to_owned(),
-        output_path: report.output.display().to_string(),
-        written: report.written,
-        sha256: report.sha256.clone(),
-        backup_paths,
-    }
-}
-
 fn run_refresh(args: RefreshArgs, context: CliContext) -> Result<()> {
     let config = load_config(context.config_path.as_deref())?;
     let receipt_cursor = refresh_receipt_cursor(&config, &context)?;
@@ -2452,7 +2339,7 @@ fn run_refresh(args: RefreshArgs, context: CliContext) -> Result<()> {
         None
     };
 
-    let mut report = perform_refresh(&config, &context, args.force)?;
+    let mut report = perform_refresh(&config, args.force)?;
     if let Some(cursor) = receipt_cursor {
         report.write_receipts = cursor.unrefreshed;
         // `hm refresh` owns only maintenance idempotency. Memory-pending debt is
@@ -2478,16 +2365,13 @@ fn emit_refresh_report(report: &HookRefreshReport, args: &RefreshArgs) -> Result
 
     if !args.quiet {
         println!(
-            "refresh: indexes={} flushed={} skipped={} failed={} unbound={} pending={} rendered={} written={} render_skipped={} forced={} write_receipts={} refreshed={} coalesced={}",
+            "refresh: indexes={} flushed={} skipped={} failed={} unbound={} pending={} forced={} write_receipts={} refreshed={} coalesced={}",
             report.indexes,
             report.flushed,
             report.skipped,
             report.failed,
             report.unbound,
             report.pending,
-            report.rendered,
-            report.written,
-            report.render_skipped,
             report.forced,
             report.write_receipts,
             report.refreshed,
@@ -2579,14 +2463,10 @@ fn run_flush(args: FlushArgs, context: CliContext) -> Result<()> {
     Ok(())
 }
 
-fn perform_refresh(
-    config: &Config,
-    context: &CliContext,
-    forced: bool,
-) -> Result<HookRefreshReport> {
+fn perform_refresh(config: &Config, forced: bool) -> Result<HookRefreshReport> {
     // Refresh is the one maintenance command hooks need to call after writes.
-    // Flushing first makes any locally queued memory visible to the index/render
-    // path in the same cycle without teaching hook scripts outbox policy.
+    // Flushing first makes any locally queued memory visible to the index in
+    // the same cycle without teaching hook scripts outbox policy.
     let flush = outbox::flush(outbox::FlushInput {
         data_dir: &config.data_dir,
         stores: &config.stores,
@@ -2603,16 +2483,6 @@ fn perform_refresh(
         indexes += 1;
     }
 
-    // Hooks may need fresh indexes without touching agent instruction files.
-    // The env switch gives dotfiles hooks a simple safety valve while keeping
-    // refresh policy centralized in `hm` instead of in shell glue.
-    let render_skipped = std::env::var("HIVE_MEMORY_NO_RENDER").ok().as_deref() == Some("1");
-    let render_summary = if render_skipped {
-        RenderRefreshSummary::default()
-    } else {
-        refresh_render_outputs(config, context)?
-    };
-
     Ok(HookRefreshReport {
         indexes,
         flushed: flush.flushed,
@@ -2620,9 +2490,6 @@ fn perform_refresh(
         failed: flush.failed,
         unbound: flush.unbound,
         pending: flush.pending,
-        rendered: render_summary.rendered,
-        written: render_summary.written,
-        render_skipped,
         forced,
         write_receipts: 0,
         refreshed: true,
@@ -2642,9 +2509,6 @@ fn skipped_refresh_report(forced: bool) -> HookRefreshReport {
         failed: 0,
         unbound: 0,
         pending: 0,
-        rendered: 0,
-        written: 0,
-        render_skipped: std::env::var("HIVE_MEMORY_NO_RENDER").ok().as_deref() == Some("1"),
         forced,
         write_receipts: 0,
         refreshed: false,
@@ -2664,9 +2528,6 @@ fn coalesced_refresh_report(forced: bool, write_receipts: usize) -> HookRefreshR
         failed: 0,
         unbound: 0,
         pending: 0,
-        rendered: 0,
-        written: 0,
-        render_skipped: std::env::var("HIVE_MEMORY_NO_RENDER").ok().as_deref() == Some("1"),
         forced,
         write_receipts,
         refreshed: false,
@@ -2835,7 +2696,7 @@ fn run_hook_tool_complete(args: HookToolCompleteArgs, context: CliContext) -> Re
         let unrefreshed_receipts = receipts.len().saturating_sub(state.refreshed_receipts);
 
         if unrefreshed_receipts > 0 {
-            let mut report = perform_refresh(&config, &context, false)?;
+            let mut report = perform_refresh(&config, false)?;
             report.write_receipts = unrefreshed_receipts;
             refresh = Some(report);
 
@@ -2922,12 +2783,6 @@ struct HookRefreshReport {
     unbound: usize,
     /// Outbox items left for retry because their store root is unavailable.
     pending: usize,
-    /// Enabled adapter outputs considered for refresh.
-    rendered: usize,
-    /// Adapter outputs whose bytes changed.
-    written: usize,
-    /// Whether hook policy disabled render refresh for this invocation.
-    render_skipped: bool,
     /// Whether the caller requested a force refresh.
     forced: bool,
     /// New session write receipts consumed by this refresh.
@@ -3065,7 +2920,7 @@ fn context_selection_key_from_assembly(assembly: &CliContextAssembly) -> String 
 ///
 /// This key intentionally tracks selection identity, not memory file mtimes.
 /// New memory writes are handled by write receipts and refresh; this cursor is
-/// only for long-lived agents moving between projects, stores, or render policy.
+/// only for long-lived agents moving between projects, stores, or source policy.
 fn context_selection_key(
     agent_id: &str,
     stores: &[String],
@@ -3183,160 +3038,6 @@ fn memory_intent_reminder() -> &'static str {
 
 fn stop_memory_reminder() -> &'static str {
     "Hive Memory: durable memory intent is still pending. Before ending, write any lasting preference, decision, or project fact with `hm remember`."
-}
-
-#[derive(Debug, Default)]
-struct RenderRefreshSummary {
-    rendered: usize,
-    written: usize,
-}
-
-/// Refresh generated adapter outputs for all enabled adapters.
-///
-/// This uses the same render path as `hm render --configured`, but never forces
-/// drifted files. A refresh should keep agents current; it should not silently
-/// clobber user edits or turn hook-time work into install-time policy changes.
-fn refresh_render_outputs(config: &Config, context: &CliContext) -> Result<RenderRefreshSummary> {
-    let options = write::AtomicWriteOptions {
-        fsync: config.storage.fsync.into(),
-        ..write::AtomicWriteOptions::default()
-    };
-    let mut summary = RenderRefreshSummary::default();
-
-    for (adapter_name, adapter) in config
-        .adapters
-        .iter()
-        .filter(|(_name, adapter)| adapter.enabled)
-    {
-        let Some(output) = adapter.output.as_ref() else {
-            anyhow::bail!("adapter {adapter_name} has no output configured");
-        };
-        let body = render_adapter_body(config, adapter_name, adapter, context)?;
-        let report = render::write_rendered_file(render::RenderFileInput {
-            output,
-            body: &body,
-            options: options.clone(),
-            force: false,
-            backup: false,
-        })?;
-        summary.rendered += 1;
-        if report.written {
-            summary.written += 1;
-        }
-    }
-
-    Ok(summary)
-}
-
-/// Resolve the adapters targeted by one render command.
-///
-/// Explicit adapter renders may target disabled adapters for manual debugging.
-/// `--configured` intentionally narrows to enabled adapters because that path is
-/// used by refresh/update automation.
-fn selected_adapters(config: &Config, args: &RenderArgs) -> Result<Vec<String>> {
-    if args.configured {
-        let adapters = config
-            .adapters
-            .iter()
-            .filter(|(_name, adapter)| adapter.enabled)
-            .map(|(name, _adapter)| name.clone())
-            .collect::<Vec<_>>();
-        if adapters.is_empty() {
-            anyhow::bail!("no enabled adapters configured");
-        }
-        return Ok(adapters);
-    }
-
-    let Some(adapter) = args.adapter.as_ref() else {
-        anyhow::bail!("hm render requires an adapter or --configured");
-    };
-    if !config.adapters.contains_key(adapter) {
-        anyhow::bail!("unknown adapter: {adapter}");
-    }
-    Ok(vec![adapter.clone()])
-}
-
-/// Render one adapter's generated include body.
-///
-/// Adapter config owns the store allowlist and render scopes. The active CLI
-/// store may further narrow that list for debugging, but cannot expand past the
-/// adapter allowlist. This keeps render-time policy with `hm` rather than with
-/// agent-specific shell hooks.
-fn render_adapter_body(
-    config: &Config,
-    adapter_name: &str,
-    adapter: &AdapterConfig,
-    context: &CliContext,
-) -> Result<String> {
-    let stores = render_stores(config, adapter_name, adapter, context.store.as_deref())?;
-    let scopes = if adapter.scopes.is_empty() {
-        config.defaults.render_scopes.clone()
-    } else {
-        adapter.scopes.clone()
-    };
-    let sources = config.defaults.context_sources.clone();
-    let include_inbox = sources
-        .iter()
-        .any(|source| source == "inbox" || source == "all");
-    let project_id = std::env::var("HIVE_MEMORY_PROJECT_ID").ok();
-    let path_hint = std::env::var("HIVE_MEMORY_PROJECT").ok();
-    let mut body = String::new();
-
-    for store_name in stores {
-        resolve_store(
-            config,
-            Some(store_name.as_str()),
-            None,
-            Some(adapter_name),
-            StoreAccess::Read,
-        )?;
-        let store_config = &config.stores[store_name.as_str()];
-        let report = rebuild_store_index(config, store_name.as_str())?;
-        let output = memory_context::assemble_context(memory_context::ContextInput {
-            store_name: store_name.as_str(),
-            store_root: &store_config.root,
-            entries: &report.entries,
-            scopes: &scopes,
-            sources: &sources,
-            include_inbox,
-            agent_id: Some(adapter_name),
-            project_id: project_id.as_deref(),
-            path_hint: path_hint.as_deref(),
-            max_tokens: 4000,
-        })?;
-        body.push_str(&output.markdown);
-        if !body.ends_with('\n') {
-            body.push('\n');
-        }
-    }
-
-    Ok(body)
-}
-
-/// Resolve which stores an adapter may render for this invocation.
-///
-/// Empty adapter store lists are rejected here instead of being treated as
-/// "all stores"; broad renders should always be explicit in config.
-fn render_stores(
-    config: &Config,
-    adapter_name: &str,
-    adapter: &AdapterConfig,
-    explicit_store: Option<&str>,
-) -> Result<Vec<String>> {
-    if let Some(store) = explicit_store {
-        if !adapter.stores.is_empty() && !adapter.stores.iter().any(|allowed| allowed == store) {
-            anyhow::bail!("adapter {adapter_name} may not render store {store}");
-        }
-        if !config.stores.contains_key(store) {
-            anyhow::bail!("unknown store: {store}");
-        }
-        return Ok(vec![store.to_owned()]);
-    }
-
-    if adapter.stores.is_empty() {
-        anyhow::bail!("adapter {adapter_name} has no render stores configured");
-    }
-    Ok(adapter.stores.clone())
 }
 
 /// Print configured store inventory.

@@ -2,10 +2,10 @@
 //!
 //! `hm stores doctor` answers "is this store root healthy?" This module answers
 //! the broader operational question hooks and dotfiles update care about: can
-//! the configured stores, local project bindings, and adapter links be trusted
-//! before an agent relies on them?
+//! the configured stores and local project bindings be trusted before an agent
+//! relies on them?
 
-use crate::{config, event, note, outbox, project, render, secret, store, write};
+use crate::{config, event, note, outbox, project, secret, store, write};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -188,7 +188,6 @@ pub fn run(input: DoctorInput<'_>) -> DoctorReport {
     check_project_bindings(input.config, &mut checks);
     check_agent_policies(input.config, &mut checks);
     check_outbox(input.config, &mut checks);
-    check_adapters(input.config, input.quick, &mut checks);
     // Secret scanning is deliberately kept off the quick path. Hooks and
     // update-time health checks need cheap structural validation, while this
     // audit walks note content and is intended for explicit human review.
@@ -1367,86 +1366,6 @@ fn check_agent_policies(config: &config::Config, checks: &mut Vec<DoctorCheck>) 
                 Vec::new(),
             ));
         }
-    }
-}
-
-fn check_adapters(config: &config::Config, _quick: bool, checks: &mut Vec<DoctorCheck>) {
-    for (name, adapter) in config
-        .adapters
-        .iter()
-        .filter(|(_name, adapter)| adapter.enabled)
-    {
-        inspect_adapter_sensitive_render(config, name, adapter, checks);
-
-        let Some(output) = adapter.output.as_ref() else {
-            checks.push(error(
-                format!("adapter.{name}.output"),
-                format!("enabled adapter {name} has no output configured"),
-                Vec::new(),
-            ));
-            continue;
-        };
-        inspect_adapter_output(name, output, checks);
-    }
-}
-
-fn inspect_adapter_sensitive_render(
-    config: &config::Config,
-    name: &str,
-    adapter: &config::AdapterConfig,
-    checks: &mut Vec<DoctorCheck>,
-) {
-    // Single-store personal renders are the normal v1 setup. Treat a render as
-    // broad only when one adapter combines multiple stores into one agent
-    // include, because that is where sensitive context can cross store
-    // boundaries by accident.
-    if !config.privacy.warn_sensitive_broad_render || adapter.stores.len() <= 1 {
-        return;
-    }
-
-    let sensitive = adapter
-        .stores
-        .iter()
-        .filter_map(|store| {
-            let store_config = config.stores.get(store)?;
-            is_sensitive(effective_store_sensitivity(store_config)).then_some(store.as_str())
-        })
-        .collect::<Vec<_>>();
-    if sensitive.is_empty() {
-        checks.push(pass(
-            format!("adapter.{name}.sensitive-render"),
-            format!("adapter {name} broad render includes no sensitive stores"),
-            Vec::new(),
-        ));
-    } else {
-        checks.push(warn(
-            format!("adapter.{name}.sensitive-render"),
-            format!(
-                "adapter {name} broadly renders sensitive store(s): {}",
-                sensitive.join(",")
-            ),
-            Vec::new(),
-        ));
-    }
-}
-
-fn inspect_adapter_output(name: &str, output: &Path, checks: &mut Vec<DoctorCheck>) {
-    match render::inspect_rendered_file(output) {
-        Ok(report) if report.valid => checks.push(pass(
-            format!("adapter.{name}.output"),
-            format!("adapter {name} output marker is valid"),
-            vec![output.display().to_string()],
-        )),
-        Ok(_report) => checks.push(warn(
-            format!("adapter.{name}.output"),
-            format!("adapter {name} output is missing; run `hm render {name}`"),
-            vec![output.display().to_string()],
-        )),
-        Err(err) => checks.push(warn(
-            format!("adapter.{name}.output"),
-            format!("adapter {name} output is not a valid generated file: {err}"),
-            vec![output.display().to_string()],
-        )),
     }
 }
 

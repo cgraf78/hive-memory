@@ -7,8 +7,8 @@ It provides a durable shared memory substrate that works across agents, hosts,
 models, and storage backends, while staying ergonomic for both agents and humans.
 
 The project should avoid assumptions about one person, one agent, Claude Code,
-Google Drive, or any specific machine layout. Those are adapters/config, not core
-architecture.
+Google Drive, or any specific machine layout. Those belong in launchers, hooks,
+or config, not core architecture.
 
 The primary binary is `hm` for agent/human ergonomics. `hive-memory` may be
 installed as a compatibility alias/wrapper for discoverability, but docs and
@@ -37,24 +37,25 @@ crippling.
   nicely componentized. Prefer small, well-named pieces with clear boundaries
   over tangled or overly clever implementation.
 - **Single-source shared knowledge**: within a memory store, canonical memory has
-  one neutral home. Agent-specific files are rendered views, not competing
-  sources of truth. Multiple stores are allowed for intentional segmentation,
-  but each store remains internally single-source.
-- **Expose clean interfaces**: agents call `hm context`, `remember`,
-  `note`, `render`, and `doctor`; they do not reimplement path mapping, locking,
-  indexing, or scope filtering.
+  one neutral home. Agent-visible context is assembled on demand, not maintained
+  as competing generated files. Multiple stores are allowed for intentional
+  segmentation, but each store remains internally single-source.
+- **Expose clean interfaces**: agents call `hm context`, `remember`, `note`, and
+  `doctor`; they do not reimplement path mapping, locking, indexing, or scope
+  filtering.
 - **Compose from single-purpose parts**: storage backend, note writer, indexer,
-  renderer, compactor, and agent adapters are separate modules with narrow APIs.
-- **Consolidate after the second use**: start with Claude/Codex adapters, then
-  extract shared adapter helpers before adding more hosts. Avoid premature
-  framework abstractions, but do not tolerate three copies of the same logic.
+  context assembler, compactor, and hook integrations are separate modules with
+  narrow APIs.
+- **Consolidate after the second use**: start with Claude/Codex hook use, then
+  extract shared helpers before adding more hosts. Avoid premature framework
+  abstractions, but do not tolerate three copies of the same logic.
 - **Guard at async boundaries**: hooks, delayed compaction, background sync, and
   cloud-drive refresh all revalidate paths, locks, file hashes, and config before
   touching state.
-- **Prevent re-entrancy in polled loops**: sync, render, and compaction use local
-  run locks so overlapping hooks skip or coalesce instead of stacking work.
-- **Isolate by separation, not by crippling**: use scoped render outputs and
-  per-agent adapters instead of weakening the canonical store or stripping useful
+- **Prevent re-entrancy in polled loops**: refresh and compaction use local run
+  locks so overlapping hooks skip or coalesce instead of stacking work.
+- **Isolate by separation, not by crippling**: use scoped context assembly and
+  per-agent policy instead of weakening the canonical store or stripping useful
   capabilities from every consumer.
 - **Storage is configurable**: the backend memory root is a config value, not a
   hard-coded path. It may live in Google Drive, Dropbox, Syncthing, a network
@@ -65,19 +66,19 @@ crippling.
 - **Append-only writes first**: agents write new immutable remembered/note files
   rather than editing shared hot files. Curated memory is updated by explicit
   compaction.
-- **Adapters are edges**: Claude, Codex, OpenClaw, Gemini, etc. consume rendered
-  views. No agent owns the canonical memory format.
+- **Hook integrations are edges**: Claude, Codex, OpenClaw, Gemini, etc. consume
+  context/actions from `hm`. No agent owns the canonical memory format.
 - **Small sharp CLI**: agents should not reimplement filesystem rules. They call
-  `hm` for reads, writes, rendering, locking, and diagnostics.
+  `hm` for reads, writes, locking, and diagnostics.
 - **Human-legible by default**: a human can browse the memory root and understand
   it without running the CLI.
-- **Generated means disposable**: rendered files, search indexes, caches, and lock
-  state are local or rebuildable unless explicitly marked canonical.
+- **Generated means disposable**: search indexes, caches, and lock state are
+  local or rebuildable unless explicitly marked canonical.
 - **Scope and privacy are first-class**: personal/work/project/agent-private scopes
   are metadata, not naming conventions only.
 - **Minimal required human maintenance**: agents should handle routine capture,
-  sync, indexing, compaction proposals, and rendering. Humans should review or
-  steer important memory changes, not babysit the system daily.
+  flush, indexing, and compaction proposals. Humans should review or steer
+  important memory changes, not babysit the system daily.
 
 ## Non-Goals
 
@@ -156,8 +157,8 @@ Planned Rust stack:
 - Prefer `cargo-dist` for release archives/checksums unless it blocks target needs
 
 Keep the architecture modular but not framework-heavy: storage, writer, index,
-renderers, and compactor as clean modules under one binary crate at first. Split
-crates only after a second real consumer needs it.
+context assembly, and compactor as clean modules under one binary crate at
+first. Split crates only after a second real consumer needs it.
 
 ## Configuration
 
@@ -192,7 +193,6 @@ atomic_rename = "auto"
 write_scope = "global"
 search_scopes = ["global", "project"]
 context_sources = ["curated", "remembered"]
-render_scopes = ["global", "project"]
 event_sidecar = "always" # never|always
 hook_context_max_tokens = 4000
 context_cache_max_age = "7d"
@@ -210,24 +210,10 @@ write_stores = ["personal"]
 allow_all_stores = false
 
 [privacy]
-default_render_policy = "conservative"
 allow_all_stores_flag = true
-warn_sensitive_broad_render = true
 secret_refuses_cloud_roots = true
 allow_secret_writes = false
 allow_hook_secret_writes = false
-
-[adapters.claude]
-enabled = true
-stores = ["personal"]
-scopes = ["global", "project"]
-output = "${HOME}/.claude/hive-memory.generated.md"
-
-[adapters.codex]
-enabled = true
-stores = ["personal"]
-scopes = ["global", "project"]
-output = "${HOME}/.codex/hive-memory.generated.md"
 ```
 
 Important: store roots are always configurable. Google Drive is just one good
@@ -278,20 +264,10 @@ HIVE_MEMORY_SCOPE=global
 HIVE_MEMORY_HOOK_ACTIVE=1                     # hook-safe defaults/recursion guard
 ```
 
-Adapter/render env vars:
-
-```bash
-HIVE_MEMORY_ADAPTER=codex                     # render adapter hint, not access identity
-HIVE_MEMORY_RENDER_STORES=personal,work       # adapter render-store allowlist
-HIVE_MEMORY_INCLUDE_SCOPES=global,project
-HIVE_MEMORY_EXCLUDE_SCOPES=agent-private
-```
-
 Behavior toggles:
 
 ```bash
 HIVE_MEMORY_OFFLINE=1                         # write to local outbox only
-HIVE_MEMORY_NO_RENDER=1                       # skip render from hooks
 HIVE_MEMORY_LOG=warn                          # error|warn|info|debug|trace
 ```
 
@@ -419,11 +395,11 @@ inside work store” and keeps privacy boundaries enforceable.
 
   generated/
     .gitignore
-    # only explicit shared generated artifacts live here; default generated
-    # adapter output stays local and rebuildable
+    # only explicit shared generated artifacts live here; indexes and hook
+    # runtime state stay local and rebuildable
 ```
 
-Why this layout: curated memory, raw inbox entries, generated adapter output, and
+Why this layout: curated memory, raw inbox entries, generated artifacts, and
 local indexes have different lifecycles. `entry_kind = "remember"` distinguishes
 remembered agent/user facts from lower-confidence notes inside the inbox. Keeping
 lifecycles separate makes it obvious what humans edit, what agents append, what
@@ -673,11 +649,11 @@ Intended use by caller:
   hm status
   ```
 
-- **Install/update automation** verifies the local setup and may refresh
-  generated adapter outputs for file-based integrations:
+- **Install/update automation** verifies the local setup. Agent-facing context is
+  delivered by rules/hooks, so update automation should not maintain generated
+  context files:
 
   ```bash
-  hm render --configured --quiet
   hm doctor --quick
   ```
 
@@ -694,31 +670,23 @@ hm stores migrate [--dry-run]
 `hm sync` is renamed to `hm flush` to avoid confusion with cloud-drive sync.
 `hm outbox flush` is an alias.
 
-## Adapter Model
+## Agent Integration Model
 
-Adapters render canonical memory into the format each agent expects.
+Agent hosts integrate with Hive Memory through static instructions plus lifecycle
+hooks that call `hm`. This keeps `hm` vendor-neutral and avoids a parallel
+generated-file system that can drift from the canonical store.
 
-Benefit: each agent gets native-feeling context files, but the canonical store
-stays vendor-neutral. Adding a new agent should mean writing a renderer, not
-changing how memory is stored.
+Dotfiles or another host integration owns agent config files such as `CLAUDE.md`
+or `AGENTS.md`. Those files should teach the agent to use `hm`; the generic
+binary should not edit host-specific instruction files.
 
-Default v1 renders write generated files only. The generic `hm` binary does not
-edit adapter config files such as `CLAUDE.md` or `AGENTS.md`; those files are
-agent-host instructions owned by dotfiles or another integration. Dotfiles
-update should install static Hive Memory guidance and hook wiring so normal
-machine bootstrap keeps agent access automatic without baking dotfiles policy
-into `hm`.
+### Claude and Codex
 
-### Claude
-
-- Render a generated include file such as `~/.claude/hive-memory.generated.md`.
-- Optionally render project memories for Claude project directories.
-- Claude hooks call generic `hm`, not Claude-only sync code.
-
-### Codex
-
-- Render a generated include file such as `~/.codex/hive-memory.generated.md`.
-- Use existing Codex lifecycle hooks to refresh context and write notes.
+- Static top-level guidance tells the agent when to call `hm`.
+- Session/prompt/tool/stop hooks call `hm hook ... --json` and inject returned
+  context/actions.
+- Agents call the same generic `hm remember`, `hm note`, `hm search`, and
+  `hm context` commands humans can inspect.
 
 ### Runtime hooks
 
@@ -805,8 +773,7 @@ Merge hook behavior:
 1. ensure `hm` CLI is installed or available
 2. materialize config from template + local overrides
 3. run `hm doctor --quick`
-4. optionally run `hm render --configured --quiet` for file-based integrations
-5. rely on dotfiles-managed instruction files and hooks for automatic agent
+4. rely on dotfiles-managed instruction files and hooks for automatic agent
    access
 
 ## Backend Flexibility
@@ -1013,18 +980,16 @@ issue order lives in SPEC.md; the broad sequencing here is:
 5. Implement the local triage index in `cache/indexes/` and doctor diagnostics.
 6. Implement `hm search` and `hm context` (curated+remembered defaults,
    data-boundary blocks, performance budget).
-7. Implement adapter render framework (magic header + sha256 marker, backup, and
-   refusal rules), including Claude/Codex generated outputs.
-8. Implement agent runtime hook integration inside the existing dotfiles
+7. Implement agent runtime hook integration inside the existing dotfiles
    `agent-hook-*` scripts through `hm hook <event>`: SessionStart context
    injection, prompt memory-intent reminders, session write receipts,
    receipt-aware refresh, and Stop reminders.
-9. Implement local outbox under XDG_DATA_HOME, `hm flush` with unbound-state
+8. Implement local outbox under XDG_DATA_HOME, `hm flush` with unbound-state
    handling, `hm promote`, and `hm inbox`.
-10. Add trust-boundary doctor patterns, cloud-sync simulation harness, and
-    performance benchmark suite to CI.
-11. Wire dotfiles hooks; add release artifacts and shdeps install support.
-12. Defer `hm import claude-memory`, compaction proposals, OpenClaw adapter,
+9. Add trust-boundary doctor patterns, cloud-sync simulation harness, and
+   performance benchmark suite to CI.
+10. Wire dotfiles hooks; add release artifacts and shdeps install support.
+11. Defer `hm import claude-memory`, compaction proposals, OpenClaw adapter,
     cross-host curated writes, and at-rest encryption until core v1 stabilizes.
 
 ## Settled Decisions
@@ -1055,13 +1020,10 @@ issue order lives in SPEC.md; the broad sequencing here is:
 - Agent-private scope is enforced via an explicit `audience` field. Valid v1
   writes materialize the field; `--audience-writer-only` records the writer as
   the only audience.
-- Adapter render uses a magic-header + sha256 generated-file marker. Claude and
-  Codex generated outputs are render-only; dotfiles owns the static guidance and
-  hook wiring that make agent access automatic.
 - Runtime hooks provide the seamless path: SessionStart reads fresh context,
   `hm hook` refreshes context when long-lived sessions move across projects,
   prompt-submit records explicit memory intent, `hm remember`/`hm note` write
-  session receipts, `hm hook tool-complete` owns receipt-aware flush/render
+  session receipts, `hm hook tool-complete` owns receipt-aware flush/index
   maintenance, and Stop reminds without writing automatically.
 - Hooks run simple `hm hook <event>` commands; `hm` owns project binding lookup,
   store affinity, context cache fallback, prompt intent, memory-pending,

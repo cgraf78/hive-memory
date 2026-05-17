@@ -1,9 +1,9 @@
 //! Configuration loading and validation for `hm`.
 //!
 //! The config layer is a public contract for every higher-level workflow:
-//! commands, render adapters, and non-interactive agent hooks all need the same
-//! store-affinity and privacy decisions. Keep policy here instead of forcing
-//! hooks or adapters to rediscover context on their own.
+//! commands and non-interactive agent hooks all need the same store-affinity and
+//! privacy decisions. Keep policy here instead of forcing hooks to rediscover
+//! context on their own.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -29,7 +29,6 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "privacy",
     "offline",
     "performance",
-    "adapters",
 ];
 
 const STORE_KEYS: &[&str] = &["root", "expected_id", "description", "sensitivity"];
@@ -38,7 +37,6 @@ const DEFAULTS_KEYS: &[&str] = &[
     "write_scope",
     "search_scopes",
     "context_sources",
-    "render_scopes",
     "event_sidecar",
     "hook_context_max_tokens",
     "context_cache_max_age",
@@ -50,9 +48,7 @@ const AGENT_KEYS: &[&str] = &[
     "allow_all_stores",
 ];
 const PRIVACY_KEYS: &[&str] = &[
-    "default_render_policy",
     "allow_all_stores_flag",
-    "warn_sensitive_broad_render",
     "secret_refuses_cloud_roots",
     "allow_secret_writes",
     "allow_hook_secret_writes",
@@ -63,8 +59,6 @@ const PERFORMANCE_KEYS: &[&str] = &[
     "context_cold_p95_ms",
     "context_store_size_target",
 ];
-const ADAPTER_KEYS: &[&str] = &["enabled", "stores", "scopes", "output"];
-
 const CLOUD_ROOT_PREFIXES: &[&str] = &[
     "${HOME}/gdrive",
     "${HOME}/Google Drive",
@@ -138,8 +132,6 @@ pub struct Config {
     pub offline: OfflineConfig,
     /// Performance budgets used by benchmark and doctor tooling.
     pub performance: PerformanceConfig,
-    /// Render targets for agent-visible context files.
-    pub adapters: BTreeMap<String, AdapterConfig>,
 }
 
 /// Storage behavior from config.
@@ -193,8 +185,6 @@ pub struct DefaultsConfig {
     pub search_scopes: Vec<String>,
     /// Default source classes included in context.
     pub context_sources: Vec<String>,
-    /// Default scopes rendered into adapter-visible context.
-    pub render_scopes: Vec<String>,
     /// Whether `hm note` writes a JSON sidecar by default.
     pub event_sidecar: EventSidecarPolicy,
     /// Hook-mode context token budget.
@@ -329,18 +319,14 @@ pub struct EffectiveAgentPolicy {
     pub allow_all_stores: bool,
 }
 
-/// Privacy controls that affect rendering, hook writes, and secret stores.
+/// Privacy controls that affect hook writes and secret stores.
 ///
 /// The defaults are intentionally conservative around secrets while still
 /// keeping ordinary single-store setups simple.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrivacyConfig {
-    /// Default policy for rendering agent-visible context.
-    pub default_render_policy: String,
     /// Whether CLI users may explicitly opt into all-store operations.
     pub allow_all_stores_flag: bool,
-    /// Whether broad renders over sensitive stores should emit warnings.
-    pub warn_sensitive_broad_render: bool,
     /// Whether secret stores are rejected under common sync roots by default.
     pub secret_refuses_cloud_roots: bool,
     /// Whether any command may write secret-classified material.
@@ -403,23 +389,6 @@ pub struct PerformanceConfig {
     pub context_store_size_target: u32,
 }
 
-/// Render adapter configuration for an agent surface.
-///
-/// Adapters describe generated files such as Claude/Codex includes. They are
-/// separate from `AgentConfig` because rendering a context file and giving an
-/// agent write access to a store are related, but not identical, policy choices.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdapterConfig {
-    /// Whether this adapter participates in render operations.
-    pub enabled: bool,
-    /// Store aliases this adapter may render from.
-    pub stores: Vec<String>,
-    /// Memory scopes this adapter may expose.
-    pub scopes: Vec<String>,
-    /// Generated include file path.
-    pub output: Option<PathBuf>,
-}
-
 /// Non-fatal configuration diagnostics.
 ///
 /// These are warnings rather than errors so v1 can tolerate future config keys
@@ -444,8 +413,8 @@ impl Display for ConfigWarning {
 /// Fatal configuration failures.
 ///
 /// Errors here mean callers should not proceed with commands that rely on the
-/// config, because continuing would use an ambiguous store, unsafe secret
-/// policy, or invalid adapter target.
+/// config, because continuing would use an ambiguous store or unsafe secret
+/// policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
     /// TOML parsing or deserialization failed.
@@ -476,25 +445,6 @@ pub enum ConfigError {
         agent: String,
         /// Missing store alias.
         store: String,
-    },
-    /// Adapter policy references no configured store.
-    UnknownAdapterStore {
-        /// Adapter id owning the bad reference.
-        adapter: String,
-        /// Missing store alias.
-        store: String,
-    },
-    /// Adapter render policy exceeds the same-name agent read policy.
-    AdapterStoreOutsideAgentPolicy {
-        /// Adapter id that also names an agent policy.
-        adapter: String,
-        /// Store alias the adapter attempted to render.
-        store: String,
-    },
-    /// Enabled adapter has nowhere to render its include file.
-    EnabledAdapterMissingOutput {
-        /// Adapter id missing output.
-        adapter: String,
     },
     /// Secret store root points under a common cloud-sync location.
     SecretStoreOnCloudRoot {
@@ -527,16 +477,6 @@ impl Display for ConfigError {
             }
             Self::UnknownAgentStore { agent, store } => {
                 write!(f, "agents.{agent} references unknown store: {store}")
-            }
-            Self::UnknownAdapterStore { adapter, store } => {
-                write!(f, "adapters.{adapter} references unknown store: {store}")
-            }
-            Self::AdapterStoreOutsideAgentPolicy { adapter, store } => write!(
-                f,
-                "adapters.{adapter}.stores includes {store}, outside agents.{adapter}.read_stores"
-            ),
-            Self::EnabledAdapterMissingOutput { adapter } => {
-                write!(f, "enabled adapter {adapter} requires output")
             }
             Self::SecretStoreOnCloudRoot { store, root } => write!(
                 f,
@@ -743,9 +683,9 @@ fn merge_tables(base: &mut toml::Table, override_table: toml::Table) {
 impl Config {
     /// Return the effective store policy for an agent id.
     ///
-    /// Agent hooks and adapters should use this API rather than inspecting
-    /// `Config::agents` directly, because this function centralizes the
-    /// conservative missing-agent behavior required by the spec.
+    /// Agent hooks should use this API rather than inspecting `Config::agents`
+    /// directly, because this function centralizes the conservative
+    /// missing-agent behavior required by the spec.
     pub fn effective_agent_policy(&self, agent: &str) -> EffectiveAgentPolicy {
         self.agents
             .get(agent)
@@ -834,16 +774,6 @@ impl Config {
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
 
-        let adapters = raw
-            .adapters
-            .into_iter()
-            .map(|(name, adapter)| {
-                let adapter = AdapterConfig::from_raw(adapter, env)?;
-                validate_adapter(&name, &adapter, &stores, &agents)?;
-                Ok((name, adapter))
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-
         Ok(Self {
             schema_version: raw.schema_version.unwrap_or(1),
             default_store,
@@ -874,7 +804,6 @@ impl Config {
             privacy,
             offline: OfflineConfig::from_raw(raw.offline),
             performance: PerformanceConfig::from_raw(raw.performance),
-            adapters,
         })
     }
 }
@@ -900,9 +829,6 @@ impl DefaultsConfig {
             context_sources: raw
                 .context_sources
                 .unwrap_or_else(|| vec!["curated".to_owned(), "remembered".to_owned()]),
-            render_scopes: raw
-                .render_scopes
-                .unwrap_or_else(|| vec!["global".to_owned(), "project".to_owned()]),
             event_sidecar: raw.event_sidecar.unwrap_or_default(),
             hook_context_max_tokens: raw.hook_context_max_tokens.unwrap_or(4000),
             context_cache_max_age: raw.context_cache_max_age.unwrap_or_else(|| "7d".to_owned()),
@@ -937,11 +863,7 @@ impl AgentConfig {
 impl PrivacyConfig {
     fn from_raw(raw: RawPrivacyConfig) -> Self {
         Self {
-            default_render_policy: raw
-                .default_render_policy
-                .unwrap_or_else(|| "conservative".to_owned()),
             allow_all_stores_flag: raw.allow_all_stores_flag.unwrap_or(true),
-            warn_sensitive_broad_render: raw.warn_sensitive_broad_render.unwrap_or(true),
             secret_refuses_cloud_roots: raw.secret_refuses_cloud_roots.unwrap_or(true),
             allow_secret_writes: raw.allow_secret_writes.unwrap_or(false),
             allow_hook_secret_writes: raw.allow_hook_secret_writes.unwrap_or(false),
@@ -969,20 +891,6 @@ impl PerformanceConfig {
     }
 }
 
-impl AdapterConfig {
-    fn from_raw<F>(raw: RawAdapterConfig, env: &F) -> Result<Self, ConfigError>
-    where
-        F: Fn(&str) -> Option<String>,
-    {
-        Ok(Self {
-            enabled: raw.enabled.unwrap_or(false),
-            stores: raw.stores.unwrap_or_default(),
-            scopes: raw.scopes.unwrap_or_default(),
-            output: raw.output.map(|path| expand_path(&path, env)).transpose()?,
-        })
-    }
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 struct RawConfig {
@@ -1000,7 +908,6 @@ struct RawConfig {
     privacy: RawPrivacyConfig,
     offline: RawOfflineConfig,
     performance: RawPerformanceConfig,
-    adapters: BTreeMap<String, RawAdapterConfig>,
 }
 
 impl Default for RawConfig {
@@ -1020,7 +927,6 @@ impl Default for RawConfig {
             privacy: RawPrivacyConfig::default(),
             offline: RawOfflineConfig::default(),
             performance: RawPerformanceConfig::default(),
-            adapters: BTreeMap::new(),
         }
     }
 }
@@ -1049,7 +955,6 @@ struct RawDefaultsConfig {
     write_scope: Option<String>,
     search_scopes: Option<Vec<String>>,
     context_sources: Option<Vec<String>>,
-    render_scopes: Option<Vec<String>>,
     event_sidecar: Option<EventSidecarPolicy>,
     hook_context_max_tokens: Option<u32>,
     context_cache_max_age: Option<String>,
@@ -1067,9 +972,7 @@ struct RawAgentConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RawPrivacyConfig {
-    default_render_policy: Option<String>,
     allow_all_stores_flag: Option<bool>,
-    warn_sensitive_broad_render: Option<bool>,
     secret_refuses_cloud_roots: Option<bool>,
     allow_secret_writes: Option<bool>,
     allow_hook_secret_writes: Option<bool>,
@@ -1091,15 +994,6 @@ struct RawPerformanceConfig {
     context_store_size_target: Option<u32>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct RawAdapterConfig {
-    enabled: Option<bool>,
-    stores: Option<Vec<String>>,
-    scopes: Option<Vec<String>>,
-    output: Option<String>,
-}
-
 fn collect_warnings(table: &toml::Table) -> Vec<ConfigWarning> {
     let allowed = TOP_LEVEL_KEYS.iter().copied().collect::<BTreeSet<_>>();
     let mut warnings = Vec::new();
@@ -1118,7 +1012,6 @@ fn collect_warnings(table: &toml::Table) -> Vec<ConfigWarning> {
     collect_table_warnings(&mut warnings, table, "privacy", PRIVACY_KEYS);
     collect_table_warnings(&mut warnings, table, "offline", OFFLINE_KEYS);
     collect_table_warnings(&mut warnings, table, "performance", PERFORMANCE_KEYS);
-    collect_dynamic_table_warnings(&mut warnings, table, "adapters", ADAPTER_KEYS);
 
     warnings
 }
@@ -1171,43 +1064,6 @@ fn collect_unknown_keys(
             .filter(|key| !allowed.contains(key.as_str()))
             .map(|key| ConfigWarning::UnknownSubkey(format!("{path}.{key}"))),
     );
-}
-
-fn validate_adapter(
-    name: &str,
-    adapter: &AdapterConfig,
-    stores: &BTreeMap<String, StoreConfig>,
-    agents: &BTreeMap<String, AgentConfig>,
-) -> Result<(), ConfigError> {
-    validate_store_refs(adapter.stores.iter().map(String::as_str), stores, |store| {
-        ConfigError::UnknownAdapterStore {
-            adapter: name.to_owned(),
-            store: store.to_owned(),
-        }
-    })?;
-
-    if let Some(agent) = agents.get(name) {
-        // Adapter render policy is only an exposure policy. The same-name agent
-        // read policy remains the authority, so a generated Claude/Codex file
-        // cannot expose stores that the corresponding agent would be refused by
-        // `hm context` or hook startup.
-        for store in &adapter.stores {
-            if !agent.read_stores.iter().any(|allowed| allowed == store) {
-                return Err(ConfigError::AdapterStoreOutsideAgentPolicy {
-                    adapter: name.to_owned(),
-                    store: store.clone(),
-                });
-            }
-        }
-    }
-
-    if adapter.enabled && adapter.output.is_none() {
-        return Err(ConfigError::EnabledAdapterMissingOutput {
-            adapter: name.to_owned(),
-        });
-    }
-
-    Ok(())
 }
 
 fn validate_store_refs<'a, I, F>(
@@ -1390,7 +1246,6 @@ mod tests {
             write_scope = "project"
             search_scopes = ["project"]
             context_sources = ["remembered"]
-            render_scopes = ["global"]
             event_sidecar = "never"
             hook_context_max_tokens = 1234
             context_cache_max_age = "2d"
@@ -1413,7 +1268,6 @@ mod tests {
         assert_eq!(loaded.config.defaults.write_scope, "project");
         assert_eq!(loaded.config.defaults.search_scopes, vec!["project"]);
         assert_eq!(loaded.config.defaults.context_sources, vec!["remembered"]);
-        assert_eq!(loaded.config.defaults.render_scopes, vec!["global"]);
         assert_eq!(
             loaded.config.defaults.event_sidecar,
             EventSidecarPolicy::Never
@@ -1691,144 +1545,6 @@ mod tests {
         .expect_err("config fails");
 
         assert_eq!(err, ConfigError::HookSecretWritesRequireSecretWrites);
-    }
-
-    #[test]
-    fn loads_enabled_adapter_with_output() {
-        let loaded = LoadedConfig::from_str_with_env(
-            r#"
-            default_store = "personal"
-
-            [stores.personal]
-            root = "/tmp/personal"
-
-            [adapters.codex]
-            enabled = true
-            stores = ["personal"]
-            output = "${HOME}/.codex/hive-memory.generated.md"
-            "#,
-            env,
-        )
-        .expect("config loads");
-
-        let adapter = &loaded.config.adapters["codex"];
-        assert!(adapter.enabled);
-        assert_eq!(
-            adapter.output,
-            Some(PathBuf::from(
-                "/home/tester/.codex/hive-memory.generated.md"
-            ))
-        );
-    }
-
-    #[test]
-    fn rejects_enabled_adapter_without_output() {
-        let err = LoadedConfig::from_str_with_env(
-            r#"
-            default_store = "personal"
-
-            [stores.personal]
-            root = "/tmp/personal"
-
-            [adapters.codex]
-            enabled = true
-            stores = ["personal"]
-            "#,
-            env,
-        )
-        .expect_err("config fails");
-
-        assert_eq!(
-            err,
-            ConfigError::EnabledAdapterMissingOutput {
-                adapter: "codex".to_owned()
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_adapter_store_outside_configured_stores() {
-        let err = LoadedConfig::from_str_with_env(
-            r#"
-            default_store = "personal"
-
-            [stores.personal]
-            root = "/tmp/personal"
-
-            [adapters.codex]
-            stores = ["work"]
-            "#,
-            env,
-        )
-        .expect_err("config fails");
-
-        assert_eq!(
-            err,
-            ConfigError::UnknownAdapterStore {
-                adapter: "codex".to_owned(),
-                store: "work".to_owned()
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_adapter_store_outside_same_name_agent_read_policy() {
-        let err = LoadedConfig::from_str_with_env(
-            r#"
-            default_store = "personal"
-
-            [stores.personal]
-            root = "/tmp/personal"
-
-            [stores.work]
-            root = "/tmp/work"
-
-            [agents.codex]
-            default_store = "personal"
-            read_stores = ["personal"]
-            write_stores = ["personal"]
-
-            [adapters.codex]
-            stores = ["work"]
-            "#,
-            env,
-        )
-        .expect_err("config fails");
-
-        assert_eq!(
-            err,
-            ConfigError::AdapterStoreOutsideAgentPolicy {
-                adapter: "codex".to_owned(),
-                store: "work".to_owned()
-            }
-        );
-    }
-
-    #[test]
-    fn allows_adapter_store_inside_same_name_agent_read_policy() {
-        let loaded = LoadedConfig::from_str_with_env(
-            r#"
-            default_store = "personal"
-
-            [stores.personal]
-            root = "/tmp/personal"
-
-            [stores.work]
-            root = "/tmp/work"
-
-            [agents.codex]
-            default_store = "personal"
-            read_stores = ["personal", "work"]
-            write_stores = ["personal"]
-
-            [adapters.codex]
-            stores = ["work"]
-            "#,
-            env,
-        )
-        .expect("config loads");
-
-        assert_eq!(loaded.config.adapters["codex"].stores, vec!["work"]);
     }
 
     #[test]
