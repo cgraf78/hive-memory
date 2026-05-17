@@ -192,7 +192,11 @@ struct PromoteArgs {
 /// Arguments for `hm projects resolve`.
 #[derive(Debug, Args)]
 struct ProjectResolveArgs {
+    /// Path, file, or directory hint as an option, matching other agent-facing commands.
+    #[arg(long, value_name = "PATH", conflicts_with = "path")]
+    project: Option<PathBuf>,
     /// Path, file, or directory hint. Defaults to HIVE_MEMORY_PROJECT, then CWD.
+    #[arg(value_name = "PATH")]
     path: Option<PathBuf>,
     /// Explicit project id override.
     #[arg(long)]
@@ -930,7 +934,8 @@ fn run_project_show(args: ProjectShowArgs, context: CliContext) -> Result<()> {
 fn run_project_resolve(args: ProjectResolveArgs, context: CliContext) -> Result<()> {
     let config = load_config(context.config_path.as_deref())?;
     let hint = args
-        .path
+        .project
+        .or(args.path)
         .or_else(|| std::env::var("HIVE_MEMORY_PROJECT").ok().map(PathBuf::from))
         .unwrap_or_default();
     let project = project::resolve_project(project::ResolveProjectInput {

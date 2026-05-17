@@ -9,7 +9,7 @@ use crate::id::WriteIdContext;
 use std::error::Error;
 use std::fmt::{self, Display};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -278,10 +278,10 @@ fn write_temp_then_publish(
             })?;
         file.write_all(contents)
             .map_err(|err| io_error("write temporary file", temp_path, err))?;
-        sync_file(&file, temp_path, options)?;
+        sync_file(&file, temp_path, "sync temporary file", options)?;
     }
 
-    publish_temp(temp_path, final_path, mode)?;
+    publish_temp(temp_path, final_path, mode, options)?;
     sync_parent(final_path, options, &mut warnings)?;
     Ok(warnings)
 }
@@ -290,7 +290,23 @@ fn publish_temp(
     temp_path: &Path,
     final_path: &Path,
     mode: PublishMode,
+    options: &AtomicWriteOptions,
 ) -> Result<(), AtomicWriteError> {
+    publish_temp_with_linker(temp_path, final_path, mode, options, |source, target| {
+        fs::hard_link(source, target)
+    })
+}
+
+fn publish_temp_with_linker<F>(
+    temp_path: &Path,
+    final_path: &Path,
+    mode: PublishMode,
+    options: &AtomicWriteOptions,
+    link: F,
+) -> Result<(), AtomicWriteError>
+where
+    F: FnOnce(&Path, &Path) -> io::Result<()>,
+{
     match mode {
         PublishMode::Replace => {
             fs::rename(temp_path, final_path)
@@ -300,26 +316,71 @@ fn publish_temp(
             // `rename` can overwrite an existing file on Unix. Creating a hard
             // link to the already-fsynced temp file gives unique inbox writes
             // the create-if-absent publish semantics they need.
-            fs::hard_link(temp_path, final_path).map_err(|err| {
-                if err.kind() == std::io::ErrorKind::AlreadyExists {
-                    AtomicWriteError::Io {
+            match link(temp_path, final_path) {
+                Ok(()) => remove_temp(temp_path),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(AtomicWriteError::Io {
                         action: "install final file",
                         path: final_path.to_path_buf(),
                         message: "final path already exists".to_owned(),
-                    }
-                } else {
-                    io_error("install final file", final_path, err)
+                    });
                 }
-            })?;
-            remove_temp(temp_path);
+                Err(_) => {
+                    // Some sync-backed filesystems, including the mounted
+                    // cloud roots this tool targets, reject hard links even
+                    // within a single directory. Fall back to a create-new copy:
+                    // it preserves the critical no-overwrite contract for
+                    // concurrent writers, though it cannot be as crash-atomic
+                    // as link-based publish on local Unix filesystems.
+                    copy_temp_create_new(temp_path, final_path, options)?;
+                    remove_temp(temp_path);
+                }
+            }
         }
     }
+    Ok(())
+}
+
+fn copy_temp_create_new(
+    temp_path: &Path,
+    final_path: &Path,
+    options: &AtomicWriteOptions,
+) -> Result<(), AtomicWriteError> {
+    let mut temp =
+        File::open(temp_path).map_err(|err| io_error("open temporary file", temp_path, err))?;
+    let mut final_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(final_path)
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                AtomicWriteError::Io {
+                    action: "install final file",
+                    path: final_path.to_path_buf(),
+                    message: "final path already exists".to_owned(),
+                }
+            } else {
+                io_error("create final file", final_path, err)
+            }
+        })?;
+
+    if let Err(err) = io::copy(&mut temp, &mut final_file) {
+        remove_temp(final_path);
+        return Err(io_error("write final file", final_path, err));
+    }
+
+    if let Err(err) = sync_file(&final_file, final_path, "sync final file", options) {
+        remove_temp(final_path);
+        return Err(err);
+    }
+
     Ok(())
 }
 
 fn sync_file(
     file: &File,
     path: &Path,
+    action: &'static str,
     options: &AtomicWriteOptions,
 ) -> Result<(), AtomicWriteError> {
     match options.fsync {
@@ -328,9 +389,7 @@ fn sync_file(
             let _ = file.sync_all();
             Ok(())
         }
-        FsyncPolicy::Required => file
-            .sync_all()
-            .map_err(|err| io_error("sync temporary file", path, err)),
+        FsyncPolicy::Required => file.sync_all().map_err(|err| io_error(action, path, err)),
     }
 }
 
@@ -590,5 +649,83 @@ mod tests {
             }
         ));
         assert_eq!(fs::read_to_string(path).expect("read final"), "existing");
+    }
+
+    #[test]
+    fn create_new_copy_fallback_preserves_contents() {
+        let parent = temp_dir("copy-fallback");
+        let temp = parent.join(".tmp.note");
+        let path = parent.join("note.md");
+        fs::write(&temp, "new").expect("write temp");
+
+        copy_temp_create_new(
+            &temp,
+            &path,
+            &AtomicWriteOptions {
+                fsync: FsyncPolicy::Never,
+                ..AtomicWriteOptions::default()
+            },
+        )
+        .expect("copy fallback succeeds");
+
+        assert_eq!(fs::read_to_string(&path).expect("read final"), "new");
+        assert!(temp.is_file());
+    }
+
+    #[test]
+    fn create_new_publish_falls_back_when_hard_links_are_unavailable() {
+        let parent = temp_dir("publish-copy-fallback");
+        let temp = parent.join(".tmp.note");
+        let path = parent.join("note.md");
+        fs::write(&temp, "new").expect("write temp");
+
+        publish_temp_with_linker(
+            &temp,
+            &path,
+            PublishMode::CreateNew,
+            &AtomicWriteOptions {
+                fsync: FsyncPolicy::Never,
+                ..AtomicWriteOptions::default()
+            },
+            |_source, _target| {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "hard links disabled",
+                ))
+            },
+        )
+        .expect("publish falls back to copy");
+
+        assert_eq!(fs::read_to_string(&path).expect("read final"), "new");
+        assert!(!temp.exists());
+    }
+
+    #[test]
+    fn create_new_copy_fallback_refuses_existing_final_path() {
+        let parent = temp_dir("copy-fallback-collision");
+        let temp = parent.join(".tmp.note");
+        let path = parent.join("note.md");
+        fs::write(&temp, "new").expect("write temp");
+        fs::write(&path, "existing").expect("write final");
+
+        let err = copy_temp_create_new(
+            &temp,
+            &path,
+            &AtomicWriteOptions {
+                fsync: FsyncPolicy::Never,
+                ..AtomicWriteOptions::default()
+            },
+        )
+        .expect_err("copy fallback fails");
+
+        assert!(matches!(
+            err,
+            AtomicWriteError::Io {
+                action: "install final file",
+                ..
+            }
+        ));
+        assert_eq!(fs::read_to_string(&path).expect("read final"), "existing");
+        assert!(temp.is_file());
     }
 }

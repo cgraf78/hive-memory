@@ -664,7 +664,7 @@ Intended use by caller:
   hm open
   hm inbox [list|stale|show]
   hm promote <note-id> [--to <curated-file>]
-  hm projects resolve [PATH]
+  hm projects resolve [PATH|--project PATH]
   hm projects bind PATH --store NAME
   hm projects unbind PATH
   hm projects alias <old-id> <new-id>

@@ -298,8 +298,9 @@ machine-readable enough for filtering and auditing.
 V1 project IDs are stable across hosts, clones, and protocol changes.
 
 Project path inputs are hints, not identity by themselves. `--project PATH`,
-`HIVE_MEMORY_PROJECT`, and `hm projects resolve PATH` may point at a repo root,
-subdirectory, or file. `hm` canonicalizes the hint before deriving identity:
+`HIVE_MEMORY_PROJECT`, `hm projects resolve PATH`, and
+`hm projects resolve --project PATH` may point at a repo root, subdirectory, or
+file. `hm` canonicalizes the hint before deriving identity:
 
 1. If the hint is a file, use its parent directory as the starting point.
 2. Walk upward for the nearest `.hive-memory-project`; when found, use that
@@ -353,9 +354,9 @@ Local project store binding:
 - `hm projects bind PATH --store NAME` writes a local-only binding under
   `data_dir/projects/` from resolved project ID to preferred store alias.
 - `hm projects unbind PATH` removes that local binding.
-- `hm projects resolve [PATH] --as-agent <id>` prints the derived project ID,
-  effective store, and whether the store came from CLI/env, local project
-  binding, agent default, or global default.
+- `hm projects resolve [PATH|--project PATH] --as-agent <id>` prints the
+  derived project ID, effective store, and whether the store came from CLI/env,
+  local project binding, agent default, or global default.
 - Bindings are intentionally local data, not canonical store data. They capture
   "this checkout belongs to the work store on this machine" without committing a
   private work/personal policy into the project repo.
@@ -1243,7 +1244,7 @@ Subcommands:
 ```bash
 hm projects list
 hm projects show [id]
-hm projects resolve [path]
+hm projects resolve [path|--project path]
 hm projects bind PATH --store NAME
 hm projects unbind PATH
 hm projects alias <old-id> <new-id>

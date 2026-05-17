@@ -4509,6 +4509,30 @@ fn projects_resolve_uses_git_root_from_file_hint() {
         .stdout(predicate::str::contains(
             "\"store_source\": \"global-default\"",
         ));
+
+    let mut resolve_with_option = cargo_bin_cmd!("hm");
+    resolve_with_option
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "projects",
+            "resolve",
+            "--project",
+            file.to_str().expect("utf8 file"),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"project_source\": \"git-remote\"",
+        ))
+        .stdout(predicate::str::contains(
+            "\"project_id\": \"github-com-cgraf78-hive-memory-",
+        ))
+        .stdout(predicate::str::contains(format!(
+            "\"project_root\": \"{}\"",
+            canonical_repo.display()
+        )));
 }
 
 #[test]
