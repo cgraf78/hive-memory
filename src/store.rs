@@ -23,7 +23,11 @@ pub const SUPPORTED_MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 const CREATED_BY: &str = "hive-memory";
 
-const CANONICAL_DIRS: &[&str] = &[
+/// Canonical directory skeleton every v1 store root should contain.
+///
+/// Store initialization creates these directories, and doctor uses the same list
+/// so layout drift is reported against the exact creation contract.
+pub const CANONICAL_DIRS: &[&str] = &[
     "people",
     "rules",
     "memories/global",

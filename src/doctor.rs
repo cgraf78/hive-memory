@@ -107,6 +107,7 @@ pub fn run(input: DoctorInput<'_>) -> DoctorReport {
     ));
 
     check_stores(input.config, &mut checks);
+    check_required_dirs(input.config, &mut checks);
     check_cloud_conflicts(input.config, &mut checks);
     check_stale_temp_files(input.config, &mut checks);
     check_project_bindings(input.config, &mut checks);
@@ -183,6 +184,43 @@ fn check_cloud_conflicts(config: &config::Config, checks: &mut Vec<DoctorCheck>)
                     conflicts.len()
                 ),
                 conflicts
+                    .into_iter()
+                    .map(|path| path.display().to_string())
+                    .collect(),
+            ));
+        }
+    }
+}
+
+fn check_required_dirs(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
+    for (store_name, store_config) in &config.stores {
+        if !store_config.root.exists() {
+            // Store availability already has a dedicated check with the real
+            // manifest/root error. Avoid turning one offline mount into a noisy
+            // cascade of derived directory warnings.
+            continue;
+        }
+
+        let missing = store::CANONICAL_DIRS
+            .iter()
+            .map(|relative| store_config.root.join(relative))
+            .filter(|path| !path.is_dir())
+            .collect::<Vec<_>>();
+
+        if missing.is_empty() {
+            checks.push(pass(
+                format!("store.{store_name}.dirs"),
+                format!("store {store_name} has required directories"),
+                vec![store_config.root.display().to_string()],
+            ));
+        } else {
+            checks.push(warn(
+                format!("store.{store_name}.dirs"),
+                format!(
+                    "store {store_name} missing required directories: {}",
+                    missing.len()
+                ),
+                missing
                     .into_iter()
                     .map(|path| path.display().to_string())
                     .collect(),

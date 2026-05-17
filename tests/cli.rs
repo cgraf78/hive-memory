@@ -647,6 +647,36 @@ fn doctor_warns_for_cloud_sync_conflict_files() {
 }
 
 #[test]
+fn doctor_warns_for_missing_required_store_dirs() {
+    let dir = temp_dir("doctor-missing-dirs");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    write_data_config(&config, &data, &personal);
+    init_store(&personal, "personal");
+    let missing = personal.join("memories/projects");
+    fs::remove_dir_all(&missing).expect("remove required dir");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "doctor",
+            "--quick",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"warnings\": 1"))
+        .stdout(predicate::str::contains(
+            "store personal missing required directories: 1",
+        ))
+        .stdout(predicate::str::contains(
+            missing.to_str().expect("utf8 missing path"),
+        ));
+}
+
+#[test]
 fn doctor_full_warns_for_likely_secret_in_private_note_without_echoing_value() {
     let dir = temp_dir("doctor-note-secret");
     let config = dir.join("config.toml");
