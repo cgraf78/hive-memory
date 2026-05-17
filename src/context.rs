@@ -142,6 +142,9 @@ impl From<crate::curated::CuratedError> for ContextError {
             crate::curated::CuratedError::ReadFile { path, message } => {
                 Self::ReadNote { path, message }
             }
+            crate::curated::CuratedError::ProjectAlias { path, message } => {
+                Self::ReadNote { path, message }
+            }
         }
     }
 }
@@ -597,6 +600,39 @@ mod tests {
         assert!(output.markdown.contains("Global curated fact."));
         assert!(output.markdown.contains("Project A curated fact."));
         assert!(!output.markdown.contains("Project B curated fact."));
+    }
+
+    #[test]
+    fn context_follows_project_aliases_for_curated_files() {
+        let dir = temp_dir("curated-alias");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        fs::create_dir_all(root.join("memories/projects/proj-current")).expect("current dir");
+        fs::create_dir_all(root.join("memories/projects/proj-old")).expect("old dir");
+        fs::write(
+            root.join("memories/projects/proj-current/MEMORY.md"),
+            "Current project curated fact.\n",
+        )
+        .expect("current memory");
+        fs::write(
+            root.join("memories/projects/proj-old/MEMORY.md"),
+            "Old project curated fact.\n",
+        )
+        .expect("old memory");
+        fs::write(
+            root.join("memories/projects/proj-current/aliases.toml"),
+            "schema_version = 1\nproject_id = \"proj-current\"\naliases = [\"proj-old\"]\n",
+        )
+        .expect("aliases");
+        let entries = entries(&root, &cache);
+        let sources = ["curated".to_owned()];
+        let mut request = input(&root, &entries, &[], &sources);
+        request.project_id = Some("proj-old");
+
+        let output = assemble_context(request).expect("context");
+
+        assert!(output.markdown.contains("Current project curated fact."));
+        assert!(output.markdown.contains("Old project curated fact."));
     }
 
     #[test]

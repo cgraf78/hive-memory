@@ -6,6 +6,8 @@
 //! search agree on which curated files are eligible and avoid following
 //! symlinks outside the store.
 
+use crate::project;
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{self, Display};
 use std::fs;
@@ -34,6 +36,13 @@ pub enum CuratedError {
         /// Original error rendered for diagnostics.
         message: String,
     },
+    /// Project alias metadata could not be read or parsed.
+    ProjectAlias {
+        /// Alias file path that failed.
+        path: PathBuf,
+        /// Original error rendered for diagnostics.
+        message: String,
+    },
 }
 
 impl Display for CuratedError {
@@ -43,6 +52,13 @@ impl Display for CuratedError {
                 write!(
                     f,
                     "failed to read curated memory {}: {message}",
+                    path.display()
+                )
+            }
+            Self::ProjectAlias { path, message } => {
+                write!(
+                    f,
+                    "failed to read project aliases {}: {message}",
                     path.display()
                 )
             }
@@ -75,15 +91,75 @@ pub fn collect(
         &mut files,
     )?;
     if let Some(project_id) = project_id {
-        collect_tree(
-            store_root,
-            &Path::new("memories/projects").join(project_id),
-            "project",
-            &mut files,
-        )?;
+        for id in project_ids_for_curated(store_root, project_id)? {
+            collect_tree(
+                store_root,
+                &Path::new("memories/projects").join(id),
+                "project",
+                &mut files,
+            )?;
+        }
     }
     files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     Ok(files)
+}
+
+fn project_ids_for_curated(
+    store_root: &Path,
+    project_id: &str,
+) -> Result<Vec<String>, CuratedError> {
+    let mut ids = BTreeSet::from([project_id.to_owned()]);
+    let root = store_root.join("memories/projects");
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ids.into_iter().collect());
+        }
+        Err(err) => return Err(read_error(root, err)),
+    };
+
+    for entry in entries {
+        let entry = entry.map_err(|err| read_error(root.clone(), err))?;
+        let path = entry.path();
+        if !entry
+            .file_type()
+            .map_err(|err| read_error(path.clone(), err))?
+            .is_dir()
+        {
+            continue;
+        }
+        let Some(canonical_id) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(aliases) = load_project_aliases(store_root, canonical_id)? else {
+            continue;
+        };
+        // Alias files declare a relationship, not a redirect-only rule. Include
+        // both the current id and its historical ids so memory remains visible
+        // while humans gradually move curated files between directories.
+        if aliases.project_id == project_id || aliases.aliases.iter().any(|id| id == project_id) {
+            ids.insert(aliases.project_id);
+            ids.insert(canonical_id.to_owned());
+            ids.extend(aliases.aliases);
+        }
+    }
+
+    Ok(ids.into_iter().collect())
+}
+
+fn load_project_aliases(
+    store_root: &Path,
+    project_id: &str,
+) -> Result<Option<project::ProjectAliases>, CuratedError> {
+    project::load_aliases(store_root, project_id).map_err(|err| match err {
+        project::ProjectError::Alias { path, message } => {
+            CuratedError::ProjectAlias { path, message }
+        }
+        other => CuratedError::ProjectAlias {
+            path: project::aliases_path(store_root, project_id),
+            message: other.to_string(),
+        },
+    })
 }
 
 fn collect_tree(

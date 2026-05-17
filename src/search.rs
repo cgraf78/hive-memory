@@ -111,6 +111,9 @@ impl From<crate::curated::CuratedError> for SearchError {
             crate::curated::CuratedError::ReadFile { path, message } => {
                 Self::Curated { path, message }
             }
+            crate::curated::CuratedError::ProjectAlias { path, message } => {
+                Self::Curated { path, message }
+            }
         }
     }
 }
@@ -634,6 +637,57 @@ mod tests {
             "memories/projects/proj-a/MEMORY.md"
         );
         assert_eq!(hits[0].entry.project_id.as_deref(), Some("proj-a"));
+    }
+
+    #[test]
+    fn search_follows_project_aliases_for_curated_files() {
+        let dir = temp_dir("curated-project-alias");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        fs::create_dir_all(root.join("memories/projects/proj-current")).expect("current dir");
+        fs::create_dir_all(root.join("memories/projects/proj-old")).expect("old dir");
+        fs::write(
+            root.join("memories/projects/proj-current/MEMORY.md"),
+            "Current project TOML memory.\n",
+        )
+        .expect("current memory");
+        fs::write(
+            root.join("memories/projects/proj-old/MEMORY.md"),
+            "Old project TOML memory.\n",
+        )
+        .expect("old memory");
+        fs::write(
+            root.join("memories/projects/proj-current/aliases.toml"),
+            "schema_version = 1\nproject_id = \"proj-current\"\naliases = [\"proj-old\"]\n",
+        )
+        .expect("aliases");
+        let sources = vec!["curated".to_owned()];
+        let scopes = vec!["project".to_owned()];
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "toml",
+            scopes: &scopes,
+            sources: &sources,
+            include_inbox: false,
+            agent_id: None,
+            project_id: Some("proj-current"),
+            limit: 20,
+        })
+        .expect("search");
+
+        let paths = hits
+            .iter()
+            .map(|hit| hit.entry.note_path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                "memories/projects/proj-current/MEMORY.md",
+                "memories/projects/proj-old/MEMORY.md"
+            ]
+        );
     }
 
     #[test]
