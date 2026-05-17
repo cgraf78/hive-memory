@@ -188,6 +188,10 @@ fn stores_init_creates_manifest() {
     assert!(manifest.contains("[store]"));
     assert!(manifest.contains("name = \"personal\""));
     assert!(root.join("inbox/notes").is_dir());
+    assert_eq!(
+        fs::read_to_string(root.join("generated/.gitignore")).expect("generated gitignore"),
+        "*\n!.gitignore\n"
+    );
 }
 
 #[cfg(unix)]
@@ -698,6 +702,66 @@ fn doctor_warns_for_missing_required_store_dirs() {
         ))
         .stdout(predicate::str::contains(
             missing.to_str().expect("utf8 missing path"),
+        ));
+}
+
+#[test]
+fn doctor_warns_for_missing_generated_gitignore() {
+    let dir = temp_dir("doctor-generated-gitignore");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    write_data_config(&config, &data, &personal);
+    init_store(&personal, "personal");
+    let path = personal.join("generated/.gitignore");
+    fs::remove_file(&path).expect("remove generated gitignore");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "doctor",
+            "--quick",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"warnings\": 1"))
+        .stdout(predicate::str::contains(
+            "store personal missing generated .gitignore",
+        ))
+        .stdout(predicate::str::contains(
+            path.to_str().expect("utf8 gitignore path"),
+        ));
+}
+
+#[test]
+fn doctor_warns_for_drifted_generated_gitignore() {
+    let dir = temp_dir("doctor-drifted-generated-gitignore");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    write_data_config(&config, &data, &personal);
+    init_store(&personal, "personal");
+    let path = personal.join("generated/.gitignore");
+    fs::write(&path, "!*\n").expect("drift generated gitignore");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "doctor",
+            "--quick",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"warnings\": 1"))
+        .stdout(predicate::str::contains(
+            "store personal generated .gitignore differs from the managed policy",
+        ))
+        .stdout(predicate::str::contains(
+            path.to_str().expect("utf8 gitignore path"),
         ));
 }
 

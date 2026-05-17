@@ -40,6 +40,13 @@ pub const CANONICAL_DIRS: &[&str] = &[
     "generated",
 ];
 
+/// Ignore policy for store-local generated artifacts.
+///
+/// Generated output is rebuildable and often adapter/session-specific. Keeping
+/// this file in every store makes accidental tracking opt-out by default while
+/// still allowing a user to force-add an explicitly shared generated artifact.
+pub const GENERATED_GITIGNORE: &str = "*\n!.gitignore\n";
+
 /// Options for creating a new store root.
 ///
 /// This is the API that `hm stores init` should call after CLI parsing. The
@@ -353,6 +360,7 @@ pub fn init_store(options: &StoreInitOptions) -> Result<StoreManifest, StoreErro
         options.sensitivity,
     );
     create_store_root(&options.root, options.sensitivity)?;
+    write_generated_gitignore(&options.root)?;
     write_readme(&options.root, &manifest)?;
     write_manifest_atomic(&options.root, &manifest)?;
     Ok(manifest)
@@ -525,6 +533,19 @@ fn protect_sensitive_root(_root: &Path, _sensitivity: Sensitivity) -> Result<(),
     Ok(())
 }
 
+fn write_generated_gitignore(root: &Path) -> Result<(), StoreError> {
+    let path = root.join("generated/.gitignore");
+    if path.exists() {
+        return Ok(());
+    }
+
+    fs::write(&path, GENERATED_GITIGNORE).map_err(|err| StoreError::Io {
+        action: "write generated .gitignore",
+        path,
+        message: err.to_string(),
+    })
+}
+
 fn write_readme(root: &Path, manifest: &StoreManifest) -> Result<(), StoreError> {
     let path = root.join("README.md");
     if path.exists() {
@@ -679,6 +700,10 @@ mod tests {
 
         assert_eq!(read, written);
         assert!(root.join("README.md").is_file());
+        assert_eq!(
+            fs::read_to_string(root.join("generated/.gitignore")).expect("generated gitignore"),
+            GENERATED_GITIGNORE
+        );
         for relative in CANONICAL_DIRS {
             assert!(root.join(relative).is_dir(), "missing {relative}");
         }

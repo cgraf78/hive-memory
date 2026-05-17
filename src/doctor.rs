@@ -108,6 +108,7 @@ pub fn run(input: DoctorInput<'_>) -> DoctorReport {
 
     check_stores(input.config, &mut checks);
     check_required_dirs(input.config, &mut checks);
+    check_generated_gitignore(input.config, &mut checks);
     check_sensitive_store_permissions(input.config, &mut checks);
     check_cloud_conflicts(input.config, &mut checks);
     check_stale_temp_files(input.config, &mut checks);
@@ -226,6 +227,46 @@ fn check_required_dirs(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
                     .map(|path| path.display().to_string())
                     .collect(),
             ));
+        }
+    }
+}
+
+fn check_generated_gitignore(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
+    for (store_name, store_config) in &config.stores {
+        if !store_config.root.exists() {
+            continue;
+        }
+
+        let generated_dir = store_config.root.join("generated");
+        if !generated_dir.is_dir() {
+            // Required-directory diagnostics already cover a missing generated
+            // directory. Only inspect the managed ignore file once its parent
+            // exists so one layout problem does not cascade into two warnings.
+            continue;
+        }
+
+        let path = generated_dir.join(".gitignore");
+        match fs::read_to_string(&path) {
+            Ok(contents) if contents == store::GENERATED_GITIGNORE => checks.push(pass(
+                format!("store.{store_name}.generated-gitignore"),
+                format!("store {store_name} generated .gitignore is present"),
+                vec![path.display().to_string()],
+            )),
+            Ok(_) => checks.push(warn(
+                format!("store.{store_name}.generated-gitignore"),
+                format!("store {store_name} generated .gitignore differs from the managed policy"),
+                vec![path.display().to_string()],
+            )),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => checks.push(warn(
+                format!("store.{store_name}.generated-gitignore"),
+                format!("store {store_name} missing generated .gitignore"),
+                vec![path.display().to_string()],
+            )),
+            Err(err) => checks.push(warn(
+                format!("store.{store_name}.generated-gitignore"),
+                format!("failed to inspect generated .gitignore: {err}"),
+                vec![path.display().to_string()],
+            )),
         }
     }
 }
