@@ -1240,8 +1240,6 @@ Checks (all surfaces at default verbosity unless noted):
 - secret-sensitivity store has a cloud-synced root (refused at config load,
   but doctor re-checks symlinks and mount points).
 - agent-private notes lack an explicit `audience`.
-- project_id values in inbox notes have no corresponding aliases.toml chain
-  (unclaimed project memory).
 - `fsync` policy + filesystem combination: warns when `fsync = "required"`
   is set on a known FUSE/cloud-drive mount where parent-dir fsync is a no-op.
 

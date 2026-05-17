@@ -194,7 +194,6 @@ pub fn run(input: DoctorInput<'_>) -> DoctorReport {
     if !input.quick {
         check_outbox_archives(input.config, &mut checks);
         check_event_pairing(input.config, &mut checks);
-        check_unclaimed_project_memory(input.config, &mut checks);
         check_agent_private_audience(input.config, &mut checks);
         check_note_secrets(input.config, &mut checks);
         check_note_prompt_risks(input.config, &mut checks);
@@ -1153,76 +1152,6 @@ fn event_declares_note(event: &event::MemoryEvent, note: &note::MarkdownNote) ->
 
 fn parse_note_created_at(value: &str) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(value, &Rfc3339).ok()
-}
-
-fn check_unclaimed_project_memory(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
-    for (store_name, store_config) in &config.stores {
-        let projects_root = store_config.root.join("memories/projects");
-        let known_projects = match project::claimed_project_ids(&store_config.root) {
-            Ok(projects) => projects,
-            Err(message) => {
-                checks.push(warn(
-                    format!("store.{store_name}.project-claims"),
-                    format!("failed to inspect project alias metadata: {message}"),
-                    vec![projects_root.display().to_string()],
-                ));
-                continue;
-            }
-        };
-        let notes_root = store_config.root.join("inbox/notes");
-        let note_paths = match collect_markdown_files(&notes_root) {
-            Ok(paths) => paths,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                checks.push(pass(
-                    format!("store.{store_name}.project-claims"),
-                    format!("store {store_name} has no project-scoped inbox notes"),
-                    vec![notes_root.display().to_string()],
-                ));
-                continue;
-            }
-            Err(err) => {
-                checks.push(warn(
-                    format!("store.{store_name}.project-claims"),
-                    format!("failed to scan notes for project claims: {err}"),
-                    vec![notes_root.display().to_string()],
-                ));
-                continue;
-            }
-        };
-
-        let mut issues = 0usize;
-        for path in note_paths {
-            // Project-scoped inbox notes can outlive repository renames. Treat
-            // aliases as explicit claims so doctor flags only truly orphaned
-            // project ids, not deliberately migrated memory.
-            let Some(project_id) = note_project_id(&path) else {
-                continue;
-            };
-            if known_projects.contains(&project_id) {
-                continue;
-            }
-            issues += 1;
-            checks.push(warn(
-                format!("store.{store_name}.project-claims"),
-                format!("project memory references unclaimed project_id {project_id}"),
-                vec![path.display().to_string()],
-            ));
-        }
-
-        if issues == 0 {
-            checks.push(pass(
-                format!("store.{store_name}.project-claims"),
-                format!("store {store_name} project-scoped memory is claimed"),
-                vec![projects_root.display().to_string()],
-            ));
-        }
-    }
-}
-
-fn note_project_id(path: &Path) -> Option<String> {
-    let contents = fs::read_to_string(path).ok()?;
-    let parsed = note::parse_note(&contents).ok()?;
-    parsed.front_matter.project_id
 }
 
 fn check_agent_private_audience(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
