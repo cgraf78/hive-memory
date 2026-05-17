@@ -978,6 +978,37 @@ fn doctor_warns_for_missing_required_store_dirs() {
         ));
 }
 
+#[cfg(unix)]
+#[test]
+fn doctor_warns_for_symlinked_store_root() {
+    let dir = temp_dir("doctor-symlink-store-root");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let target = dir.join("personal-real");
+    let symlink = dir.join("personal-link");
+    init_store(&target, "personal");
+    std::os::unix::fs::symlink(&target, &symlink).expect("store symlink");
+    write_data_config(&config, &data, &symlink);
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "doctor",
+            "--quick",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"warnings\": 1"))
+        .stdout(predicate::str::contains(
+            "store personal root is a symlink; configure the canonical target path",
+        ))
+        .stdout(predicate::str::contains(
+            symlink.to_str().expect("utf8 symlink path"),
+        ));
+}
+
 #[test]
 fn doctor_warns_for_missing_generated_gitignore() {
     let dir = temp_dir("doctor-generated-gitignore");

@@ -177,6 +177,7 @@ pub fn run(input: DoctorInput<'_>) -> DoctorReport {
     ));
 
     check_stores(input.config, &mut checks);
+    check_store_root_symlinks(input.config, &mut checks);
     check_required_dirs(input.config, &mut checks);
     check_generated_gitignore(input.config, &mut checks);
     check_sensitive_store_permissions(input.config, &mut checks);
@@ -243,6 +244,35 @@ fn check_stores(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
                     paths,
                 )),
             }
+        }
+    }
+}
+
+fn check_store_root_symlinks(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
+    for (store_name, store_config) in &config.stores {
+        // Symlink spellings can make one physical store look like multiple
+        // roots to project resolution, cloud-sync checks, and future repair
+        // logic. Warn instead of following silently so config can converge on
+        // the canonical target path.
+        match fs::symlink_metadata(&store_config.root) {
+            Ok(metadata) if metadata.file_type().is_symlink() => checks.push(warn(
+                format!("store.{store_name}.root-symlink"),
+                format!(
+                    "store {store_name} root is a symlink; configure the canonical target path"
+                ),
+                vec![store_config.root.display().to_string()],
+            )),
+            Ok(_) => checks.push(pass(
+                format!("store.{store_name}.root-symlink"),
+                format!("store {store_name} root is not a symlink"),
+                vec![store_config.root.display().to_string()],
+            )),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => checks.push(warn(
+                format!("store.{store_name}.root-symlink"),
+                format!("failed to inspect store root symlink status: {err}"),
+                vec![store_config.root.display().to_string()],
+            )),
         }
     }
 }
