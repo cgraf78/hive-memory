@@ -4317,6 +4317,60 @@ fn hook_stop_reminds_when_memory_pending_remains() {
 }
 
 #[test]
+fn hook_prompt_submit_does_not_emit_initial_context() {
+    let dir = temp_dir("hook-prompt-no-initial-context");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let state = dir.join("state");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            state_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+            "#,
+            state.display(),
+            personal.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    let mut prompt = cargo_bin_cmd!("hm");
+    let output = prompt
+        .env("HIVE_MEMORY_SESSION_ID", "session-no-initial")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "prompt-submit",
+            "--project",
+            "/repo-a/src/main.rs",
+            "--text",
+            "Please inspect the tests.",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).expect("utf8 stdout");
+    assert!(stdout.contains("\"context_emitted\": false"));
+    assert!(!stdout.contains("\"kind\": \"inject_context\""));
+    assert!(
+        !state
+            .join("runs/session-no-initial/hook-state.json")
+            .exists()
+    );
+}
+
+#[test]
 fn hook_prompt_submit_emits_context_only_when_selection_changes() {
     let dir = temp_dir("hook-context-change");
     let config = dir.join("config.toml");

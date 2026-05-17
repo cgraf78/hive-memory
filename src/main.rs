@@ -2877,6 +2877,7 @@ fn run_hook_prompt_submit(args: HookPromptSubmitArgs, context: CliContext) -> Re
         &context,
         path_hint.as_deref(),
         session_id.as_deref(),
+        false,
     )? {
         context_emitted = true;
         actions.push(action);
@@ -2940,6 +2941,7 @@ fn run_hook_tool_complete(args: HookToolCompleteArgs, context: CliContext) -> Re
         &context,
         path_hint.as_deref(),
         session_id.as_deref(),
+        false,
     )? {
         context_emitted = true;
         actions.push(action);
@@ -3119,6 +3121,7 @@ fn hook_context_action_if_changed(
     context: &CliContext,
     path_hint: Option<&str>,
     session_id: Option<&str>,
+    emit_initial: bool,
 ) -> Result<Option<HookAction>> {
     let Some(session_id) = session_id else {
         return Ok(None);
@@ -3129,6 +3132,14 @@ fn hook_context_action_if_changed(
     // so hooks can reinject when path/project/store policy changes.
     let context_key = hook_context_key(config, context, path_hint)?;
     let state = memory_hook::load_state(&config.state_dir, session_id)?;
+    // SessionStart owns initial context injection. Prompt/tool hooks should only
+    // reinject after an existing session selection changes; otherwise hook
+    // runners that fire SessionStart and PromptSubmit close together can show
+    // duplicate "Hive Memory Context" blocks before either process observes the
+    // other's freshly written state.
+    if state.context_key.is_none() && !emit_initial {
+        return Ok(None);
+    }
     if state.context_key.as_deref() == Some(context_key.as_str()) {
         return Ok(None);
     }
