@@ -76,6 +76,14 @@ jobs:
           mkdir -p smoke
           tar -xzf "$archive" -C smoke
           ./smoke/hm --version
+          ./smoke/hm stores init personal --root "$PWD/smoke-store"
+          cat >smoke-config.toml <<EOF
+          default_store = "personal"
+
+          [stores.personal]
+          root = "$PWD/smoke-store"
+          EOF
+          ./smoke/hm --config "$PWD/smoke-config.toml" doctor --quick
 
       - name: Upload release assets
         env:

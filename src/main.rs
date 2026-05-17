@@ -117,6 +117,10 @@ enum StoresCommand {
 /// Project identity commands.
 #[derive(Debug, Subcommand)]
 enum ProjectsCommand {
+    /// List local project-to-store bindings.
+    List(ProjectListArgs),
+    /// Show local policy and aliases for one project.
+    Show(ProjectShowArgs),
     /// Resolve a path/file hint to a stable project id.
     Resolve(ProjectResolveArgs),
     /// Bind a project to a local preferred store.
@@ -204,6 +208,27 @@ struct ProjectResolveArgs {
     /// Explicit project id override.
     #[arg(long)]
     project_id: Option<String>,
+    /// Emit machine-readable output.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Arguments for `hm projects list`.
+#[derive(Debug, Args)]
+struct ProjectListArgs {
+    /// Emit machine-readable output.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Arguments for `hm projects show`.
+#[derive(Debug, Args)]
+struct ProjectShowArgs {
+    /// Project id to inspect. Defaults to resolving the current project hint.
+    project_id: Option<String>,
+    /// Path, file, or directory hint used when no project id is provided.
+    #[arg(long)]
+    path: Option<PathBuf>,
     /// Emit machine-readable output.
     #[arg(long)]
     json: bool,
@@ -831,11 +856,95 @@ fn run_stores(command: StoresCommand, context: CliContext) -> Result<()> {
 
 fn run_projects(command: ProjectsCommand, context: CliContext) -> Result<()> {
     match command {
+        ProjectsCommand::List(args) => run_project_list(args, context),
+        ProjectsCommand::Show(args) => run_project_show(args, context),
         ProjectsCommand::Resolve(args) => run_project_resolve(args, context),
         ProjectsCommand::Bind(args) => run_project_bind(args, context),
         ProjectsCommand::Unbind(args) => run_project_unbind(args, context),
         ProjectsCommand::Alias(args) => run_project_alias(args, context),
     }
+}
+
+fn run_project_list(args: ProjectListArgs, context: CliContext) -> Result<()> {
+    let config = load_config(context.config_path.as_deref())?;
+    let bindings = project::list_bindings(&config.data_dir)?;
+
+    if args.json {
+        let output = ProjectListOutput {
+            data_dir: config.data_dir.display().to_string(),
+            bindings,
+        };
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("data_dir: {}", config.data_dir.display());
+        println!("bindings: {}", bindings.len());
+        for binding in bindings {
+            println!("  {} -> {}", binding.project_id, binding.store);
+        }
+    }
+
+    Ok(())
+}
+
+fn run_project_show(args: ProjectShowArgs, context: CliContext) -> Result<()> {
+    let config = load_config(context.config_path.as_deref())?;
+    let project_id = if let Some(project_id) = args.project_id {
+        project_id
+    } else {
+        let hint = args
+            .path
+            .or_else(|| std::env::var("HIVE_MEMORY_PROJECT").ok().map(PathBuf::from))
+            .unwrap_or_default();
+        project::resolve_project(project::ResolveProjectInput {
+            hint,
+            explicit_project_id: None,
+            env_project_id: std::env::var("HIVE_MEMORY_PROJECT_ID").ok(),
+        })?
+        .project_id
+    };
+    let binding = project::load_binding(&config.data_dir, &project_id)?;
+    let agent_id = resolve_agent_id(context.as_agent);
+    let store = resolve_store(
+        &config,
+        context.store.as_deref(),
+        binding.as_ref().map(|binding| binding.store.as_str()),
+        agent_id.as_deref(),
+        StoreAccess::Read,
+    )?;
+    let store_config = &config.stores[store.name.as_str()];
+    let aliases = project::related_project_ids(&store_config.root, &project_id)?
+        .into_iter()
+        .filter(|related| related != &project_id)
+        .collect::<Vec<_>>();
+
+    if args.json {
+        let output = ProjectShowOutput {
+            project_id,
+            binding,
+            effective_store: store.name,
+            store_source: store.source.to_string(),
+            related_project_ids: aliases,
+        };
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("project_id: {}", project_id);
+        match &binding {
+            Some(binding) => println!("binding: {}", binding.store),
+            None => println!("binding: none"),
+        }
+        println!("store: {}", store.name);
+        println!("store_source: {}", store.source);
+        if aliases.is_empty() {
+            println!("related_project_ids: none");
+        } else {
+            println!("related_project_ids:");
+            for alias in aliases {
+                println!("  {alias}");
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn run_project_resolve(args: ProjectResolveArgs, context: CliContext) -> Result<()> {
@@ -994,6 +1103,21 @@ struct ProjectAliasOutput {
     store: String,
     store_source: String,
     path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ProjectListOutput {
+    data_dir: String,
+    bindings: Vec<project::ProjectBinding>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProjectShowOutput {
+    project_id: String,
+    binding: Option<project::ProjectBinding>,
+    effective_store: String,
+    store_source: String,
+    related_project_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]

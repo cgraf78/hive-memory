@@ -63,9 +63,10 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
-      # This test is intentionally separate from the default test suite because
-      # it creates a 5000-note store and measures real CLI process latency.
-      - name: Check warm context/search budgets
+      # These tests are intentionally separate from the default suite because
+      # they create large synthetic stores/outboxes and measure real CLI
+      # process latency.
+      - name: Check context/search/flush budgets
         run: cargo test --release --test perf_budget -- --ignored --nocapture
 
   cloud-sync-sim:

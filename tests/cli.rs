@@ -4652,6 +4652,40 @@ fn projects_bind_and_unbind_local_store_affinity() {
     let binding = fs::read_to_string(data.join("projects/bound-project.toml")).expect("binding");
     assert!(binding.contains("store = \"work\""));
 
+    let mut list = cargo_bin_cmd!("hm");
+    list.args([
+        "--config",
+        config.to_str().expect("utf8 config"),
+        "projects",
+        "list",
+        "--json",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains(
+        "\"project_id\": \"bound-project\"",
+    ))
+    .stdout(predicate::str::contains("\"store\": \"work\""));
+
+    let mut show = cargo_bin_cmd!("hm");
+    show.args([
+        "--config",
+        config.to_str().expect("utf8 config"),
+        "projects",
+        "show",
+        "bound-project",
+        "--json",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains(
+        "\"project_id\": \"bound-project\"",
+    ))
+    .stdout(predicate::str::contains("\"effective_store\": \"work\""))
+    .stdout(predicate::str::contains(
+        "\"store_source\": \"project-binding\"",
+    ));
+
     let mut resolve = cargo_bin_cmd!("hm");
     resolve
         .args([

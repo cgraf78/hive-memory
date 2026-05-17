@@ -1,6 +1,7 @@
 use assert_cmd::cargo::cargo_bin_cmd;
 use hive_memory::config::Sensitivity;
 use hive_memory::note::{self, Confidence};
+use hive_memory::outbox;
 use hive_memory::store::{self, StoreInitOptions};
 use hive_memory::write::{AtomicWriteOptions, FsyncPolicy};
 use std::fs;
@@ -15,6 +16,9 @@ const RUNS: usize = 30;
 // costs every time they ask Hive Memory for context.
 const CONTEXT_WARM_BUDGET_MS: u128 = 200;
 const SEARCH_WARM_BUDGET_MS: u128 = 300;
+const SYNTHETIC_OUTBOX_ITEMS: usize = 100;
+const FLUSH_RUNS: usize = 10;
+const FLUSH_100_ITEM_BUDGET_MS: u128 = 2_000;
 
 fn temp_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -57,6 +61,27 @@ fn context_and_search_stay_within_warm_budget() {
     );
 }
 
+#[test]
+#[ignore = "CI runs this explicitly because it creates synthetic outbox stores"]
+fn flush_100_item_outbox_stays_within_budget() {
+    let flush_p95 = p95_ms(
+        (0..FLUSH_RUNS)
+            .map(|run| {
+                let fixture = FlushFixture::new(run);
+                let start = Instant::now();
+                fixture.hm(["flush", "--json"]);
+                start.elapsed()
+            })
+            .collect(),
+    );
+    eprintln!("hm flush 100-item p95: {flush_p95}ms");
+
+    assert!(
+        flush_p95 <= FLUSH_100_ITEM_BUDGET_MS,
+        "hm flush 100-item p95 {flush_p95}ms exceeded {FLUSH_100_ITEM_BUDGET_MS}ms"
+    );
+}
+
 struct SyntheticStore {
     config: PathBuf,
 }
@@ -89,10 +114,65 @@ impl SyntheticStore {
     }
 }
 
+struct FlushFixture {
+    config: PathBuf,
+}
+
+impl FlushFixture {
+    fn new(run: usize) -> Self {
+        let dir = temp_dir(&format!("flush-budget-{run}"));
+        let config = dir.join("config.toml");
+        let root = dir.join("personal");
+        let data = dir.join("data");
+        store::init_store(&StoreInitOptions {
+            name: "personal".to_owned(),
+            root: root.clone(),
+            description: Some("Synthetic flush performance budget store".to_owned()),
+            sensitivity: Sensitivity::Private,
+        })
+        .expect("init flush store");
+        let manifest = store::read_manifest(&root).expect("read manifest");
+        write_flush_config(&config, &root, &data);
+        for index in 0..SYNTHETIC_OUTBOX_ITEMS {
+            write_outbox_note_item(
+                &data,
+                "personal",
+                &format!("flush-item-{index:03}"),
+                Some(manifest.store.id.clone()),
+                &format!("inbox/notes/2026/05/17/flush-item-{index:03}.md"),
+                format!("flush budget note {index}\n").as_bytes(),
+            );
+        }
+        Self { config }
+    }
+
+    fn hm<const N: usize>(&self, args: [&str; N]) {
+        hm_command(&self.config, args).assert().success();
+    }
+}
+
 fn hm_command<const N: usize>(config: &Path, args: [&str; N]) -> assert_cmd::Command {
     let mut command = cargo_bin_cmd!("hm");
     command.arg("--config").arg(config).args(args);
     command
+}
+
+fn write_flush_config(config: &Path, root: &Path, data: &Path) {
+    fs::write(
+        config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+            "#,
+            data.display(),
+            root.display()
+        ),
+    )
+    .expect("write flush config");
 }
 
 fn write_config(config: &Path, root: &Path, cache: &Path, state: &Path) {
@@ -119,6 +199,38 @@ fn write_config(config: &Path, root: &Path, cache: &Path, state: &Path) {
         ),
     )
     .expect("write config");
+}
+
+fn write_outbox_note_item(
+    data_dir: &Path,
+    store_name: &str,
+    item_id: &str,
+    expected_store_id: Option<String>,
+    final_note_path: &str,
+    note_body: &[u8],
+) {
+    let item_dir = data_dir.join("outbox").join(store_name).join(item_id);
+    fs::create_dir_all(&item_dir).expect("create outbox item");
+    fs::write(item_dir.join("note.md"), note_body).expect("write outbox note");
+    let meta = outbox::OutboxMeta {
+        schema_version: outbox::OUTBOX_SCHEMA_VERSION,
+        id: item_id.to_owned(),
+        store: store_name.to_owned(),
+        expected_store_id,
+        final_note_path: final_note_path.to_owned(),
+        note_sha256: outbox::payload_sha256(note_body),
+        final_event_path: None,
+        event_sha256: None,
+        created_at: "2026-05-17T00:00:00Z".to_owned(),
+        attempt_count: 0,
+        last_error: None,
+        state: outbox::OutboxState::Pending,
+    };
+    fs::write(
+        item_dir.join("meta.toml"),
+        outbox::render_meta(&meta).expect("render outbox meta"),
+    )
+    .expect("write outbox meta");
 }
 
 fn write_notes(root: &Path) {

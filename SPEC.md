@@ -2198,7 +2198,11 @@ When ready, create GitHub issues roughly in this order. Each carries a
 
 0. **Binary namespace check**: validate `hm` against Homebrew/Apt/common CLI
    namespaces, and `hm` collisions on Linux/macOS/WSL before cementing CLI
-   examples. Tests required: none (manual research issue).
+   examples. Current audit: `hm` is not an exact Homebrew core formula name, but
+   there are existing `hm` names in Ubuntu and crates.io. V1 still keeps the
+   primary binary named `hm` for direct release/shdeps installs; do not rely on
+   package-manager global uniqueness, and keep the publishable project/package
+   name `hive-memory`. Tests required: none (manual research issue).
 1. **Project skeleton**: Rust crate, clap CLI, CI fmt/clippy/test. Tests
    required: smoke `hm --version`.
 2. **License and metadata**: MIT license, README badges, contribution notes.

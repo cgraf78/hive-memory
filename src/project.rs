@@ -304,6 +304,50 @@ pub fn load_binding(
     Ok(Some(binding))
 }
 
+/// List every local project store binding.
+///
+/// Bindings are local machine policy, so this intentionally reads only
+/// `data_dir/projects` and does not scan canonical stores. Canonical project
+/// aliases are shared memory metadata and are surfaced by `hm projects show`
+/// for a selected project instead.
+pub fn list_bindings(data_dir: &Path) -> Result<Vec<ProjectBinding>, ProjectError> {
+    let root = data_dir.join("projects");
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(ProjectError::Binding {
+                path: root,
+                message: err.to_string(),
+            });
+        }
+    };
+
+    let mut bindings = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| ProjectError::Binding {
+            path: root.clone(),
+            message: err.to_string(),
+        })?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("toml") {
+            continue;
+        }
+        let contents = fs::read_to_string(&path).map_err(|err| ProjectError::Binding {
+            path: path.clone(),
+            message: err.to_string(),
+        })?;
+        bindings.push(toml::from_str::<ProjectBinding>(&contents).map_err(|err| {
+            ProjectError::Binding {
+                path: path.clone(),
+                message: err.to_string(),
+            }
+        })?);
+    }
+    bindings.sort_by(|left, right| left.project_id.cmp(&right.project_id));
+    Ok(bindings)
+}
+
 /// Write or replace a local project store binding.
 ///
 /// Bindings are small, but still policy-bearing. Use the shared atomic writer so
