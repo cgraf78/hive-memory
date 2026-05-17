@@ -40,11 +40,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "release ${TAG} already exists; bump Cargo.toml before releasing" >&2
+          if is_draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [ "$is_draft" = "true" ]; then
+              echo "release ${TAG} draft already exists; reusing it"
+              exit 0
+            fi
+            echo "release ${TAG} already exists and is published; bump Cargo.toml before releasing" >&2
             exit 1
           fi
-          gh release create "$TAG" --draft --title "$TAG" --generate-notes
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --title "$TAG" --generate-notes
 
   build:
     name: Build ${{ matrix.target }}
@@ -103,7 +107,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: gh release upload "$TAG" dist/*.tar.gz dist/*.sha256 --clobber
+        run: gh release upload "$TAG" dist/*.tar.gz dist/*.sha256 --repo "$GITHUB_REPOSITORY" --clobber
 
   publish-release:
     name: Publish release
@@ -116,4 +120,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: gh release edit "$TAG" --draft=false --latest
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest

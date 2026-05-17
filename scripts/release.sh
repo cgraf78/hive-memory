@@ -57,7 +57,12 @@ tag="v${version}"
 # A new release must use a new version. Check origin before creating or pushing
 # anything so rerunning the helper cannot accidentally replace assets for an
 # already published version.
-git fetch --quiet origin --tags
+git fetch --quiet origin main:refs/remotes/origin/main --tags
+if git rev-parse --verify origin/main >/dev/null 2>&1 &&
+  ! git merge-base --is-ancestor origin/main HEAD; then
+  echo "release: local main is not based on origin/main; update before releasing" >&2
+  exit 1
+fi
 if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
   echo "release: origin already has tag ${tag}; bump Cargo.toml before releasing" >&2
   exit 1
