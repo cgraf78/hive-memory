@@ -41,7 +41,8 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
-            exit 0
+            echo "release ${TAG} already exists; bump Cargo.toml before releasing" >&2
+            exit 1
           fi
           gh release create "$TAG" --draft --title "$TAG" --notes "Automated Hive Memory release."
 

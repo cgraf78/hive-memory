@@ -53,6 +53,20 @@ tag="v${version}"
 # The version appears in the Git tag because GitHub releases are tag-based, but
 # humans should not type it twice. Derive the tag from Cargo.toml and make the
 # workflow verify that the pushed tag still matches the crate version.
+#
+# A new release must use a new version. Check origin before creating or pushing
+# anything so rerunning the helper cannot accidentally replace assets for an
+# already published version.
+git fetch --quiet origin --tags
+if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+  echo "release: origin already has tag ${tag}; bump Cargo.toml before releasing" >&2
+  exit 1
+fi
+if command -v gh >/dev/null 2>&1 && gh release view "$tag" >/dev/null 2>&1; then
+  echo "release: GitHub release ${tag} already exists; bump Cargo.toml before releasing" >&2
+  exit 1
+fi
+
 if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
   tagged_commit=$(git rev-list -n 1 "$tag")
   head_commit=$(git rev-parse HEAD)
