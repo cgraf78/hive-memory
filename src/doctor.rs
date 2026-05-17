@@ -1788,10 +1788,12 @@ fn load_mounts() -> std::io::Result<Vec<MountInfo>> {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_mountinfo(contents: &str) -> Vec<MountInfo> {
     contents.lines().filter_map(parse_mountinfo_line).collect()
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_mountinfo_line(line: &str) -> Option<MountInfo> {
     // `/proc/*/mountinfo` has optional fields before the ` - ` separator; the
     // stable fields we need are mount point on the left and filesystem/source
@@ -1810,6 +1812,7 @@ fn parse_mountinfo_line(line: &str) -> Option<MountInfo> {
     })
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn unescape_mountinfo_field(value: &str) -> String {
     // Mountinfo escapes spaces and other bytes as octal sequences. Decode them
     // before prefix matching so stores under paths like `/media/My Drive` map to

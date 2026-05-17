@@ -794,7 +794,14 @@ mod tests {
         .expect("resolve project");
 
         assert_eq!(resolved.project_id, "project-explicit");
-        assert_eq!(resolved.project_root, root);
+        // macOS exposes the temp directory through /var while canonical paths
+        // resolve through /private/var. The resolver intentionally stores the
+        // canonical marker root so project identity is stable across equivalent
+        // path spellings.
+        assert_eq!(
+            resolved.project_root,
+            root.canonicalize().expect("canonical root")
+        );
         assert_eq!(resolved.source, ProjectIdSource::Marker);
     }
 
