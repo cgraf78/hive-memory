@@ -949,6 +949,44 @@ fn doctor_warns_for_cloud_sync_conflict_files() {
 }
 
 #[test]
+fn doctor_fix_quarantines_cloud_sync_conflict_files() {
+    let dir = temp_dir("doctor-fix-cloud-conflict");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    write_data_config(&config, &data, &personal);
+    init_store(&personal, "personal");
+    let conflict_dir = personal.join("inbox/notes/2026/05/16");
+    fs::create_dir_all(&conflict_dir).expect("conflict dir");
+    let conflict = conflict_dir.join("remembered sync-conflict.md");
+    fs::write(&conflict, "conflicting memory copy").expect("conflict file");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "doctor",
+            "--quick",
+            "--fix",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"fixed\": 1"))
+        .stdout(predicate::str::contains("\"warnings\": 0"));
+
+    assert!(
+        !conflict.exists(),
+        "conflict copy should move out of canonical scan paths"
+    );
+    let quarantined = fs::read_dir(personal.join(".quarantine/cloud-conflicts"))
+        .expect("quarantine root")
+        .next()
+        .is_some();
+    assert!(quarantined, "conflict copy should remain recoverable");
+}
+
+#[test]
 fn doctor_warns_for_missing_required_store_dirs() {
     let dir = temp_dir("doctor-missing-dirs");
     let config = dir.join("config.toml");

@@ -765,9 +765,10 @@ mod tests {
         let output = assemble_context(request).expect("context");
 
         assert_eq!(output.sections.len(), 1);
-        assert!(output
+        let contains_renamed_memory = output
             .markdown
-            .contains("Remembered before the repo rename."));
+            .contains("Remembered before the repo rename.");
+        assert!(contains_renamed_memory);
     }
 
     #[test]

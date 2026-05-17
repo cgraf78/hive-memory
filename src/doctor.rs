@@ -10,7 +10,8 @@ use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
-use time::{Date, Month, OffsetDateTime, format_description::well_known::Rfc3339};
+use time::format_description::well_known::Rfc3339;
+use time::{Date, Month, OffsetDateTime};
 
 const STALE_TEMP_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const OLD_OUTBOX_ITEM_DAYS: i64 = 7;
@@ -206,13 +207,15 @@ pub fn run(input: DoctorInput<'_>) -> DoctorReport {
 ///
 /// Repairs are deliberately narrower than diagnostics. `hm doctor --fix` may
 /// recreate tool-owned layout, restore the managed generated `.gitignore`, and
-/// quarantine stale atomic-write residue, but it must not initialize missing
-/// stores, rewrite canonical notes, or delete user memory. Those higher-risk
-/// decisions stay visible in diagnostics for a human to resolve.
+/// quarantine cloud-conflict or stale atomic-write residue, but it must not
+/// initialize missing stores, rewrite canonical notes, or delete user memory.
+/// Those higher-risk decisions stay visible in diagnostics for a human to
+/// resolve.
 pub fn fix(input: DoctorFixInput<'_>) -> DoctorFixReport {
     let mut actions = Vec::new();
     fix_required_dirs(input.config, &mut actions);
     fix_generated_gitignore(input.config, &mut actions);
+    fix_cloud_conflicts(input.config, &mut actions);
     fix_stale_temp_files(input.config, &mut actions);
     fix_expired_outbox_archives(input.config, &mut actions);
     summarize_fixes(actions)
@@ -312,6 +315,51 @@ fn check_cloud_conflicts(config: &config::Config, checks: &mut Vec<DoctorCheck>)
                     .map(|path| path.display().to_string())
                     .collect(),
             ));
+        }
+    }
+}
+
+fn fix_cloud_conflicts(config: &config::Config, actions: &mut Vec<DoctorFixAction>) {
+    let quarantine_id = current_quarantine_id();
+    for (store_name, store_config) in &config.stores {
+        let conflicts = match collect_cloud_conflicts(&store_config.root) {
+            Ok(conflicts) => conflicts,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                actions.push(fix_skipped(
+                    "cloud-conflicts",
+                    store_name,
+                    &store_config.root,
+                    "store root is missing; skipped cloud conflict quarantine",
+                ));
+                continue;
+            }
+            Err(err) => {
+                actions.push(fix_failed(
+                    "cloud-conflicts",
+                    store_name,
+                    &store_config.root,
+                    format!("failed to scan cloud conflicts: {err}"),
+                ));
+                continue;
+            }
+        };
+
+        for path in conflicts {
+            // Sync conflict files can contain divergent user memory, so `--fix`
+            // moves them out of canonical read/index paths instead of deleting
+            // or merging them. The quarantine path preserves enough context for
+            // a human to inspect and recover anything useful later.
+            match quarantine_file(&store_config.root, &path, "cloud-conflicts", &quarantine_id) {
+                Ok(destination) => actions.push(fix_fixed(
+                    "cloud-conflicts",
+                    store_name,
+                    &path,
+                    format!("quarantined cloud conflict at {}", destination.display()),
+                )),
+                Err(message) => {
+                    actions.push(fix_failed("cloud-conflicts", store_name, &path, message))
+                }
+            }
         }
     }
 }
@@ -616,10 +664,7 @@ fn check_stale_temp_files(config: &config::Config, checks: &mut Vec<DoctorCheck>
 
 fn fix_stale_temp_files(config: &config::Config, actions: &mut Vec<DoctorFixAction>) {
     let now = SystemTime::now();
-    let quarantine_id = OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| "now".to_owned())
-        .replace(':', "");
+    let quarantine_id = current_quarantine_id();
     for (store_name, store_config) in &config.stores {
         let stale = match collect_stale_temp_files(&store_config.root, now) {
             Ok(stale) => stale,
@@ -644,33 +689,14 @@ fn fix_stale_temp_files(config: &config::Config, actions: &mut Vec<DoctorFixActi
         };
 
         for path in stale {
-            let destination =
-                quarantine_destination(&store_config.root, &path, "stale-temps", &quarantine_id);
-            if let Some(parent) = destination.parent()
-                && let Err(err) = fs::create_dir_all(parent)
-            {
-                actions.push(fix_failed(
-                    "stale-temps",
-                    store_name,
-                    &path,
-                    format!("failed to create quarantine directory: {err}"),
-                ));
-                continue;
-            }
-
-            match fs::rename(&path, &destination) {
-                Ok(()) => actions.push(fix_fixed(
+            match quarantine_file(&store_config.root, &path, "stale-temps", &quarantine_id) {
+                Ok(destination) => actions.push(fix_fixed(
                     "stale-temps",
                     store_name,
                     &path,
                     format!("quarantined stale temp file at {}", destination.display()),
                 )),
-                Err(err) => actions.push(fix_failed(
-                    "stale-temps",
-                    store_name,
-                    &path,
-                    format!("failed to quarantine stale temp file: {err}"),
-                )),
+                Err(message) => actions.push(fix_failed("stale-temps", store_name, &path, message)),
             }
         }
     }
@@ -1056,19 +1082,14 @@ fn parse_note_created_at(value: &str) -> Option<OffsetDateTime> {
 
 fn check_unclaimed_project_memory(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
     for (store_name, store_config) in &config.stores {
+        let projects_root = store_config.root.join("memories/projects");
         let known_projects = match project::claimed_project_ids(&store_config.root) {
             Ok(projects) => projects,
             Err(message) => {
                 checks.push(warn(
                     format!("store.{store_name}.project-claims"),
                     format!("failed to inspect project alias metadata: {message}"),
-                    vec![
-                        store_config
-                            .root
-                            .join("memories/projects")
-                            .display()
-                            .to_string(),
-                    ],
+                    vec![projects_root.display().to_string()],
                 ));
                 continue;
             }
@@ -1117,13 +1138,7 @@ fn check_unclaimed_project_memory(config: &config::Config, checks: &mut Vec<Doct
             checks.push(pass(
                 format!("store.{store_name}.project-claims"),
                 format!("store {store_name} project-scoped memory is claimed"),
-                vec![
-                    store_config
-                        .root
-                        .join("memories/projects")
-                        .display()
-                        .to_string(),
-                ],
+                vec![projects_root.display().to_string()],
             ));
         }
     }
@@ -1820,6 +1835,28 @@ fn quarantine_destination(
         .join(quarantine_id)
         .join(relative);
     unique_destination(base)
+}
+
+fn current_quarantine_id() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "now".to_owned())
+        .replace(':', "")
+}
+
+fn quarantine_file(
+    store_root: &Path,
+    path: &Path,
+    category: &str,
+    quarantine_id: &str,
+) -> Result<PathBuf, String> {
+    let destination = quarantine_destination(store_root, path, category, quarantine_id);
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create quarantine directory: {err}"))?;
+    }
+    fs::rename(path, &destination).map_err(|err| format!("failed to quarantine file: {err}"))?;
+    Ok(destination)
 }
 
 fn unique_destination(path: PathBuf) -> PathBuf {
