@@ -231,6 +231,9 @@ struct ProjectBindArgs {
     /// Store alias to prefer for this project on this machine.
     #[arg(long)]
     store: String,
+    /// Emit machine-readable output.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Arguments for `hm projects unbind`.
@@ -238,6 +241,9 @@ struct ProjectBindArgs {
 struct ProjectUnbindArgs {
     /// Path, file, or directory hint for the project to unbind.
     path: PathBuf,
+    /// Emit machine-readable output.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Arguments for `hm projects alias`.
@@ -269,6 +275,9 @@ struct StoreInitArgs {
     /// Store sensitivity policy to record in the manifest.
     #[arg(long, default_value = "private", value_parser = parse_sensitivity)]
     sensitivity: Sensitivity,
+    /// Emit machine-readable output.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Arguments for `hm stores list`.
@@ -294,6 +303,9 @@ struct StoreShowArgs {
 struct StoreDoctorArgs {
     /// Store alias to diagnose. Defaults to all configured stores.
     name: Option<String>,
+    /// Emit machine-readable output.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Arguments for `hm doctor`.
@@ -317,6 +329,28 @@ struct DoctorFixOutput<'a> {
     fixes: &'a doctor::DoctorFixReport,
     /// Diagnostic report after repairs have been attempted.
     doctor: &'a doctor::DoctorReport,
+}
+
+#[derive(Debug, Serialize)]
+struct StoreInitOutput {
+    name: String,
+    root: String,
+    store_id: String,
+    sensitivity: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ProjectBindOutput {
+    project_id: String,
+    store: String,
+    binding: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ProjectUnbindOutput {
+    project_id: String,
+    removed: bool,
+    binding: Option<String>,
 }
 
 /// Arguments for `hm stores migrate`.
@@ -570,8 +604,10 @@ impl Cli {
     /// callers a stable JSON success *and* failure envelope.
     fn wants_json(&self) -> bool {
         match &self.command {
+            Some(Command::Stores(StoresCommand::Init(args))) => args.json,
             Some(Command::Stores(StoresCommand::List(args))) => args.json,
             Some(Command::Stores(StoresCommand::Show(args))) => args.json,
+            Some(Command::Stores(StoresCommand::Doctor(args))) => args.json,
             Some(Command::Remember(args)) | Some(Command::Note(args)) => args.json,
             Some(Command::Search(args)) => args.json,
             Some(Command::Context(args)) => args.json,
@@ -580,6 +616,8 @@ impl Cli {
                 args.json
             }
             Some(Command::Projects(ProjectsCommand::Resolve(args))) => args.json,
+            Some(Command::Projects(ProjectsCommand::Bind(args))) => args.json,
+            Some(Command::Projects(ProjectsCommand::Unbind(args))) => args.json,
             Some(Command::Hook(HookCommand::SessionStart(args))) => args.json,
             Some(Command::Hook(HookCommand::PromptSubmit(args))) => args.json,
             Some(Command::Hook(HookCommand::ToolComplete(args))) => args.json,
@@ -775,11 +813,21 @@ fn run_stores(command: StoresCommand, context: CliContext) -> Result<()> {
             };
             let root = options.root.clone();
             let manifest = store::init_store(&options)?;
-            println!(
-                "initialized store {} at {}",
-                manifest.store.name,
-                root.display()
-            );
+            if args.json {
+                let output = StoreInitOutput {
+                    name: manifest.store.name,
+                    root: root.display().to_string(),
+                    store_id: manifest.store.id,
+                    sensitivity: manifest.store.sensitivity.to_string(),
+                };
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                println!(
+                    "initialized store {} at {}",
+                    manifest.store.name,
+                    root.display()
+                );
+            }
             Ok(())
         }
         StoresCommand::List(args) => {
@@ -798,7 +846,7 @@ fn run_stores(command: StoresCommand, context: CliContext) -> Result<()> {
         }
         StoresCommand::Doctor(args) => {
             let config = load_config(context.config_path.as_deref())?;
-            run_store_doctor(&config, args.name.as_deref())
+            run_store_doctor(&config, args.name.as_deref(), args.json)
         }
         StoresCommand::Migrate(args) => {
             let config = load_config(context.config_path.as_deref())?;
@@ -975,9 +1023,18 @@ fn run_project_bind(args: ProjectBindArgs, context: CliContext) -> Result<()> {
     };
     let path = project::save_binding(&config.data_dir, &binding, &hook_options(&config))?;
 
-    println!("project_id: {}", project.project_id);
-    println!("store: {}", binding.store);
-    println!("binding: {}", path.display());
+    if args.json {
+        let output = ProjectBindOutput {
+            project_id: project.project_id,
+            store: binding.store,
+            binding: path.display().to_string(),
+        };
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("project_id: {}", project.project_id);
+        println!("store: {}", binding.store);
+        println!("binding: {}", path.display());
+    }
     Ok(())
 }
 
@@ -990,10 +1047,19 @@ fn run_project_unbind(args: ProjectUnbindArgs, context: CliContext) -> Result<()
     })?;
     let removed = project::remove_binding(&config.data_dir, &project.project_id)?;
 
-    println!("project_id: {}", project.project_id);
-    println!("removed: {}", removed.is_some());
-    if let Some(path) = removed {
-        println!("binding: {}", path.display());
+    if args.json {
+        let output = ProjectUnbindOutput {
+            project_id: project.project_id,
+            removed: removed.is_some(),
+            binding: removed.map(|path| path.display().to_string()),
+        };
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("project_id: {}", project.project_id);
+        println!("removed: {}", removed.is_some());
+        if let Some(path) = removed {
+            println!("binding: {}", path.display());
+        }
     }
     Ok(())
 }
@@ -3226,9 +3292,23 @@ fn effective_agent_policy_json(policy: config::EffectiveAgentPolicy) -> Effectiv
     }
 }
 
-fn run_store_doctor(config: &Config, name: Option<&str>) -> Result<()> {
+fn run_store_doctor(config: &Config, name: Option<&str>, json: bool) -> Result<()> {
     let reports = doctor_reports(config, name)?;
     let mut has_error = false;
+
+    if json {
+        has_error = reports.iter().any(|report| {
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.level == store::StoreDoctorLevel::Error)
+        });
+        println!("{}", serde_json::to_string_pretty(&reports)?);
+        if has_error {
+            anyhow::bail!("store doctor found errors");
+        }
+        return Ok(());
+    }
 
     for report in &reports {
         println!("store: {}", report.name);

@@ -227,6 +227,30 @@ fn stores_init_creates_manifest() {
     );
 }
 
+#[test]
+fn stores_init_json_reports_manifest_identity() {
+    let root = temp_dir("stores-init-json").join("personal");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "stores",
+            "init",
+            "personal",
+            "--root",
+            root.to_str().expect("utf8 temp path"),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"name\": \"personal\""))
+        .stdout(predicate::str::contains(format!(
+            "\"root\": \"{}\"",
+            root.display()
+        )))
+        .stdout(predicate::str::contains("\"store_id\": \""))
+        .stdout(predicate::str::contains("\"sensitivity\": \"private\""));
+}
+
 #[cfg(unix)]
 #[test]
 fn stores_init_protects_private_root_permissions() {
@@ -492,6 +516,31 @@ fn stores_doctor_warns_for_missing_manifest() {
         .stdout(predicate::str::contains("store: personal"))
         .stdout(predicate::str::contains("manifest: missing"))
         .stdout(predicate::str::contains("warning: missing manifest"));
+}
+
+#[test]
+fn stores_doctor_json_reports_issues() {
+    let dir = temp_dir("stores-doctor-json");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "stores",
+            "doctor",
+            "personal",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"name\": \"personal\""))
+        .stdout(predicate::str::contains("\"manifest_available\": false"))
+        .stdout(predicate::str::contains("\"level\": \"warning\""))
+        .stdout(predicate::str::contains("missing manifest"));
 }
 
 #[test]
@@ -4249,6 +4298,77 @@ fn projects_bind_and_unbind_local_store_affinity() {
         .stdout(predicate::str::contains(
             "\"store_source\": \"global-default\"",
         ));
+}
+
+#[test]
+fn projects_bind_and_unbind_json_reports_binding() {
+    let dir = temp_dir("projects-bind-json");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    let repo = dir.join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    fs::write(
+        repo.join(".hive-memory-project"),
+        "id = \"bound-project-json\"\n",
+    )
+    .expect("marker");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+
+            [stores.work]
+            root = "{}"
+            "#,
+            data.display(),
+            personal.display(),
+            work.display()
+        ),
+    )
+    .expect("write config");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "projects",
+            "bind",
+            repo.to_str().expect("utf8 repo"),
+            "--store",
+            "work",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"project_id\": \"bound-project-json\"",
+        ))
+        .stdout(predicate::str::contains("\"store\": \"work\""))
+        .stdout(predicate::str::contains("\"binding\": \""));
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "projects",
+            "unbind",
+            repo.to_str().expect("utf8 repo"),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"project_id\": \"bound-project-json\"",
+        ))
+        .stdout(predicate::str::contains("\"removed\": true"))
+        .stdout(predicate::str::contains("\"binding\": \""));
 }
 
 #[test]

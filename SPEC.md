@@ -751,11 +751,20 @@ Stable `--json` success field sets. Fields are mandatory unless explicitly noted
   "readable", "writable", "default_for_agent" } ]`; the last three fields are
   computed from `HIVE_MEMORY_AGENT_ID` / `--as-agent` when present and are `null`
   for unrestricted human invocations.
+- `hm stores init --json`:
+  `{ "name", "root", "store_id", "sensitivity" }`.
 - `hm stores show --json`:
   `{ "name", "config", "manifest", "available", "effective_agent_policy" }`.
+- `hm stores doctor --json`:
+  `[ { "name", "root", "manifest_available", "manifest", "issues" } ]`.
 - `hm projects resolve --json`:
   `{ "project_id", "project_root", "project_hint", "store", "store_source",
   "agent_id", "readable", "writable" }`.
+- `hm projects bind --json`:
+  `{ "project_id", "store", "binding" }`.
+- `hm projects unbind --json`:
+  `{ "project_id", "removed", "binding" }`, where `binding` is `null` when no
+  local binding existed.
 - `hm doctor --json`:
   `{ "ok", "summary", "checks" }`, where `summary` contains
   `{ "errors", "warnings" }` and each check contains

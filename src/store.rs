@@ -78,7 +78,7 @@ pub struct StoreDoctorInput<'a> {
 }
 
 /// Diagnostic result for one configured store.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StoreDoctorReport {
     /// Local config alias that was checked.
     pub name: String,
@@ -95,7 +95,7 @@ pub struct StoreDoctorReport {
 /// Missing manifests and alias drift are warnings because they are expected in
 /// early setup or after a harmless local alias rename. Newer/corrupt manifests
 /// are errors because continuing could interpret store data incorrectly.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StoreDoctorIssue {
     /// Finding severity.
     pub level: StoreDoctorLevel,
@@ -104,7 +104,8 @@ pub struct StoreDoctorIssue {
 }
 
 /// Severity for a store diagnostic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum StoreDoctorLevel {
     /// Non-fatal setup or drift issue.
     Warning,
