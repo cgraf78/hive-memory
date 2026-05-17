@@ -115,6 +115,7 @@ pub fn run(input: DoctorInput<'_>) -> DoctorReport {
     check_cloud_conflicts(input.config, &mut checks);
     check_stale_temp_files(input.config, &mut checks);
     check_project_bindings(input.config, &mut checks);
+    check_agent_policies(input.config, &mut checks);
     check_outbox(input.config, &mut checks);
     check_adapters(input.config, input.quick, &mut checks);
     // Secret scanning is deliberately kept off the quick path. Hooks and
@@ -692,6 +693,38 @@ fn check_project_bindings(config: &config::Config, checks: &mut Vec<DoctorCheck>
             "no local project bindings configured",
             vec![dir.display().to_string()],
         ));
+    }
+}
+
+fn check_agent_policies(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
+    let sensitive_stores = config
+        .stores
+        .iter()
+        .filter_map(|(name, store_config)| {
+            is_sensitive(effective_store_sensitivity(store_config)).then_some(name.as_str())
+        })
+        .collect::<Vec<_>>();
+
+    for (agent_name, agent) in &config.agents {
+        // `allow_all_stores` is explicit, but it also grows automatically as
+        // new stores are added later. Warn only when it can actually broaden
+        // access across a multi-store config containing private/secret data.
+        if agent.allow_all_stores && config.stores.len() > 1 && !sensitive_stores.is_empty() {
+            checks.push(warn(
+                format!("agent.{agent_name}.broad-access"),
+                format!(
+                    "agent {agent_name} has all-store access while sensitive store(s) exist: {}",
+                    sensitive_stores.join(",")
+                ),
+                Vec::new(),
+            ));
+        } else {
+            checks.push(pass(
+                format!("agent.{agent_name}.broad-access"),
+                format!("agent {agent_name} does not have risky broad store access"),
+                Vec::new(),
+            ));
+        }
     }
 }
 

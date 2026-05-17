@@ -643,6 +643,54 @@ fn doctor_warns_for_broad_sensitive_adapter_render() {
 }
 
 #[test]
+fn doctor_warns_for_agent_all_store_access_with_sensitive_stores() {
+    let dir = temp_dir("doctor-agent-broad-access");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "{}"
+
+            [stores.work]
+            root = "{}"
+
+            [agents.codex]
+            default_store = "personal"
+            read_stores = ["personal"]
+            write_stores = ["personal"]
+            allow_all_stores = true
+            "#,
+            personal.display(),
+            work.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+    init_store(&work, "work");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "doctor",
+            "--quick",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"warnings\": 1"))
+        .stdout(predicate::str::contains(
+            "agent codex has all-store access while sensitive store(s) exist: personal,work",
+        ));
+}
+
+#[test]
 fn doctor_warns_for_unknown_project_binding_store() {
     let dir = temp_dir("doctor-project-binding");
     let config = dir.join("config.toml");
