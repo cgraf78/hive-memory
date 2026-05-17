@@ -5,7 +5,7 @@
 //! the configured stores, local project bindings, and adapter links be trusted
 //! before an agent relies on them?
 
-use crate::{config, note, outbox, project, render, secret, store, write};
+use crate::{config, event, note, outbox, project, render, secret, store, write};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -191,6 +191,7 @@ pub fn run(input: DoctorInput<'_>) -> DoctorReport {
     // audit walks note content and is intended for explicit human review.
     if !input.quick {
         check_outbox_archives(input.config, &mut checks);
+        check_event_pairing(input.config, &mut checks);
         check_agent_private_audience(input.config, &mut checks);
         check_note_secrets(input.config, &mut checks);
         check_note_prompt_risks(input.config, &mut checks);
@@ -807,6 +808,177 @@ fn check_outbox_archives(config: &config::Config, checks: &mut Vec<DoctorCheck>)
             ));
         }
     }
+}
+
+fn check_event_pairing(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
+    // Plain notes are allowed to omit events; only validate relationships that
+    // the note or event explicitly declares so `hm note --no-event` stays clean.
+    for (store_name, store_config) in &config.stores {
+        let mut issues = 0usize;
+        issues += check_notes_with_declared_events(store_name, store_config, checks);
+        issues += check_events_with_declared_notes(store_name, store_config, checks);
+        if issues == 0 {
+            checks.push(pass(
+                format!("store.{store_name}.event-pairs"),
+                format!("store {store_name} declared note/event pairs are intact"),
+                vec![store_config.root.display().to_string()],
+            ));
+        }
+    }
+}
+
+fn check_notes_with_declared_events(
+    store_name: &str,
+    store_config: &config::StoreConfig,
+    checks: &mut Vec<DoctorCheck>,
+) -> usize {
+    let notes_root = store_config.root.join("inbox/notes");
+    let note_paths = match collect_markdown_files(&notes_root) {
+        Ok(paths) => paths,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(err) => {
+            checks.push(warn(
+                format!("store.{store_name}.event-pairs"),
+                format!("failed to scan notes for event pairing: {err}"),
+                vec![notes_root.display().to_string()],
+            ));
+            return 1;
+        }
+    };
+
+    let mut issues = 0usize;
+    for path in note_paths {
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(err) => {
+                issues += 1;
+                checks.push(warn(
+                    format!("store.{store_name}.event-pairs"),
+                    format!("failed to read note while checking event pair: {err}"),
+                    vec![path.display().to_string()],
+                ));
+                continue;
+            }
+        };
+        let parsed = match note::parse_note(&contents) {
+            Ok(parsed) => parsed,
+            // Strict note scans already report parse failures. Pairing only
+            // adds signal when a valid note declares a companion event.
+            Err(_) => continue,
+        };
+        let Some(related_event_id) = parsed.front_matter.related_event_id.as_deref() else {
+            continue;
+        };
+        let Some(created_at) = parse_note_created_at(&parsed.front_matter.created_at) else {
+            continue;
+        };
+        let expected = store_config
+            .root
+            .join(event::event_relative_path(related_event_id, created_at));
+        if !expected.is_file() {
+            issues += 1;
+            checks.push(warn(
+                format!("store.{store_name}.event-pairs"),
+                format!(
+                    "note {} declares missing event {}",
+                    parsed.front_matter.id, related_event_id
+                ),
+                vec![path.display().to_string(), expected.display().to_string()],
+            ));
+        }
+    }
+    issues
+}
+
+fn check_events_with_declared_notes(
+    store_name: &str,
+    store_config: &config::StoreConfig,
+    checks: &mut Vec<DoctorCheck>,
+) -> usize {
+    let events_root = store_config.root.join("inbox/events");
+    let event_paths = match collect_json_files(&events_root) {
+        Ok(paths) => paths,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(err) => {
+            checks.push(warn(
+                format!("store.{store_name}.event-pairs"),
+                format!("failed to scan events for note pairing: {err}"),
+                vec![events_root.display().to_string()],
+            ));
+            return 1;
+        }
+    };
+
+    let mut issues = 0usize;
+    for path in event_paths {
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(err) => {
+                issues += 1;
+                checks.push(warn(
+                    format!("store.{store_name}.event-pairs"),
+                    format!("failed to read event while checking note pair: {err}"),
+                    vec![path.display().to_string()],
+                ));
+                continue;
+            }
+        };
+        let parsed = match event::parse_event(&contents) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                issues += 1;
+                checks.push(warn(
+                    format!("store.{store_name}.event-pairs"),
+                    format!("failed to parse event while checking note pair: {err}"),
+                    vec![path.display().to_string()],
+                ));
+                continue;
+            }
+        };
+        let Some(note_path) = parsed.note_path.as_deref() else {
+            continue;
+        };
+        let expected = store_config.root.join(note_path);
+        if !expected.is_file() {
+            issues += 1;
+            checks.push(warn(
+                format!("store.{store_name}.event-pairs"),
+                format!("event {} declares missing note", parsed.id),
+                vec![path.display().to_string(), expected.display().to_string()],
+            ));
+            continue;
+        }
+        match fs::read_to_string(&expected)
+            .map_err(|err| err.to_string())
+            .and_then(|contents| note::parse_note(&contents).map_err(|err| err.to_string()))
+        {
+            Ok(note) if note.front_matter.id == parsed.id => {}
+            Ok(note) => {
+                issues += 1;
+                checks.push(warn(
+                    format!("store.{store_name}.event-pairs"),
+                    format!(
+                        "event {} declares note with different id {}",
+                        parsed.id, note.front_matter.id
+                    ),
+                    vec![path.display().to_string(), expected.display().to_string()],
+                ));
+            }
+            Err(message) => {
+                issues += 1;
+                checks.push(warn(
+                    format!("store.{store_name}.event-pairs"),
+                    format!("failed to parse paired note: {message}"),
+                    vec![path.display().to_string(), expected.display().to_string()],
+                ));
+            }
+        }
+    }
+    issues
+}
+
+fn parse_note_created_at(value: &str) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(value, &Rfc3339).ok()
 }
 
 fn check_agent_private_audience(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
@@ -1537,6 +1709,30 @@ fn collect_markdown_files_into(
         if metadata.is_dir() {
             collect_markdown_files_into(&path, paths)?;
         } else if path.extension().and_then(|value| value.to_str()) == Some("md") {
+            paths.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn collect_json_files(root: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
+    let mut paths = Vec::new();
+    collect_json_files_into(root, &mut paths)?;
+    paths.sort();
+    Ok(paths)
+}
+
+fn collect_json_files_into(
+    root: &Path,
+    paths: &mut Vec<std::path::PathBuf>,
+) -> std::io::Result<()> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            collect_json_files_into(&path, paths)?;
+        } else if path.extension().and_then(|value| value.to_str()) == Some("json") {
             paths.push(path);
         }
     }
