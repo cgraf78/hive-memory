@@ -707,6 +707,36 @@ fn doctor_warns_for_old_outbox_items() {
 }
 
 #[test]
+fn doctor_full_warns_for_expired_outbox_archives() {
+    let dir = temp_dir("doctor-expired-archive");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    write_data_config(&config, &data, &personal);
+    init_store(&personal, "personal");
+    let archive = personal.join(".outbox-archive/test-host/2000-01-01/old-item");
+    fs::create_dir_all(&archive).expect("create old archive");
+    fs::write(archive.join("note.md"), "archived note").expect("write archive note");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "doctor",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"warnings\": 1"))
+        .stdout(predicate::str::contains(
+            "store personal has 1 outbox archive item(s) older than 30 days",
+        ))
+        .stdout(predicate::str::contains(
+            archive.to_str().expect("utf8 archive path"),
+        ));
+}
+
+#[test]
 fn doctor_warns_for_cloud_sync_conflict_files() {
     let dir = temp_dir("doctor-cloud-conflict");
     let config = dir.join("config.toml");

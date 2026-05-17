@@ -10,7 +10,7 @@ use serde::Serialize;
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
-use time::OffsetDateTime;
+use time::{Date, Month, OffsetDateTime};
 
 const STALE_TEMP_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const OLD_OUTBOX_ITEM_DAYS: i64 = 7;
@@ -121,6 +121,7 @@ pub fn run(input: DoctorInput<'_>) -> DoctorReport {
     // update-time health checks need cheap structural validation, while this
     // audit walks note content and is intended for explicit human review.
     if !input.quick {
+        check_outbox_archives(input.config, &mut checks);
         check_note_secrets(input.config, &mut checks);
         check_note_prompt_risks(input.config, &mut checks);
     }
@@ -511,6 +512,55 @@ fn outbox_item_is_old(created_at: &str, now: OffsetDateTime) -> Option<bool> {
     Some(now - created_at > time::Duration::days(OLD_OUTBOX_ITEM_DAYS))
 }
 
+fn check_outbox_archives(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
+    let now = OffsetDateTime::now_utc().date();
+    let retention_days = i64::from(config.offline.archive_retention_days);
+    for (store_name, store_config) in &config.stores {
+        let root = store_config.root.join(".outbox-archive");
+        let expired = match collect_expired_outbox_archives(&root, now, retention_days) {
+            Ok(expired) => expired,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                checks.push(pass(
+                    format!("store.{store_name}.outbox-archive"),
+                    format!("store {store_name} has no outbox archives"),
+                    vec![root.display().to_string()],
+                ));
+                continue;
+            }
+            Err(err) => {
+                checks.push(warn(
+                    format!("store.{store_name}.outbox-archive"),
+                    format!("failed to scan outbox archives: {err}"),
+                    vec![root.display().to_string()],
+                ));
+                continue;
+            }
+        };
+
+        if expired.is_empty() {
+            checks.push(pass(
+                format!("store.{store_name}.outbox-archive"),
+                format!(
+                    "store {store_name} has no outbox archives older than {retention_days} days"
+                ),
+                vec![root.display().to_string()],
+            ));
+        } else {
+            checks.push(warn(
+                format!("store.{store_name}.outbox-archive"),
+                format!(
+                    "store {store_name} has {} outbox archive item(s) older than {retention_days} days",
+                    expired.len()
+                ),
+                expired
+                    .into_iter()
+                    .map(|path| path.display().to_string())
+                    .collect(),
+            ));
+        }
+    }
+}
+
 fn check_project_bindings(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
     let dir = config.data_dir.join("projects");
     let entries = match fs::read_dir(&dir) {
@@ -861,6 +911,58 @@ fn starts_with_word_boundary(line: &str, prefix: &str) -> bool {
         .is_none_or(|next| !next.is_ascii_alphanumeric() && next != '_')
 }
 
+fn collect_expired_outbox_archives(
+    root: &Path,
+    now: Date,
+    retention_days: i64,
+) -> std::io::Result<Vec<std::path::PathBuf>> {
+    let mut expired = Vec::new();
+    for host_entry in fs::read_dir(root)? {
+        let host_entry = host_entry?;
+        if !host_entry.file_type()?.is_dir() {
+            continue;
+        }
+        for date_entry in fs::read_dir(host_entry.path())? {
+            let date_entry = date_entry?;
+            if !date_entry.file_type()?.is_dir() {
+                continue;
+            }
+            let Some(date) = date_entry.file_name().to_str().and_then(parse_archive_date) else {
+                // Archive cleanup only owns hm's dated archive layout. Ignore
+                // unexpected directories rather than treating arbitrary user
+                // files under `.outbox-archive` as expired data.
+                continue;
+            };
+            if !archive_date_expired(date, now, retention_days) {
+                continue;
+            }
+            for item_entry in fs::read_dir(date_entry.path())? {
+                let item_entry = item_entry?;
+                if item_entry.file_type()?.is_dir() {
+                    expired.push(item_entry.path());
+                }
+            }
+        }
+    }
+    expired.sort();
+    Ok(expired)
+}
+
+fn parse_archive_date(input: &str) -> Option<Date> {
+    let mut parts = input.split('-');
+    let year = parts.next()?.parse::<i32>().ok()?;
+    let month = parts.next()?.parse::<u8>().ok()?;
+    let day = parts.next()?.parse::<u8>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Date::from_calendar_date(year, Month::try_from(month).ok()?, day).ok()
+}
+
+fn archive_date_expired(date: Date, now: Date, retention_days: i64) -> bool {
+    now.midnight() - date.midnight() > time::Duration::days(retention_days)
+}
+
 fn collect_cloud_conflicts(root: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
     let mut paths = Vec::new();
     collect_cloud_conflicts_into(root, &mut paths)?;
@@ -1080,5 +1182,17 @@ mod tests {
             prompt_risk_detectors(&"x".repeat(5001)),
             vec!["length-spike"]
         );
+    }
+
+    #[test]
+    fn archive_expiration_uses_strict_retention_days() {
+        let now = parse_archive_date("2026-05-16").expect("parse now");
+        let expired = parse_archive_date("2026-04-15").expect("parse expired");
+        let boundary = parse_archive_date("2026-04-16").expect("parse boundary");
+
+        assert!(archive_date_expired(expired, now, 30));
+        assert!(!archive_date_expired(boundary, now, 30));
+        assert!(parse_archive_date("bad").is_none());
+        assert!(parse_archive_date("2026-13-01").is_none());
     }
 }
