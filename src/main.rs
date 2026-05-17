@@ -41,7 +41,7 @@ Do not copy generated memory bodies into this instruction file.";
 /// Vendor-neutral shared memory infrastructure for AI agents.
 #[derive(Debug, Parser)]
 #[command(name = "hm")]
-#[command(version)]
+#[command(version = option_env!("HM_CLI_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")))]
 #[command(about = "Vendor-neutral shared memory infrastructure for AI agents.")]
 struct Cli {
     /// Main config file to load.

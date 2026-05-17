@@ -183,7 +183,8 @@ fn version_prints_binary_name() {
     cmd.arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("hm "));
+        .stdout(predicate::str::contains("hm "))
+        .stdout(predicate::str::contains("schema 1"));
 }
 
 #[test]
