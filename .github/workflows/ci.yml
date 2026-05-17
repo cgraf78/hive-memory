@@ -67,3 +67,20 @@ jobs:
       # it creates a 5000-note store and measures real CLI process latency.
       - name: Check warm context/search budgets
         run: cargo test --release --test perf_budget -- --ignored --nocapture
+
+  cloud-sync-sim:
+    name: Cloud sync simulation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      # Simulate the file-level behaviors cloud drives tend to produce around
+      # agent writes: independent files merging, conflict copies, and renames.
+      - name: Run cloud sync simulation
+        run: cargo test --test cloud_sync_sim -- --ignored --nocapture
