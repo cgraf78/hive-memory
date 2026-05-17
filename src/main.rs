@@ -1197,13 +1197,24 @@ fn run_write_memory(
     // offline work.
     let outcome = match read_store_manifest(&config, &resolved_store.name, store_config) {
         Ok(manifest) => write_canonical_memory(&store_config.root, &manifest, write_input)?,
-        Err(store::StoreError::Io { .. }) => enqueue_outbox_memory(
-            &config,
-            store_config,
-            &resolved_store.name,
-            known_store_identity(&config, &resolved_store.name, store_config)?,
-            write_input,
-        )?,
+        Err(store::StoreError::Io { .. }) if config.offline.write_fallback_enabled() => {
+            enqueue_outbox_memory(
+                &config,
+                store_config,
+                &resolved_store.name,
+                known_store_identity(&config, &resolved_store.name, store_config)?,
+                write_input,
+            )?
+        }
+        Err(store::StoreError::Io { .. }) => {
+            return Err(BackendUnavailable {
+                message: format!(
+                    "store {} is unavailable and offline fallback is disabled",
+                    resolved_store.name
+                ),
+            }
+            .into());
+        }
         Err(err) => return Err(err.into()),
     };
 

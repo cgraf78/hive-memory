@@ -57,7 +57,7 @@ const PRIVACY_KEYS: &[&str] = &[
     "allow_secret_writes",
     "allow_hook_secret_writes",
 ];
-const OFFLINE_KEYS: &[&str] = &["enabled", "mode"];
+const OFFLINE_KEYS: &[&str] = &["enabled", "mode", "archive_retention_days"];
 const PERFORMANCE_KEYS: &[&str] = &[
     "context_warm_p95_ms",
     "context_cold_p95_ms",
@@ -141,6 +141,8 @@ pub struct Config {
     pub agents: BTreeMap<String, AgentConfig>,
     /// Privacy and secret-handling policy shared by commands and hooks.
     pub privacy: PrivacyConfig,
+    /// Offline write and local outbox policy.
+    pub offline: OfflineConfig,
     /// Render/install targets for agent-visible context files.
     pub adapters: BTreeMap<String, AdapterConfig>,
 }
@@ -350,6 +352,45 @@ pub struct PrivacyConfig {
     pub allow_secret_writes: bool,
     /// Whether non-interactive hooks may write secret-classified material.
     pub allow_hook_secret_writes: bool,
+}
+
+/// Offline write policy for the local outbox.
+///
+/// The outbox is a recovery mechanism, not an implicit sync backend. Keeping
+/// this policy in config lets users explicitly disable local durability for
+/// environments where a missing store should fail immediately.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfflineConfig {
+    /// Whether unavailable-store writes may use the local outbox.
+    pub enabled: bool,
+    /// Operator preference for unavailable-store fallback.
+    pub mode: OfflineMode,
+    /// Days to retain per-store flush archives before future cleanup.
+    pub archive_retention_days: u32,
+}
+
+impl OfflineConfig {
+    /// Return whether write commands may enqueue when the target store is offline.
+    ///
+    /// `Always` is still a fallback policy rather than a request to bypass a
+    /// reachable store. Normal online writes should publish canonically first
+    /// so the outbox does not become a shadow sync queue.
+    pub fn write_fallback_enabled(&self) -> bool {
+        self.enabled && self.mode != OfflineMode::Never
+    }
+}
+
+/// Offline fallback mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OfflineMode {
+    /// Use the outbox only for recoverable unavailable-store errors.
+    #[default]
+    Auto,
+    /// Prefer the outbox whenever a command elects to use offline fallback.
+    Always,
+    /// Refuse unavailable-store writes instead of queueing them locally.
+    Never,
 }
 
 /// Render/install adapter configuration for an agent surface.
@@ -828,6 +869,7 @@ impl Config {
             stores,
             agents,
             privacy,
+            offline: OfflineConfig::from_raw(raw.offline),
             adapters,
         })
     }
@@ -903,6 +945,16 @@ impl PrivacyConfig {
     }
 }
 
+impl OfflineConfig {
+    fn from_raw(raw: RawOfflineConfig) -> Self {
+        Self {
+            enabled: raw.enabled.unwrap_or(true),
+            mode: raw.mode.unwrap_or_default(),
+            archive_retention_days: raw.archive_retention_days.unwrap_or(30),
+        }
+    }
+}
+
 impl AdapterConfig {
     fn from_raw<F>(raw: RawAdapterConfig, env: &F) -> Result<Self, ConfigError>
     where
@@ -937,6 +989,7 @@ struct RawConfig {
     defaults: RawDefaultsConfig,
     agents: BTreeMap<String, RawAgentConfig>,
     privacy: RawPrivacyConfig,
+    offline: RawOfflineConfig,
     adapters: BTreeMap<String, RawAdapterConfig>,
 }
 
@@ -955,6 +1008,7 @@ impl Default for RawConfig {
             defaults: RawDefaultsConfig::default(),
             agents: BTreeMap::new(),
             privacy: RawPrivacyConfig::default(),
+            offline: RawOfflineConfig::default(),
             adapters: BTreeMap::new(),
         }
     }
@@ -1008,6 +1062,14 @@ struct RawPrivacyConfig {
     secret_refuses_cloud_roots: Option<bool>,
     allow_secret_writes: Option<bool>,
     allow_hook_secret_writes: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawOfflineConfig {
+    enabled: Option<bool>,
+    mode: Option<OfflineMode>,
+    archive_retention_days: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1268,6 +1330,15 @@ mod tests {
             loaded.config.defaults.event_sidecar,
             EventSidecarPolicy::Always
         );
+        assert_eq!(
+            loaded.config.offline,
+            OfflineConfig {
+                enabled: true,
+                mode: OfflineMode::Auto,
+                archive_retention_days: 30,
+            }
+        );
+        assert!(loaded.config.offline.write_fallback_enabled());
         assert!(loaded.warnings.is_empty());
     }
 
@@ -1291,6 +1362,11 @@ mod tests {
             event_sidecar = "never"
             hook_context_max_tokens = 1234
             context_cache_max_age = "2d"
+
+            [offline]
+            enabled = false
+            mode = "never"
+            archive_retention_days = 14
             "#,
             env,
         )
@@ -1307,6 +1383,15 @@ mod tests {
         );
         assert_eq!(loaded.config.defaults.hook_context_max_tokens, 1234);
         assert_eq!(loaded.config.defaults.context_cache_max_age, "2d");
+        assert_eq!(
+            loaded.config.offline,
+            OfflineConfig {
+                enabled: false,
+                mode: OfflineMode::Never,
+                archive_retention_days: 14,
+            }
+        );
+        assert!(!loaded.config.offline.write_fallback_enabled());
     }
 
     #[test]

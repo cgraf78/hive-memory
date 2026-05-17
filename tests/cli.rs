@@ -801,6 +801,54 @@ fn remember_enqueues_outbox_when_store_unavailable_with_expected_id() {
 }
 
 #[test]
+fn remember_refuses_offline_outbox_when_disabled() {
+    let dir = temp_dir("remember-outbox-disabled");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("missing-personal");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+            expected_id = "018f5f57-bd9b-7d33-9e21-1f44f0c5a013"
+
+            [offline]
+            enabled = false
+            "#,
+            data.display(),
+            personal.display()
+        ),
+    )
+    .expect("write config");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "This should not enqueue.",
+            "--json",
+        ])
+        .assert()
+        .code(5)
+        .stderr(predicate::str::contains("\"ok\": false"))
+        .stderr(predicate::str::contains(
+            "\"code\": \"backend_unavailable\"",
+        ))
+        .stderr(predicate::str::contains(
+            "store personal is unavailable and offline fallback is disabled",
+        ));
+
+    assert!(!data.join("outbox").exists());
+}
+
+#[test]
 fn remember_uses_cached_store_identity_for_offline_outbox() {
     let dir = temp_dir("remember-outbox-cache");
     let config = dir.join("config.toml");
