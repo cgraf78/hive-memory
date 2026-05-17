@@ -609,6 +609,24 @@ impl Display for BackendUnavailable {
 
 impl Error for BackendUnavailable {}
 
+/// Privacy or safety policy refusal.
+///
+/// These errors mean `hm` deliberately refused to read, write, or render data
+/// because doing so could cross an agent/store boundary, expose secret material,
+/// or create memory with unclear audience. Callers should not retry unchanged.
+#[derive(Debug)]
+struct PrivacyRefusal {
+    message: String,
+}
+
+impl Display for PrivacyRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl Error for PrivacyRefusal {}
+
 #[derive(Debug, Serialize)]
 struct JsonErrorOutput<'a> {
     ok: bool,
@@ -648,6 +666,8 @@ fn emit_cli_error(err: &anyhow::Error, json: bool) {
 fn error_code(err: &anyhow::Error) -> &'static str {
     if err.downcast_ref::<BackendUnavailable>().is_some() {
         "backend_unavailable"
+    } else if err.downcast_ref::<PrivacyRefusal>().is_some() {
+        "privacy_refusal"
     } else if err.downcast_ref::<config::ConfigError>().is_some() {
         "config_error"
     } else {
@@ -659,6 +679,8 @@ fn error_code(err: &anyhow::Error) -> &'static str {
 fn exit_code(err: &anyhow::Error) -> i32 {
     if err.downcast_ref::<BackendUnavailable>().is_some() {
         5
+    } else if err.downcast_ref::<PrivacyRefusal>().is_some() {
+        4
     } else if err.downcast_ref::<config::ConfigError>().is_some() {
         3
     } else {
@@ -3524,10 +3546,13 @@ fn resolve_store(
             StoreAccess::Write => (&policy.write_stores, "write"),
         };
         if !policy.allow_all_stores && !allowed_stores.iter().any(|store| store == &name) {
-            anyhow::bail!(
-                "agent {agent_id} may not {access_name} store {name}; configured {access_name} stores: {}",
-                allowed_stores.join(",")
-            );
+            return Err(PrivacyRefusal {
+                message: format!(
+                    "agent {agent_id} may not {access_name} store {name}; configured {access_name} stores: {}",
+                    allowed_stores.join(",")
+                ),
+            }
+            .into());
         }
     }
 
@@ -3572,26 +3597,38 @@ fn validate_secret_write(
         .collect::<Vec<_>>()
         .join(",");
     if !allow_secret_write {
-        anyhow::bail!(
-            "Hive Memory does not store likely secrets by default; detectors: {detector_ids}; rerun with --allow-secret-write only for intentional secret-store writes"
-        );
+        return Err(PrivacyRefusal {
+            message: format!(
+                "Hive Memory does not store likely secrets by default; detectors: {detector_ids}; rerun with --allow-secret-write only for intentional secret-store writes"
+            ),
+        }
+        .into());
     }
     if store.sensitivity != Sensitivity::Secret {
-        anyhow::bail!(
-            "--allow-secret-write requires a resolved secret store; detectors: {detector_ids}"
-        );
+        return Err(PrivacyRefusal {
+            message: format!(
+                "--allow-secret-write requires a resolved secret store; detectors: {detector_ids}"
+            ),
+        }
+        .into());
     }
     if !config.privacy.allow_secret_writes {
-        anyhow::bail!(
-            "--allow-secret-write requires privacy.allow_secret_writes = true; detectors: {detector_ids}"
-        );
+        return Err(PrivacyRefusal {
+            message: format!(
+                "--allow-secret-write requires privacy.allow_secret_writes = true; detectors: {detector_ids}"
+            ),
+        }
+        .into());
     }
     if std::env::var("HIVE_MEMORY_HOOK_ACTIVE").ok().as_deref() == Some("1")
         && !config.privacy.allow_hook_secret_writes
     {
-        anyhow::bail!(
-            "hook secret writes require privacy.allow_hook_secret_writes = true; detectors: {detector_ids}"
-        );
+        return Err(PrivacyRefusal {
+            message: format!(
+                "hook secret writes require privacy.allow_hook_secret_writes = true; detectors: {detector_ids}"
+            ),
+        }
+        .into());
     }
 
     Ok(())
@@ -3614,7 +3651,10 @@ fn resolve_audience(
     }
 
     if args.audience.is_empty() {
-        anyhow::bail!("agent-private writes require --audience or --audience-writer-only");
+        return Err(PrivacyRefusal {
+            message: "agent-private writes require --audience or --audience-writer-only".to_owned(),
+        }
+        .into());
     }
 
     Ok(args.audience.clone())

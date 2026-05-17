@@ -1096,9 +1096,12 @@ fn remember_refuses_likely_secret_without_echoing_value() {
             "remember",
             "--text",
             &format!("api_key = \"{secret_value}\""),
+            "--json",
         ])
         .assert()
-        .failure()
+        .code(4)
+        .stderr(predicate::str::contains("\"ok\": false"))
+        .stderr(predicate::str::contains("\"code\": \"privacy_refusal\""))
         .stderr(predicate::str::contains("detectors: secret-assignment"))
         .stderr(predicate::str::contains(secret_value).not());
 }
@@ -1140,9 +1143,11 @@ fn allow_secret_write_requires_secret_store() {
             "--allow-secret-write",
             "--text",
             "api_key = \"localvalueforsecretdetection\"",
+            "--json",
         ])
         .assert()
-        .failure()
+        .code(4)
+        .stderr(predicate::str::contains("\"code\": \"privacy_refusal\""))
         .stderr(predicate::str::contains(
             "--allow-secret-write requires a resolved secret store",
         ));
@@ -1178,9 +1183,11 @@ fn allow_secret_write_requires_config_opt_in() {
             "--allow-secret-write",
             "--text",
             "api_key = \"localvalueforsecretdetection\"",
+            "--json",
         ])
         .assert()
-        .failure()
+        .code(4)
+        .stderr(predicate::str::contains("\"code\": \"privacy_refusal\""))
         .stderr(predicate::str::contains(
             "--allow-secret-write requires privacy.allow_secret_writes = true",
         ));
@@ -1998,11 +2005,64 @@ fn search_enforces_agent_read_store_policy() {
             "work",
             "search",
             "toml",
+            "--json",
         ])
         .assert()
-        .failure()
+        .code(4)
+        .stderr(predicate::str::contains("\"ok\": false"))
+        .stderr(predicate::str::contains("\"code\": \"privacy_refusal\""))
         .stderr(predicate::str::contains(
             "agent codex may not read store work",
+        ));
+}
+
+#[test]
+fn remember_enforces_agent_write_store_policy() {
+    let dir = temp_dir("remember-agent-write-policy");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "{}"
+
+            [stores.work]
+            root = "{}"
+
+            [agents.codex]
+            default_store = "personal"
+            read_stores = ["personal", "work"]
+            write_stores = ["personal"]
+            "#,
+            personal.display(),
+            work.display()
+        ),
+    )
+    .expect("write config");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "--store",
+            "work",
+            "remember",
+            "--text",
+            "This should not cross the write boundary.",
+            "--json",
+        ])
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains("\"code\": \"privacy_refusal\""))
+        .stderr(predicate::str::contains(
+            "agent codex may not write store work",
         ));
 }
 
