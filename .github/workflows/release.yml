@@ -20,6 +20,21 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Validate tag version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          cargo_version=$(scripts/cargo-version.sh)
+          if [ "$TAG" != "v${cargo_version}" ]; then
+            echo "release tag ${TAG} does not match Cargo.toml version ${cargo_version}" >&2
+            exit 1
+          fi
+
       - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -63,8 +78,6 @@ jobs:
       # Keeping packaging in a script makes the release contract locally
       # reproducible and gives dotfiles/shdeps one stable archive shape.
       - name: Package archive
-        env:
-          HM_RELEASE_VERSION: ${{ github.ref_name }}
         run: scripts/package-release.sh "${{ matrix.target }}"
 
       - name: Smoke install

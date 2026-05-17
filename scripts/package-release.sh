@@ -7,13 +7,7 @@ if [[ $# -ne 1 ]]; then
 fi
 
 target=$1
-version=${HM_RELEASE_VERSION:-}
-if [[ -z $version ]]; then
-  version=$(awk -F'"' '/^version =/ { print $2; exit }' Cargo.toml)
-fi
-# Git tags are `v0.1.0`, while Cargo versions are `0.1.0`. Normalize both
-# inputs to the bare SemVer string so archive names always get exactly one `v`.
-version=${version#v}
+version=$(scripts/cargo-version.sh)
 
 asset="hm-v${version}-${target}.tar.gz"
 dist_dir=dist

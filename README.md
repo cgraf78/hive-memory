@@ -13,6 +13,19 @@ The primary binary is `hm`.
 
 The current design plan lives in [PLAN.md](PLAN.md), and the normative v1 implementation spec lives in [SPEC.md](SPEC.md). The goal is to build a configurable, backend-agnostic memory layer that gives agent sessions across Linux, macOS, and WSL a shared hive-brain while keeping the canonical store human-readable, durable, and conflict-resistant.
 
+## Release
+
+`Cargo.toml` is the release-version source of truth. To publish a release,
+bump `package.version`, commit the change, then run:
+
+```sh
+scripts/release.sh --push
+```
+
+The script derives the `vX.Y.Z` tag from `Cargo.toml` and pushes it. GitHub
+Actions verifies the tag still matches the Cargo version before creating the
+draft release and building target archives.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
