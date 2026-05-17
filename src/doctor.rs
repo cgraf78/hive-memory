@@ -9,6 +9,9 @@ use crate::{config, note, outbox, project, render, secret, store};
 use serde::Serialize;
 use std::fs;
 use std::path::Path;
+use std::time::{Duration, SystemTime};
+
+const STALE_TEMP_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Input for one top-level doctor run.
 #[derive(Debug, Clone)]
@@ -105,6 +108,7 @@ pub fn run(input: DoctorInput<'_>) -> DoctorReport {
 
     check_stores(input.config, &mut checks);
     check_cloud_conflicts(input.config, &mut checks);
+    check_stale_temp_files(input.config, &mut checks);
     check_project_bindings(input.config, &mut checks);
     check_outbox(input.config, &mut checks);
     check_adapters(input.config, input.quick, &mut checks);
@@ -179,6 +183,46 @@ fn check_cloud_conflicts(config: &config::Config, checks: &mut Vec<DoctorCheck>)
                     conflicts.len()
                 ),
                 conflicts
+                    .into_iter()
+                    .map(|path| path.display().to_string())
+                    .collect(),
+            ));
+        }
+    }
+}
+
+fn check_stale_temp_files(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
+    for (store_name, store_config) in &config.stores {
+        // Atomic-write temp files are not dangerous by themselves, and doctor
+        // is intentionally read-only. Surface stale residue here so a future
+        // explicit repair path can quarantine it without hooks mutating stores.
+        let stale = match collect_stale_temp_files(&store_config.root, SystemTime::now()) {
+            Ok(stale) => stale,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                checks.push(warn(
+                    format!("store.{store_name}.stale-temps"),
+                    format!("failed to scan store for stale temp files: {err}"),
+                    vec![store_config.root.display().to_string()],
+                ));
+                continue;
+            }
+        };
+
+        if stale.is_empty() {
+            checks.push(pass(
+                format!("store.{store_name}.stale-temps"),
+                format!("store {store_name} has no stale temp files"),
+                vec![store_config.root.display().to_string()],
+            ));
+        } else {
+            checks.push(warn(
+                format!("store.{store_name}.stale-temps"),
+                format!(
+                    "store {store_name} has {} stale temp file(s) older than 24h",
+                    stale.len()
+                ),
+                stale
                     .into_iter()
                     .map(|path| path.display().to_string())
                     .collect(),
@@ -569,6 +613,58 @@ fn is_cloud_conflict_name(name: &str) -> bool {
         || lower.contains("sync-conflict")
 }
 
+fn collect_stale_temp_files(
+    root: &Path,
+    now: SystemTime,
+) -> std::io::Result<Vec<std::path::PathBuf>> {
+    let mut paths = Vec::new();
+    collect_stale_temp_files_into(root, now, &mut paths)?;
+    paths.sort();
+    Ok(paths)
+}
+
+fn collect_stale_temp_files_into(
+    root: &Path,
+    now: SystemTime,
+    paths: &mut Vec<std::path::PathBuf>,
+) -> std::io::Result<()> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_stale_temp_files_into(&path, now, paths)?;
+            continue;
+        }
+        if !file_type.is_file()
+            || !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_atomic_temp_name)
+        {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        if metadata
+            .modified()
+            .ok()
+            .is_some_and(|modified| is_stale_temp_modified_at(modified, now))
+        {
+            paths.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn is_atomic_temp_name(name: &str) -> bool {
+    name.starts_with(".tmp.")
+}
+
+fn is_stale_temp_modified_at(modified: SystemTime, now: SystemTime) -> bool {
+    now.duration_since(modified)
+        .is_ok_and(|age| age > STALE_TEMP_TTL)
+}
+
 fn collect_markdown_files(root: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
     let mut paths = Vec::new();
     collect_markdown_files_into(root, &mut paths)?;
@@ -641,4 +737,31 @@ fn error(id: impl Into<String>, message: impl Into<String>, paths: Vec<String>) 
 
 fn path_is_toml(path: &Path) -> bool {
     path.extension().and_then(|value| value.to_str()) == Some("toml")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atomic_temp_name_matches_writer_temps() {
+        assert!(is_atomic_temp_name(".tmp.memory.md.123-456"));
+        assert!(is_atomic_temp_name(".tmp.20260517T120000Z_abc.1234"));
+        assert!(!is_atomic_temp_name("memory.tmp"));
+        assert!(!is_atomic_temp_name("tmp.memory.md"));
+    }
+
+    #[test]
+    fn stale_temp_age_uses_strict_ttl() {
+        let now = SystemTime::UNIX_EPOCH + STALE_TEMP_TTL + Duration::from_secs(10);
+        assert!(is_stale_temp_modified_at(SystemTime::UNIX_EPOCH, now));
+        assert!(!is_stale_temp_modified_at(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+            now,
+        ));
+        assert!(!is_stale_temp_modified_at(
+            now + Duration::from_secs(1),
+            now,
+        ));
+    }
 }
