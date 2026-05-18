@@ -1631,7 +1631,8 @@ Recommended repository: `cgraf78/hive-memory`.
 
 `hm --version` should print `hm X.Y.Z (git <short-sha>, schema <n>)` when build
 metadata is available. Checksums use SHA-256 lines compatible with `sha256sum -c`.
-Minimum glibc baseline should be documented before the first Linux release.
+Linux releases use musl targets so normal installs do not depend on a distro
+glibc baseline.
 
 Recommended jobs:
 
@@ -1650,35 +1651,29 @@ Recommended jobs:
 Initial release target matrix:
 
 ```text
-x86_64-unknown-linux-gnu
-aarch64-unknown-linux-gnu
+x86_64-unknown-linux-musl
+aarch64-unknown-linux-musl
 x86_64-apple-darwin
 aarch64-apple-darwin
 ```
 
 Installer target mapping:
 
-| OS/arch | Target |
+| OS/arch | Platform |
 | --- | --- |
-| Linux x86_64, including WSL | `x86_64-unknown-linux-gnu` |
-| Linux aarch64 | `aarch64-unknown-linux-gnu` |
-| macOS Intel | `x86_64-apple-darwin` |
-| macOS Apple Silicon | `aarch64-apple-darwin` |
-
-Deferred target:
-
-```text
-x86_64-unknown-linux-musl
-```
+| Linux x86_64, including WSL | `linux-x86_64-musl` |
+| Linux aarch64 | `linux-aarch64-musl` |
+| macOS Intel | `macos-x86_64` |
+| macOS Apple Silicon | `macos-aarch64` |
 
 Artifact layout:
 
 ```text
-hm-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
-hm-vX.Y.Z-aarch64-unknown-linux-gnu.tar.gz
-hm-vX.Y.Z-x86_64-apple-darwin.tar.gz
-hm-vX.Y.Z-aarch64-apple-darwin.tar.gz
-checksums.txt
+hm-vX.Y.Z-linux-x86_64-musl.tar.gz
+hm-vX.Y.Z-linux-aarch64-musl.tar.gz
+hm-vX.Y.Z-macos-x86_64.tar.gz
+hm-vX.Y.Z-macos-aarch64.tar.gz
+hm-vX.Y.Z-<platform>.tar.gz.sha256
 ```
 
 Each archive contains:
@@ -1708,14 +1703,14 @@ should make this easy:
 shdeps_binary_from_github \
   "cgraf78/hive-memory" \
   "hm" \
-  "hm-v${version}-${target}.tar.gz"
+  "hm-v${version}-${platform}.tar.gz"
 ```
 
 Installer responsibilities:
 
-- detect OS/arch target.
-- download matching archive and `checksums.txt`.
-- verify checksum before installing.
+- detect OS/arch platform.
+- download the matching archive and `.sha256` file.
+- verify the checksum before installing.
 - install `hm` into the dotfiles-managed bin dir.
 - optionally install `hive-memory` alias only after that deferred decision is
   made.

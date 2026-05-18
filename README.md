@@ -509,6 +509,17 @@ Actions verifies that the tag still matches the Cargo version before creating
 the release draft, building target archives, uploading assets, and publishing
 the release.
 
+Linux release archives use musl targets to avoid requiring a specific distro
+glibc version at runtime. Published archive labels use installer-facing platform
+names instead of Rust target triples:
+
+```text
+hm-vX.Y.Z-linux-x86_64-musl.tar.gz
+hm-vX.Y.Z-linux-aarch64-musl.tar.gz
+hm-vX.Y.Z-macos-x86_64.tar.gz
+hm-vX.Y.Z-macos-aarch64.tar.gz
+```
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

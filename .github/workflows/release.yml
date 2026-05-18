@@ -51,7 +51,7 @@ jobs:
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --title "$TAG" --generate-notes
 
   build:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.asset-platform }}
     needs: create-release
     runs-on: ${{ matrix.os }}
     # Asset upload is the only write operation in this job. Keeping that
@@ -63,13 +63,17 @@ jobs:
       matrix:
         include:
           - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
+            rust-target: x86_64-unknown-linux-musl
+            asset-platform: linux-x86_64-musl
           - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+            rust-target: aarch64-unknown-linux-musl
+            asset-platform: linux-aarch64-musl
           - os: macos-15-intel
-            target: x86_64-apple-darwin
+            rust-target: x86_64-apple-darwin
+            asset-platform: macos-x86_64
           - os: macos-latest
-            target: aarch64-apple-darwin
+            rust-target: aarch64-apple-darwin
+            asset-platform: macos-aarch64
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -78,19 +82,21 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ matrix.rust-target }}
 
       # Build native archives on hosted runners for every v1 release target.
       # Keeping packaging in a script makes the release contract locally
       # reproducible and gives dotfiles/shdeps one stable archive shape.
       - name: Package archive
-        run: scripts/package-release.sh "${{ matrix.target }}"
+        run: scripts/package-release.sh "${{ matrix.rust-target }}" "${{ matrix.asset-platform }}"
 
       - name: Smoke install
         env:
           VERSION: ${{ github.ref_name }}
-          TARGET: ${{ matrix.target }}
+          ASSET_PLATFORM: ${{ matrix.asset-platform }}
         run: |
-          archive="dist/hm-${VERSION}-${TARGET}.tar.gz"
+          archive="dist/hm-${VERSION}-${ASSET_PLATFORM}.tar.gz"
           mkdir -p smoke
           tar -xzf "$archive" -C smoke
           ./smoke/hm --version

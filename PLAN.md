@@ -117,15 +117,16 @@ Distribution requirements:
 Likely release artifacts use the versioned release format:
 
 ```text
-hm-vX.Y.Z-aarch64-apple-darwin.tar.gz
-hm-vX.Y.Z-x86_64-apple-darwin.tar.gz
-hm-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
-hm-vX.Y.Z-aarch64-unknown-linux-gnu.tar.gz
+hm-vX.Y.Z-linux-x86_64-musl.tar.gz
+hm-vX.Y.Z-linux-aarch64-musl.tar.gz
+hm-vX.Y.Z-macos-x86_64.tar.gz
+hm-vX.Y.Z-macos-aarch64.tar.gz
 ```
 
-WSL should use the Linux binaries. Musl Linux binaries are a deferred release
-decision. If they are practical, add `x86_64-unknown-linux-musl` for broad Linux
-compatibility; otherwise document the glibc expectation clearly.
+WSL should use the Linux binaries. Linux release artifacts use musl targets to
+avoid requiring the install host to provide the same or newer glibc as the build
+runner. Archive names use installer-facing platform labels instead of raw Rust
+target triples.
 
 ## Implementation Language
 
