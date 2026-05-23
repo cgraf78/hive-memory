@@ -2743,13 +2743,21 @@ fn run_hook_tool_complete(args: HookToolCompleteArgs, context: CliContext) -> Re
         false
     };
     let mut context_emitted = false;
-    if let Some(action) = hook_context_action_if_changed(
-        &config,
-        &context,
-        path_hint.as_deref(),
-        session_id.as_deref(),
-        false,
-    )? {
+    // Tool-complete is often called without project context so it can stay on
+    // the cheap receipt/refresh path after every tool. Treat that as "no
+    // context update" rather than a move to the global/no-project selection;
+    // otherwise prompt hooks and tool hooks bounce the agent between project
+    // context and `project: none`, making Codex show the full memory block
+    // after nearly every prompt/tool boundary.
+    if path_hint.is_some()
+        && let Some(action) = hook_context_action_if_changed(
+            &config,
+            &context,
+            path_hint.as_deref(),
+            session_id.as_deref(),
+            false,
+        )?
+    {
         context_emitted = true;
         actions.push(action);
     }

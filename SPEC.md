@@ -1087,11 +1087,13 @@ Behavior:
   only when the selection changed, runs the durable-memory intent heuristic, and
   records `memory-pending` when the heuristic matches. It returns `inject_context`
   and/or `remind` actions as needed.
-- `tool-complete`: resolves the current project/store selection, emits context
-  only when selection changed, runs receipt-aware refresh after successful tool
-  events, and clears `memory-pending` when consumed write receipts prove a memory
-  write occurred. Hooks pass tool status and an optional active path; `hm` owns
-  deciding whether refresh/context actions are needed.
+- `tool-complete`: resolves the current project/store selection when the hook
+  supplies a project/path hint, emits context only when that hinted selection
+  changed, runs receipt-aware refresh after successful tool events, and clears
+  `memory-pending` when consumed write receipts prove a memory write occurred.
+  Hooks pass tool status and an optional active path; `hm` owns deciding whether
+  refresh/context actions are needed. A projectless tool completion MUST NOT
+  downgrade the session's last context selection to global/no-project context.
 - `stop`: if `memory-pending` remains, returns a reminder action. It may run
   `hm refresh --force` equivalent maintenance when configured, but it MUST NOT
   write canonical memory automatically.
@@ -1870,8 +1872,11 @@ Test categories per module:
   same selected stores/project metadata as `hm context --json`.
 - `hm hook prompt-submit --text ... --json` records memory-pending and returns a
   reminder action for durable-memory intent, without writing canonical memory.
-- `hm hook prompt-submit` / `hm hook tool-complete` emit context only when the
-  resolved project/store/scope/source selection changed.
+- `hm hook prompt-submit` emits context only when the resolved
+  project/store/scope/source selection changed.
+- `hm hook tool-complete` emits context only when it receives a project/path hint
+  and the resolved project/store/scope/source selection changed; projectless
+  completions leave the prior context selection intact.
 - `hm hook tool-complete --status 0 --json` consumes session write receipts,
   runs receipt-aware refresh, and clears memory-pending when receipts prove a
   memory write occurred.
@@ -1891,6 +1896,9 @@ Test categories per module:
 - Prompt/tool-boundary hooks pass the best active path hint to `hm hook
   prompt-submit` / `hm hook tool-complete` so long-lived sessions receive fresh
   context after moving to another project without hook-side project tracking.
+  Tool-complete hooks that intentionally omit a path stay on the cheap
+  receipt/refresh path and must not force a visible global/no-project context
+  reinjection.
 - General long-lived agent launchers do not set `HIVE_MEMORY_PROJECT_ID`; an
   explicitly pinned project ID prevents path-hint based project switching.
 - `hm hook prompt-submit` reminder action is advisory and does not write
