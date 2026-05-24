@@ -508,9 +508,9 @@ scripts/release.sh --push
 ```
 
 The script derives the `vX.Y.Z` tag from `Cargo.toml` and pushes it. GitHub
-Actions verifies that the tag still matches the Cargo version before creating
-the release draft, building target archives, uploading assets, and publishing
-the release.
+Actions uses the shared `cgraf78/actions` Rust release workflow to verify that
+the tag still matches the Cargo version before creating the release draft,
+building target archives, uploading assets, and publishing the release.
 
 Linux release archives use musl targets to avoid requiring a specific distro
 glibc version at runtime. Published archive labels use installer-facing platform
