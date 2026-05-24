@@ -491,9 +491,12 @@ cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-CI runs the same core Rust checks. If a change affects public behavior, update
-[SPEC.md](SPEC.md). If it changes design rationale or non-goals, update
-[PLAN.md](PLAN.md).
+CI runs these checks through the shared `cgraf78/actions` Rust workflow:
+`cargo test` runs on the core portability matrix for push and pull requests,
+and on the full matrix for scheduled or manual runs. Formatting, clippy, and
+public-doc checks run as the Ubuntu quality gate. If a change affects public
+behavior, update [SPEC.md](SPEC.md). If it changes design rationale or
+non-goals, update [PLAN.md](PLAN.md).
 
 ## Release
 
