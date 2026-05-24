@@ -18,6 +18,8 @@ env:
 jobs:
   test:
     uses: cgraf78/actions/.github/workflows/rust-ci.yml@main # zizmor: ignore[unpinned-uses]
+    with:
+      doc-command: RUSTDOCFLAGS='-D missing-docs' cargo doc --no-deps
 
   performance-budget:
     name: Performance budget
