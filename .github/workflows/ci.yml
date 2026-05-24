@@ -1,4 +1,4 @@
-name: CI
+name: Tests
 
 on:
   pull_request:
@@ -16,8 +16,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  rust:
-    name: Rust checks
+  test:
     uses: cgraf78/actions/.github/workflows/rust-ci.yml@main # zizmor: ignore[unpinned-uses]
 
   performance-budget:
