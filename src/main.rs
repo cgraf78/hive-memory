@@ -9,7 +9,7 @@ use clap::{Args, Parser, Subcommand};
 use hive_memory::config::{Config, ConfigPaths, EventSidecarPolicy, Sensitivity, StoreConfig};
 use hive_memory::{
     config, context as memory_context, curation, doctor, event, hook as memory_hook, id, index,
-    memory, note, outbox, path as memory_path, project, search, secret, store, write,
+    inject, memory, note, outbox, path as memory_path, project, search, secret, store, write,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1917,6 +1917,8 @@ struct CliContextAssembly {
     store_source: String,
     scopes: Vec<String>,
     sources: Vec<String>,
+    /// Resolved selection strategy label, part of the cache key.
+    strategy: String,
     stale: bool,
     cache_created_at: Option<String>,
 }
@@ -1947,6 +1949,10 @@ fn assemble_cli_context(
         || sources
             .iter()
             .any(|source| source == "inbox" || source == "all");
+    // Resolve the selection strategy once; it feeds both the assembly and the
+    // cache key so a strategy change invalidates any cached context.
+    let strategy_label = config.defaults.context_strategy.clone();
+    let inject_strategy = inject::Strategy::from_config(&strategy_label);
     let path_hint = selection
         .path_hint
         .or_else(|| std::env::var("HIVE_MEMORY_PROJECT").ok());
@@ -1973,6 +1979,7 @@ fn assemble_cli_context(
         path_hint.as_deref(),
         &scopes,
         &sources,
+        &strategy_label,
     );
     if std::env::var("HIVE_MEMORY_HOOK_ACTIVE").ok().as_deref() == Some("1")
         && let Err(store::StoreError::Io { .. }) = store::read_manifest(&store_config.root)
@@ -2017,6 +2024,7 @@ fn assemble_cli_context(
         project_id: project_id.as_deref(),
         path_hint: path_hint.as_deref(),
         max_tokens,
+        inject_strategy,
     })
     .map_err(anyhow::Error::from)?;
 
@@ -2029,6 +2037,7 @@ fn assemble_cli_context(
         store_source,
         scopes,
         sources,
+        strategy: strategy_label,
         stale: false,
         cache_created_at: None,
     };
@@ -2244,6 +2253,9 @@ fn load_context_cache(
         store_source,
         scopes: entry.scopes,
         sources: entry.sources,
+        // A cache hit means the key matched, and the key includes the strategy,
+        // so the active strategy is the one this entry was written under.
+        strategy: config.defaults.context_strategy.clone(),
         stale: true,
         cache_created_at: Some(entry.created_at),
     }))
@@ -2987,6 +2999,7 @@ fn context_selection_key_from_assembly(assembly: &CliContextAssembly) -> String 
         assembly.project_hint.as_deref(),
         &assembly.scopes,
         &assembly.sources,
+        &assembly.strategy,
     )
 }
 
@@ -3002,9 +3015,10 @@ fn context_selection_key(
     path_hint: Option<&str>,
     scopes: &[String],
     sources: &[String],
+    strategy: &str,
 ) -> String {
     format!(
-        "agent={agent_id}\nstores={}\nproject_id={}\npath={}\nscopes={}\nsources={}",
+        "agent={agent_id}\nstores={}\nproject_id={}\npath={}\nscopes={}\nsources={}\nstrategy={strategy}",
         stores.join(","),
         project_id.unwrap_or_default(),
         path_hint.unwrap_or_default(),
@@ -3037,6 +3051,7 @@ fn hook_context_key(
         path_hint,
         &config.defaults.search_scopes,
         &config.defaults.context_sources,
+        &config.defaults.context_strategy,
     ))
 }
 

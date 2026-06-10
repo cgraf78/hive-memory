@@ -6,6 +6,7 @@
 
 use crate::curated::CuratedFile;
 use crate::index::IndexEntry;
+use crate::inject::{self, ClassifyInput, IncidentMarkers, InjectClass};
 use crate::{note, project, visibility};
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -39,6 +40,10 @@ pub struct ContextInput<'a> {
     pub path_hint: Option<&'a str>,
     /// Token-ish budget using the v1 byte/4 approximation.
     pub max_tokens: usize,
+    /// Session-start selection strategy. `Recency` (default) keeps legacy
+    /// include-all behavior; `Relevance` withholds search-only candidates via
+    /// the inject classifier.
+    pub inject_strategy: inject::Strategy,
 }
 
 /// Assembled context output.
@@ -205,6 +210,8 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
         }
     }
 
+    // Built once and reused; the Relevance strategy consults it per candidate.
+    let markers = IncidentMarkers::default();
     for entry in sorted_candidates(input.entries) {
         if !source_allowed(entry, input.sources, input.include_inbox) {
             continue;
@@ -228,6 +235,22 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
             path: note_path,
             message: err.to_string(),
         })?;
+        // Under Relevance, withhold candidates the classifier marks search-only
+        // (operational logs, raw notes) so startup context stays focused. The
+        // body must be read first because the operational signal is content.
+        if input.inject_strategy == inject::Strategy::Relevance {
+            let class = inject::classify(
+                ClassifyInput {
+                    scope: &entry.scope,
+                    entry_kind: entry.entry_kind,
+                    body: &parsed.body,
+                },
+                &markers,
+            );
+            if class == InjectClass::SearchOnly {
+                continue;
+            }
+        }
         let trust = trust_for(entry.entry_kind);
         let body = escape_memory_body(&parsed.body);
         let block = render_memory_block(input.store_name, entry, trust, &parsed.body);
@@ -580,6 +603,7 @@ mod tests {
             project_id: None,
             path_hint: Some("/repo/src/main.rs"),
             max_tokens: 4000,
+            inject_strategy: inject::Strategy::Recency,
         }
     }
 
@@ -848,5 +872,44 @@ mod tests {
 
         let tiny_budget_sections = assemble_context(request).expect("context").sections;
         assert!(tiny_budget_sections.is_empty());
+    }
+
+    #[test]
+    fn relevance_strategy_withholds_operational_records() {
+        let dir = temp_dir("relevance");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(TestRecord {
+            root: &root,
+            entry_kind: note::EntryKind::Remember,
+            scope: "global",
+            body: "Prefer fd over find.",
+            created_at: timestamp(1_778_946_153),
+            project_id: None,
+            audience: Vec::new(),
+        });
+        write_record(TestRecord {
+            root: &root,
+            entry_kind: note::EntryKind::Remember,
+            scope: "global",
+            body: "2026-06-06 root cause: a cron job leaked daemons.",
+            created_at: timestamp(1_778_946_200),
+            project_id: None,
+            audience: Vec::new(),
+        });
+        let entries = entries(&root, &cache);
+        let sources = ["remembered".to_owned()];
+
+        // Recency (default) includes both records.
+        let recency = assemble_context(input(&root, &entries, &[], &sources)).expect("context");
+        assert_eq!(recency.sections.len(), 2);
+
+        // Relevance withholds the operational record but keeps the preference.
+        let mut request = input(&root, &entries, &[], &sources);
+        request.inject_strategy = inject::Strategy::Relevance;
+        let relevance = assemble_context(request).expect("context");
+        assert_eq!(relevance.sections.len(), 1);
+        assert!(relevance.markdown.contains("Prefer fd over find."));
+        assert!(!relevance.markdown.contains("root cause"));
     }
 }

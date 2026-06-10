@@ -17,7 +17,7 @@
 use hive_memory::config::Sensitivity;
 use hive_memory::context::{ContextInput, assemble_context};
 use hive_memory::index::{self, IndexEntry, RebuildIndexInput};
-use hive_memory::inject::{ClassifyInput, IncidentMarkers, InjectClass, classify};
+use hive_memory::inject::Strategy as InjectStrategy;
 use hive_memory::memory::{self, WriteRecordInput};
 use hive_memory::note::{Confidence, EntryKind};
 use hive_memory::path::PathCase;
@@ -186,26 +186,15 @@ fn materialize(corpus: &Corpus, root: &Path) -> Vec<IndexEntry> {
 // Strategies
 // ---------------------------------------------------------------------------
 
-/// Selection strategies under evaluation. The eval scores them side by side so
-/// a candidate's gains (and residual gaps) are measured against the baseline.
-#[derive(Debug, Clone, Copy)]
-enum Strategy {
-    /// Current behavior: scope + source filtering, no relevance/inject control.
-    Baseline,
-    /// Baseline plus the read-time inject classifier: search-only candidates are
-    /// dropped before assembly. Mutates nothing; pure pre-filter.
-    Conservative,
-}
-
 /// Run a strategy for one session and return the subjects it would inject.
 ///
-/// `bodies` maps record id to canonical body so the classifier can run without
-/// re-reading files; the baseline ignores it.
+/// This drives the real production path: the strategy is handed to
+/// `assemble_context` exactly as the live hook does, so the eval scores the
+/// shipped selector rather than a parallel reimplementation.
 fn inject(
-    strategy: Strategy,
+    strategy: InjectStrategy,
     root: &Path,
     entries: &[IndexEntry],
-    bodies: &BTreeMap<String, String>,
     project_id: Option<&str>,
 ) -> BTreeSet<String> {
     let by_id: BTreeMap<&str, &str> = entries
@@ -213,36 +202,12 @@ fn inject(
         .filter_map(|e| e.subject.as_deref().map(|s| (e.id.as_str(), s)))
         .collect();
 
-    // The classifier only ever removes candidates before the existing selector
-    // runs, so assembly still owns ordering, project matching, and budgeting.
-    let filtered: Vec<IndexEntry> = match strategy {
-        Strategy::Baseline => entries.to_vec(),
-        Strategy::Conservative => {
-            let markers = IncidentMarkers::default();
-            entries
-                .iter()
-                .filter(|entry| {
-                    let class = classify(
-                        ClassifyInput {
-                            scope: &entry.scope,
-                            entry_kind: entry.entry_kind,
-                            body: bodies.get(&entry.id).map_or("", String::as_str),
-                        },
-                        &markers,
-                    );
-                    class != InjectClass::SearchOnly
-                })
-                .cloned()
-                .collect()
-        }
-    };
-
     let scopes: [String; 0] = [];
     let sources = ["remembered".to_owned()];
     let output = assemble_context(ContextInput {
         store_name: "personal",
         store_root: root,
-        entries: &filtered,
+        entries,
         scopes: &scopes,
         sources: &sources,
         include_inbox: false,
@@ -250,6 +215,7 @@ fn inject(
         project_id,
         path_hint: Some("/repo/src/main.rs"),
         max_tokens: 4000,
+        inject_strategy: strategy,
     })
     .expect("assemble context");
     output
@@ -321,35 +287,18 @@ fn recall(tp: usize, fn_: usize) -> f64 {
 
 /// Run a strategy over every labeled context and return per-context scores plus
 /// a micro-averaged aggregate. Prints a report (visible under `--nocapture`).
-fn evaluate(strategy: Strategy) -> (Vec<(String, Score)>, Score) {
+fn evaluate(strategy: InjectStrategy) -> (Vec<(String, Score)>, Score) {
     let corpus = load_corpus();
     let labels = load_labels();
     let root = temp_dir("store");
     let entries = materialize(&corpus, &root);
-
-    // Map id -> body via subject so the classifier sees canonical bodies without
-    // re-reading files. Subjects are unique (asserted by fixtures_are_consistent).
-    let body_by_subject: BTreeMap<&str, &str> = corpus
-        .record
-        .iter()
-        .map(|r| (r.subject.as_str(), r.body.as_str()))
-        .collect();
-    let bodies: BTreeMap<String, String> = entries
-        .iter()
-        .filter_map(|e| {
-            e.subject
-                .as_deref()
-                .and_then(|s| body_by_subject.get(s))
-                .map(|body| (e.id.clone(), (*body).to_owned()))
-        })
-        .collect();
 
     let mut per_context = Vec::new();
     let mut total = Score::default();
     println!("\ninjection eval — strategy={strategy:?}");
     for ctx in &labels.context {
         let project = (!ctx.project_id.is_empty()).then_some(ctx.project_id.as_str());
-        let injected = inject(strategy, &root, &entries, &bodies, project);
+        let injected = inject(strategy, &root, &entries, project);
         let score = score_context(&injected, ctx);
         println!(
             "  {:<20} precision={:.3} recall={:.3}  tp={} fp={} fn={} hi-fn={}",
@@ -428,7 +377,7 @@ fn fixtures_are_consistent() {
 /// to 1.0 while keeping `fn_` and `high_value_fn` at zero.
 #[test]
 fn baseline_characterization() {
-    let (per_context, total) = evaluate(Strategy::Baseline);
+    let (per_context, total) = evaluate(InjectStrategy::Recency);
 
     // Perfect recall, no dropped memory anywhere — the property a precision
     // win must not regress.
@@ -464,7 +413,7 @@ fn baseline_characterization() {
 /// final answer. Crucially, the adversarial dated *preference* is NOT dropped.
 #[test]
 fn conservative_improves_precision_safely() {
-    let (per_context, total) = evaluate(Strategy::Conservative);
+    let (per_context, total) = evaluate(InjectStrategy::Relevance);
 
     // Same safety floor as baseline: nothing important dropped anywhere.
     for (name, score) in &per_context {
@@ -486,7 +435,7 @@ fn conservative_improves_precision_safely() {
         "classifier should catch only the clearly dated incidents"
     );
 
-    let baseline = evaluate(Strategy::Baseline).1;
+    let baseline = evaluate(InjectStrategy::Recency).1;
     assert!(
         precision(total.tp, total.fp) > precision(baseline.tp, baseline.fp),
         "classifier must beat baseline precision"
