@@ -17,6 +17,7 @@
 use hive_memory::config::Sensitivity;
 use hive_memory::context::{ContextInput, assemble_context};
 use hive_memory::index::{self, IndexEntry, RebuildIndexInput};
+use hive_memory::inject::{ClassifyInput, IncidentMarkers, InjectClass, classify};
 use hive_memory::memory::{self, WriteRecordInput};
 use hive_memory::note::{Confidence, EntryKind};
 use hive_memory::path::PathCase;
@@ -185,20 +186,26 @@ fn materialize(corpus: &Corpus, root: &Path) -> Vec<IndexEntry> {
 // Strategies
 // ---------------------------------------------------------------------------
 
-/// Selection strategies under evaluation. PR1 ships only the baseline (the
-/// current `assemble_context` selector); later phases add candidates here and
-/// the eval scores them side by side.
+/// Selection strategies under evaluation. The eval scores them side by side so
+/// a candidate's gains (and residual gaps) are measured against the baseline.
 #[derive(Debug, Clone, Copy)]
 enum Strategy {
     /// Current behavior: scope + source filtering, no relevance/inject control.
     Baseline,
+    /// Baseline plus the read-time inject classifier: search-only candidates are
+    /// dropped before assembly. Mutates nothing; pure pre-filter.
+    Conservative,
 }
 
 /// Run a strategy for one session and return the subjects it would inject.
+///
+/// `bodies` maps record id to canonical body so the classifier can run without
+/// re-reading files; the baseline ignores it.
 fn inject(
     strategy: Strategy,
     root: &Path,
     entries: &[IndexEntry],
+    bodies: &BTreeMap<String, String>,
     project_id: Option<&str>,
 ) -> BTreeSet<String> {
     let by_id: BTreeMap<&str, &str> = entries
@@ -206,30 +213,50 @@ fn inject(
         .filter_map(|e| e.subject.as_deref().map(|s| (e.id.as_str(), s)))
         .collect();
 
-    match strategy {
-        Strategy::Baseline => {
-            let scopes: [String; 0] = [];
-            let sources = ["remembered".to_owned()];
-            let output = assemble_context(ContextInput {
-                store_name: "personal",
-                store_root: root,
-                entries,
-                scopes: &scopes,
-                sources: &sources,
-                include_inbox: false,
-                agent_id: Some("eval-agent"),
-                project_id,
-                path_hint: Some("/repo/src/main.rs"),
-                max_tokens: 4000,
-            })
-            .expect("assemble context");
-            output
-                .sections
+    // The classifier only ever removes candidates before the existing selector
+    // runs, so assembly still owns ordering, project matching, and budgeting.
+    let filtered: Vec<IndexEntry> = match strategy {
+        Strategy::Baseline => entries.to_vec(),
+        Strategy::Conservative => {
+            let markers = IncidentMarkers::default();
+            entries
                 .iter()
-                .filter_map(|s| by_id.get(s.id.as_str()).map(|s| (*s).to_owned()))
+                .filter(|entry| {
+                    let class = classify(
+                        ClassifyInput {
+                            scope: &entry.scope,
+                            entry_kind: entry.entry_kind,
+                            body: bodies.get(&entry.id).map_or("", String::as_str),
+                        },
+                        &markers,
+                    );
+                    class != InjectClass::SearchOnly
+                })
+                .cloned()
                 .collect()
         }
-    }
+    };
+
+    let scopes: [String; 0] = [];
+    let sources = ["remembered".to_owned()];
+    let output = assemble_context(ContextInput {
+        store_name: "personal",
+        store_root: root,
+        entries: &filtered,
+        scopes: &scopes,
+        sources: &sources,
+        include_inbox: false,
+        agent_id: Some("eval-agent"),
+        project_id,
+        path_hint: Some("/repo/src/main.rs"),
+        max_tokens: 4000,
+    })
+    .expect("assemble context");
+    output
+        .sections
+        .iter()
+        .filter_map(|s| by_id.get(s.id.as_str()).map(|s| (*s).to_owned()))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -300,12 +327,29 @@ fn evaluate(strategy: Strategy) -> (Vec<(String, Score)>, Score) {
     let root = temp_dir("store");
     let entries = materialize(&corpus, &root);
 
+    // Map id -> body via subject so the classifier sees canonical bodies without
+    // re-reading files. Subjects are unique (asserted by fixtures_are_consistent).
+    let body_by_subject: BTreeMap<&str, &str> = corpus
+        .record
+        .iter()
+        .map(|r| (r.subject.as_str(), r.body.as_str()))
+        .collect();
+    let bodies: BTreeMap<String, String> = entries
+        .iter()
+        .filter_map(|e| {
+            e.subject
+                .as_deref()
+                .and_then(|s| body_by_subject.get(s))
+                .map(|body| (e.id.clone(), (*body).to_owned()))
+        })
+        .collect();
+
     let mut per_context = Vec::new();
     let mut total = Score::default();
     println!("\ninjection eval — strategy={strategy:?}");
     for ctx in &labels.context {
         let project = (!ctx.project_id.is_empty()).then_some(ctx.project_id.as_str());
-        let injected = inject(strategy, &root, &entries, project);
+        let injected = inject(strategy, &root, &entries, &bodies, project);
         let score = score_context(&injected, ctx);
         println!(
             "  {:<20} precision={:.3} recall={:.3}  tp={} fp={} fn={} hi-fn={}",
@@ -397,15 +441,59 @@ fn baseline_characterization() {
     assert_eq!(total.fn_, 0, "baseline must drop nothing");
     assert_eq!(total.high_value_fn, 0, "baseline must drop no preference");
 
-    // Exact confusion matrix: 16 correct inclusions, 12 over-inclusions
+    // Exact confusion matrix: 19 correct inclusions, 12 over-inclusions
     // (3 incidents + 1 reference) injected across the 3 sessions.
-    assert_eq!(total.tp, 16, "baseline true positives drifted");
+    assert_eq!(total.tp, 19, "baseline true positives drifted");
     assert_eq!(total.fp, 12, "baseline false positives drifted");
 
-    // Headline: high recall, mediocre precision (~0.571). This is the gap.
+    // Headline: high recall, mediocre precision (~0.613). This is the gap.
     assert!(
-        precision(total.tp, total.fp) < 0.6,
+        precision(total.tp, total.fp) < 0.65,
         "baseline precision should be the low number we are trying to beat"
     );
     assert!((recall(total.tp, total.fn_) - 1.0).abs() < f64::EPSILON);
+}
+
+/// The read-time classifier must raise precision while keeping the baseline's
+/// safety guarantees: drop nothing it should keep, and never drop a preference.
+///
+/// It catches the clearly dated+operational incidents but, by design, leaves in
+/// a marker-less incident and a plain reference (a content heuristic cannot
+/// safely tell those from durable facts). That residual is the measured case
+/// for an explicit `kind` signal — the classifier is the safe bridge, not the
+/// final answer. Crucially, the adversarial dated *preference* is NOT dropped.
+#[test]
+fn conservative_improves_precision_safely() {
+    let (per_context, total) = evaluate(Strategy::Conservative);
+
+    // Same safety floor as baseline: nothing important dropped anywhere.
+    for (name, score) in &per_context {
+        assert_eq!(score.fn_, 0, "{name}: classifier dropped a wanted memory");
+    }
+    assert_eq!(total.fn_, 0, "classifier must drop nothing wanted");
+    assert_eq!(
+        total.high_value_fn, 0,
+        "classifier must never drop a preference (incl. the dated one)"
+    );
+
+    // Keeps every true positive the baseline had...
+    assert_eq!(total.tp, 19, "classifier must not lose true positives");
+    // ...and halves the over-inclusion: catches the 2 dated incidents in every
+    // session (6 fewer false positives), leaving the marker-less incident and
+    // the reference (2 records x 3 sessions = 6) as the honest residual.
+    assert_eq!(
+        total.fp, 6,
+        "classifier should catch only the clearly dated incidents"
+    );
+
+    let baseline = evaluate(Strategy::Baseline).1;
+    assert!(
+        precision(total.tp, total.fp) > precision(baseline.tp, baseline.fp),
+        "classifier must beat baseline precision"
+    );
+    // Still short of 1.0: content alone cannot close the gap safely.
+    assert!(
+        precision(total.tp, total.fp) < 1.0,
+        "residual over-inclusion is expected and motivates an explicit kind"
+    );
 }

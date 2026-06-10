@@ -58,6 +58,15 @@ confidence = "high"
 body = "Prefer tooling that works across multiple agent runtimes rather than being tied to one."
 note = "behavioral preference; inject everywhere"
 
+[[record]]
+subject = "pref-dated-policy"
+kind = "preference"
+entry_kind = "remember"
+scope = "global"
+confidence = "high"
+body = "Since 2026-01-01, always run the formatter and linter before committing."
+note = "ADVERSARIAL: a preference that carries a date but no operational keyword. A naive 'has a date' filter would wrongly drop it; the classifier must keep it (inject everywhere)."
+
 # ---- project-facts: project scope, inject only in their project ----
 
 [[record]]
