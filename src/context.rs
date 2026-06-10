@@ -243,6 +243,7 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
                 ClassifyInput {
                     scope: &entry.scope,
                     entry_kind: entry.entry_kind,
+                    kind: entry.kind,
                     body: &parsed.body,
                 },
                 &markers,
@@ -564,6 +565,7 @@ mod tests {
             body: record.body.to_owned(),
             project_id: record.project_id.map(str::to_owned),
             subject: None,
+            kind: None,
             tags: Vec::new(),
             audience: record.audience,
             source_kind: None,
@@ -837,6 +839,7 @@ mod tests {
             tags: Vec::new(),
             subject: None,
             confidence: note::Confidence::High,
+            kind: None,
             agent_id: "co<dex".to_owned(),
             created_at: "2026-05-16T00:00:00Z".to_owned(),
             note_path: "inbox/notes/2026-05-16/id.md".to_owned(),

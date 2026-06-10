@@ -98,6 +98,10 @@ pub struct MemoryEvent {
     pub tags: Vec<String>,
     /// Writer confidence used by later rendering and compaction.
     pub confidence: Confidence,
+    /// Optional explicit memory kind, mirrored from the note. The index prefers
+    /// the event copy, so it must be carried here too, not only on the note.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<crate::note::MemoryKind>,
     /// Explicit allowed agents for `agent-private` events.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub audience: Vec<String>,
@@ -206,6 +210,7 @@ impl MemoryEvent {
             subject: input.subject,
             tags: input.tags,
             confidence: input.confidence,
+            kind: input.kind,
             audience,
             body: input.body,
             note_path: input.note_path.map(path_to_event_string),
@@ -248,6 +253,8 @@ pub struct EventObservationInput {
     pub tags: Vec<String>,
     /// Writer confidence used by later rendering and compaction.
     pub confidence: Confidence,
+    /// Optional explicit memory kind, mirrored from the note.
+    pub kind: Option<crate::note::MemoryKind>,
     /// Explicit allowed agents for `agent-private` events.
     pub audience: Vec<String>,
     /// Machine-readable copy of the note body for indexing and dedupe.
@@ -429,6 +436,7 @@ mod tests {
             subject: Some("workflow.preference".to_owned()),
             tags: vec!["preference".to_owned(), "workflow".to_owned()],
             confidence: Confidence::High,
+            kind: None,
             audience: Vec::new(),
             body: "Chris prefers concise summaries.".to_owned(),
             note_path: Some(note::note_relative_path("event-id", timestamp())),

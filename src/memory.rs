@@ -44,6 +44,8 @@ pub struct WriteRecordInput<'a> {
     pub project_id: Option<String>,
     /// Optional short subject.
     pub subject: Option<String>,
+    /// Optional explicit memory kind driving inject selection.
+    pub kind: Option<note::MemoryKind>,
     /// Optional tags.
     pub tags: Vec<String>,
     /// Explicit audience for agent-private records.
@@ -130,6 +132,7 @@ pub fn write_record(input: WriteRecordInput<'_>) -> Result<WriteRecordResult, Me
                     subject: input.subject.clone(),
                     tags: input.tags.clone(),
                     confidence: input.confidence,
+                    kind: input.kind,
                     audience: input.audience.clone(),
                     body: input.body.clone(),
                     note_path: Some(note_relative_path.clone()),
@@ -163,6 +166,7 @@ pub fn write_record(input: WriteRecordInput<'_>) -> Result<WriteRecordResult, Me
             source_ref: input.source_ref.clone(),
             related_event_id: input.write_event.then(|| id.clone()),
             expires_at: None,
+            kind: input.kind,
             audience: input.audience.clone(),
         };
         let note_result =

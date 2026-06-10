@@ -25,6 +25,26 @@ pub enum EntryKind {
     Note,
 }
 
+/// Durable classification of a memory, set explicitly by the writer.
+///
+/// Drives session-start inject selection: preferences are always-on, project
+/// facts inject in their own project, incidents and references are search-only.
+/// When absent (legacy records, or writers that don't set it), the inject
+/// classifier falls back to a content heuristic. This lives with the note schema
+/// because it is persisted metadata, mirrored into the event sidecar and index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MemoryKind {
+    /// Durable behavioral guidance; inject in every session.
+    Preference,
+    /// Fact about one project or system; inject only in that project.
+    ProjectFact,
+    /// Operational event or fix; search-only, never auto-injected at startup.
+    Incident,
+    /// Pointer or lookup fact; search-only.
+    Reference,
+}
+
 /// Confidence assigned to a note.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -94,6 +114,9 @@ pub struct NoteFrontMatter {
     /// Optional RFC3339 expiration timestamp.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
+    /// Optional explicit memory kind driving inject selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<MemoryKind>,
     /// Explicit allowed agents for `agent-private` notes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub audience: Vec<String>,
@@ -151,6 +174,8 @@ pub struct NoteWriteInput {
     pub related_event_id: Option<String>,
     /// Optional RFC3339 expiration timestamp.
     pub expires_at: Option<String>,
+    /// Optional explicit memory kind driving inject selection.
+    pub kind: Option<MemoryKind>,
     /// Explicit allowed agents for `agent-private` notes.
     pub audience: Vec<String>,
 }
@@ -244,6 +269,7 @@ impl NoteWriteInput {
             source_ref: self.source_ref.clone(),
             related_event_id: self.related_event_id.clone(),
             expires_at: self.expires_at.clone(),
+            kind: self.kind,
             audience: if self.scope == "agent-private" {
                 self.audience.clone()
             } else {
@@ -457,6 +483,7 @@ mod tests {
             source_ref: None,
             related_event_id: None,
             expires_at: None,
+            kind: None,
             audience: Vec::new(),
         }
     }

@@ -19,7 +19,7 @@
 //! new writes in a later change, is the durable fix that closes the residual
 //! gap safely; this heuristic is the bridge for untagged history.
 
-use crate::note::EntryKind;
+use crate::note::{EntryKind, MemoryKind};
 
 /// Session-start selection strategy, chosen by `context_strategy` config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -99,6 +99,9 @@ pub struct ClassifyInput<'a> {
     pub scope: &'a str,
     /// Whether the record is a durable `remember` or a raw `note`.
     pub entry_kind: EntryKind,
+    /// Explicit memory kind when the writer set one. Authoritative over the
+    /// content heuristic; absent for legacy records.
+    pub kind: Option<MemoryKind>,
     /// Canonical note body, used only for the conservative content signal.
     pub body: &'a str,
 }
@@ -108,13 +111,23 @@ pub struct ClassifyInput<'a> {
 /// Order matters and encodes the conservative bias:
 /// 1. Raw `note` material is search-only (mirrors the default that `hm note`
 ///    entries do not auto-inject).
-/// 2. Project-scoped records defer to the existing project filter.
-/// 3. A global record is withheld ONLY when it reads as operational (a date
-///    AND an operational keyword); otherwise it is always-on. Requiring both
-///    signals keeps a dated *preference* from being misread as an incident.
+/// 2. An explicit `kind` is authoritative: the writer told us what this is, so
+///    trust it and skip the heuristic entirely. This is the safe way to catch
+///    records the content heuristic cannot (a marker-less incident, a plain
+///    reference) without guessing.
+/// 3. Otherwise fall back: project-scoped records defer to the project filter,
+///    and a global record is withheld ONLY when it reads as operational (a date
+///    AND an operational keyword), so a dated *preference* is not misread.
 pub fn classify(input: ClassifyInput<'_>, markers: &IncidentMarkers) -> InjectClass {
     if input.entry_kind == EntryKind::Note {
         return InjectClass::SearchOnly;
+    }
+    if let Some(kind) = input.kind {
+        return match kind {
+            MemoryKind::Preference => InjectClass::AlwaysOn,
+            MemoryKind::ProjectFact => InjectClass::ProjectScoped,
+            MemoryKind::Incident | MemoryKind::Reference => InjectClass::SearchOnly,
+        };
     }
     if input.scope == "project" {
         return InjectClass::ProjectScoped;
@@ -163,6 +176,7 @@ mod tests {
         ClassifyInput {
             scope: "global",
             entry_kind: EntryKind::Remember,
+            kind: None,
             body,
         }
     }
@@ -172,6 +186,7 @@ mod tests {
         let input = ClassifyInput {
             scope: "global",
             entry_kind: EntryKind::Note,
+            kind: None,
             body: "a stray idea",
         };
         assert_eq!(
@@ -185,12 +200,36 @@ mod tests {
         let input = ClassifyInput {
             scope: "project",
             entry_kind: EntryKind::Remember,
+            kind: None,
             body: "repo alpha deploys on tag push",
         };
         assert_eq!(
             classify(input, &IncidentMarkers::default()),
             InjectClass::ProjectScoped
         );
+    }
+
+    #[test]
+    fn explicit_kind_overrides_heuristic() {
+        let markers = IncidentMarkers::default();
+        // A marker-less incident the heuristic cannot catch is correctly
+        // withheld once tagged.
+        let tagged_incident = ClassifyInput {
+            scope: "global",
+            entry_kind: EntryKind::Remember,
+            kind: Some(MemoryKind::Incident),
+            body: "the installer now rebuilds when the version is stale",
+        };
+        assert_eq!(classify(tagged_incident, &markers), InjectClass::SearchOnly);
+
+        // An explicit preference stays always-on even if it reads operational.
+        let tagged_pref = ClassifyInput {
+            scope: "global",
+            entry_kind: EntryKind::Remember,
+            kind: Some(MemoryKind::Preference),
+            body: "2026-06-06 root cause taught us to always run the linter",
+        };
+        assert_eq!(classify(tagged_pref, &markers), InjectClass::AlwaysOn);
     }
 
     #[test]

@@ -132,22 +132,24 @@ note = "operational postmortem; search-only"
 [[record]]
 subject = "incident-stale-binary"
 kind = "incident"
+tagged = true
 entry_kind = "remember"
 scope = "global"
 confidence = "medium"
 body = "A source-checkout canary found a stale binary; the fix makes the installer rebuild when the recorded version no longer matches the checkout head."
-note = "operational fix log; search-only"
+note = "ADVERSARIAL: a marker-less incident (no date) the content heuristic cannot catch. Tagged kind=incident to simulate a new write; the explicit kind withholds it."
 
 # ---- reference: a pointer/lookup fact; search-only ----
 
 [[record]]
 subject = "ref-release-labels"
 kind = "reference"
+tagged = true
 entry_kind = "remember"
 scope = "global"
 confidence = "low"
 body = "Release archives publish installer-facing labels distinct from the internal build target triples."
-note = "lookup reference; search-only"
+note = "a plain reference the content heuristic cannot catch. Tagged kind=reference; the explicit kind withholds it."
 
 # ---- raw note: low-confidence hm note; must not inject by default ----
 

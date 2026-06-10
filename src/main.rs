@@ -385,6 +385,9 @@ struct WriteMemoryArgs {
     /// Optional short subject.
     #[arg(long)]
     subject: Option<String>,
+    /// Optional explicit memory kind driving session-start inject selection.
+    #[arg(long, value_parser = parse_memory_kind)]
+    kind: Option<note::MemoryKind>,
     /// Optional comma-separated tags.
     #[arg(long, value_delimiter = ',')]
     tags: Vec<String>,
@@ -1316,6 +1319,16 @@ fn parse_confidence(input: &str) -> std::result::Result<note::Confidence, String
     }
 }
 
+fn parse_memory_kind(input: &str) -> std::result::Result<note::MemoryKind, String> {
+    match input {
+        "preference" => Ok(note::MemoryKind::Preference),
+        "project-fact" => Ok(note::MemoryKind::ProjectFact),
+        "incident" => Ok(note::MemoryKind::Incident),
+        "reference" => Ok(note::MemoryKind::Reference),
+        _ => Err("expected one of: preference, project-fact, incident, reference".to_owned()),
+    }
+}
+
 /// Load CLI-selected config and report non-fatal warnings.
 ///
 /// The path resolution policy lives in `ConfigPaths`; this function only
@@ -1461,6 +1474,7 @@ fn run_write_memory(
         body: args.text,
         project_id: project_id.clone(),
         subject: args.subject,
+        kind: args.kind,
         tags: args.tags,
         audience: audience.clone(),
         source_kind: args.source_kind,
@@ -1546,6 +1560,7 @@ struct MemoryWriteFields {
     body: String,
     project_id: Option<String>,
     subject: Option<String>,
+    kind: Option<note::MemoryKind>,
     tags: Vec<String>,
     audience: Vec<String>,
     source_kind: Option<String>,
@@ -1581,6 +1596,7 @@ fn write_canonical_memory(
         body: input.body,
         project_id: input.project_id,
         subject: input.subject,
+        kind: input.kind,
         tags: input.tags,
         audience: input.audience,
         source_kind: input.source_kind,
@@ -1647,6 +1663,7 @@ fn enqueue_outbox_memory(
         source_ref: input.source_ref.clone(),
         related_event_id: write_event.then(|| id.clone()),
         expires_at: None,
+        kind: input.kind,
         audience: input.audience.clone(),
     };
     let note = note::render_note(&note::MarkdownNote {
@@ -1669,6 +1686,7 @@ fn enqueue_outbox_memory(
                 subject: input.subject,
                 tags: input.tags,
                 confidence: input.confidence,
+                kind: input.kind,
                 audience: input.audience,
                 body: input.body,
                 note_path: Some(note_relative_path.clone()),

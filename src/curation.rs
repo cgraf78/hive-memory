@@ -347,6 +347,9 @@ fn write_promotion_event(
         subject: Some("inbox promotion".to_owned()),
         tags: vec!["promotion".to_owned()],
         confidence: source.confidence,
+        // Carry the source record's kind through promotion so a promoted memory
+        // keeps its inject classification.
+        kind: source.kind,
         audience: Vec::new(),
         body: format!(
             "source_note_id = \"{}\"\ntarget_path = \"{}\"\n",
