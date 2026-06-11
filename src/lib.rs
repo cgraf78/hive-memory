@@ -25,3 +25,4 @@ pub mod store;
 pub mod version;
 pub mod visibility;
 pub mod write;
+pub mod write_classify;

@@ -1531,6 +1531,74 @@ fn remember_accepts_project_fact_with_project_scope_and_id() {
 }
 
 #[test]
+fn remember_infers_preference_kind_by_default() {
+    let dir = temp_dir("remember-infer-kind");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+
+    let output = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Chris prefers deterministic agent tooling.",
+        ])
+        .output()
+        .expect("run remember");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(
+        stdout.contains("kind: preference (inferred)"),
+        "stdout: {stdout}"
+    );
+    let note =
+        fs::read_to_string(PathBuf::from(stdout_value(&stdout, "note:"))).expect("read note");
+    assert!(note.contains("kind = \"preference\""), "note: {note}");
+}
+
+#[test]
+fn remember_no_infer_kind_stores_untagged_record() {
+    let dir = temp_dir("remember-no-infer-kind");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+
+    let output = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Chris prefers deterministic agent tooling.",
+            "--no-infer-kind",
+        ])
+        .output()
+        .expect("run remember");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(!stdout.contains("kind:"), "stdout: {stdout}");
+    let note =
+        fs::read_to_string(PathBuf::from(stdout_value(&stdout, "note:"))).expect("read note");
+    assert!(!note.contains("\nkind ="), "note: {note}");
+}
+
+#[test]
 fn remember_json_reports_stable_write_fields() {
     let dir = temp_dir("remember-json");
     let config = dir.join("config.toml");
@@ -1562,6 +1630,11 @@ fn remember_json_reports_stable_write_fields() {
         .stdout(predicate::str::contains("\"scope\": \"global\""))
         .stdout(predicate::str::contains("\"project_id\": null"))
         .stdout(predicate::str::contains("\"audience\": []"))
+        .stdout(predicate::str::contains("\"kind\": \"preference\""))
+        .stdout(predicate::str::contains("\"kind_inferred\": true"))
+        .stdout(predicate::str::contains(
+            "\"kind_reason\": \"preference-language\"",
+        ))
         .stdout(predicate::str::contains("\"note_path\": \""))
         .stdout(predicate::str::contains("\"event_path\": \""))
         .stdout(predicate::str::contains("\"created\": true"))

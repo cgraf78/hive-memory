@@ -10,6 +10,7 @@ use hive_memory::config::{Config, ConfigPaths, EventSidecarPolicy, Sensitivity, 
 use hive_memory::{
     config, context as memory_context, curation, doctor, event, hook as memory_hook, id, index,
     inject, memory, note, outbox, path as memory_path, project, search, secret, store, write,
+    write_classify,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -388,6 +389,9 @@ struct WriteMemoryArgs {
     /// Optional explicit memory kind driving session-start inject selection.
     #[arg(long, value_parser = parse_memory_kind)]
     kind: Option<note::MemoryKind>,
+    /// Store without automatic kind inference when `--kind` is omitted.
+    #[arg(long, conflicts_with = "kind")]
+    no_infer_kind: bool,
     /// Optional comma-separated tags.
     #[arg(long, value_delimiter = ',')]
     tags: Vec<String>,
@@ -1329,6 +1333,63 @@ fn parse_memory_kind(input: &str) -> std::result::Result<note::MemoryKind, Strin
     }
 }
 
+fn memory_kind_label(kind: note::MemoryKind) -> &'static str {
+    match kind {
+        note::MemoryKind::Preference => "preference",
+        note::MemoryKind::ProjectFact => "project-fact",
+        note::MemoryKind::Incident => "incident",
+        note::MemoryKind::Reference => "reference",
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WriteKindDecision {
+    kind: Option<note::MemoryKind>,
+    inferred: bool,
+    reason: Option<&'static str>,
+}
+
+fn resolve_write_kind(
+    entry_kind: note::EntryKind,
+    explicit: Option<note::MemoryKind>,
+    no_infer: bool,
+    scope: &str,
+    project_id: Option<&str>,
+    body: &str,
+) -> WriteKindDecision {
+    if explicit.is_some() {
+        return WriteKindDecision {
+            kind: explicit,
+            inferred: false,
+            reason: None,
+        };
+    }
+    if no_infer || entry_kind != note::EntryKind::Remember {
+        return WriteKindDecision {
+            kind: None,
+            inferred: false,
+            reason: None,
+        };
+    }
+
+    match write_classify::infer_kind(write_classify::InferKindInput {
+        scope,
+        project_id,
+        body,
+    }) {
+        Some(inference) => WriteKindDecision {
+            kind: Some(inference.kind),
+            inferred: true,
+            reason: Some(inference.reason),
+        },
+        None => WriteKindDecision {
+            kind: None,
+            inferred: false,
+            reason: None,
+        },
+    }
+}
+
 /// Load CLI-selected config and report non-fatal warnings.
 ///
 /// The path resolution policy lives in `ConfigPaths`; this function only
@@ -1438,7 +1499,15 @@ fn run_write_memory(
     // identity before choosing the write store. This keeps work/personal routing
     // centralized in `hm` instead of requiring hook scripts or agents to infer it.
     let project_id = resolve_project_id(args.project_id.clone(), project_hint.as_deref())?;
-    validate_memory_kind_context(args.kind, &scope, project_id.as_deref())?;
+    let kind_decision = resolve_write_kind(
+        entry_kind,
+        args.kind,
+        args.no_infer_kind,
+        &scope,
+        project_id.as_deref(),
+        &args.text,
+    );
+    validate_memory_kind_context(kind_decision.kind, &scope, project_id.as_deref())?;
     let project_binding = project_binding_store(&config, project_id.as_deref())?;
     let resolved_store = resolve_store(
         &config,
@@ -1475,7 +1544,7 @@ fn run_write_memory(
         body: args.text,
         project_id: project_id.clone(),
         subject: args.subject,
-        kind: args.kind,
+        kind: kind_decision.kind,
         tags: args.tags,
         audience: audience.clone(),
         source_kind: args.source_kind,
@@ -1519,6 +1588,9 @@ fn run_write_memory(
             scope: scope.clone(),
             project_id: project_id.clone(),
             audience: audience.clone(),
+            kind: kind_decision.kind,
+            kind_inferred: kind_decision.inferred,
+            kind_reason: kind_decision.reason.map(str::to_owned),
             note_path: outcome.note_path.display().to_string(),
             event_path: outcome
                 .event_path
@@ -1531,6 +1603,14 @@ fn run_write_memory(
     } else {
         println!("id: {}", outcome.id);
         println!("store: {}", resolved_store.name);
+        if let Some(kind) = kind_decision.kind {
+            let suffix = if kind_decision.inferred {
+                " (inferred)"
+            } else {
+                ""
+            };
+            println!("kind: {}{suffix}", memory_kind_label(kind));
+        }
         println!("note: {}", outcome.note_path.display());
         if let Some(path) = &outcome.event_path {
             println!("event: {}", path.display());
@@ -1736,6 +1816,9 @@ struct WriteMemoryJson {
     scope: String,
     project_id: Option<String>,
     audience: Vec<String>,
+    kind: Option<note::MemoryKind>,
+    kind_inferred: bool,
+    kind_reason: Option<String>,
     note_path: String,
     event_path: Option<String>,
     created: bool,
