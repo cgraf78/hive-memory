@@ -295,7 +295,11 @@ pub fn index_path(cache_dir: &Path, store_name: &str) -> PathBuf {
         .join(format!("{store_name}.jsonl"))
 }
 
-fn scoped_index_path(cache_dir: &Path, store_name: &str, store_root: &Path) -> PathBuf {
+/// Return the scoped cache path for one store alias and root.
+///
+/// The root is part of the cache key so changing a configured store root cannot
+/// accidentally reuse a stale index from an older location with the same alias.
+pub fn scoped_index_path(cache_dir: &Path, store_name: &str, store_root: &Path) -> PathBuf {
     cache_dir
         .join("indexes")
         .join(format!("{}.jsonl", store_cache_key(store_name, store_root)))
