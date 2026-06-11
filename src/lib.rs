@@ -21,6 +21,7 @@ pub mod path;
 pub mod project;
 pub mod search;
 pub mod secret;
+pub mod signals;
 pub mod store;
 pub mod version;
 pub mod visibility;
