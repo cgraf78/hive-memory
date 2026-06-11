@@ -1438,6 +1438,7 @@ fn run_write_memory(
     // identity before choosing the write store. This keeps work/personal routing
     // centralized in `hm` instead of requiring hook scripts or agents to infer it.
     let project_id = resolve_project_id(args.project_id.clone(), project_hint.as_deref())?;
+    validate_memory_kind_context(args.kind, &scope, project_id.as_deref())?;
     let project_binding = project_binding_store(&config, project_id.as_deref())?;
     let resolved_store = resolve_store(
         &config,
@@ -1860,12 +1861,18 @@ fn run_context(args: ContextArgs, context: CliContext) -> Result<()> {
     let config = load_config(context.config_path.as_deref())?;
     let path_hint = args.project.or(args.path);
     let project_id = resolve_project_id(args.project_id, path_hint.as_deref())?;
+    let include_search_only = args.include_inbox
+        || args
+            .source
+            .iter()
+            .any(|source| source == "inbox" || source == "all");
     let assembly = assemble_cli_context(
         &config,
         &context,
         ContextSelection {
             max_tokens: args.max_tokens,
             include_inbox: args.include_inbox,
+            include_search_only,
             scopes: args.scope,
             sources: args.source,
             project_id,
@@ -1916,6 +1923,8 @@ struct ContextSelection {
     max_tokens: Option<usize>,
     /// Explicitly opt into lower-confidence raw inbox notes.
     include_inbox: bool,
+    /// Explicitly render records the relevance strategy classifies as search-only.
+    include_search_only: bool,
     /// Scope filter from CLI/hook policy. Empty defers to config defaults.
     scopes: Vec<String>,
     /// Source filter from CLI/hook policy. Empty defers to config defaults.
@@ -1935,6 +1944,10 @@ struct CliContextAssembly {
     store_source: String,
     scopes: Vec<String>,
     sources: Vec<String>,
+    /// Whether raw inbox records were eligible for this assembly.
+    include_inbox: bool,
+    /// Whether search-only records were intentionally rendered.
+    include_search_only: bool,
     /// Resolved selection strategy label, part of the cache key.
     strategy: String,
     stale: bool,
@@ -1967,6 +1980,7 @@ fn assemble_cli_context(
         || sources
             .iter()
             .any(|source| source == "inbox" || source == "all");
+    let include_search_only = selection.include_search_only && include_inbox;
     // Resolve the selection strategy once; it feeds both the assembly and the
     // cache key so a strategy change invalidates any cached context.
     let strategy_label = config.defaults.context_strategy.clone();
@@ -1997,7 +2011,11 @@ fn assemble_cli_context(
         path_hint.as_deref(),
         &scopes,
         &sources,
-        &strategy_label,
+        ContextKeyPolicy {
+            include_inbox,
+            include_search_only,
+            strategy: &strategy_label,
+        },
     );
     if std::env::var("HIVE_MEMORY_HOOK_ACTIVE").ok().as_deref() == Some("1")
         && let Err(store::StoreError::Io { .. }) = store::read_manifest(&store_config.root)
@@ -2038,6 +2056,7 @@ fn assemble_cli_context(
         scopes: &scopes,
         sources: &sources,
         include_inbox,
+        include_search_only,
         agent_id: agent_id.as_deref(),
         project_id: project_id.as_deref(),
         path_hint: path_hint.as_deref(),
@@ -2055,6 +2074,8 @@ fn assemble_cli_context(
         store_source,
         scopes,
         sources,
+        include_inbox,
+        include_search_only,
         strategy: strategy_label,
         stale: false,
         cache_created_at: None,
@@ -2084,6 +2105,10 @@ struct ContextJsonOutput {
     scopes: Vec<String>,
     /// Source filter actually used for this assembly.
     sources: Vec<String>,
+    /// Whether lower-confidence raw inbox notes were eligible.
+    include_inbox: bool,
+    /// Whether search-only records were intentionally rendered.
+    include_search_only: bool,
     /// Approximate token count for the emitted Markdown.
     estimated_tokens: usize,
     /// False only when `--if-changed` suppresses unchanged context.
@@ -2140,6 +2165,12 @@ struct ContextCacheEntry {
     scopes: Vec<String>,
     /// Source filter used for this assembly.
     sources: Vec<String>,
+    /// Whether lower-confidence raw inbox notes were eligible.
+    #[serde(default)]
+    include_inbox: bool,
+    /// Whether search-only records were intentionally rendered.
+    #[serde(default)]
+    include_search_only: bool,
     /// Token estimate from the fresh assembly.
     estimated_tokens: usize,
     /// Section metadata kept so stale JSON output preserves data boundaries.
@@ -2179,6 +2210,8 @@ fn write_context_cache(config: &Config, assembly: &CliContextAssembly) -> Result
         store_source: assembly.store_source.clone(),
         scopes: assembly.scopes.clone(),
         sources: assembly.sources.clone(),
+        include_inbox: assembly.include_inbox,
+        include_search_only: assembly.include_search_only,
         estimated_tokens: assembly.output.estimated_tokens,
         sections: assembly
             .output
@@ -2271,6 +2304,8 @@ fn load_context_cache(
         store_source,
         scopes: entry.scopes,
         sources: entry.sources,
+        include_inbox: entry.include_inbox,
+        include_search_only: entry.include_search_only,
         // A cache hit means the key matched, and the key includes the strategy,
         // so the active strategy is the one this entry was written under.
         strategy: config.defaults.context_strategy.clone(),
@@ -2340,6 +2375,8 @@ fn context_json(
         store_source: assembly.store_source,
         scopes: assembly.scopes,
         sources: assembly.sources,
+        include_inbox: assembly.include_inbox,
+        include_search_only: assembly.include_search_only,
         estimated_tokens: assembly.output.estimated_tokens,
         emitted,
         stale,
@@ -2375,6 +2412,8 @@ fn context_json_suppressed(
         store_source: assembly.store_source,
         scopes: assembly.scopes,
         sources: assembly.sources,
+        include_inbox: assembly.include_inbox,
+        include_search_only: assembly.include_search_only,
         estimated_tokens: 0,
         emitted: false,
         stale,
@@ -2660,6 +2699,7 @@ fn run_hook_session_start(args: HookContextArgs, mut context: CliContext) -> Res
         ContextSelection {
             max_tokens: Some(usize::try_from(config.defaults.hook_context_max_tokens)?),
             include_inbox: false,
+            include_search_only: false,
             scopes: Vec::new(),
             sources: Vec::new(),
             project_id: std::env::var("HIVE_MEMORY_PROJECT_ID").ok(),
@@ -2989,6 +3029,7 @@ fn hook_context_action_if_changed(
         ContextSelection {
             max_tokens: Some(usize::try_from(config.defaults.hook_context_max_tokens)?),
             include_inbox: false,
+            include_search_only: false,
             scopes: Vec::new(),
             sources: Vec::new(),
             project_id: std::env::var("HIVE_MEMORY_PROJECT_ID").ok(),
@@ -3010,6 +3051,11 @@ fn hook_context_action_if_changed(
 
 fn context_selection_key_from_assembly(assembly: &CliContextAssembly) -> String {
     let agent_id = assembly.agent_id.as_deref().unwrap_or("unknown");
+    let policy = ContextKeyPolicy {
+        include_inbox: assembly.include_inbox,
+        include_search_only: assembly.include_search_only,
+        strategy: &assembly.strategy,
+    };
     context_selection_key(
         agent_id,
         &assembly.stores,
@@ -3017,7 +3063,7 @@ fn context_selection_key_from_assembly(assembly: &CliContextAssembly) -> String 
         assembly.project_hint.as_deref(),
         &assembly.scopes,
         &assembly.sources,
-        &assembly.strategy,
+        policy,
     )
 }
 
@@ -3033,16 +3079,27 @@ fn context_selection_key(
     path_hint: Option<&str>,
     scopes: &[String],
     sources: &[String],
-    strategy: &str,
+    policy: ContextKeyPolicy<'_>,
 ) -> String {
+    let ContextKeyPolicy {
+        include_inbox,
+        include_search_only,
+        strategy,
+    } = policy;
     format!(
-        "agent={agent_id}\nstores={}\nproject_id={}\npath={}\nscopes={}\nsources={}\nstrategy={strategy}",
+        "agent={agent_id}\nstores={}\nproject_id={}\npath={}\nscopes={}\nsources={}\ninclude_inbox={include_inbox}\ninclude_search_only={include_search_only}\nstrategy={strategy}",
         stores.join(","),
         project_id.unwrap_or_default(),
         path_hint.unwrap_or_default(),
         scopes.join(","),
         sources.join(",")
     )
+}
+
+struct ContextKeyPolicy<'a> {
+    include_inbox: bool,
+    include_search_only: bool,
+    strategy: &'a str,
 }
 
 fn hook_context_key(
@@ -3069,8 +3126,54 @@ fn hook_context_key(
         path_hint,
         &config.defaults.search_scopes,
         &config.defaults.context_sources,
-        &config.defaults.context_strategy,
+        ContextKeyPolicy {
+            include_inbox: false,
+            include_search_only: false,
+            strategy: &config.defaults.context_strategy,
+        },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::context_selection_key;
+
+    #[test]
+    fn context_key_tracks_inbox_and_search_only_policy() {
+        let stores = ["personal".to_owned()];
+        let scopes = ["global".to_owned()];
+        let sources = ["remembered".to_owned()];
+        let strict = context_selection_key(
+            "codex",
+            &stores,
+            Some("project-a"),
+            Some("/repo"),
+            &scopes,
+            &sources,
+            super::ContextKeyPolicy {
+                include_inbox: false,
+                include_search_only: false,
+                strategy: "relevance",
+            },
+        );
+        let inbox = context_selection_key(
+            "codex",
+            &stores,
+            Some("project-a"),
+            Some("/repo"),
+            &scopes,
+            &sources,
+            super::ContextKeyPolicy {
+                include_inbox: true,
+                include_search_only: true,
+                strategy: "relevance",
+            },
+        );
+
+        assert_ne!(strict, inbox);
+        assert!(strict.contains("include_inbox=false"));
+        assert!(inbox.contains("include_search_only=true"));
+    }
 }
 
 /// Validate read-side hook policy without assembling or emitting context.
@@ -3637,4 +3740,24 @@ fn resolve_audience(
     }
 
     Ok(args.audience.clone())
+}
+
+fn validate_memory_kind_context(
+    kind: Option<note::MemoryKind>,
+    scope: &str,
+    project_id: Option<&str>,
+) -> Result<()> {
+    if kind != Some(note::MemoryKind::ProjectFact) {
+        return Ok(());
+    }
+
+    if scope == "project" && project_id.is_some() {
+        return Ok(());
+    }
+
+    Err(PrivacyRefusal {
+        message: "`--kind project-fact` requires `--scope project` and a resolved project id"
+            .to_owned(),
+    }
+    .into())
 }

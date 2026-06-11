@@ -20,18 +20,15 @@ use hive_memory::index::{self, IndexEntry, RebuildIndexInput};
 use hive_memory::inject::Strategy as InjectStrategy;
 use hive_memory::memory::{self, WriteRecordInput};
 use hive_memory::note::{Confidence, EntryKind, MemoryKind};
-use hive_memory::path as memory_path;
+use hive_memory::path::PathCase;
 use hive_memory::store::StoreManifest;
 use hive_memory::write::{AtomicWriteOptions, FsyncPolicy};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
-
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Fixture model
@@ -111,10 +108,9 @@ fn temp_dir(name: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("system clock after epoch")
         .as_nanos();
-    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "hm-inject-eval-{name}-{}-{counter}-{nanos}",
-        std::process::id(),
+        "hm-inject-eval-{name}-{}-{nanos}",
+        std::process::id()
     ));
     fs::create_dir_all(&path).expect("create temp dir");
     path
@@ -203,7 +199,7 @@ fn materialize(corpus: &Corpus, root: &Path) -> Vec<IndexEntry> {
         store_root: root,
         cache_dir: &root.join(".cache"),
         options: options(),
-        path_case: memory_path::resolve_case("auto", root),
+        path_case: PathCase::Sensitive,
     })
     .expect("rebuild index")
     .entries
@@ -238,6 +234,7 @@ fn inject(
         scopes: &scopes,
         sources: &sources,
         include_inbox: false,
+        include_search_only: false,
         agent_id: Some("eval-agent"),
         project_id,
         path_hint: Some("/repo/src/main.rs"),

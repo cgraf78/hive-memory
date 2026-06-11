@@ -32,6 +32,12 @@ pub struct ContextInput<'a> {
     pub sources: &'a [String],
     /// Whether raw `hm note` entries are explicitly included.
     pub include_inbox: bool,
+    /// Whether records classified as search-only should still render.
+    ///
+    /// Interactive inspection can ask for raw/search-only material explicitly,
+    /// but hook/session-start context keeps these records out so startup memory
+    /// stays focused.
+    pub include_search_only: bool,
     /// Active agent identity for agent-private audience filtering.
     pub agent_id: Option<&'a str>,
     /// Active project identity. When present, project-scoped notes must match it.
@@ -248,7 +254,7 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
                 },
                 &markers,
             );
-            if class == InjectClass::SearchOnly {
+            if class == InjectClass::SearchOnly && !input.include_search_only {
                 continue;
             }
         }
@@ -601,6 +607,7 @@ mod tests {
             scopes,
             sources,
             include_inbox: false,
+            include_search_only: false,
             agent_id: Some("codex"),
             project_id: None,
             path_hint: Some("/repo/src/main.rs"),
