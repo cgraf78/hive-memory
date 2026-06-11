@@ -43,6 +43,25 @@ body = "The test workflow runs on Ubuntu and macOS."
 expected_kind = "project-fact"
 
 [[record]]
+id = "url-reference"
+scope = "global"
+body = "Build status dashboard: https://ci.example.com/dashboards/42."
+expected_kind = "reference"
+
+[[record]]
+id = "doc-citing-project-fact"
+scope = "project"
+project_id = "repo-alpha"
+body = "Architecture decisions live in docs/adr/0001-store-layout.md."
+expected_kind = "project-fact"
+
+[[record]]
+id = "doc-mention-global"
+scope = "global"
+body = "The guidelines file is AGENTS.md, kept at the repo root."
+expected_kind = ""
+
+[[record]]
 id = "ambiguous"
 scope = "global"
 body = "Something worth revisiting later."
