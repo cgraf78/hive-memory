@@ -16,8 +16,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fmt::{self, Display};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::SystemTime;
 use time::OffsetDateTime;
 
 // Clap derives user-facing help from doc comments, so keep implementation
@@ -63,6 +64,8 @@ enum Command {
     Search(SearchArgs),
     /// Assemble agent-readable memory context.
     Context(ContextArgs),
+    /// Report store/index freshness without mutating memory.
+    SyncStatus(SyncStatusArgs),
     /// Refresh local outbox and indexes.
     Refresh(RefreshArgs),
     /// Flush local outbox writes to reachable stores.
@@ -487,6 +490,14 @@ struct ContextArgs {
     json: bool,
 }
 
+/// Arguments for `hm sync-status`.
+#[derive(Debug, Args)]
+struct SyncStatusArgs {
+    /// Emit machine-readable output.
+    #[arg(long)]
+    json: bool,
+}
+
 /// Arguments for `hm refresh`.
 #[derive(Debug, Args)]
 struct RefreshArgs {
@@ -596,6 +607,7 @@ fn run(cli: Cli) -> Result<()> {
         Some(Command::Note(args)) => run_write_memory(note::EntryKind::Note, args, context),
         Some(Command::Search(args)) => run_search(args, context),
         Some(Command::Context(args)) => run_context(args, context),
+        Some(Command::SyncStatus(args)) => run_sync_status(args, context),
         Some(Command::Refresh(args)) => run_refresh(args, context),
         Some(Command::Flush(args)) => run_flush(args, context),
         Some(Command::Outbox(OutboxCommand::Flush(args))) => run_flush(args, context),
@@ -624,6 +636,7 @@ impl Cli {
             Some(Command::Remember(args)) | Some(Command::Note(args)) => args.json,
             Some(Command::Search(args)) => args.json,
             Some(Command::Context(args)) => args.json,
+            Some(Command::SyncStatus(args)) => args.json,
             Some(Command::Refresh(args)) => args.json,
             Some(Command::Flush(args)) | Some(Command::Outbox(OutboxCommand::Flush(args))) => {
                 args.json
@@ -2644,6 +2657,174 @@ fn context_json_suppressed(
         sections: Vec::new(),
         decisions: Vec::new(),
     }
+}
+
+#[derive(Debug, Serialize)]
+struct SyncStatusJsonOutput {
+    store: String,
+    store_source: String,
+    store_id: Option<String>,
+    manifest_schema_version: Option<u32>,
+    root: PathBuf,
+    reachable: bool,
+    manifest_error: Option<String>,
+    index_path: PathBuf,
+    index_exists: bool,
+    index_modified_at: Option<String>,
+    newest_note_at: Option<String>,
+    newest_event_at: Option<String>,
+    newest_canonical_at: Option<String>,
+    index_stale: bool,
+    cloud_conflict_files: usize,
+}
+
+fn run_sync_status(args: SyncStatusArgs, context: CliContext) -> Result<()> {
+    let config = load_config(context.config_path.as_deref())?;
+    let agent_id = resolve_agent_id(context.as_agent.clone());
+    let resolved_store = resolve_store(
+        &config,
+        context.store.as_deref(),
+        None,
+        agent_id.as_deref(),
+        StoreAccess::Read,
+    )?;
+    let store_config = &config.stores[resolved_store.name.as_str()];
+    let manifest = store::read_manifest(&store_config.root);
+    let (reachable, store_id, manifest_schema_version, manifest_error) = match manifest {
+        Ok(manifest) => (
+            true,
+            Some(manifest.store.id),
+            Some(manifest.schema_version),
+            None,
+        ),
+        Err(err) => (false, None, None, Some(err.to_string())),
+    };
+
+    let notes_root = store_config.root.join("inbox/notes");
+    let events_root = store_config.root.join("inbox/events");
+    let newest_note = newest_file_mtime(&notes_root)?;
+    let newest_event = newest_file_mtime(&events_root)?;
+    let newest_canonical = [newest_note, newest_event].into_iter().flatten().max();
+    let index_path =
+        index::scoped_index_path(&config.cache_dir, &resolved_store.name, &store_config.root);
+    let index_modified = file_mtime(&index_path)?;
+    let index_exists = index_modified.is_some();
+    let index_stale = match (newest_canonical, index_modified) {
+        (Some(_), None) => true,
+        (Some(canonical), Some(index_modified)) => canonical > index_modified,
+        _ => false,
+    };
+    let cloud_conflict_files = count_conflict_files(&store_config.root)?;
+
+    let output = SyncStatusJsonOutput {
+        store: resolved_store.name,
+        store_source: resolved_store.source.to_string(),
+        store_id,
+        manifest_schema_version,
+        root: store_config.root.clone(),
+        reachable,
+        manifest_error,
+        index_path,
+        index_exists,
+        index_modified_at: system_time_rfc3339(index_modified),
+        newest_note_at: system_time_rfc3339(newest_note),
+        newest_event_at: system_time_rfc3339(newest_event),
+        newest_canonical_at: system_time_rfc3339(newest_canonical),
+        index_stale,
+        cloud_conflict_files,
+    };
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
+
+    println!("store: {} ({})", output.store, output.store_source);
+    println!("root: {}", output.root.display());
+    println!("reachable: {}", if output.reachable { "yes" } else { "no" });
+    if let Some(error) = output.manifest_error.as_deref() {
+        println!("manifest_error: {error}");
+    }
+    println!(
+        "index: {} ({})",
+        output.index_path.display(),
+        if output.index_exists {
+            "exists"
+        } else {
+            "missing"
+        }
+    );
+    println!(
+        "index_stale: {}",
+        if output.index_stale { "yes" } else { "no" }
+    );
+    println!("cloud_conflict_files: {}", output.cloud_conflict_files);
+    Ok(())
+}
+
+fn file_mtime(path: &Path) -> Result<Option<SystemTime>> {
+    match path.metadata() {
+        Ok(metadata) => Ok(Some(metadata.modified()?)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn newest_file_mtime(root: &Path) -> Result<Option<SystemTime>> {
+    let mut newest = None;
+    visit_files(root, &mut |path| {
+        if let Some(modified) = file_mtime(path)? {
+            newest = Some(newest.map_or(modified, |current: SystemTime| current.max(modified)));
+        }
+        Ok(())
+    })?;
+    Ok(newest)
+}
+
+fn count_conflict_files(root: &Path) -> Result<usize> {
+    let mut count = 0;
+    visit_files(root, &mut |path| {
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.to_ascii_lowercase().contains("conflict"))
+        {
+            count += 1;
+        }
+        Ok(())
+    })?;
+    Ok(count)
+}
+
+fn visit_files<F>(root: &Path, visit: &mut F) -> Result<()>
+where
+    F: FnMut(&Path) -> Result<()>,
+{
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        if file_type.is_dir() {
+            visit_files(&path, visit)?;
+        } else if file_type.is_file() {
+            visit(&path)?;
+        }
+    }
+    Ok(())
+}
+
+fn system_time_rfc3339(value: Option<SystemTime>) -> Option<String> {
+    value.map(|time| {
+        OffsetDateTime::from(time)
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("RFC3339 formatting should not fail")
+    })
 }
 
 fn rebuild_store_index(config: &Config, store_name: &str) -> Result<index::LoadIndexReport> {

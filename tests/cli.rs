@@ -3524,6 +3524,102 @@ fn remember_project_hint_infers_project_scope_and_kind() {
 }
 
 #[test]
+fn sync_status_reports_reachable_store_and_index_freshness() {
+    let dir = temp_dir("sync-status");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Sync status should notice this unindexed memory.",
+        ])
+        .assert()
+        .success();
+
+    let stale = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "sync-status",
+            "--json",
+        ])
+        .output()
+        .expect("run sync-status");
+    assert!(stale.status.success(), "sync-status failed: {stale:?}");
+    let stale: serde_json::Value = serde_json::from_slice(&stale.stdout).expect("sync-status json");
+    assert_eq!(stale["store"], "personal");
+    assert_eq!(stale["store_source"], "global-default");
+    assert_eq!(stale["reachable"], true);
+    assert!(stale["store_id"].as_str().is_some());
+    assert_eq!(stale["index_exists"], false);
+    assert_eq!(stale["index_stale"], true);
+    assert!(stale["newest_note_at"].as_str().is_some());
+    assert!(stale["newest_canonical_at"].as_str().is_some());
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--quiet",
+        ])
+        .assert()
+        .success();
+
+    let fresh = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "sync-status",
+            "--json",
+        ])
+        .output()
+        .expect("run fresh sync-status");
+    assert!(fresh.status.success(), "sync-status failed: {fresh:?}");
+    let fresh: serde_json::Value =
+        serde_json::from_slice(&fresh.stdout).expect("fresh sync-status json");
+    assert_eq!(fresh["reachable"], true);
+    assert_eq!(fresh["index_exists"], true);
+    assert_eq!(fresh["index_stale"], false);
+    assert!(fresh["index_modified_at"].as_str().is_some());
+}
+
+#[test]
+fn sync_status_reports_unavailable_store_without_failing() {
+    let dir = temp_dir("sync-status-unavailable");
+    let config = dir.join("config.toml");
+    let personal = dir.join("missing-personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+
+    let output = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "sync-status",
+            "--json",
+        ])
+        .output()
+        .expect("run sync-status");
+    assert!(output.status.success(), "sync-status failed: {output:?}");
+
+    let status: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("sync-status json");
+    assert_eq!(status["store"], "personal");
+    assert_eq!(status["reachable"], false);
+    assert!(status["manifest_error"].as_str().is_some());
+    assert_eq!(status["index_exists"], false);
+    assert_eq!(status["index_stale"], false);
+}
+
+#[test]
 fn refresh_rebuilds_indexes() {
     let dir = temp_dir("refresh");
     let config = dir.join("config.toml");
