@@ -66,3 +66,44 @@ id = "ambiguous"
 scope = "global"
 body = "Something worth revisiting later."
 expected_kind = ""
+
+# Scope-inference rows. Evaluated with a project hint present (the launcher
+# exports one for every agent write made inside a repo), so these encode which
+# bodies may be promoted to project scope. `expected_scope` of "" means the
+# configured default must win; `high_value` marks preferences whose demotion
+# into one project would be a silent cross-session recall loss.
+
+[[scope_record]]
+id = "repo-local-fact"
+body = "This repo deploys from tags."
+expected_scope = "project"
+
+[[scope_record]]
+id = "explicit-project-fact"
+explicit_kind = "project-fact"
+body = "The test workflow runs on Ubuntu and macOS."
+expected_scope = "project"
+
+[[scope_record]]
+id = "preference-with-ci-language"
+body = "Always run ci checks before deploy."
+expected_scope = ""
+high_value = true
+
+[[scope_record]]
+id = "cross-repo-preference"
+body = "Prefer reusable workflow stanzas across repos."
+expected_scope = ""
+high_value = true
+
+[[scope_record]]
+id = "explicit-preference-with-repo-language"
+explicit_kind = "preference"
+body = "Keep this repo's ci green before pushing."
+expected_scope = ""
+high_value = true
+
+[[scope_record]]
+id = "generic-preference"
+body = "Chris prefers deterministic agent tooling."
+expected_scope = ""

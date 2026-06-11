@@ -55,6 +55,13 @@ pub struct ScopeInference {
 /// global from scratch. The configured default remains authoritative unless a
 /// project id is available and either the explicit kind or text clearly says the
 /// memory belongs to the active repo.
+///
+/// Preferences are exempt from promotion entirely. Launchers attach a project
+/// hint to every in-repo agent write, so without this guard a global
+/// preference that merely mentions repo-local words ("ci", "deploy",
+/// "workflow") would be scoped into one project and silently stop injecting
+/// in every other session — the same high-value loss the read-time classifier
+/// is tuned to never cause.
 pub fn infer_scope(input: InferScopeInput<'_>) -> Option<ScopeInference> {
     input.project_id?;
     if input.explicit_kind == Some(MemoryKind::ProjectFact) {
@@ -66,6 +73,9 @@ pub fn infer_scope(input: InferScopeInput<'_>) -> Option<ScopeInference> {
 
     let lower = input.body.trim().to_lowercase();
     if lower.is_empty() {
+        return None;
+    }
+    if input.explicit_kind == Some(MemoryKind::Preference) || reads_as_preference(&lower) {
         return None;
     }
     if reads_as_repo_local(&lower) {
@@ -282,6 +292,44 @@ mod tests {
                 project_id: Some("repo-alpha"),
                 explicit_kind: None,
                 body: "Chris prefers deterministic agent tooling.",
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn preference_language_blocks_project_promotion() {
+        // Agent launchers export a project hint for every write made inside a
+        // repo, so scope inference runs on global preferences too. A preference
+        // that mentions repo-local words ("ci", "deploy", "workflow") must not
+        // be demoted into one project — it would silently stop injecting in
+        // every other session, the high-value loss the inject stack guards
+        // against at read time.
+        assert!(
+            infer_scope(InferScopeInput {
+                project_id: Some("repo-alpha"),
+                explicit_kind: None,
+                body: "Always run ci checks before deploy.",
+            })
+            .is_none()
+        );
+        assert!(
+            infer_scope(InferScopeInput {
+                project_id: Some("repo-alpha"),
+                explicit_kind: None,
+                body: "Prefer reusable workflow stanzas across repos.",
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn explicit_preference_kind_blocks_promotion() {
+        assert!(
+            infer_scope(InferScopeInput {
+                project_id: Some("repo-alpha"),
+                explicit_kind: Some(MemoryKind::Preference),
+                body: "Keep this repo's ci green before pushing.",
             })
             .is_none()
         );
