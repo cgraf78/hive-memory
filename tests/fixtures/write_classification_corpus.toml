@@ -1,0 +1,49 @@
+# Synthetic write-time classification corpus.
+#
+# These records are public-safe examples of the write shapes agents should
+# classify automatically. `expected_kind` is the ground truth; empty expected
+# kind means the deterministic classifier should leave the write untagged.
+
+[[record]]
+id = "global-preference"
+scope = "global"
+body = "Chris prefers deterministic agent tooling over runtime-specific magic."
+expected_kind = "preference"
+
+[[record]]
+id = "imperative-preference"
+scope = "global"
+body = "Always run the focused test before saying a bug is fixed."
+expected_kind = "preference"
+
+[[record]]
+id = "dated-preference"
+scope = "global"
+body = "Since 2026-01-01, always keep generated agent rules in one source."
+expected_kind = "preference"
+high_value = true
+
+[[record]]
+id = "incident"
+scope = "global"
+body = "2026-06-06 root cause: cron leaked dbus processes until cleanup."
+expected_kind = "incident"
+
+[[record]]
+id = "reference"
+scope = "global"
+body = "For host details, read ~/.local/share/doc/dot/home-lab.md before changing machines."
+expected_kind = "reference"
+
+[[record]]
+id = "project-fact"
+scope = "project"
+project_id = "repo-alpha"
+body = "The test workflow runs on Ubuntu and macOS."
+expected_kind = "project-fact"
+
+[[record]]
+id = "ambiguous"
+scope = "global"
+body = "Something worth revisiting later."
+expected_kind = ""
