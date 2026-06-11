@@ -13,6 +13,7 @@ pub mod event;
 pub mod hook;
 pub mod id;
 pub mod index;
+pub mod inject;
 pub mod memory;
 pub mod note;
 pub mod outbox;

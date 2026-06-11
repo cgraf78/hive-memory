@@ -23,6 +23,7 @@ include = [
   "pref-comments",
   "pref-comments-echo",
   "pref-agnostic",
+  "pref-dated-policy",
   "fact-alpha-ci",
   "fact-alpha-layout",
 ]
@@ -44,6 +45,7 @@ include = [
   "pref-comments",
   "pref-comments-echo",
   "pref-agnostic",
+  "pref-dated-policy",
   "fact-beta-deploy",
   "fact-beta-schema",
 ]
@@ -60,7 +62,13 @@ exclude = [
 [[context]]
 name = "generic-no-project"
 project_id = ""
-include = ["pref-fd-rg", "pref-comments", "pref-comments-echo", "pref-agnostic"]
+include = [
+  "pref-fd-rg",
+  "pref-comments",
+  "pref-comments-echo",
+  "pref-agnostic",
+  "pref-dated-policy",
+]
 exclude = [
   "fact-alpha-ci",
   "fact-alpha-layout",
