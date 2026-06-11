@@ -28,6 +28,55 @@ pub struct KindInference {
     pub reason: &'static str,
 }
 
+/// Input for inferring write scope before kind inference runs.
+#[derive(Debug, Clone, Copy)]
+pub struct InferScopeInput<'a> {
+    /// Resolved project id, when the caller supplied project context.
+    pub project_id: Option<&'a str>,
+    /// Explicit kind supplied by the caller, if any.
+    pub explicit_kind: Option<MemoryKind>,
+    /// Markdown body being remembered.
+    pub body: &'a str,
+}
+
+/// Inferred memory scope plus a stable machine-readable reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScopeInference {
+    /// Selected scope.
+    pub scope: &'static str,
+    /// Stable reason key for explain/debug output.
+    pub reason: &'static str,
+}
+
+/// Infer write scope when the caller did not provide `--scope`.
+///
+/// This deliberately only promotes to `project`; it never infers private or
+/// global from scratch. The configured default remains authoritative unless a
+/// project id is available and either the explicit kind or text clearly says the
+/// memory belongs to the active repo.
+pub fn infer_scope(input: InferScopeInput<'_>) -> Option<ScopeInference> {
+    input.project_id?;
+    if input.explicit_kind == Some(MemoryKind::ProjectFact) {
+        return Some(ScopeInference {
+            scope: "project",
+            reason: "explicit-project-fact",
+        });
+    }
+
+    let lower = input.body.trim().to_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+    if reads_as_repo_local(&lower) {
+        return Some(ScopeInference {
+            scope: "project",
+            reason: "repo-local-language",
+        });
+    }
+
+    None
+}
+
 /// Infer a memory kind from write context and text shape.
 ///
 /// The ordering intentionally protects durable behavior guidance first:
@@ -113,6 +162,19 @@ fn reads_as_reference(lower: &str) -> bool {
         || lower.contains(".md")
 }
 
+fn reads_as_repo_local(lower: &str) -> bool {
+    lower.contains("this repo")
+        || lower.contains("this project")
+        || lower.contains("this checkout")
+        || lower.contains("the repo ")
+        || lower.contains("repo ")
+        || lower.contains("repository")
+        || lower.contains("workflow")
+        || lower.contains("ci ")
+        || lower.contains("deploy")
+        || lower.contains("test command")
+}
+
 fn has_iso_date(text: &str) -> bool {
     let bytes = text.as_bytes();
     bytes.windows(10).any(|window| {
@@ -177,5 +239,37 @@ mod tests {
     #[test]
     fn ambiguous_global_write_stays_untagged() {
         assert!(infer("Something worth revisiting later.").is_none());
+    }
+
+    #[test]
+    fn explicit_project_fact_infers_project_scope() {
+        let result = infer_scope(InferScopeInput {
+            project_id: Some("repo-alpha"),
+            explicit_kind: Some(MemoryKind::ProjectFact),
+            body: "The test workflow runs on Ubuntu and macOS.",
+        });
+        assert_eq!(result.map(|result| result.scope), Some("project"));
+    }
+
+    #[test]
+    fn repo_language_infers_project_scope() {
+        let result = infer_scope(InferScopeInput {
+            project_id: Some("repo-alpha"),
+            explicit_kind: None,
+            body: "This repo deploys from tags.",
+        });
+        assert_eq!(result.map(|result| result.scope), Some("project"));
+    }
+
+    #[test]
+    fn generic_preference_does_not_infer_project_scope() {
+        assert!(
+            infer_scope(InferScopeInput {
+                project_id: Some("repo-alpha"),
+                explicit_kind: None,
+                body: "Chris prefers deterministic agent tooling.",
+            })
+            .is_none()
+        );
     }
 }
