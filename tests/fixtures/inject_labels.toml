@@ -1,0 +1,74 @@
+# Ground-truth labels for the injection eval.
+#
+# Each [[context]] is a session shape the hook can actually produce (project_id
+# + path only — matching ContextInput; deliberately NOT git branch/log, which
+# the hook does not carry and which is noisy). `include` / `exclude` are the
+# subject slugs from inject_corpus.toml that SHOULD and SHOULD NOT appear in the
+# injected context for that session.
+#
+# The load-bearing judgments encoded here (these are what the eval grades a
+# strategy against — review and correct them, they are the ground truth):
+#   - preferences inject in every session.
+#   - a project-fact injects only in its own project's session.
+#   - incidents and references are SEARCH-ONLY: they never auto-inject at
+#     session start, even though they are stored global+remember today. This is
+#     the precision the new strategy must win without dropping anything above.
+#   - raw notes never inject by default.
+
+[[context]]
+name = "in-project-alpha"
+project_id = "proj-alpha"
+include = [
+  "pref-fd-rg",
+  "pref-comments",
+  "pref-comments-echo",
+  "pref-agnostic",
+  "fact-alpha-ci",
+  "fact-alpha-layout",
+]
+exclude = [
+  "fact-beta-deploy",
+  "fact-beta-schema",
+  "incident-bus-exhaustion",
+  "incident-disk-cleanup",
+  "incident-stale-binary",
+  "ref-release-labels",
+  "note-triage-idea",
+]
+
+[[context]]
+name = "in-project-beta"
+project_id = "proj-beta"
+include = [
+  "pref-fd-rg",
+  "pref-comments",
+  "pref-comments-echo",
+  "pref-agnostic",
+  "fact-beta-deploy",
+  "fact-beta-schema",
+]
+exclude = [
+  "fact-alpha-ci",
+  "fact-alpha-layout",
+  "incident-bus-exhaustion",
+  "incident-disk-cleanup",
+  "incident-stale-binary",
+  "ref-release-labels",
+  "note-triage-idea",
+]
+
+[[context]]
+name = "generic-no-project"
+project_id = ""
+include = ["pref-fd-rg", "pref-comments", "pref-comments-echo", "pref-agnostic"]
+exclude = [
+  "fact-alpha-ci",
+  "fact-alpha-layout",
+  "fact-beta-deploy",
+  "fact-beta-schema",
+  "incident-bus-exhaustion",
+  "incident-disk-cleanup",
+  "incident-stale-binary",
+  "ref-release-labels",
+  "note-triage-idea",
+]

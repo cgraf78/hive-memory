@@ -1,0 +1,152 @@
+# Synthetic injection-eval corpus.
+#
+# A SANITIZED, fictional store that mirrors the SHAPES of a real Hive Memory
+# store, so the injection eval (tests/injection_eval.rs) can measure selection
+# quality without committing any private data. Every record carries a stable
+# `subject` slug; the labels file (inject_labels.toml) uses those slugs as
+# ground truth for what a given session should and should not inject.
+#
+# `kind` and `note` are human annotations for reviewers. The PR1 baseline
+# harness keys only on `entry_kind`, `scope`, and `project_id` (the signals the
+# current selector actually uses); later phases add a `kind`-aware strategy.
+#
+# Shapes modeled (and the ground-truth call on each):
+#   preference   - durable behavioral guidance, global scope. Inject in EVERY
+#                  session: it is how the agent should work.
+#   project-fact - a fact about one repo/system, project scope. Inject ONLY in
+#                  that project's session.
+#   incident     - an operational postmortem/fix, stored today as global+remember.
+#                  Ground truth: SEARCH-ONLY, must not auto-inject at startup.
+#   reference    - a pointer/lookup fact, global+remember. Ground truth: search-only.
+#   raw-note     - low-confidence `hm note` material; must not inject by default.
+
+# ---- preferences: global behavioral guidance, inject everywhere ----
+
+[[record]]
+subject = "pref-fd-rg"
+kind = "preference"
+entry_kind = "remember"
+scope = "global"
+confidence = "high"
+body = "Prefer fd over find and rg over grep when searching the filesystem."
+note = "behavioral preference; inject everywhere"
+
+[[record]]
+subject = "pref-comments"
+kind = "preference"
+entry_kind = "remember"
+scope = "global"
+confidence = "high"
+body = "Write generous code comments that explain why: invariants, tradeoffs, and surprising constraints, not restatements of the code."
+note = "behavioral preference; inject everywhere"
+
+[[record]]
+subject = "pref-comments-echo"
+kind = "preference"
+entry_kind = "remember"
+scope = "global"
+confidence = "medium"
+body = "Add comments that capture non-obvious rationale; avoid large walls of uncommented code."
+note = "near-duplicate of pref-comments; both inject today (dedup is intentionally out of scope)"
+
+[[record]]
+subject = "pref-agnostic"
+kind = "preference"
+entry_kind = "remember"
+scope = "global"
+confidence = "high"
+body = "Prefer tooling that works across multiple agent runtimes rather than being tied to one."
+note = "behavioral preference; inject everywhere"
+
+# ---- project-facts: project scope, inject only in their project ----
+
+[[record]]
+subject = "fact-alpha-ci"
+kind = "project-fact"
+entry_kind = "remember"
+scope = "project"
+project_id = "proj-alpha"
+confidence = "high"
+body = "Repo alpha runs CI through the shared shell-ci reusable workflow with a setup profile input."
+note = "inject only in a proj-alpha session"
+
+[[record]]
+subject = "fact-alpha-layout"
+kind = "project-fact"
+entry_kind = "remember"
+scope = "project"
+project_id = "proj-alpha"
+confidence = "medium"
+body = "Repo alpha stores layered config under an ordered config.d directory so overlays extend the base."
+note = "inject only in a proj-alpha session"
+
+[[record]]
+subject = "fact-beta-deploy"
+kind = "project-fact"
+entry_kind = "remember"
+scope = "project"
+project_id = "proj-beta"
+confidence = "high"
+body = "Repo beta deploys on tag push; the release workflow validates the tag shape before publishing."
+note = "inject only in a proj-beta session"
+
+[[record]]
+subject = "fact-beta-schema"
+kind = "project-fact"
+entry_kind = "remember"
+scope = "project"
+project_id = "proj-beta"
+confidence = "medium"
+body = "Repo beta uses additive schema versioning so older binaries tolerate new optional fields."
+note = "inject only in a proj-beta session"
+
+# ---- incidents: operational logs stored global+remember; search-only ----
+
+[[record]]
+subject = "incident-bus-exhaustion"
+kind = "incident"
+entry_kind = "remember"
+scope = "global"
+confidence = "high"
+body = "2026-06-06 root cause: a cron job leaked session bus daemons until per-user connection limits were hit; fixed with a wrapper that rejects the offending non-interactive call."
+note = "operational postmortem; ground truth is SEARCH-ONLY, not session-start"
+
+[[record]]
+subject = "incident-disk-cleanup"
+kind = "incident"
+entry_kind = "remember"
+scope = "global"
+confidence = "high"
+body = "2026-05-26 cleanup: relocated a large container directory to a symlinked volume and freed the root partition from near-full back to comfortable headroom."
+note = "operational postmortem; search-only"
+
+[[record]]
+subject = "incident-stale-binary"
+kind = "incident"
+entry_kind = "remember"
+scope = "global"
+confidence = "medium"
+body = "A source-checkout canary found a stale binary; the fix makes the installer rebuild when the recorded version no longer matches the checkout head."
+note = "operational fix log; search-only"
+
+# ---- reference: a pointer/lookup fact; search-only ----
+
+[[record]]
+subject = "ref-release-labels"
+kind = "reference"
+entry_kind = "remember"
+scope = "global"
+confidence = "low"
+body = "Release archives publish installer-facing labels distinct from the internal build target triples."
+note = "lookup reference; search-only"
+
+# ---- raw note: low-confidence hm note; must not inject by default ----
+
+[[record]]
+subject = "note-triage-idea"
+kind = "raw-note"
+entry_kind = "note"
+scope = "global"
+confidence = "low"
+body = "Maybe worth exploring a status dashboard someday; unverified triage thought."
+note = "raw hm note; excluded by default (include_inbox is false)"
