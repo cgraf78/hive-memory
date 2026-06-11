@@ -1629,6 +1629,8 @@ fn remember_json_reports_stable_write_fields() {
         ))
         .stdout(predicate::str::contains("\"scope\": \"global\""))
         .stdout(predicate::str::contains("\"project_id\": null"))
+        .stdout(predicate::str::contains("\"scope_inferred\": false"))
+        .stdout(predicate::str::contains("\"scope_reason\": null"))
         .stdout(predicate::str::contains("\"audience\": []"))
         .stdout(predicate::str::contains("\"kind\": \"preference\""))
         .stdout(predicate::str::contains("\"kind_inferred\": true"))
@@ -3382,6 +3384,69 @@ fn remember_project_hint_feeds_project_context() {
         .stdout(predicate::str::contains(
             "Project hints derive memory identity.",
         ));
+}
+
+#[test]
+fn remember_project_hint_infers_project_scope_and_kind() {
+    let dir = temp_dir("remember-project-infer-scope");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    let repo = dir.join("repo");
+    let file = repo.join("src/lib.rs");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    fs::create_dir_all(file.parent().expect("file parent")).expect("repo src");
+    fs::write(&file, "// source\n").expect("source file");
+    let init = Command::new("git")
+        .args(["-C", repo.to_str().expect("utf8 repo"), "init"])
+        .output()
+        .expect("git init");
+    assert!(init.status.success());
+    let remote = Command::new("git")
+        .args([
+            "-C",
+            repo.to_str().expect("utf8 repo"),
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/cgraf78/hive-memory.git",
+        ])
+        .output()
+        .expect("git remote");
+    assert!(remote.status.success());
+
+    let output = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--project",
+            file.to_str().expect("utf8 file"),
+            "--text",
+            "This repo deploys from tag pushes.",
+        ])
+        .output()
+        .expect("run remember");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    assert!(
+        stdout.contains("scope: project (inferred)"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("kind: project-fact (inferred)"),
+        "stdout: {stdout}"
+    );
+    let note = fs::read_to_string(stdout_value(&stdout, "note:")).expect("read note");
+    assert!(note.contains("scope = \"project\""), "note: {note}");
+    assert!(note.contains("project_id = \"github-com-cgraf78-hive-memory-"));
+    assert!(note.contains("kind = \"project-fact\""), "note: {note}");
 }
 
 #[test]

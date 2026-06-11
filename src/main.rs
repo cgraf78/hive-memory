@@ -374,6 +374,9 @@ struct WriteMemoryArgs {
     /// Memory scope. Defaults to config.defaults.write_scope.
     #[arg(long)]
     scope: Option<String>,
+    /// Use config.defaults.write_scope without automatic scope inference.
+    #[arg(long, conflicts_with = "scope")]
+    no_infer_scope: bool,
     /// Writer confidence.
     #[arg(long, default_value = "medium", value_parser = parse_confidence)]
     confidence: note::Confidence,
@@ -1349,6 +1352,55 @@ struct WriteKindDecision {
     reason: Option<&'static str>,
 }
 
+#[derive(Debug, Clone)]
+struct WriteScopeDecision {
+    scope: String,
+    inferred: bool,
+    reason: Option<&'static str>,
+}
+
+fn resolve_write_scope(
+    entry_kind: note::EntryKind,
+    explicit: Option<&str>,
+    no_infer: bool,
+    default_scope: &str,
+    project_id: Option<&str>,
+    explicit_kind: Option<note::MemoryKind>,
+    body: &str,
+) -> WriteScopeDecision {
+    if let Some(scope) = explicit {
+        return WriteScopeDecision {
+            scope: scope.to_owned(),
+            inferred: false,
+            reason: None,
+        };
+    }
+    if no_infer || entry_kind != note::EntryKind::Remember {
+        return WriteScopeDecision {
+            scope: default_scope.to_owned(),
+            inferred: false,
+            reason: None,
+        };
+    }
+
+    match write_classify::infer_scope(write_classify::InferScopeInput {
+        project_id,
+        explicit_kind,
+        body,
+    }) {
+        Some(inference) => WriteScopeDecision {
+            scope: inference.scope.to_owned(),
+            inferred: true,
+            reason: Some(inference.reason),
+        },
+        None => WriteScopeDecision {
+            scope: default_scope.to_owned(),
+            inferred: false,
+            reason: None,
+        },
+    }
+}
+
 fn resolve_write_kind(
     entry_kind: note::EntryKind,
     explicit: Option<note::MemoryKind>,
@@ -1487,10 +1539,6 @@ fn run_write_memory(
     let config = load_config(context.config_path.as_deref())?;
     let agent_id = resolve_agent_id(context.as_agent);
     let writer_agent_id = agent_id.clone().unwrap_or_else(|| "human".to_owned());
-    let scope = args
-        .scope
-        .clone()
-        .unwrap_or_else(|| config.defaults.write_scope.clone());
     let project_hint = args
         .project
         .as_ref()
@@ -1499,6 +1547,16 @@ fn run_write_memory(
     // identity before choosing the write store. This keeps work/personal routing
     // centralized in `hm` instead of requiring hook scripts or agents to infer it.
     let project_id = resolve_project_id(args.project_id.clone(), project_hint.as_deref())?;
+    let scope_decision = resolve_write_scope(
+        entry_kind,
+        args.scope.as_deref(),
+        args.no_infer_scope,
+        &config.defaults.write_scope,
+        project_id.as_deref(),
+        args.kind,
+        &args.text,
+    );
+    let scope = scope_decision.scope;
     let kind_decision = resolve_write_kind(
         entry_kind,
         args.kind,
@@ -1587,6 +1645,8 @@ fn run_write_memory(
             store_source: resolved_store.source.to_string(),
             scope: scope.clone(),
             project_id: project_id.clone(),
+            scope_inferred: scope_decision.inferred,
+            scope_reason: scope_decision.reason.map(str::to_owned),
             audience: audience.clone(),
             kind: kind_decision.kind,
             kind_inferred: kind_decision.inferred,
@@ -1603,6 +1663,9 @@ fn run_write_memory(
     } else {
         println!("id: {}", outcome.id);
         println!("store: {}", resolved_store.name);
+        if scope_decision.inferred {
+            println!("scope: {} (inferred)", scope);
+        }
         if let Some(kind) = kind_decision.kind {
             let suffix = if kind_decision.inferred {
                 " (inferred)"
@@ -1815,6 +1878,8 @@ struct WriteMemoryJson {
     store_source: String,
     scope: String,
     project_id: Option<String>,
+    scope_inferred: bool,
+    scope_reason: Option<String>,
     audience: Vec<String>,
     kind: Option<note::MemoryKind>,
     kind_inferred: bool,
