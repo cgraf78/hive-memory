@@ -287,6 +287,9 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
         let block_tokens = estimate_tokens(&block);
         if estimated_tokens + block_tokens > input.max_tokens {
             push_decision(&mut decisions, &input, entry, "skipped", "budget");
+            if !input.explain {
+                break;
+            }
             continue;
         }
 
@@ -894,6 +897,7 @@ mod tests {
             kind: None,
             agent_id: "co<dex".to_owned(),
             created_at: "2026-05-16T00:00:00Z".to_owned(),
+            body: "body".to_owned(),
             note_path: "inbox/notes/2026-05-16/id.md".to_owned(),
             event_path: None,
         };

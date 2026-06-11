@@ -1,13 +1,14 @@
 //! Deterministic text search over curated files and the local triage index.
 //!
 //! Curated files are read directly because they are small human-maintained
-//! Markdown documents. Inbox records use the index to narrow candidates by
-//! metadata, then search still reads canonical Markdown for body matching so
-//! the cache never becomes a second source of truth for memory text.
+//! Markdown documents. Inbox records use the fresh local index for metadata and
+//! body matching; older cache entries without a body fall back to canonical
+//! Markdown so stale indexes remain recoverable.
 
 use crate::curated::CuratedFile;
 use crate::index::IndexEntry;
 use crate::{note, project, visibility};
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{self, Display};
@@ -179,23 +180,15 @@ pub fn search(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
             continue;
         }
 
-        let note_path = input.store_root.join(&entry.note_path);
-        let contents = fs::read_to_string(&note_path).map_err(|err| SearchError::ReadNote {
-            path: note_path.clone(),
-            message: err.to_string(),
-        })?;
-        let note = note::parse_note(&contents).map_err(|err| SearchError::ParseNote {
-            path: note_path,
-            message: err.to_string(),
-        })?;
-        let score = score_entry(entry, &note.body, &query);
+        let body = indexed_body(input.store_root, entry)?;
+        let score = score_entry(entry, &body, &query);
         if score == 0 {
             continue;
         }
         hits.push(SearchHit {
             entry: entry.clone(),
             score,
-            snippet: snippet(entry, &note.body, &query),
+            snippet: snippet(entry, &body, &query),
         });
     }
 
@@ -210,6 +203,23 @@ pub fn search(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
     });
     hits.truncate(input.limit);
     Ok(hits)
+}
+
+fn indexed_body<'a>(store_root: &Path, entry: &'a IndexEntry) -> Result<Cow<'a, str>, SearchError> {
+    if !entry.body.is_empty() {
+        return Ok(Cow::Borrowed(entry.body.as_str()));
+    }
+
+    let note_path = store_root.join(&entry.note_path);
+    let contents = fs::read_to_string(&note_path).map_err(|err| SearchError::ReadNote {
+        path: note_path.clone(),
+        message: err.to_string(),
+    })?;
+    let note = note::parse_note(&contents).map_err(|err| SearchError::ParseNote {
+        path: note_path,
+        message: err.to_string(),
+    })?;
+    Ok(Cow::Owned(note.body))
 }
 
 fn curated_source_allowed(sources: &[String]) -> bool {
@@ -360,6 +370,7 @@ fn curated_entry(curated: &CuratedFile, project_id: Option<&str>) -> IndexEntry 
         kind: None,
         agent_id: "human".to_owned(),
         created_at: String::new(),
+        body: curated.body.clone(),
         note_path: curated.relative_path.clone(),
         event_path: None,
     }
@@ -584,6 +595,39 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert!(hits[0].score > 0);
         assert_eq!(hits[0].snippet, "TOML config is preferred.");
+    }
+
+    #[test]
+    fn search_uses_indexed_body_without_reopening_note() {
+        let dir = temp_dir("indexed-body");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "Indexed bodies keep warm search fast.",
+            timestamp(1_778_946_153),
+            Vec::new(),
+        );
+        let entries = entries(&root, &cache);
+        fs::remove_dir_all(root.join("inbox")).expect("remove canonical inbox");
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries,
+            query: "warm search",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].snippet, "Indexed bodies keep warm search fast.");
     }
 
     #[test]
