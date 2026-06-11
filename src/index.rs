@@ -44,6 +44,13 @@ pub struct IndexEntry {
     pub agent_id: String,
     /// RFC3339 creation timestamp.
     pub created_at: String,
+    /// Parsed note body cached for warm search.
+    ///
+    /// The Markdown note remains canonical. This field is populated only by
+    /// index rebuilds and is safe to discard; changing the cache schema bumps
+    /// the fingerprint so existing caches are rebuilt before search trusts it.
+    #[serde(default)]
+    pub body: String,
     /// Store-relative Markdown note path.
     pub note_path: String,
     /// Store-relative JSON event path when present.
@@ -253,6 +260,7 @@ pub fn rebuild_index(input: RebuildIndexInput<'_>) -> Result<RebuildIndexReport,
         let event = read_paired_event(&expected_event_path, &parsed.front_matter.id, &mut warnings);
         entries.push(entry_from_note(
             &parsed.front_matter,
+            &parsed.body,
             &relative_note_path,
             event.as_ref().map(|_| relative_event_path.as_str()),
             event.as_ref(),
@@ -391,6 +399,7 @@ fn read_paired_event(
 
 fn entry_from_note(
     front_matter: &note::NoteFrontMatter,
+    body: &str,
     note_path: &str,
     event_path: Option<&str>,
     event: Option<&event::MemoryEvent>,
@@ -415,6 +424,7 @@ fn entry_from_note(
             kind: event.kind.or(front_matter.kind),
             agent_id: event.agent_id.clone(),
             created_at: event.created_at.clone(),
+            body: body.to_owned(),
             note_path: note_path.to_owned(),
             event_path: event_path.map(str::to_owned),
         };
@@ -433,6 +443,7 @@ fn entry_from_note(
         kind: front_matter.kind,
         agent_id: front_matter.agent_id.clone(),
         created_at: front_matter.created_at.clone(),
+        body: body.to_owned(),
         note_path: note_path.to_owned(),
         event_path: None,
     }
@@ -493,7 +504,7 @@ fn canonical_fingerprint(store_root: &Path) -> Result<IndexFingerprint, IndexErr
         ));
     }
     Ok(IndexFingerprint {
-        schema_version: 2,
+        schema_version: 3,
         store_root: store_root.display().to_string(),
         canonical_dirs: dirs.len(),
         latest_directory_modified_nanos,
@@ -642,6 +653,7 @@ mod tests {
             report.entries[0].note_path,
             relative_path(&root, &written.note_path, memory_path::PathCase::Sensitive)
         );
+        assert_eq!(report.entries[0].body, "Chris prefers TOML config.");
         assert_eq!(
             report.entries[0].event_path.as_deref(),
             Some(
