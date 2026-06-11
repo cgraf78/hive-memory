@@ -7,6 +7,7 @@
 //! have. Explicit CLI/API `kind` always remains authoritative.
 
 use crate::note::MemoryKind;
+use crate::signals;
 
 /// Input for inferring a memory kind while writing a `remember` record.
 #[derive(Debug, Clone, Copy)]
@@ -132,22 +133,7 @@ fn reads_as_preference(lower: &str) -> bool {
 }
 
 fn reads_as_incident(lower: &str) -> bool {
-    has_iso_date(lower)
-        && [
-            "root cause",
-            "postmortem",
-            "cleanup",
-            "leaked",
-            "exhaustion",
-            "regression",
-            "hotfix",
-            "emergency",
-            "incident",
-            "outage",
-            "fixed",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker))
+    signals::looks_operational(lower, signals::OPERATIONAL_KEYWORDS.iter().copied())
 }
 
 fn reads_as_reference(lower: &str) -> bool {
@@ -175,17 +161,6 @@ fn reads_as_repo_local(lower: &str) -> bool {
         || lower.contains("test command")
 }
 
-fn has_iso_date(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    bytes.windows(10).any(|window| {
-        window[..4].iter().all(u8::is_ascii_digit)
-            && window[4] == b'-'
-            && window[5..7].iter().all(u8::is_ascii_digit)
-            && window[7] == b'-'
-            && window[8..10].iter().all(u8::is_ascii_digit)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,6 +186,17 @@ mod tests {
     fn operational_language_becomes_incident() {
         assert_eq!(
             infer("2026-06-06 root cause: cron leaked dbus processes."),
+            Some(MemoryKind::Incident)
+        );
+    }
+
+    #[test]
+    fn dated_freed_resources_becomes_incident() {
+        // "freed" is part of the shared operational vocabulary; the read-time
+        // classifier already withholds this shape, so write-time inference must
+        // tag it the same way or the verdict depends on which side judged it.
+        assert_eq!(
+            infer("2026-05-26 freed 40GB on the root partition after relocating containers."),
             Some(MemoryKind::Incident)
         );
     }

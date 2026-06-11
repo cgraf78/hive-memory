@@ -20,6 +20,7 @@
 //! gap safely; this heuristic is the bridge for untagged history.
 
 use crate::note::{EntryKind, MemoryKind};
+use crate::signals;
 
 /// Session-start selection strategy, chosen by `context_strategy` config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -61,8 +62,10 @@ pub enum InjectClass {
 /// Keyword signals that, combined with a date, mark a record as operational.
 ///
 /// Kept as data so a later change can source these from config without
-/// touching the classifier. The defaults describe postmortem/cleanup language;
-/// matching is case-insensitive substring.
+/// touching the classifier. The defaults come from the shared
+/// `signals::OPERATIONAL_KEYWORDS` vocabulary so read-time selection and
+/// write-time inference cannot drift apart; matching is case-insensitive
+/// substring.
 #[derive(Debug, Clone)]
 pub struct IncidentMarkers {
     /// Operational keywords; presence of any one (with a date) flags a record.
@@ -72,22 +75,10 @@ pub struct IncidentMarkers {
 impl Default for IncidentMarkers {
     fn default() -> Self {
         Self {
-            keywords: [
-                "root cause",
-                "postmortem",
-                "cleanup",
-                "freed",
-                "leaked",
-                "exhaustion",
-                "regression",
-                "hotfix",
-                "emergency",
-                "incident",
-                "outage",
-            ]
-            .iter()
-            .map(|keyword| (*keyword).to_owned())
-            .collect(),
+            keywords: signals::OPERATIONAL_KEYWORDS
+                .iter()
+                .map(|keyword| (*keyword).to_owned())
+                .collect(),
         }
     }
 }
@@ -138,34 +129,10 @@ pub fn classify(input: ClassifyInput<'_>, markers: &IncidentMarkers) -> InjectCl
     InjectClass::AlwaysOn
 }
 
-/// True when the body reads as an operational log: it carries an ISO date AND at
-/// least one operational keyword. Both are required so durable guidance that
-/// merely mentions a date is not mistaken for an incident.
+/// True when the body reads as an operational log; see `signals` for the
+/// shared date-plus-keyword rule.
 fn looks_operational(body: &str, markers: &IncidentMarkers) -> bool {
-    if !has_iso_date(body) {
-        return false;
-    }
-    let lower = body.to_lowercase();
-    markers
-        .keywords
-        .iter()
-        .any(|keyword| lower.contains(&keyword.to_lowercase()))
-}
-
-/// Detect a `YYYY-MM-DD` date anywhere in the text without a regex dependency.
-///
-/// Deliberately loose on calendar validity (e.g. accepts `2026-13-40`): the goal
-/// is a cheap "this looks like a dated log entry" signal, not date parsing.
-fn has_iso_date(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    // A date needs 10 chars: 4 digits, '-', 2 digits, '-', 2 digits.
-    bytes.windows(10).any(|window| {
-        window[..4].iter().all(u8::is_ascii_digit)
-            && window[4] == b'-'
-            && window[5..7].iter().all(u8::is_ascii_digit)
-            && window[7] == b'-'
-            && window[8..10].iter().all(u8::is_ascii_digit)
-    })
+    signals::looks_operational(body, markers.keywords.iter().map(String::as_str))
 }
 
 #[cfg(test)]
@@ -251,6 +218,19 @@ mod tests {
     }
 
     #[test]
+    fn dated_fix_log_is_search_only() {
+        // "fixed" is part of the shared operational vocabulary used by both
+        // write-time inference and this read-time classifier. A drift between
+        // the two sides would let the same text be judged differently at write
+        // and read time.
+        let body = "2026-06-02 fixed the stale launcher by rebuilding on version mismatch.";
+        assert_eq!(
+            classify(global(body), &IncidentMarkers::default()),
+            InjectClass::SearchOnly
+        );
+    }
+
+    #[test]
     fn dated_preference_without_keyword_stays_always_on() {
         // The conservative guard: a preference that mentions a date must not be
         // mistaken for an incident, because no operational keyword is present.
@@ -284,10 +264,16 @@ mod tests {
     }
 
     #[test]
-    fn iso_date_detection() {
-        assert!(has_iso_date("logged 2026-05-26 cleanup"));
-        assert!(has_iso_date("2026-01-01 at the start"));
-        assert!(!has_iso_date("version 1.2.3 released"));
-        assert!(!has_iso_date("no date here at all"));
+    fn default_markers_match_shared_vocabulary() {
+        // Anti-drift lock: read-time selection must judge untagged text with
+        // exactly the vocabulary write-time inference uses, or a record can be
+        // injected here that another machine would have tagged search-only.
+        assert_eq!(
+            IncidentMarkers::default().keywords,
+            signals::OPERATIONAL_KEYWORDS
+                .iter()
+                .map(|keyword| (*keyword).to_owned())
+                .collect::<Vec<_>>()
+        );
     }
 }
