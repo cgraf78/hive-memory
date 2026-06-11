@@ -136,6 +136,11 @@ fn reads_as_incident(lower: &str) -> bool {
     signals::looks_operational(lower, signals::OPERATIONAL_KEYWORDS.iter().copied())
 }
 
+// Reference language requires an actual pointer: a URL, or a "see"/"read"
+// directive aimed at a path. A bare file-name mention (e.g. a fact that cites
+// `docs/adr/0001.md`) is NOT a pointer — tagging it reference would persist a
+// search-only verdict and silently hide a durable fact from session start, so
+// ambiguity here must fall through to the other rules or stay untagged.
 fn reads_as_reference(lower: &str) -> bool {
     lower.contains("http://")
         || lower.contains("https://")
@@ -145,7 +150,6 @@ fn reads_as_reference(lower: &str) -> bool {
         || lower.contains("read ~/.")
         || lower.contains("see /")
         || lower.contains("read /")
-        || lower.contains(".md")
 }
 
 fn reads_as_repo_local(lower: &str) -> bool {
@@ -207,6 +211,30 @@ mod tests {
             infer("For host details, read ~/.local/share/doc/dot/home-lab.md."),
             Some(MemoryKind::Reference)
         );
+    }
+
+    #[test]
+    fn doc_citing_project_fact_stays_project_fact() {
+        // A fact that merely mentions a Markdown file is not a pointer record.
+        // Tagging it `reference` would persist a search-only verdict and the
+        // fact would silently stop injecting in its own project's sessions —
+        // a recall loss the conservative bias exists to prevent.
+        let result = infer_kind(InferKindInput {
+            scope: "project",
+            project_id: Some("repo-alpha"),
+            body: "Architecture decisions live in docs/adr/0001-store-layout.md.",
+        });
+        assert_eq!(
+            result.map(|result| result.kind),
+            Some(MemoryKind::ProjectFact)
+        );
+    }
+
+    #[test]
+    fn doc_mention_without_pointer_stays_untagged() {
+        // Mentioning a file name in passing is not reference language; an
+        // untagged global write keeps injecting (conservative direction).
+        assert!(infer("The guidelines file is AGENTS.md, kept at the repo root.").is_none());
     }
 
     #[test]
