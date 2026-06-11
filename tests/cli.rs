@@ -3137,6 +3137,80 @@ fn context_json_reports_selection_and_sections() {
 }
 
 #[test]
+fn context_json_explain_reports_included_and_skipped_decisions() {
+    let dir = temp_dir("context-explain");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "{}"
+
+            [stores.work]
+            root = "{}"
+
+            [defaults]
+            context_strategy = "relevance"
+            "#,
+            personal.display(),
+            work.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Chris prefers compact memory context.",
+        ])
+        .assert()
+        .success();
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "2026-06-06 root cause: a hook leaked processes.",
+        ])
+        .assert()
+        .success();
+
+    let output = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "context",
+            "--json",
+            "--explain",
+        ])
+        .output()
+        .expect("run context explain");
+    assert!(output.status.success(), "context failed: {output:?}");
+    let context: serde_json::Value = serde_json::from_slice(&output.stdout).expect("context json");
+    let decisions = context["decisions"].as_array().expect("decisions");
+
+    assert!(
+        decisions.iter().any(|decision| {
+            decision["action"] == "included" && decision["reason"] == "included"
+        })
+    );
+    assert!(decisions.iter().any(|decision| {
+        decision["action"] == "skipped" && decision["reason"] == "search-only"
+    }));
+    assert_eq!(context["sections"].as_array().expect("sections").len(), 1);
+}
+
+#[test]
 fn hook_context_fails_when_store_unavailable_without_cache() {
     let dir = temp_dir("context-no-cache");
     let config = dir.join("config.toml");

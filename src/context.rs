@@ -50,6 +50,8 @@ pub struct ContextInput<'a> {
     /// include-all behavior; `Relevance` withholds search-only candidates via
     /// the inject classifier.
     pub inject_strategy: inject::Strategy,
+    /// Capture candidate-level include/skip decisions for debugging selection.
+    pub explain: bool,
 }
 
 /// Assembled context output.
@@ -59,8 +61,23 @@ pub struct ContextOutput {
     pub markdown: String,
     /// Rendered sections included after filtering and budgeting.
     pub sections: Vec<ContextSection>,
+    /// Candidate decisions captured when `ContextInput::explain` is true.
+    pub decisions: Vec<ContextDecision>,
     /// Approximate token count for the rendered Markdown.
     pub estimated_tokens: usize,
+}
+
+/// One explain record for an indexed context candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextDecision {
+    /// Memory id.
+    pub id: String,
+    /// Store-relative source path.
+    pub source_path: String,
+    /// `included` or `skipped`.
+    pub action: &'static str,
+    /// Stable reason key.
+    pub reason: &'static str,
 }
 
 /// One rendered memory section in context output.
@@ -186,6 +203,7 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
     let header = render_header(&input);
     let mut markdown = header;
     let mut sections = Vec::new();
+    let mut decisions = Vec::new();
     let mut estimated_tokens = estimate_tokens(&markdown);
     let project_ids = project_filter_ids(input.store_root, input.project_id)?;
 
@@ -220,15 +238,19 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
     let markers = IncidentMarkers::default();
     for entry in sorted_candidates(input.entries) {
         if !source_allowed(entry, input.sources, input.include_inbox) {
+            push_decision(&mut decisions, &input, entry, "skipped", "source");
             continue;
         }
         if !scope_allowed(entry, input.scopes) {
+            push_decision(&mut decisions, &input, entry, "skipped", "scope");
             continue;
         }
         if !project_allowed(entry, project_ids.as_ref()) {
+            push_decision(&mut decisions, &input, entry, "skipped", "project");
             continue;
         }
         if !visibility::audience_allows(entry, input.agent_id) {
+            push_decision(&mut decisions, &input, entry, "skipped", "audience");
             continue;
         }
 
@@ -255,6 +277,7 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
                 &markers,
             );
             if class == InjectClass::SearchOnly && !input.include_search_only {
+                push_decision(&mut decisions, &input, entry, "skipped", "search-only");
                 continue;
             }
         }
@@ -263,6 +286,7 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
         let block = render_memory_block(input.store_name, entry, trust, &parsed.body);
         let block_tokens = estimate_tokens(&block);
         if estimated_tokens + block_tokens > input.max_tokens {
+            push_decision(&mut decisions, &input, entry, "skipped", "budget");
             continue;
         }
 
@@ -278,13 +302,33 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
             body,
             estimated_tokens: block_tokens,
         });
+        push_decision(&mut decisions, &input, entry, "included", "included");
     }
 
     Ok(ContextOutput {
         markdown,
         sections,
+        decisions,
         estimated_tokens,
     })
+}
+
+fn push_decision(
+    decisions: &mut Vec<ContextDecision>,
+    input: &ContextInput<'_>,
+    entry: &IndexEntry,
+    action: &'static str,
+    reason: &'static str,
+) {
+    if !input.explain {
+        return;
+    }
+    decisions.push(ContextDecision {
+        id: entry.id.clone(),
+        source_path: entry.note_path.clone(),
+        action,
+        reason,
+    });
 }
 
 /// Estimate tokens with the v1 byte/4 heuristic.
@@ -613,6 +657,7 @@ mod tests {
             path_hint: Some("/repo/src/main.rs"),
             max_tokens: 4000,
             inject_strategy: inject::Strategy::Recency,
+            explain: false,
         }
     }
 
