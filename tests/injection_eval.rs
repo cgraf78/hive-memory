@@ -19,16 +19,19 @@ use hive_memory::context::{ContextInput, assemble_context};
 use hive_memory::index::{self, IndexEntry, RebuildIndexInput};
 use hive_memory::inject::Strategy as InjectStrategy;
 use hive_memory::memory::{self, WriteRecordInput};
-use hive_memory::note::{Confidence, EntryKind};
-use hive_memory::path::PathCase;
+use hive_memory::note::{Confidence, EntryKind, MemoryKind};
+use hive_memory::path as memory_path;
 use hive_memory::store::StoreManifest;
 use hive_memory::write::{AtomicWriteOptions, FsyncPolicy};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Fixture model
@@ -39,8 +42,11 @@ use time::OffsetDateTime;
 #[derive(Debug, Deserialize)]
 struct Record {
     subject: String,
-    #[allow(dead_code)]
     kind: Option<String>,
+    /// When true, the synthetic store carries the explicit `kind` (simulating a
+    /// write made after kind support). When false/absent, the record is stored
+    /// untagged (legacy) and relies on the content heuristic.
+    tagged: Option<bool>,
     entry_kind: String,
     scope: String,
     project_id: Option<String>,
@@ -48,6 +54,18 @@ struct Record {
     body: String,
     #[allow(dead_code)]
     note: Option<String>,
+}
+
+/// Map a corpus `kind` annotation to the schema enum. Only the kinds that can be
+/// explicitly tagged are accepted; `raw-note` records are never tagged.
+fn memory_kind(value: &str) -> MemoryKind {
+    match value {
+        "preference" => MemoryKind::Preference,
+        "project-fact" => MemoryKind::ProjectFact,
+        "incident" => MemoryKind::Incident,
+        "reference" => MemoryKind::Reference,
+        other => panic!("corpus record tagged with un-taggable kind: {other}"),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,9 +111,10 @@ fn temp_dir(name: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("system clock after epoch")
         .as_nanos();
+    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "hm-inject-eval-{name}-{}-{nanos}",
-        std::process::id()
+        "hm-inject-eval-{name}-{}-{counter}-{nanos}",
+        std::process::id(),
     ));
     fs::create_dir_all(&path).expect("create temp dir");
     path
@@ -147,6 +166,13 @@ fn materialize(corpus: &Corpus, root: &Path) -> Vec<IndexEntry> {
     for (offset, record) in corpus.record.iter().enumerate() {
         let created_at = OffsetDateTime::from_unix_timestamp(base + offset as i64)
             .expect("valid synthetic timestamp");
+        // Tagged records carry the explicit kind; untagged ones are stored bare
+        // so the content-heuristic fallback is exercised on the same run.
+        let kind = if record.tagged.unwrap_or(false) {
+            record.kind.as_deref().map(memory_kind)
+        } else {
+            None
+        };
         memory::write_record(WriteRecordInput {
             root,
             manifest: &manifest,
@@ -161,6 +187,7 @@ fn materialize(corpus: &Corpus, root: &Path) -> Vec<IndexEntry> {
             body: record.body.clone(),
             project_id: record.project_id.clone(),
             subject: Some(record.subject.clone()),
+            kind,
             tags: Vec::new(),
             audience: Vec::new(),
             source_kind: None,
@@ -176,7 +203,7 @@ fn materialize(corpus: &Corpus, root: &Path) -> Vec<IndexEntry> {
         store_root: root,
         cache_dir: &root.join(".cache"),
         options: options(),
-        path_case: PathCase::Sensitive,
+        path_case: memory_path::resolve_case("auto", root),
     })
     .expect("rebuild index")
     .entries
@@ -403,46 +430,42 @@ fn baseline_characterization() {
     assert!((recall(total.tp, total.fn_) - 1.0).abs() < f64::EPSILON);
 }
 
-/// The read-time classifier must raise precision while keeping the baseline's
-/// safety guarantees: drop nothing it should keep, and never drop a preference.
+/// With explicit `kind` closing the residual, the relevance strategy reaches
+/// full precision while preserving every safety guarantee.
 ///
-/// It catches the clearly dated+operational incidents but, by design, leaves in
-/// a marker-less incident and a plain reference (a content heuristic cannot
-/// safely tell those from durable facts). That residual is the measured case
-/// for an explicit `kind` signal — the classifier is the safe bridge, not the
-/// final answer. Crucially, the adversarial dated *preference* is NOT dropped.
+/// Two paths combine: the untagged dated incidents are caught by the content
+/// heuristic, and the marker-less incident plus the plain reference — which the
+/// heuristic cannot safely catch — are withheld because they carry an explicit
+/// `kind`. The dated *preference* is still kept (never dropped), and project
+/// facts still inject only in their own project.
 #[test]
-fn conservative_improves_precision_safely() {
+fn relevance_reaches_full_precision_with_kind() {
     let (per_context, total) = evaluate(InjectStrategy::Relevance);
 
-    // Same safety floor as baseline: nothing important dropped anywhere.
+    // Safety floor: nothing wanted dropped anywhere, no preference dropped.
     for (name, score) in &per_context {
         assert_eq!(score.fn_, 0, "{name}: classifier dropped a wanted memory");
     }
     assert_eq!(total.fn_, 0, "classifier must drop nothing wanted");
     assert_eq!(
         total.high_value_fn, 0,
-        "classifier must never drop a preference (incl. the dated one)"
+        "classifier must never drop a preference"
     );
 
-    // Keeps every true positive the baseline had...
+    // Keeps every true positive the baseline had, and drops every over-inclusion.
     assert_eq!(total.tp, 19, "classifier must not lose true positives");
-    // ...and halves the over-inclusion: catches the 2 dated incidents in every
-    // session (6 fewer false positives), leaving the marker-less incident and
-    // the reference (2 records x 3 sessions = 6) as the honest residual.
     assert_eq!(
-        total.fp, 6,
-        "classifier should catch only the clearly dated incidents"
+        total.fp, 0,
+        "explicit kind plus the heuristic should withhold all search-only records"
     );
 
     let baseline = evaluate(InjectStrategy::Recency).1;
     assert!(
         precision(total.tp, total.fp) > precision(baseline.tp, baseline.fp),
-        "classifier must beat baseline precision"
+        "relevance must beat baseline precision"
     );
-    // Still short of 1.0: content alone cannot close the gap safely.
     assert!(
-        precision(total.tp, total.fp) < 1.0,
-        "residual over-inclusion is expected and motivates an explicit kind"
+        (precision(total.tp, total.fp) - 1.0).abs() < f64::EPSILON,
+        "explicit kind closes the residual to full precision"
     );
 }

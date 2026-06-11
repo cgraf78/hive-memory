@@ -37,6 +37,9 @@ pub struct IndexEntry {
     pub subject: Option<String>,
     /// Writer confidence.
     pub confidence: note::Confidence,
+    /// Optional explicit memory kind, used by inject classification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<note::MemoryKind>,
     /// Agent that wrote the record.
     pub agent_id: String,
     /// RFC3339 creation timestamp.
@@ -403,6 +406,9 @@ fn entry_from_note(
             tags: event.tags.clone(),
             subject: event.subject.clone(),
             confidence: event.confidence,
+            // Prefer the event's kind, falling back to the note's so a note that
+            // carries kind without an event copy is still classified correctly.
+            kind: event.kind.or(front_matter.kind),
             agent_id: event.agent_id.clone(),
             created_at: event.created_at.clone(),
             note_path: note_path.to_owned(),
@@ -420,6 +426,7 @@ fn entry_from_note(
         tags: front_matter.tags.clone(),
         subject: front_matter.subject.clone(),
         confidence: front_matter.confidence,
+        kind: front_matter.kind,
         agent_id: front_matter.agent_id.clone(),
         created_at: front_matter.created_at.clone(),
         note_path: note_path.to_owned(),
@@ -597,6 +604,7 @@ mod tests {
             body: "Chris prefers TOML config.".to_owned(),
             project_id: Some("github-com-cgraf78-hive-memory-018f5f57".to_owned()),
             subject: Some("workflow.preference".to_owned()),
+            kind: None,
             tags: vec!["preference".to_owned(), "config".to_owned()],
             audience: Vec::new(),
             source_kind: Some("session".to_owned()),
