@@ -66,6 +66,8 @@ enum Command {
     Context(ContextArgs),
     /// Report store/index freshness without mutating memory.
     SyncStatus(SyncStatusArgs),
+    /// Correct the persisted memory kind on an existing record.
+    Retag(RetagArgs),
     /// Refresh local outbox and indexes.
     Refresh(RefreshArgs),
     /// Flush local outbox writes to reachable stores.
@@ -498,6 +500,20 @@ struct SyncStatusArgs {
     json: bool,
 }
 
+/// Arguments for `hm retag`.
+#[derive(Debug, Args)]
+struct RetagArgs {
+    /// Memory record id to correct.
+    id: String,
+    /// New kind: preference, project-fact, incident, reference, or `none` to
+    /// clear the tag and fall back to read-time classification.
+    #[arg(long)]
+    kind: String,
+    /// Emit machine-readable output.
+    #[arg(long)]
+    json: bool,
+}
+
 /// Arguments for `hm refresh`.
 #[derive(Debug, Args)]
 struct RefreshArgs {
@@ -608,6 +624,7 @@ fn run(cli: Cli) -> Result<()> {
         Some(Command::Search(args)) => run_search(args, context),
         Some(Command::Context(args)) => run_context(args, context),
         Some(Command::SyncStatus(args)) => run_sync_status(args, context),
+        Some(Command::Retag(args)) => run_retag(args, context),
         Some(Command::Refresh(args)) => run_refresh(args, context),
         Some(Command::Flush(args)) => run_flush(args, context),
         Some(Command::Outbox(OutboxCommand::Flush(args))) => run_flush(args, context),
@@ -637,6 +654,7 @@ impl Cli {
             Some(Command::Search(args)) => args.json,
             Some(Command::Context(args)) => args.json,
             Some(Command::SyncStatus(args)) => args.json,
+            Some(Command::Retag(args)) => args.json,
             Some(Command::Refresh(args)) => args.json,
             Some(Command::Flush(args)) | Some(Command::Outbox(OutboxCommand::Flush(args))) => {
                 args.json
@@ -2769,6 +2787,101 @@ fn host_sync_status(index_path: &Path) -> Vec<HostSyncStatus> {
             records: accumulator.records,
         })
         .collect()
+}
+
+/// JSON envelope for `hm retag`.
+#[derive(Debug, Serialize)]
+struct RetagJsonOutput {
+    /// Corrected record id.
+    id: String,
+    /// Store that holds the record.
+    store: String,
+    /// Kind carried before the rewrite.
+    previous_kind: Option<&'static str>,
+    /// Kind persisted by the rewrite; absent when cleared.
+    kind: Option<&'static str>,
+    /// Store-relative note path that was rewritten.
+    note_path: String,
+    /// Whether a paired event sidecar was rewritten too.
+    event_updated: bool,
+}
+
+/// Correct the persisted kind on one existing record.
+///
+/// This is the recovery path for wrong write-time inference: kind is a
+/// persisted search-only/always-on verdict, and without a retag command the
+/// only fix is hand-editing cloud-synced Markdown. The rewrite goes through
+/// the same note+event pair as ordinary writes so the index (which prefers
+/// event metadata) converges on the corrected value at the next rebuild.
+fn run_retag(args: RetagArgs, context: CliContext) -> Result<()> {
+    let config = load_config(context.config_path.as_deref())?;
+    let agent_id = resolve_agent_id(context.as_agent.clone());
+    let resolved_store = resolve_store(
+        &config,
+        context.store.as_deref(),
+        None,
+        agent_id.as_deref(),
+        StoreAccess::Write,
+    )?;
+    let store_config = &config.stores[resolved_store.name.as_str()];
+    let kind = match args.kind.as_str() {
+        "none" => None,
+        other => Some(
+            parse_memory_kind(other)
+                .map_err(|message| anyhow::anyhow!("invalid --kind: {message}, or none"))?,
+        ),
+    };
+
+    let report = rebuild_store_index(&config, &resolved_store.name)?;
+    let entry = report
+        .entries
+        .iter()
+        .find(|entry| entry.id == args.id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no memory record with id {} in store {}",
+                args.id,
+                resolved_store.name
+            )
+        })?;
+    // Same invariant as write time: kind and scope must not disagree, or a
+    // project fact would classify as project-scoped without a project filter.
+    validate_memory_kind_context(kind, &entry.scope, entry.project_id.as_deref())?;
+
+    let options = write::AtomicWriteOptions {
+        fsync: config.storage.fsync.into(),
+        ..write::AtomicWriteOptions::default()
+    };
+    let result = memory::retag_record(memory::RetagRecordInput {
+        root: &store_config.root,
+        note_path: &entry.note_path,
+        kind,
+        options,
+    })?;
+
+    if args.json {
+        let output = RetagJsonOutput {
+            id: result.id,
+            store: resolved_store.name.clone(),
+            previous_kind: result.previous_kind.map(memory_kind_label),
+            kind: result.kind.map(memory_kind_label),
+            note_path: entry.note_path.clone(),
+            event_updated: result.event_path.is_some(),
+        };
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("id: {}", result.id);
+        println!("store: {}", resolved_store.name);
+        println!(
+            "kind: {} -> {}",
+            result.previous_kind.map_or("none", memory_kind_label),
+            result.kind.map_or("none", memory_kind_label)
+        );
+        if result.event_path.is_some() {
+            println!("event: updated");
+        }
+    }
+    Ok(())
 }
 
 fn run_sync_status(args: SyncStatusArgs, context: CliContext) -> Result<()> {

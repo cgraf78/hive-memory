@@ -3679,6 +3679,176 @@ fn sync_status_reports_reachable_store_and_index_freshness() {
 }
 
 #[test]
+fn retag_updates_kind_and_relevance_selection() {
+    let dir = temp_dir("retag-relevance");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let state = dir.join("state");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            state_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+
+            [defaults]
+            context_strategy = "relevance"
+            "#,
+            state.display(),
+            personal.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    let remembered = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Always run the linter before pushing.",
+            "--json",
+        ])
+        .output()
+        .expect("run remember");
+    assert!(
+        remembered.status.success(),
+        "remember failed: {remembered:?}"
+    );
+    let remembered: serde_json::Value =
+        serde_json::from_slice(&remembered.stdout).expect("remember json");
+    let id = remembered["id"].as_str().expect("memory id").to_owned();
+    assert_eq!(remembered["kind"], "preference");
+
+    // The inferred preference is always-on under relevance.
+    cargo_bin_cmd!("hm")
+        .args(["--config", config.to_str().expect("utf8 config"), "context"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Always run the linter"));
+
+    let retag = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "retag",
+            &id,
+            "--kind",
+            "reference",
+            "--json",
+        ])
+        .output()
+        .expect("run retag");
+    assert!(retag.status.success(), "retag failed: {retag:?}");
+    let retag: serde_json::Value = serde_json::from_slice(&retag.stdout).expect("retag json");
+    assert_eq!(retag["id"], id.as_str());
+    assert_eq!(retag["previous_kind"], "preference");
+    assert_eq!(retag["kind"], "reference");
+    assert_eq!(retag["event_updated"], true);
+
+    // The corrected kind must drive live selection: an explicit reference is
+    // search-only at session start.
+    cargo_bin_cmd!("hm")
+        .args(["--config", config.to_str().expect("utf8 config"), "context"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Always run the linter").not());
+
+    // Clearing the tag restores heuristic classification (always-on here).
+    let cleared = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "retag",
+            &id,
+            "--kind",
+            "none",
+            "--json",
+        ])
+        .output()
+        .expect("run retag clear");
+    assert!(cleared.status.success(), "retag clear failed: {cleared:?}");
+    let cleared: serde_json::Value =
+        serde_json::from_slice(&cleared.stdout).expect("retag clear json");
+    assert_eq!(cleared["previous_kind"], "reference");
+    assert!(cleared["kind"].is_null());
+    cargo_bin_cmd!("hm")
+        .args(["--config", config.to_str().expect("utf8 config"), "context"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Always run the linter"));
+}
+
+#[test]
+fn retag_rejects_project_fact_for_global_record() {
+    let dir = temp_dir("retag-project-fact");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+
+    let remembered = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Something stored at global scope.",
+            "--json",
+        ])
+        .output()
+        .expect("run remember");
+    assert!(
+        remembered.status.success(),
+        "remember failed: {remembered:?}"
+    );
+    let remembered: serde_json::Value =
+        serde_json::from_slice(&remembered.stdout).expect("remember json");
+    let id = remembered["id"].as_str().expect("memory id").to_owned();
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "retag",
+            &id,
+            "--kind",
+            "project-fact",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("project"));
+}
+
+#[test]
+fn retag_fails_for_unknown_id() {
+    let dir = temp_dir("retag-unknown");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "retag",
+            "20990101T000000.000000Z_none_000000_codex_deadbeef",
+            "--kind",
+            "incident",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no memory record"));
+}
+
+#[test]
 fn sync_status_reports_per_host_last_seen() {
     let dir = temp_dir("sync-status-hosts");
     let config = dir.join("config.toml");
