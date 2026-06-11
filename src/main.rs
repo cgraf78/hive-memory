@@ -479,6 +479,9 @@ struct ContextArgs {
     /// Suppress output when this session already saw the same context selection.
     #[arg(long)]
     if_changed: bool,
+    /// Include candidate-level selection decisions in JSON output.
+    #[arg(long)]
+    explain: bool,
     /// Emit machine-readable output.
     #[arg(long)]
     json: bool,
@@ -2021,6 +2024,7 @@ fn run_context(args: ContextArgs, context: CliContext) -> Result<()> {
             max_tokens: args.max_tokens,
             include_inbox: args.include_inbox,
             include_search_only,
+            explain: args.explain,
             scopes: args.scope,
             sources: args.source,
             project_id,
@@ -2073,6 +2077,8 @@ struct ContextSelection {
     include_inbox: bool,
     /// Explicitly render records the relevance strategy classifies as search-only.
     include_search_only: bool,
+    /// Capture candidate-level selection decisions for JSON debugging.
+    explain: bool,
     /// Scope filter from CLI/hook policy. Empty defers to config defaults.
     scopes: Vec<String>,
     /// Source filter from CLI/hook policy. Empty defers to config defaults.
@@ -2210,6 +2216,7 @@ fn assemble_cli_context(
         path_hint: path_hint.as_deref(),
         max_tokens,
         inject_strategy,
+        explain: selection.explain,
     })
     .map_err(anyhow::Error::from)?;
 
@@ -2267,6 +2274,8 @@ struct ContextJsonOutput {
     cache_created_at: Option<String>,
     /// Included memory sections after filtering and budgeting.
     sections: Vec<ContextSectionJson>,
+    /// Candidate-level include/skip reasons, present when `--explain` was used.
+    decisions: Vec<ContextDecisionJson>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2287,6 +2296,14 @@ struct ContextSectionJson {
     estimated_tokens: usize,
     /// Safe-to-inject body rendered for this context section.
     body: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ContextDecisionJson {
+    id: String,
+    source_path: String,
+    action: &'static str,
+    reason: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2323,6 +2340,9 @@ struct ContextCacheEntry {
     estimated_tokens: usize,
     /// Section metadata kept so stale JSON output preserves data boundaries.
     sections: Vec<ContextCacheSection>,
+    /// Candidate decisions captured with the fresh assembly.
+    #[serde(default)]
+    decisions: Vec<ContextCacheDecision>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2335,6 +2355,14 @@ struct ContextCacheSection {
     source_path: String,
     estimated_tokens: usize,
     body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ContextCacheDecision {
+    id: String,
+    source_path: String,
+    action: String,
+    reason: String,
 }
 
 fn write_context_cache(config: &Config, assembly: &CliContextAssembly) -> Result<PathBuf> {
@@ -2374,6 +2402,17 @@ fn write_context_cache(config: &Config, assembly: &CliContextAssembly) -> Result
                 source_path: section.source_path.clone(),
                 estimated_tokens: section.estimated_tokens,
                 body: section.body.clone(),
+            })
+            .collect(),
+        decisions: assembly
+            .output
+            .decisions
+            .iter()
+            .map(|decision| ContextCacheDecision {
+                id: decision.id.clone(),
+                source_path: decision.source_path.clone(),
+                action: decision.action.to_owned(),
+                reason: decision.reason.to_owned(),
             })
             .collect(),
     };
@@ -2438,11 +2477,22 @@ fn load_context_cache(
             body: section.body,
         })
         .collect();
+    let decisions = entry
+        .decisions
+        .into_iter()
+        .map(|decision| memory_context::ContextDecision {
+            id: decision.id,
+            source_path: decision.source_path,
+            action: cached_decision_label(&decision.action),
+            reason: cached_decision_label(&decision.reason),
+        })
+        .collect();
 
     Ok(Some(CliContextAssembly {
         output: memory_context::ContextOutput {
             markdown,
             sections,
+            decisions,
             estimated_tokens: entry.estimated_tokens,
         },
         agent_id: entry.agent_id,
@@ -2509,6 +2559,20 @@ fn cached_trust(value: &str) -> memory_context::TrustLevel {
     }
 }
 
+fn cached_decision_label(value: &str) -> &'static str {
+    match value {
+        "included" => "included",
+        "skipped" => "skipped",
+        "source" => "source",
+        "scope" => "scope",
+        "project" => "project",
+        "audience" => "audience",
+        "search-only" => "search-only",
+        "budget" => "budget",
+        _ => "unknown",
+    }
+}
+
 fn context_json(
     assembly: CliContextAssembly,
     emitted: bool,
@@ -2544,6 +2608,17 @@ fn context_json(
                 body: section.body,
             })
             .collect(),
+        decisions: assembly
+            .output
+            .decisions
+            .into_iter()
+            .map(|decision| ContextDecisionJson {
+                id: decision.id,
+                source_path: decision.source_path,
+                action: decision.action,
+                reason: decision.reason,
+            })
+            .collect(),
     }
 }
 
@@ -2567,6 +2642,7 @@ fn context_json_suppressed(
         stale,
         cache_created_at,
         sections: Vec::new(),
+        decisions: Vec::new(),
     }
 }
 
@@ -2848,6 +2924,7 @@ fn run_hook_session_start(args: HookContextArgs, mut context: CliContext) -> Res
             max_tokens: Some(usize::try_from(config.defaults.hook_context_max_tokens)?),
             include_inbox: false,
             include_search_only: false,
+            explain: false,
             scopes: Vec::new(),
             sources: Vec::new(),
             project_id: std::env::var("HIVE_MEMORY_PROJECT_ID").ok(),
@@ -3178,6 +3255,7 @@ fn hook_context_action_if_changed(
             max_tokens: Some(usize::try_from(config.defaults.hook_context_max_tokens)?),
             include_inbox: false,
             include_search_only: false,
+            explain: false,
             scopes: Vec::new(),
             sources: Vec::new(),
             project_id: std::env::var("HIVE_MEMORY_PROJECT_ID").ok(),

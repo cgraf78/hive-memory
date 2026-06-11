@@ -240,6 +240,7 @@ fn inject(
         path_hint: Some("/repo/src/main.rs"),
         max_tokens: 4000,
         inject_strategy: strategy,
+        explain: false,
     })
     .expect("assemble context");
     output
