@@ -3679,6 +3679,116 @@ fn sync_status_reports_reachable_store_and_index_freshness() {
 }
 
 #[test]
+fn sync_status_reports_per_host_last_seen() {
+    let dir = temp_dir("sync-status-hosts");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let state = dir.join("state");
+    let write_host_config = |host: &str| {
+        fs::write(
+            &config,
+            format!(
+                r#"
+                default_store = "personal"
+                state_dir = "{}"
+                host_id = "{host}"
+
+                [stores.personal]
+                root = "{}"
+                "#,
+                state.display(),
+                personal.display()
+            ),
+        )
+        .expect("write config");
+    };
+    write_host_config("host-alpha");
+    init_store(&personal, "personal");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Alpha host writes the first memory.",
+        ])
+        .assert()
+        .success();
+
+    // A second machine syncing into the same store is simulated by switching
+    // the configured host identity before the next write.
+    write_host_config("host-beta");
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Beta host writes the second memory.",
+        ])
+        .assert()
+        .success();
+
+    // Hosts come from the same index file search and context use; before any
+    // index exists the diagnostic must stay read-only and report none.
+    let unindexed = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "sync-status",
+            "--json",
+        ])
+        .output()
+        .expect("run sync-status");
+    assert!(
+        unindexed.status.success(),
+        "sync-status failed: {unindexed:?}"
+    );
+    let unindexed: serde_json::Value =
+        serde_json::from_slice(&unindexed.stdout).expect("sync-status json");
+    assert_eq!(unindexed["index_exists"], false);
+    assert_eq!(unindexed["hosts"].as_array().expect("hosts array").len(), 0);
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--quiet",
+        ])
+        .assert()
+        .success();
+
+    let output = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "sync-status",
+            "--json",
+        ])
+        .output()
+        .expect("run sync-status");
+    assert!(output.status.success(), "sync-status failed: {output:?}");
+    let status: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("sync-status json");
+    let hosts = status["hosts"].as_array().expect("hosts array");
+    assert_eq!(hosts.len(), 2);
+    // Deterministic host_id ordering so output diffs cleanly.
+    assert_eq!(hosts[0]["host_id"], "host-alpha");
+    assert_eq!(hosts[0]["records"], 1);
+    assert!(hosts[0]["last_seen_at"].as_str().is_some());
+    assert_eq!(hosts[1]["host_id"], "host-beta");
+    assert_eq!(hosts[1]["records"], 1);
+    let alpha_seen = hosts[0]["last_seen_at"].as_str().expect("alpha seen");
+    let beta_seen = hosts[1]["last_seen_at"].as_str().expect("beta seen");
+    assert!(
+        beta_seen >= alpha_seen,
+        "beta wrote later: {beta_seen} vs {alpha_seen}"
+    );
+}
+
+#[test]
 fn sync_status_reports_unavailable_store_without_failing() {
     let dir = temp_dir("sync-status-unavailable");
     let config = dir.join("config.toml");

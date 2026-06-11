@@ -369,6 +369,7 @@ fn curated_entry(curated: &CuratedFile, project_id: Option<&str>) -> IndexEntry 
         confidence: note::Confidence::High,
         kind: None,
         agent_id: "human".to_owned(),
+        host_id: String::new(),
         created_at: String::new(),
         body: curated.body.clone(),
         note_path: curated.relative_path.clone(),
