@@ -93,19 +93,6 @@ pub struct ContextDecision {
     pub reason: &'static str,
 }
 
-/// One explain record for an indexed context candidate.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContextDecision {
-    /// Memory id.
-    pub id: String,
-    /// Store-relative source path.
-    pub source_path: String,
-    /// `included` or `skipped`.
-    pub action: &'static str,
-    /// Stable reason key.
-    pub reason: &'static str,
-}
-
 /// One rendered memory section in context output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextSection {
