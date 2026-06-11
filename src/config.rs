@@ -40,6 +40,7 @@ const DEFAULTS_KEYS: &[&str] = &[
     "event_sidecar",
     "hook_context_max_tokens",
     "context_cache_max_age",
+    "context_strategy",
 ];
 const AGENT_KEYS: &[&str] = &[
     "default_store",
@@ -191,6 +192,11 @@ pub struct DefaultsConfig {
     pub hook_context_max_tokens: u32,
     /// Max age string for hook context cache fallback.
     pub context_cache_max_age: String,
+    /// Session-start selection strategy: `recency` (legacy include-all) or
+    /// `relevance` (apply the inject classifier). Stored as a string so an
+    /// unrecognized value degrades to legacy behavior instead of failing the
+    /// hook path; resolved via `inject::Strategy::from_config`.
+    pub context_strategy: String,
 }
 
 /// Sidecar policy for note writes.
@@ -832,6 +838,7 @@ impl DefaultsConfig {
             event_sidecar: raw.event_sidecar.unwrap_or_default(),
             hook_context_max_tokens: raw.hook_context_max_tokens.unwrap_or(4000),
             context_cache_max_age: raw.context_cache_max_age.unwrap_or_else(|| "7d".to_owned()),
+            context_strategy: raw.context_strategy.unwrap_or_else(|| "recency".to_owned()),
         }
     }
 }
@@ -958,6 +965,7 @@ struct RawDefaultsConfig {
     event_sidecar: Option<EventSidecarPolicy>,
     hook_context_max_tokens: Option<u32>,
     context_cache_max_age: Option<String>,
+    context_strategy: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1210,6 +1218,9 @@ mod tests {
             loaded.config.defaults.event_sidecar,
             EventSidecarPolicy::Always
         );
+        // Unset strategy defaults to legacy behavior, so existing stores are
+        // unaffected until they opt in.
+        assert_eq!(loaded.config.defaults.context_strategy, "recency");
         assert_eq!(
             loaded.config.offline,
             OfflineConfig {
@@ -1249,6 +1260,7 @@ mod tests {
             event_sidecar = "never"
             hook_context_max_tokens = 1234
             context_cache_max_age = "2d"
+            context_strategy = "relevance"
 
             [offline]
             enabled = false
@@ -1274,6 +1286,7 @@ mod tests {
         );
         assert_eq!(loaded.config.defaults.hook_context_max_tokens, 1234);
         assert_eq!(loaded.config.defaults.context_cache_max_age, "2d");
+        assert_eq!(loaded.config.defaults.context_strategy, "relevance");
         assert_eq!(
             loaded.config.offline,
             OfflineConfig {

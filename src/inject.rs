@@ -21,6 +21,31 @@
 
 use crate::note::EntryKind;
 
+/// Session-start selection strategy, chosen by `context_strategy` config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Strategy {
+    /// Legacy behavior: include everything in scope, ordered by recency. No
+    /// inject classification. This is the default so nothing changes until a
+    /// store opts in.
+    #[default]
+    Recency,
+    /// Apply the inject classifier: search-only candidates are withheld so
+    /// session-start context favors durable, project-relevant memory.
+    Relevance,
+}
+
+impl Strategy {
+    /// Resolve the strategy from its config string, defaulting to `Recency` on
+    /// anything unrecognized. Unknown values must not fail the latency-sensitive
+    /// hook path, so an unexpected string degrades to today's behavior.
+    pub fn from_config(value: &str) -> Self {
+        match value.trim().to_lowercase().as_str() {
+            "relevance" => Self::Relevance,
+            _ => Self::Recency,
+        }
+    }
+}
+
 /// How a candidate memory should be treated at session-start injection time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InjectClass {
@@ -207,6 +232,16 @@ mod tests {
             classify(global(body), &IncidentMarkers::default()),
             InjectClass::AlwaysOn
         );
+    }
+
+    #[test]
+    fn strategy_from_config_defaults_safely() {
+        assert_eq!(Strategy::from_config("relevance"), Strategy::Relevance);
+        assert_eq!(Strategy::from_config("  Relevance "), Strategy::Relevance);
+        assert_eq!(Strategy::from_config("recency"), Strategy::Recency);
+        // Unknown values degrade to legacy behavior rather than erroring.
+        assert_eq!(Strategy::from_config("bogus"), Strategy::Recency);
+        assert_eq!(Strategy::from_config(""), Strategy::Recency);
     }
 
     #[test]
