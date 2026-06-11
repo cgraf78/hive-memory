@@ -1671,11 +1671,11 @@ Installer target mapping:
 Artifact layout:
 
 ```text
-hm-vX.Y.Z-linux-x86_64-musl.tar.gz
-hm-vX.Y.Z-linux-aarch64-musl.tar.gz
-hm-vX.Y.Z-macos-x86_64.tar.gz
-hm-vX.Y.Z-macos-aarch64.tar.gz
-hm-vX.Y.Z-<platform>.tar.gz.sha256
+hm-YYYYMMDD-HHMMSS-<8hex>-linux-x86_64-musl.tar.gz
+hm-YYYYMMDD-HHMMSS-<8hex>-linux-aarch64-musl.tar.gz
+hm-YYYYMMDD-HHMMSS-<8hex>-macos-x86_64.tar.gz
+hm-YYYYMMDD-HHMMSS-<8hex>-macos-aarch64.tar.gz
+hm-YYYYMMDD-HHMMSS-<8hex>-<platform>.tar.gz.sha256
 ```
 
 Each archive contains:
@@ -1705,7 +1705,7 @@ should make this easy:
 shdeps_binary_from_github \
   "cgraf78/hive-memory" \
   "hm" \
-  "hm-v${version}-${platform}.tar.gz"
+  "hm-${version}-${platform}.tar.gz"
 ```
 
 Installer responsibilities:

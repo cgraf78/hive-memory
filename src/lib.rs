@@ -21,5 +21,6 @@ pub mod project;
 pub mod search;
 pub mod secret;
 pub mod store;
+pub mod version;
 pub mod visibility;
 pub mod write;

@@ -3,7 +3,9 @@ name: Release
 on:
   push:
     tags:
-      - v*.*.*
+      # GitHub's filter glob is intentionally coarse here; scripts/release-tag.sh
+      # performs the exact YYYYMMDD-HHMMSS-<8hex> validation against the commit.
+      - "20*"
 
 permissions:
   contents: read
@@ -14,6 +16,11 @@ jobs:
     permissions:
       contents: write
     with:
-      version-command: scripts/cargo-version.sh
+      # Hive Memory's public version is generated from the UTC committer
+      # timestamp plus the commit suffix, not from Cargo.toml semver. Ask the
+      # shared workflow to validate the exact release tag instead of forcing
+      # this repo through Cargo's semver-oriented `version-command` +
+      # `tag-prefix` path.
+      tag-command: scripts/release-tag.sh
       package-command: scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
       smoke-command: scripts/smoke-release.sh "$ASSET_PLATFORM"

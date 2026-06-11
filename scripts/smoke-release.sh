@@ -2,25 +2,55 @@
 set -euo pipefail
 
 if [[ $# -ne 1 ]]; then
-  echo "usage: scripts/smoke-release.sh <asset-platform>" >&2
+  printf 'usage: scripts/smoke-release.sh <asset-platform>\n' >&2
   exit 2
 fi
 
 asset_platform=$1
-version=$(scripts/cargo-version.sh)
-archive="dist/hm-v${version}-${asset_platform}.tar.gz"
+case "$asset_platform" in
+  *unknown*)
+    # Smoke tests run against the same label that gets uploaded. Reject target
+    # triples here too so a workflow edit cannot package a clean label but smoke
+    # a different, Rust-internal archive name by mistake.
+    printf 'asset platform must be a public release label, not a Rust target triple: %s\n' "$asset_platform" >&2
+    exit 2
+    ;;
+esac
 
-mkdir -p smoke
-tar -xzf "$archive" -C smoke
+tag=$(scripts/release-tag.sh)
+archive="dist/hm-${tag}-${asset_platform}.tar.gz"
+if [[ ! -f "$archive" && -f dist/.hive-memory-release-version ]]; then
+  # Local dry-runs are not anchored by a pushed release tag. Reuse the package
+  # script's recorded version so smoke always verifies the archive produced by
+  # the immediately preceding package step.
+  tag=$(<dist/.hive-memory-release-version)
+  case "$tag" in
+    '' | *[!A-Za-z0-9._-]*)
+      printf 'recorded release version is unsafe for asset names: %s\n' "$tag" >&2
+      exit 2
+      ;;
+  esac
+  archive="dist/hm-${tag}-${asset_platform}.tar.gz"
+fi
+smoke=$(mktemp -d)
+smoke_store=$(mktemp -d)
+smoke_config=$(mktemp)
 
-./smoke/hm --version
-./smoke/hm stores init personal --root "$PWD/smoke-store"
+cleanup() {
+  rm -rf "$smoke" "$smoke_store" "$smoke_config"
+}
+trap cleanup EXIT
 
-cat >smoke-config.toml <<EOF
+tar -xzf "$archive" -C "$smoke"
+
+"$smoke/hm" --version
+"$smoke/hm" stores init personal --root "$smoke_store"
+
+cat >"$smoke_config" <<EOF
 default_store = "personal"
 
 [stores.personal]
-root = "$PWD/smoke-store"
+root = "$smoke_store"
 EOF
 
-./smoke/hm --config "$PWD/smoke-config.toml" doctor --quick
+"$smoke/hm" --config "$smoke_config" doctor --quick
