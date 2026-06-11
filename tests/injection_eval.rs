@@ -234,6 +234,7 @@ fn inject(
         scopes: &scopes,
         sources: &sources,
         include_inbox: false,
+        include_search_only: false,
         agent_id: Some("eval-agent"),
         project_id,
         path_hint: Some("/repo/src/main.rs"),
