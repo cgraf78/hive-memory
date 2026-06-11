@@ -6,7 +6,7 @@
 //! preference misses, because dropping behavior guidance is the costly failure.
 
 use hive_memory::note::MemoryKind;
-use hive_memory::write_classify::{self, InferKindInput};
+use hive_memory::write_classify::{self, InferKindInput, InferScopeInput};
 use serde::Deserialize;
 
 const CORPUS: &str = include_str!("fixtures/write_classification_corpus.toml");
@@ -14,6 +14,22 @@ const CORPUS: &str = include_str!("fixtures/write_classification_corpus.toml");
 #[derive(Debug, Deserialize)]
 struct Corpus {
     record: Vec<Record>,
+    #[serde(default)]
+    scope_record: Vec<ScopeRecord>,
+}
+
+/// One scope-inference row, always evaluated with a project hint present
+/// because agent launchers attach one to every in-repo write.
+#[derive(Debug, Deserialize)]
+struct ScopeRecord {
+    id: String,
+    #[serde(default)]
+    explicit_kind: String,
+    body: String,
+    /// "" means no promotion: the configured default scope must win.
+    expected_scope: String,
+    #[serde(default)]
+    high_value: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,4 +100,47 @@ fn write_kind_classifier_matches_fixture_labels() {
     );
     assert_eq!(score.high_value_fn, 0, "must not miss key preferences");
     assert_eq!(score.correct, score.total);
+}
+
+#[test]
+fn scope_inference_matches_fixture_labels() {
+    let corpus: Corpus = toml::from_str(CORPUS).expect("parse corpus");
+    assert!(
+        !corpus.scope_record.is_empty(),
+        "scope fixture must not be empty"
+    );
+    let mut failures = Vec::new();
+    let mut high_value_demotions = 0_usize;
+
+    for record in &corpus.scope_record {
+        let inferred = write_classify::infer_scope(InferScopeInput {
+            project_id: Some("repo-alpha"),
+            explicit_kind: expected_kind(&record.explicit_kind),
+            body: &record.body,
+        });
+        let actual = inferred.map(|inference| inference.scope).unwrap_or("");
+        if actual == record.expected_scope {
+            continue;
+        }
+        // A promoted preference is the costly direction: the record stops
+        // injecting everywhere except one project. Track it separately and
+        // hold it at zero, mirroring the kind eval's high-value guard.
+        if record.high_value && record.expected_scope.is_empty() {
+            high_value_demotions += 1;
+        }
+        failures.push(format!(
+            "{} expected scope {:?} got {:?}",
+            record.id, record.expected_scope, actual
+        ));
+    }
+
+    assert_eq!(
+        high_value_demotions, 0,
+        "must not demote preferences into one project"
+    );
+    assert!(
+        failures.is_empty(),
+        "scope inference mismatches:\n{}",
+        failures.join("\n")
+    );
 }
