@@ -3137,6 +3137,93 @@ fn context_json_reports_selection_and_sections() {
 }
 
 #[test]
+fn hook_context_falls_back_to_cache_on_assembly_error() {
+    let dir = temp_dir("context-assembly-fallback");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "remember",
+            "--text",
+            "Cache fallback should preserve this memory.",
+        ])
+        .assert()
+        .success();
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "context",
+            "--path",
+            "/repo/src/main.rs",
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    // Curated trees are read on every assembly. A file that cannot be read
+    // (mid-sync truncation, encoding damage) makes assembly fail even though
+    // the manifest is reachable — the shape the manifest-only fallback missed.
+    fs::create_dir_all(personal.join("rules")).expect("create rules dir");
+    fs::write(personal.join("rules/broken.md"), [0xFF, 0xFE, 0xFD]).expect("write broken rule");
+
+    // Interactive context must still surface the underlying failure.
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "context",
+            "--path",
+            "/repo/src/main.rs",
+            "--json",
+        ])
+        .assert()
+        .failure();
+
+    // Hook context degrades to the last known-good cache instead of starting
+    // the agent session with no memory at all.
+    let stale_output = cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_HOOK_ACTIVE", "1")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "context",
+            "--path",
+            "/repo/src/main.rs",
+            "--json",
+        ])
+        .output()
+        .expect("run hook context");
+    assert!(
+        stale_output.status.success(),
+        "hook context failed: {stale_output:?}"
+    );
+    let stale_context: serde_json::Value =
+        serde_json::from_slice(&stale_output.stdout).expect("stale context json");
+    assert_eq!(stale_context["stale"], true);
+    assert!(stale_context["cache_created_at"].as_str().is_some());
+    assert_eq!(
+        stale_context["sections"][0]["body"],
+        "Cache fallback should preserve this memory."
+    );
+}
+
+#[test]
 fn context_json_explain_reports_included_and_skipped_decisions() {
     let dir = temp_dir("context-explain");
     let config = dir.join("config.toml");

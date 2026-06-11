@@ -65,6 +65,19 @@ pub struct ContextOutput {
     pub decisions: Vec<ContextDecision>,
     /// Approximate token count for the rendered Markdown.
     pub estimated_tokens: usize,
+    /// Per-record degradations (e.g. an unreadable canonical note that was
+    /// skipped). Callers should surface these; they are not failures because
+    /// one mid-sync record must not strip all memory from a session.
+    pub warnings: Vec<ContextWarning>,
+}
+
+/// One non-fatal degradation encountered while assembling context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextWarning {
+    /// Store-relative path of the record that was skipped.
+    pub source_path: String,
+    /// Human-readable cause.
+    pub message: String,
 }
 
 /// One explain record for an indexed context candidate.
@@ -204,6 +217,7 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
     let mut markdown = header;
     let mut sections = Vec::new();
     let mut decisions = Vec::new();
+    let mut warnings = Vec::new();
     let mut estimated_tokens = estimate_tokens(&markdown);
     let project_ids = project_filter_ids(input.store_root, input.project_id)?;
 
@@ -254,25 +268,38 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
             continue;
         }
 
-        let note_path = input.store_root.join(&entry.note_path);
-        let contents = fs::read_to_string(&note_path).map_err(|err| ContextError::ReadNote {
-            path: note_path.clone(),
-            message: err.to_string(),
-        })?;
-        let parsed = note::parse_note(&contents).map_err(|err| ContextError::ParseNote {
-            path: note_path,
-            message: err.to_string(),
-        })?;
+        // Prefer the indexed body: on a cloud-synced store the canonical note
+        // can be mid-sync or already gone, and the rebuildable index is the
+        // local copy the latency-sensitive hook path can trust. Canonical
+        // reads remain only as a fallback for body-less entries from an older
+        // index schema, and a fallback failure degrades to a per-record skip —
+        // one unreadable record must not strip all memory from a session.
+        let record_body = if entry.body.is_empty() {
+            let note_path = input.store_root.join(&entry.note_path);
+            match read_note_body(&note_path) {
+                Ok(body) => body,
+                Err(message) => {
+                    warnings.push(ContextWarning {
+                        source_path: entry.note_path.clone(),
+                        message,
+                    });
+                    push_decision(&mut decisions, &input, entry, "skipped", "unreadable");
+                    continue;
+                }
+            }
+        } else {
+            entry.body.clone()
+        };
         // Under Relevance, withhold candidates the classifier marks search-only
         // (operational logs, raw notes) so startup context stays focused. The
-        // body must be read first because the operational signal is content.
+        // body must be resolved first because the operational signal is content.
         if input.inject_strategy == inject::Strategy::Relevance {
             let class = inject::classify(
                 ClassifyInput {
                     scope: &entry.scope,
                     entry_kind: entry.entry_kind,
                     kind: entry.kind,
-                    body: &parsed.body,
+                    body: &record_body,
                 },
                 &markers,
             );
@@ -282,8 +309,8 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
             }
         }
         let trust = trust_for(entry.entry_kind);
-        let body = escape_memory_body(&parsed.body);
-        let block = render_memory_block(input.store_name, entry, trust, &parsed.body);
+        let body = escape_memory_body(&record_body);
+        let block = render_memory_block(input.store_name, entry, trust, &record_body);
         let block_tokens = estimate_tokens(&block);
         if estimated_tokens + block_tokens > input.max_tokens {
             push_decision(&mut decisions, &input, entry, "skipped", "budget");
@@ -313,7 +340,20 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
         sections,
         decisions,
         estimated_tokens,
+        warnings,
     })
+}
+
+/// Read and parse one canonical note body for a body-less index entry.
+///
+/// Returns a message instead of a `ContextError` because callers degrade to a
+/// per-record warning rather than failing the assembly.
+fn read_note_body(note_path: &Path) -> Result<String, String> {
+    let contents = fs::read_to_string(note_path)
+        .map_err(|err| format!("read note {}: {err}", note_path.display()))?;
+    note::parse_note(&contents)
+        .map(|parsed| parsed.body)
+        .map_err(|err| format!("parse note: {err}"))
 }
 
 fn push_decision(
@@ -970,5 +1010,92 @@ mod tests {
         assert_eq!(relevance.sections.len(), 1);
         assert!(relevance.markdown.contains("Prefer fd over find."));
         assert!(!relevance.markdown.contains("root cause"));
+    }
+
+    #[test]
+    fn context_uses_indexed_body_without_reopening_note() {
+        // On a cloud-synced store a canonical note can vanish between index
+        // build and context read (partial sync, remote delete). The index body
+        // must be enough to keep session-start context alive.
+        let dir = temp_dir("indexed-body");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(TestRecord {
+            root: &root,
+            entry_kind: note::EntryKind::Remember,
+            scope: "global",
+            body: "Indexed bodies keep hook context alive.",
+            created_at: timestamp(1_778_946_153),
+            project_id: None,
+            audience: Vec::new(),
+        });
+        let entries = entries(&root, &cache);
+        fs::remove_dir_all(root.join("inbox")).expect("remove canonical inbox");
+
+        let sources = ["remembered".to_owned()];
+        let output = assemble_context(input(&root, &entries, &[], &sources)).expect("context");
+        assert_eq!(output.sections.len(), 1);
+        assert!(
+            output
+                .markdown
+                .contains("Indexed bodies keep hook context alive.")
+        );
+        assert!(output.warnings.is_empty());
+    }
+
+    #[test]
+    fn unreadable_note_is_skipped_with_warning() {
+        // A legacy body-less index entry whose canonical note is unreadable
+        // must degrade to a per-record skip with a surfaced warning. Failing
+        // the whole assembly would strip ALL memory from the session because
+        // one record was mid-sync.
+        let dir = temp_dir("unreadable-note");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(TestRecord {
+            root: &root,
+            entry_kind: note::EntryKind::Remember,
+            scope: "global",
+            body: "Survivor memory stays available.",
+            created_at: timestamp(1_778_946_153),
+            project_id: None,
+            audience: Vec::new(),
+        });
+        write_record(TestRecord {
+            root: &root,
+            entry_kind: note::EntryKind::Remember,
+            scope: "global",
+            body: "Mid-sync memory is missing on disk.",
+            created_at: timestamp(1_778_946_200),
+            project_id: None,
+            audience: Vec::new(),
+        });
+        let mut entries = entries(&root, &cache);
+        let victim = entries
+            .iter_mut()
+            .find(|entry| entry.body.contains("Mid-sync"))
+            .expect("victim entry");
+        // Simulate an index produced before bodies were cached, pointing at a
+        // note that never finished syncing to this machine.
+        victim.body = String::new();
+        let victim_path = victim.note_path.clone();
+        fs::remove_file(root.join(&victim_path)).expect("remove victim note");
+
+        let sources = ["remembered".to_owned()];
+        let mut request = input(&root, &entries, &[], &sources);
+        request.explain = true;
+        let output = assemble_context(request).expect("context");
+
+        assert_eq!(output.sections.len(), 1);
+        assert!(output.markdown.contains("Survivor memory stays available."));
+        assert!(!output.markdown.contains("Mid-sync"));
+        assert_eq!(output.warnings.len(), 1);
+        assert_eq!(output.warnings[0].source_path, victim_path);
+        assert!(
+            output
+                .decisions
+                .iter()
+                .any(|decision| decision.action == "skipped" && decision.reason == "unreadable")
+        );
     }
 }
