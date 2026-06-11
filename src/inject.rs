@@ -242,6 +242,22 @@ mod tests {
     }
 
     #[test]
+    fn untagged_design_sketch_is_a_known_residual() {
+        // Honest residual, mirrored from a real store: a long design sketch
+        // carries a date ("discussed 2026-06-09") but no operational keyword,
+        // so the conservative heuristic leaves it always-on rather than risk
+        // withholding durable guidance. The explicit kind (see the tagged
+        // design-sketch corpus record) is the safe withhold for this shape.
+        let body = "Detailed design sketch for an automated review gate in CI \
+                    (discussed 2026-06-09, not built): a reusable workflow each \
+                    repo opts into, gating on severity.";
+        assert_eq!(
+            classify(global(body), &IncidentMarkers::default()),
+            InjectClass::AlwaysOn
+        );
+    }
+
+    #[test]
     fn marker_less_incident_is_left_in() {
         // Honest residual: an operational note with no date is NOT withheld. We
         // accept this miss rather than risk dropping real guidance; the explicit
