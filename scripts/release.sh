@@ -3,91 +3,142 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-usage: scripts/release.sh [--push]
+usage: scripts/release.sh [--push] [--dry-run]
 
-Create the release tag for the version in Cargo.toml.
+Create the UTC commit-timestamp/hash release tag for the current main commit.
 
 Options:
-  --push   push main and the generated tag to origin
+  --push     push main and the generated tag to origin
+  --dry-run  validate and print the tag/actions without creating anything
 EOF
 }
 
 push=0
-case "${1:-}" in
-  "")
-    ;;
-  --push)
-    push=1
-    ;;
-  -h | --help)
-    usage
-    exit 0
-    ;;
-  *)
-    usage
-    exit 2
-    ;;
-esac
+dry_run=0
 
-if [[ $# -gt 1 ]]; then
-  usage
-  exit 2
-fi
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --push)
+      push=1
+      ;;
+    --dry-run)
+      dry_run=1
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+remote=${HIVE_MEMORY_RELEASE_REMOTE:-origin}
+branch=${HIVE_MEMORY_RELEASE_BRANCH:-main}
+remote_ref="refs/remotes/$remote/$branch"
 
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
 
-if [[ $(git branch --show-current) != "main" ]]; then
-  echo "release: run from main" >&2
+die() {
+  printf 'release: %s\n' "$*" >&2
   exit 1
+}
+
+if [[ $(git branch --show-current) != "$branch" ]]; then
+  die "run from $branch"
 fi
 
-if ! git diff --quiet || ! git diff --cached --quiet; then
-  echo "release: worktree must be clean" >&2
-  exit 1
+if [[ -n $(git status --porcelain) ]]; then
+  die "worktree must be clean"
 fi
 
-version=$(scripts/cargo-version.sh)
-tag="v${version}"
+# Fetch before deriving the tag so local release cuts are anchored to the same
+# commit that GitHub will build. The explicit refspec keeps this independent of
+# whatever upstream tracking configuration a developer happens to have locally.
+git fetch --quiet --tags "$remote" "+refs/heads/$branch:$remote_ref"
 
-# The version appears in the Git tag because GitHub releases are tag-based, but
-# humans should not type it twice. Derive the tag from Cargo.toml and make the
-# workflow verify that the pushed tag still matches the crate version.
-#
-# A new release must use a new version. Check origin before creating or pushing
-# anything so rerunning the helper cannot accidentally replace assets for an
-# already published version.
-git fetch --quiet origin main:refs/remotes/origin/main --tags
-if git rev-parse --verify origin/main >/dev/null 2>&1 &&
-  ! git merge-base --is-ancestor origin/main HEAD; then
-  echo "release: local main is not based on origin/main; update before releasing" >&2
-  exit 1
-fi
-if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
-  echo "release: origin already has tag ${tag}; bump Cargo.toml before releasing" >&2
-  exit 1
-fi
-if command -v gh >/dev/null 2>&1 && gh release view "$tag" >/dev/null 2>&1; then
-  echo "release: GitHub release ${tag} already exists; bump Cargo.toml before releasing" >&2
-  exit 1
+head_commit=$(git rev-parse HEAD)
+remote_commit=$(git rev-parse "$remote_ref")
+if [[ "$head_commit" != "$remote_commit" ]]; then
+  die "local $branch ($head_commit) does not match $remote/$branch ($remote_commit)"
 fi
 
-if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
-  tagged_commit=$(git rev-list -n 1 "$tag")
-  head_commit=$(git rev-parse HEAD)
-  if [[ "$tagged_commit" != "$head_commit" ]]; then
-    echo "release: tag ${tag} already points at ${tagged_commit}, not HEAD ${head_commit}" >&2
-    exit 1
+# `release-version.sh` intentionally honors several CI/build environment
+# overrides because packaging jobs and source snapshots need that flexibility.
+# The release cutter has a narrower contract: publish the clean local HEAD that
+# was just verified against origin/main. Keep ambient shell/GitHub env from
+# changing which tag this script creates.
+tag=$(
+  unset HIVE_MEMORY_BUILD_VERSION HIVE_MEMORY_BUILD_TIMESTAMP GITHUB_REF_TYPE GITHUB_REF_NAME GITHUB_REF GITHUB_SHA
+  HIVE_MEMORY_BUILD_COMMIT="$head_commit" scripts/release-tag.sh
+)
+tag_exists=0
+
+if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+  tag_type=$(git cat-file -t "refs/tags/$tag")
+  if [[ "$tag_type" != "commit" ]]; then
+    die "local tag $tag is a $tag_type object; release tags must be lightweight"
   fi
-  echo "release: tag ${tag} already exists at HEAD"
+  tagged_commit=$(git rev-list -n 1 "$tag")
+  if [[ "$tagged_commit" != "$head_commit" ]]; then
+    die "local tag $tag already points at $tagged_commit, not HEAD $head_commit"
+  fi
+  tag_exists=1
+fi
+
+if git ls-remote --exit-code --tags "$remote" "refs/tags/$tag" >/dev/null 2>&1; then
+  die "$remote already has tag $tag"
+fi
+
+if command -v gh >/dev/null 2>&1 && gh release view "$tag" >/dev/null 2>&1; then
+  die "GitHub release $tag already exists"
+fi
+
+if [[ "$dry_run" == 1 ]]; then
+  printf 'release: tag %s\n' "$tag"
+  if [[ "$tag_exists" == 1 ]]; then
+    printf 'release: local tag %s already exists at HEAD\n' "$tag"
+  else
+    printf 'release: would create local tag %s at %s\n' "$tag" "$head_commit"
+  fi
+  if [[ "$push" == 1 ]]; then
+    printf 'release: would push %s and refs/tags/%s to %s\n' "$branch" "$tag" "$remote"
+  fi
+  exit 0
+fi
+
+# Use a lightweight tag on purpose. Hive Memory release identity embeds the
+# target commit suffix in the tag itself; annotated tags add a separate
+# tag-object hash that provides no value here and can confuse CI environments
+# that expose the triggering SHA differently for annotated tag pushes.
+created_tag=1
+pushed_tag=0
+cleanup_unpushed_tag() {
+  if [[ "$push" == 1 && "$created_tag" == 1 && "$pushed_tag" == 0 ]]; then
+    git tag -d "$tag" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup_unpushed_tag EXIT
+
+if [[ "$tag_exists" == 1 ]]; then
+  created_tag=0
+  printf 'release: local tag %s already exists at HEAD\n' "$tag"
 else
-  git tag -a "$tag" -m "$tag"
-  echo "release: created tag ${tag}"
+  git tag "$tag"
+  printf 'release: created tag %s\n' "$tag"
 fi
 
 if [[ "$push" == 1 ]]; then
-  git push origin main
-  git push origin "$tag"
+  git push --quiet "$remote" "$branch"
+  git push --quiet "$remote" "refs/tags/$tag"
+  pushed_tag=1
+  printf 'release: pushed tag %s\n' "$tag"
+else
+  printf 'release: tag %s is local only; rerun with --push to publish\n' "$tag"
 fi
 
-echo "release: ${tag}"
+printf 'release: %s\n' "$tag"

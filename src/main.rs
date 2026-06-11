@@ -28,7 +28,7 @@ use time::OffsetDateTime;
 /// Vendor-neutral shared memory infrastructure for AI agents.
 #[derive(Debug, Parser)]
 #[command(name = "hm")]
-#[command(version = option_env!("HM_CLI_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")))]
+#[command(version = hive_memory::version::cli())]
 #[command(about = "Vendor-neutral shared memory infrastructure for AI agents.")]
 struct Cli {
     /// Main config file to load.

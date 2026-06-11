@@ -23,10 +23,10 @@ the CLI.
 
 ## Status
 
-The primary binary is `hm`. The crate is currently pre-1.0, and `Cargo.toml` is
-the release-version source of truth. The implemented command surface follows
-the v1 schema and behavior described in [SPEC.md](SPEC.md); broader design
-rationale lives in [PLAN.md](PLAN.md).
+The primary binary is `hm`. The crate is currently pre-1.0, and public release
+versions are generated from the UTC commit timestamp plus the commit suffix. The
+implemented command surface follows the v1 schema and behavior described in
+[SPEC.md](SPEC.md); broader design rationale lives in [PLAN.md](PLAN.md).
 
 Because the project is still `0.x`, storage schemas may change between releases.
 If a change affects public command behavior, file formats, or hook contracts,
@@ -259,7 +259,7 @@ layout for configured stores.
 Use `remember` for durable facts and preferences:
 
 ```sh
-hm remember --text "The release version source of truth is Cargo.toml."
+hm remember --text "Release versions use UTC commit timestamp/hash tags."
 ```
 
 Use `note` for lower-confidence observations or triage material:
@@ -489,6 +489,7 @@ Run the local checks before sending a change:
 cargo fmt --check
 cargo test
 cargo clippy --all-targets --all-features -- -D warnings
+tests/shell/release-scripts-test
 ```
 
 CI runs these checks through the shared `cgraf78/actions` Rust workflow:
@@ -500,27 +501,29 @@ non-goals, update [PLAN.md](PLAN.md).
 
 ## Release
 
-`Cargo.toml` is the release-version source of truth. To publish a release, bump
-`package.version`, commit the change, then run:
+Hive Memory uses the same release identity scheme as `shdeps`:
+`YYYYMMDD-HHMMSS-<8hex>`, derived from the UTC commit timestamp and commit hash.
+To publish a release from an up-to-date clean `main`, run:
 
 ```sh
 scripts/release.sh --push
 ```
 
-The script derives the `vX.Y.Z` tag from `Cargo.toml` and pushes it. GitHub
-Actions uses the shared `cgraf78/actions` Rust release workflow to verify that
-the tag still matches the Cargo version before creating the release draft,
-building target archives, uploading assets, and publishing the release.
+The script verifies local `main` matches `origin/main`, creates a lightweight
+release tag for the current commit, and pushes it. GitHub Actions uses the
+shared `cgraf78/actions` Rust release workflow to verify the exact generated tag
+before creating the release draft, building target archives, uploading assets,
+and publishing the release.
 
 Linux release archives use musl targets to avoid requiring a specific distro
 glibc version at runtime. Published archive labels use installer-facing platform
 names instead of Rust target triples:
 
 ```text
-hm-vX.Y.Z-linux-x86_64-musl.tar.gz
-hm-vX.Y.Z-linux-aarch64-musl.tar.gz
-hm-vX.Y.Z-macos-x86_64.tar.gz
-hm-vX.Y.Z-macos-aarch64.tar.gz
+hm-YYYYMMDD-HHMMSS-<8hex>-linux-x86_64-musl.tar.gz
+hm-YYYYMMDD-HHMMSS-<8hex>-linux-aarch64-musl.tar.gz
+hm-YYYYMMDD-HHMMSS-<8hex>-macos-x86_64.tar.gz
+hm-YYYYMMDD-HHMMSS-<8hex>-macos-aarch64.tar.gz
 ```
 
 ## License
