@@ -2184,7 +2184,8 @@ fn assemble_cli_context(
             strategy: &strategy_label,
         },
     );
-    if std::env::var("HIVE_MEMORY_HOOK_ACTIVE").ok().as_deref() == Some("1")
+    let hook_active = std::env::var("HIVE_MEMORY_HOOK_ACTIVE").ok().as_deref() == Some("1");
+    if hook_active
         && let Err(store::StoreError::Io { .. }) = store::read_manifest(&store_config.root)
     {
         // Hook context runs at agent startup/prompt boundaries, where failing
@@ -2202,13 +2203,12 @@ fn assemble_cli_context(
         }
         .into());
     }
-    let report = rebuild_store_index(config, &resolved_store.name)?;
     let max_tokens = selection.max_tokens.unwrap_or_else(|| {
         // Hooks run on latency-sensitive agent boundaries, so they use the
         // configured hook budget unless the caller has explicitly provided a
         // tighter or broader limit. Interactive `hm context` keeps the larger
         // v1 default for inspection and manual debugging.
-        if std::env::var("HIVE_MEMORY_HOOK_ACTIVE").ok().as_deref() == Some("1") {
+        if hook_active {
             usize::try_from(config.defaults.hook_context_max_tokens)
                 .expect("hook context token budget fits usize")
         } else {
@@ -2216,22 +2216,50 @@ fn assemble_cli_context(
         }
     });
 
-    let output = memory_context::assemble_context(memory_context::ContextInput {
-        store_name: store_name.as_str(),
-        store_root: &store_config.root,
-        entries: &report.entries,
-        scopes: &scopes,
-        sources: &sources,
-        include_inbox,
-        include_search_only,
-        agent_id: agent_id.as_deref(),
-        project_id: project_id.as_deref(),
-        path_hint: path_hint.as_deref(),
-        max_tokens,
-        inject_strategy,
-        explain: selection.explain,
-    })
-    .map_err(anyhow::Error::from)?;
+    // Fresh assembly can still fail past the manifest check: the index rebuild
+    // or a curated/canonical read can hit a mid-sync file on a cloud-backed
+    // root. In hook mode those failures degrade to the last known-good cache,
+    // exactly like an unreachable store; interactive commands surface the
+    // underlying error so the store gets fixed instead of papered over.
+    let fresh = rebuild_store_index(config, &resolved_store.name).and_then(|report| {
+        memory_context::assemble_context(memory_context::ContextInput {
+            store_name: store_name.as_str(),
+            store_root: &store_config.root,
+            entries: &report.entries,
+            scopes: &scopes,
+            sources: &sources,
+            include_inbox,
+            include_search_only,
+            agent_id: agent_id.as_deref(),
+            project_id: project_id.as_deref(),
+            path_hint: path_hint.as_deref(),
+            max_tokens,
+            inject_strategy,
+            explain: selection.explain,
+        })
+        .map_err(anyhow::Error::from)
+    });
+    let output = match fresh {
+        Ok(output) => output,
+        Err(err) => {
+            if hook_active
+                && let Some(assembly) =
+                    load_context_cache(config, &context_key, store_source.clone())?
+            {
+                eprintln!("warning: hook context degraded to cached fallback: {err}");
+                return Ok(assembly);
+            }
+            return Err(err);
+        }
+    };
+    // Per-record degradations are non-fatal by design; surface them on stderr
+    // so sync damage is visible without stripping memory from the session.
+    for warning in &output.warnings {
+        eprintln!(
+            "warning: context skipped {}: {}",
+            warning.source_path, warning.message
+        );
+    }
 
     let assembly = CliContextAssembly {
         output,
@@ -2507,6 +2535,9 @@ fn load_context_cache(
             sections,
             decisions,
             estimated_tokens: entry.estimated_tokens,
+            // Cached fallback output never replays assembly-time degradations;
+            // staleness itself is already labeled on the assembly.
+            warnings: Vec::new(),
         },
         agent_id: entry.agent_id,
         project_id: entry.project_id,
