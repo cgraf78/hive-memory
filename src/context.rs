@@ -936,6 +936,7 @@ mod tests {
             confidence: note::Confidence::High,
             kind: None,
             agent_id: "co<dex".to_owned(),
+            host_id: "taylor".to_owned(),
             created_at: "2026-05-16T00:00:00Z".to_owned(),
             body: "body".to_owned(),
             note_path: "inbox/notes/2026-05-16/id.md".to_owned(),

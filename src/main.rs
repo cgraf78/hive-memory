@@ -2707,6 +2707,68 @@ struct SyncStatusJsonOutput {
     newest_canonical_at: Option<String>,
     index_stale: bool,
     cloud_conflict_files: usize,
+    hosts: Vec<HostSyncStatus>,
+}
+
+/// Per-host activity summary derived from the local index.
+#[derive(Debug, Serialize)]
+struct HostSyncStatus {
+    /// Host identity recorded on the indexed writes.
+    host_id: String,
+    /// RFC3339 timestamp of the newest indexed record from this host. Absent
+    /// only when no row for the host carries a parseable timestamp.
+    last_seen_at: Option<String>,
+    /// Number of indexed records written by this host.
+    records: usize,
+}
+
+/// Aggregate per-host last-seen activity from the existing scoped index.
+///
+/// Local-only checks cannot see that a remote machine's writes stopped
+/// arriving through cloud sync; a per-host last-seen derived from synced
+/// records is the cheap signal that one machine has gone silent. Reads the
+/// same index file search and context use, deliberately without rebuilding:
+/// the diagnostic stays read-only. A missing or unreadable index yields no
+/// host rows; `index_exists`/`index_stale` already describe the cache state.
+fn host_sync_status(index_path: &Path) -> Vec<HostSyncStatus> {
+    let Ok(entries) = index::read_index(index_path) else {
+        return Vec::new();
+    };
+    #[derive(Default)]
+    struct Accumulator {
+        last_seen: Option<(OffsetDateTime, String)>,
+        records: usize,
+    }
+    let mut hosts = std::collections::BTreeMap::<String, Accumulator>::new();
+    for entry in entries {
+        // Rows from a pre-v4 cache schema carry no host identity; the
+        // fingerprint bump rebuilds them on the next warm path.
+        if entry.host_id.is_empty() {
+            continue;
+        }
+        let slot = hosts.entry(entry.host_id).or_default();
+        slot.records += 1;
+        // Compare parsed timestamps, not strings: RFC3339 fractional-second
+        // lengths make lexicographic order unreliable.
+        if let Ok(created_at) = OffsetDateTime::parse(
+            &entry.created_at,
+            &time::format_description::well_known::Rfc3339,
+        ) && slot
+            .last_seen
+            .as_ref()
+            .is_none_or(|(best, _)| created_at > *best)
+        {
+            slot.last_seen = Some((created_at, entry.created_at));
+        }
+    }
+    hosts
+        .into_iter()
+        .map(|(host_id, accumulator)| HostSyncStatus {
+            host_id,
+            last_seen_at: accumulator.last_seen.map(|(_, raw)| raw),
+            records: accumulator.records,
+        })
+        .collect()
 }
 
 fn run_sync_status(args: SyncStatusArgs, context: CliContext) -> Result<()> {
@@ -2746,6 +2808,7 @@ fn run_sync_status(args: SyncStatusArgs, context: CliContext) -> Result<()> {
         _ => false,
     };
     let cloud_conflict_files = count_conflict_files(&store_config.root)?;
+    let hosts = host_sync_status(&index_path);
 
     let output = SyncStatusJsonOutput {
         store: resolved_store.name,
@@ -2763,6 +2826,7 @@ fn run_sync_status(args: SyncStatusArgs, context: CliContext) -> Result<()> {
         newest_canonical_at: system_time_rfc3339(newest_canonical),
         index_stale,
         cloud_conflict_files,
+        hosts,
     };
 
     if args.json {
@@ -2790,6 +2854,14 @@ fn run_sync_status(args: SyncStatusArgs, context: CliContext) -> Result<()> {
         if output.index_stale { "yes" } else { "no" }
     );
     println!("cloud_conflict_files: {}", output.cloud_conflict_files);
+    for host in &output.hosts {
+        println!(
+            "host {}: last_seen={} records={}",
+            host.host_id,
+            host.last_seen_at.as_deref().unwrap_or("unknown"),
+            host.records
+        );
+    }
     Ok(())
 }
 

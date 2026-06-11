@@ -42,6 +42,14 @@ pub struct IndexEntry {
     pub kind: Option<note::MemoryKind>,
     /// Agent that wrote the record.
     pub agent_id: String,
+    /// Host that wrote the record.
+    ///
+    /// Carried so diagnostics can report per-host last-seen activity from the
+    /// index alone — the cheap way to notice that another machine's writes
+    /// have stopped arriving through cloud sync. Empty only for entries from
+    /// an older cache schema, which the fingerprint bump rebuilds.
+    #[serde(default)]
+    pub host_id: String,
     /// RFC3339 creation timestamp.
     pub created_at: String,
     /// Parsed note body cached for warm search.
@@ -423,6 +431,7 @@ fn entry_from_note(
             // carries kind without an event copy is still classified correctly.
             kind: event.kind.or(front_matter.kind),
             agent_id: event.agent_id.clone(),
+            host_id: event.host_id.clone(),
             created_at: event.created_at.clone(),
             body: body.to_owned(),
             note_path: note_path.to_owned(),
@@ -442,6 +451,7 @@ fn entry_from_note(
         confidence: front_matter.confidence,
         kind: front_matter.kind,
         agent_id: front_matter.agent_id.clone(),
+        host_id: front_matter.host_id.clone(),
         created_at: front_matter.created_at.clone(),
         body: body.to_owned(),
         note_path: note_path.to_owned(),
@@ -504,7 +514,8 @@ fn canonical_fingerprint(store_root: &Path) -> Result<IndexFingerprint, IndexErr
         ));
     }
     Ok(IndexFingerprint {
-        schema_version: 3,
+        // v4: entries carry `host_id` for per-host sync diagnostics.
+        schema_version: 4,
         store_root: store_root.display().to_string(),
         canonical_dirs: dirs.len(),
         latest_directory_modified_nanos,
@@ -654,6 +665,9 @@ mod tests {
             relative_path(&root, &written.note_path, memory_path::PathCase::Sensitive)
         );
         assert_eq!(report.entries[0].body, "Chris prefers TOML config.");
+        // Host identity rides along so diagnostics (sync-status) can report
+        // per-host last-seen activity from the index alone.
+        assert_eq!(report.entries[0].host_id, "taylor");
         assert_eq!(
             report.entries[0].event_path.as_deref(),
             Some(
