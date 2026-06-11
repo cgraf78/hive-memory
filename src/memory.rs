@@ -194,3 +194,243 @@ pub fn write_record(input: WriteRecordInput<'_>) -> Result<WriteRecordResult, Me
 
     Err(MemoryError::CollisionLimit)
 }
+
+/// Input for retagging one existing record's memory kind.
+///
+/// Retag exists so a wrong write-time inference is correctable: kind is a
+/// persisted, behavior-shaping verdict (search-only vs always-on), and the
+/// only previous remedy was hand-editing synced Markdown.
+#[derive(Debug, Clone)]
+pub struct RetagRecordInput<'a> {
+    /// Store root holding the canonical files.
+    pub root: &'a Path,
+    /// Store-relative Markdown note path, as carried by the index.
+    pub note_path: &'a str,
+    /// New kind; `None` clears the tag so read-time classification applies.
+    pub kind: Option<note::MemoryKind>,
+    /// Atomic write durability options.
+    pub options: write::AtomicWriteOptions,
+}
+
+/// Result of retagging one record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetagRecordResult {
+    /// Shared logical record id.
+    pub id: String,
+    /// Kind carried by the record before the rewrite.
+    pub previous_kind: Option<note::MemoryKind>,
+    /// Kind persisted by the rewrite.
+    pub kind: Option<note::MemoryKind>,
+    /// Absolute note path that was rewritten.
+    pub note_path: PathBuf,
+    /// Absolute event path that was rewritten, when a sidecar existed.
+    pub event_path: Option<PathBuf>,
+}
+
+/// Rewrite the persisted memory kind on an existing note/event pair.
+///
+/// Both copies must change together: the index prefers event metadata, so a
+/// note-only rewrite would be silently undone by the next index rebuild. Like
+/// `write_record`, this does not promise a cross-file transaction; the note is
+/// rewritten first and a missing sidecar is tolerated (note-only records).
+/// Rewrites use replace-mode atomic publishing, and the resulting mtime bump
+/// invalidates the index fingerprint so read paths pick up the new kind.
+pub fn retag_record(input: RetagRecordInput<'_>) -> Result<RetagRecordResult, MemoryError> {
+    let note_path = input.root.join(input.note_path);
+    let contents = std::fs::read_to_string(&note_path)
+        .map_err(|err| MemoryError::Note(format!("read {}: {err}", note_path.display())))?;
+    let mut parsed =
+        note::parse_note(&contents).map_err(|err| MemoryError::Note(err.to_string()))?;
+    let previous_kind = parsed.front_matter.kind;
+    parsed.front_matter.kind = input.kind;
+    let rendered = note::render_note(&parsed).map_err(|err| MemoryError::Note(err.to_string()))?;
+    write::write_atomic(&note_path, rendered.as_bytes(), &input.options)
+        .map_err(|err| MemoryError::Note(err.to_string()))?;
+
+    let created_at = OffsetDateTime::parse(
+        &parsed.front_matter.created_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .map_err(|err| MemoryError::Note(format!("parse created_at: {err}")))?;
+    let event_path = input.root.join(event::event_relative_path(
+        &parsed.front_matter.id,
+        created_at,
+    ));
+    let event_path = match std::fs::read_to_string(&event_path) {
+        Ok(event_contents) => {
+            let mut event = event::parse_event(&event_contents)
+                .map_err(|err| MemoryError::Event(err.to_string()))?;
+            event.kind = input.kind;
+            let rendered_event =
+                event::render_event(&event).map_err(|err| MemoryError::Event(err.to_string()))?;
+            write::write_atomic(&event_path, rendered_event.as_bytes(), &input.options)
+                .map_err(|err| MemoryError::Event(err.to_string()))?;
+            Some(event_path)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            return Err(MemoryError::Event(format!(
+                "read {}: {err}",
+                event_path.display()
+            )));
+        }
+    };
+
+    Ok(RetagRecordResult {
+        id: parsed.front_matter.id,
+        previous_kind,
+        kind: input.kind,
+        note_path,
+        event_path,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Sensitivity;
+    use crate::write::{AtomicWriteOptions, FsyncPolicy};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "hive-memory-memory-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    fn manifest() -> store::StoreManifest {
+        store::StoreManifest::with_identity(
+            "personal",
+            Some("Personal memory".to_owned()),
+            Sensitivity::Private,
+            "018f5f57-bd9b-7d33-9e21-1f44f0c5a013".to_owned(),
+            "2026-05-16T00:00:00Z".to_owned(),
+        )
+    }
+
+    fn options() -> AtomicWriteOptions {
+        AtomicWriteOptions {
+            fsync: FsyncPolicy::Never,
+            ..AtomicWriteOptions::default()
+        }
+    }
+
+    fn write(root: &Path, kind: Option<note::MemoryKind>, write_event: bool) -> WriteRecordResult {
+        write_record(WriteRecordInput {
+            root,
+            manifest: &manifest(),
+            entry_kind: note::EntryKind::Remember,
+            created_at: OffsetDateTime::from_unix_timestamp(1_778_946_153).expect("timestamp"),
+            agent_id: "codex".to_owned(),
+            host_id: "taylor".to_owned(),
+            user_id: "chris".to_owned(),
+            session_id: None,
+            scope: "global".to_owned(),
+            confidence: note::Confidence::High,
+            body: "Retag should rewrite this record.".to_owned(),
+            project_id: None,
+            subject: None,
+            kind,
+            tags: Vec::new(),
+            audience: Vec::new(),
+            source_kind: None,
+            source_ref: None,
+            write_event,
+            options: options(),
+        })
+        .expect("write memory record")
+    }
+
+    fn relative(root: &Path, path: &Path) -> String {
+        path.strip_prefix(root)
+            .expect("store-relative path")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn retag_rewrites_note_and_event_together() {
+        let root = temp_dir("retag-pair");
+        let written = write(&root, Some(note::MemoryKind::Preference), true);
+
+        let result = retag_record(RetagRecordInput {
+            root: &root,
+            note_path: &relative(&root, &written.note_path),
+            kind: Some(note::MemoryKind::Incident),
+            options: options(),
+        })
+        .expect("retag");
+
+        assert_eq!(result.id, written.id);
+        assert_eq!(result.previous_kind, Some(note::MemoryKind::Preference));
+        assert_eq!(result.kind, Some(note::MemoryKind::Incident));
+        let note = note::parse_note(&fs::read_to_string(&written.note_path).expect("read note"))
+            .expect("parse note");
+        assert_eq!(note.front_matter.kind, Some(note::MemoryKind::Incident));
+        assert_eq!(note.body, "Retag should rewrite this record.");
+        let event_path = result.event_path.expect("event rewritten");
+        let event = event::parse_event(&fs::read_to_string(event_path).expect("read event"))
+            .expect("parse event");
+        assert_eq!(event.kind, Some(note::MemoryKind::Incident));
+    }
+
+    #[test]
+    fn retag_clears_kind() {
+        let root = temp_dir("retag-clear");
+        let written = write(&root, Some(note::MemoryKind::Reference), true);
+
+        let result = retag_record(RetagRecordInput {
+            root: &root,
+            note_path: &relative(&root, &written.note_path),
+            kind: None,
+            options: options(),
+        })
+        .expect("retag");
+
+        assert_eq!(result.previous_kind, Some(note::MemoryKind::Reference));
+        assert_eq!(result.kind, None);
+        let note = note::parse_note(&fs::read_to_string(&written.note_path).expect("read note"))
+            .expect("parse note");
+        assert_eq!(note.front_matter.kind, None);
+    }
+
+    #[test]
+    fn retag_tolerates_missing_event_sidecar() {
+        let root = temp_dir("retag-note-only");
+        let written = write(&root, None, false);
+
+        let result = retag_record(RetagRecordInput {
+            root: &root,
+            note_path: &relative(&root, &written.note_path),
+            kind: Some(note::MemoryKind::Reference),
+            options: options(),
+        })
+        .expect("retag");
+
+        assert_eq!(result.previous_kind, None);
+        assert_eq!(result.event_path, None);
+        let note = note::parse_note(&fs::read_to_string(&written.note_path).expect("read note"))
+            .expect("parse note");
+        assert_eq!(note.front_matter.kind, Some(note::MemoryKind::Reference));
+    }
+
+    #[test]
+    fn retag_fails_on_missing_note() {
+        let root = temp_dir("retag-missing");
+        let result = retag_record(RetagRecordInput {
+            root: &root,
+            note_path: "inbox/notes/2026-05-16/missing.md",
+            kind: Some(note::MemoryKind::Incident),
+            options: options(),
+        });
+        assert!(matches!(result, Err(MemoryError::Note(_))));
+    }
+}
