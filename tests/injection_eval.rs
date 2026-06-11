@@ -415,10 +415,11 @@ fn baseline_characterization() {
     assert_eq!(total.fn_, 0, "baseline must drop nothing");
     assert_eq!(total.high_value_fn, 0, "baseline must drop no preference");
 
-    // Exact confusion matrix: 19 correct inclusions, 12 over-inclusions
-    // (3 incidents + 1 reference) injected across the 3 sessions.
+    // Exact confusion matrix: 19 correct inclusions, 15 over-inclusions
+    // (3 incidents + 1 reference + 1 design sketch) injected across the 3
+    // sessions.
     assert_eq!(total.tp, 19, "baseline true positives drifted");
-    assert_eq!(total.fp, 12, "baseline false positives drifted");
+    assert_eq!(total.fp, 15, "baseline false positives drifted");
 
     // Headline: high recall, mediocre precision (~0.613). This is the gap.
     assert!(

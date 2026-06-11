@@ -151,6 +151,24 @@ confidence = "low"
 body = "Release archives publish installer-facing labels distinct from the internal build target triples."
 note = "a plain reference the content heuristic cannot catch. Tagged kind=reference; the explicit kind withholds it."
 
+# ---- design sketch: a long dated design/decision record; search-only ----
+#
+# Mirrors a real-store shape: agents store multi-paragraph design sketches as
+# global remembers. They carry dates ("discussed 2026-06-09") but no
+# operational keywords, so the content heuristic cannot catch them — tagging
+# is the only safe withhold. The untagged variant of this shape is documented
+# as a known residual in src/inject.rs tests.
+
+[[record]]
+subject = "design-sketch-ci-review"
+kind = "reference"
+tagged = true
+entry_kind = "remember"
+scope = "global"
+confidence = "medium"
+body = "Detailed design sketch for an automated review gate in CI (discussed 2026-06-09, not built): a reusable workflow each repo opts into, computing the diff against the base branch, feeding a rubric to a model for structured findings, posting review comments, and gating on severity. Open question is unattended auth token rotation."
+note = "dated design sketch with no operational keywords; the heuristic cannot catch it, the explicit kind withholds it. SEARCH-ONLY."
+
 # ---- raw note: low-confidence hm note; must not inject by default ----
 
 [[record]]

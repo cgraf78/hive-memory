@@ -34,6 +34,7 @@ exclude = [
   "incident-disk-cleanup",
   "incident-stale-binary",
   "ref-release-labels",
+  "design-sketch-ci-review",
   "note-triage-idea",
 ]
 
@@ -56,6 +57,7 @@ exclude = [
   "incident-disk-cleanup",
   "incident-stale-binary",
   "ref-release-labels",
+  "design-sketch-ci-review",
   "note-triage-idea",
 ]
 
@@ -78,5 +80,6 @@ exclude = [
   "incident-disk-cleanup",
   "incident-stale-binary",
   "ref-release-labels",
+  "design-sketch-ci-review",
   "note-triage-idea",
 ]
