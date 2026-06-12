@@ -415,11 +415,12 @@ fn baseline_characterization() {
     assert_eq!(total.fn_, 0, "baseline must drop nothing");
     assert_eq!(total.high_value_fn, 0, "baseline must drop no preference");
 
-    // Exact confusion matrix: 19 correct inclusions, 15 over-inclusions
-    // (3 incidents + 1 reference + 1 design sketch) injected across the 3
-    // sessions.
+    // Exact confusion matrix: 19 correct inclusions, 19 over-inclusions
+    // (3 incidents + 1 reference + 1 legacy global project/tool fact + 1
+    // design sketch across 3 sessions, plus one project-scoped transient PR
+    // status in its matching project).
     assert_eq!(total.tp, 19, "baseline true positives drifted");
-    assert_eq!(total.fp, 15, "baseline false positives drifted");
+    assert_eq!(total.fp, 19, "baseline false positives drifted");
 
     // Headline: high recall, mediocre precision (~0.613). This is the gap.
     assert!(
@@ -429,14 +430,13 @@ fn baseline_characterization() {
     assert!((recall(total.tp, total.fn_) - 1.0).abs() < f64::EPSILON);
 }
 
-/// With explicit `kind` closing the residual, the relevance strategy reaches
-/// full precision while preserving every safety guarantee.
+/// Relevance reaches full precision while preserving every safety guarantee.
 ///
-/// Two paths combine: the untagged dated incidents are caught by the content
-/// heuristic, and the marker-less incident plus the plain reference — which the
-/// heuristic cannot safely catch — are withheld because they carry an explicit
-/// `kind`. The dated *preference* is still kept (never dropped), and project
-/// facts still inject only in their own project.
+/// Three paths combine: explicit `kind` withholds known incidents/references,
+/// the operational heuristic catches dated incidents, and the strict legacy
+/// global fallback withholds ambiguous project/tool facts. The dated
+/// *preference* is still kept (never dropped), and project facts still inject
+/// only in their own project.
 #[test]
 fn relevance_reaches_full_precision_with_kind() {
     let (per_context, total) = evaluate(InjectStrategy::Relevance);

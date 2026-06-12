@@ -30,10 +30,12 @@ include = [
 exclude = [
   "fact-beta-deploy",
   "fact-beta-schema",
+  "transient-pr-status",
   "incident-bus-exhaustion",
   "incident-disk-cleanup",
   "incident-stale-binary",
   "ref-release-labels",
+  "legacy-global-tool-fact",
   "design-sketch-ci-review",
   "note-triage-idea",
 ]
@@ -53,10 +55,12 @@ include = [
 exclude = [
   "fact-alpha-ci",
   "fact-alpha-layout",
+  "transient-pr-status",
   "incident-bus-exhaustion",
   "incident-disk-cleanup",
   "incident-stale-binary",
   "ref-release-labels",
+  "legacy-global-tool-fact",
   "design-sketch-ci-review",
   "note-triage-idea",
 ]
@@ -76,10 +80,12 @@ exclude = [
   "fact-alpha-layout",
   "fact-beta-deploy",
   "fact-beta-schema",
+  "transient-pr-status",
   "incident-bus-exhaustion",
   "incident-disk-cleanup",
   "incident-stale-binary",
   "ref-release-labels",
+  "legacy-global-tool-fact",
   "design-sketch-ci-review",
   "note-triage-idea",
 ]

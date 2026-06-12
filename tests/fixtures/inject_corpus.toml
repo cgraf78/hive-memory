@@ -109,6 +109,19 @@ confidence = "medium"
 body = "Repo beta uses additive schema versioning so older binaries tolerate new optional fields."
 note = "inject only in a proj-beta session"
 
+# ---- transient project workflow state: search-only even in its own project ----
+
+[[record]]
+subject = "transient-pr-status"
+kind = "project-fact"
+tagged = true
+entry_kind = "remember"
+scope = "project"
+project_id = "proj-alpha"
+confidence = "medium"
+body = "Repo alpha PR stack is all CI-green, OPEN/MERGEABLE, UNMERGED pending review; do NOT merge without review."
+note = "point-in-time PR/task coordination; searchable but too stale-risky for automatic startup injection"
+
 # ---- incidents: operational logs stored global+remember; search-only ----
 
 [[record]]
@@ -150,6 +163,21 @@ scope = "global"
 confidence = "low"
 body = "Release archives publish installer-facing labels distinct from the internal build target triples."
 note = "a plain reference the content heuristic cannot catch. Tagged kind=reference; the explicit kind withholds it."
+
+# ---- legacy global project/tool fact: search-only unless scoped/tagged ----
+#
+# Mirrors the real noisy SessionStart payload shape observed after rollout:
+# useful operational/project context stored as global+remember, but not behavior
+# guidance that should attach to every future session.
+
+[[record]]
+subject = "legacy-global-tool-fact"
+kind = "project-fact"
+entry_kind = "remember"
+scope = "global"
+confidence = "high"
+body = "Project shdeps rebuilds source-checkout binaries when the recorded version no longer matches checkout HEAD."
+note = "legacy untagged global project/tool fact; searchable, but too broad for automatic startup injection"
 
 # ---- design sketch: a long dated design/decision record; search-only ----
 #

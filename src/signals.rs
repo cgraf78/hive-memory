@@ -3,10 +3,12 @@
 //! Write-time kind inference (`write_classify`) and read-time inject
 //! selection (`inject`) must judge the same text the same way: a record that
 //! write inference would tag `incident` must also be withheld by the read-time
-//! heuristic when it arrives untagged from another machine or an older writer.
-//! That only holds if both sides consume one vocabulary and one date signal,
-//! so this module is the single owner of both. Do not re-declare operational
-//! keywords or date detection in classifier code; extend the list here.
+//! heuristic when it arrives untagged from another machine or an older writer,
+//! and a record that write inference would tag `preference` must survive
+//! stricter startup filtering. That only holds if both sides consume one
+//! vocabulary and one date signal, so this module is the single owner of both.
+//! Do not re-declare durable text-shape keywords in classifier code; extend the
+//! helpers here.
 
 /// Operational keywords marking postmortem/cleanup/fix language.
 ///
@@ -27,6 +29,57 @@ pub const OPERATIONAL_KEYWORDS: &[&str] = &[
     "outage",
     "fixed",
 ];
+
+/// True when text reads as durable behavior guidance.
+///
+/// This is intentionally narrower than "contains should". Startup context can
+/// tolerate a missed legacy project fact because it remains searchable, but a
+/// generic "repo X should..." fact should not become an always-on preference in
+/// every future session. Keep this aligned with the examples in
+/// `write_classify` tests and with real global preference memories such as
+/// "the maintainer prefers...", "Always...", and "When working..., prefer...".
+pub fn reads_as_preference(lower: &str) -> bool {
+    lower.starts_with("prefer ")
+        || (lower.starts_with("when ") && lower.contains(" prefer "))
+        || lower.contains(" prefers ")
+        || lower.starts_with("always ")
+        || lower.contains(" always ")
+        || lower.starts_with("never ")
+        || lower.contains(" never ")
+        || lower.starts_with("use ")
+        || lower.starts_with("avoid ")
+        || lower.contains(" avoid ")
+        || lower.starts_with("add comments")
+        || lower.contains(" add comments")
+        || (lower.starts_with("write ") && lower.contains("comments"))
+        || lower.starts_with("do not ")
+        || lower.contains(" do not ")
+        || lower.starts_with("don't ")
+        || lower.contains(" don't ")
+        || lower.contains(" wants coding agents ")
+        || lower.contains(" wants agents ")
+        || lower.contains(" wants the agent ")
+        || lower.contains("agent should ")
+        || lower.contains("agents should ")
+        || lower.contains("coding agents should ")
+        || lower.contains("default to ")
+}
+
+/// True when text is a point-in-time task/PR status rather than durable
+/// context.
+///
+/// These records can still be useful through search, but injecting stale
+/// "unmerged" or "do not merge" instructions at session start is actively
+/// misleading after the work lands. Keep this vocabulary deliberately narrow:
+/// it should catch workflow-state snapshots, not normal project facts.
+pub fn looks_transient_status(lower: &str) -> bool {
+    lower.contains("open/mergeable")
+        || lower.contains("unmerged")
+        || lower.contains("do not merge")
+        || lower.contains("pending review")
+        || lower.contains("pending owner review")
+        || lower.contains("pending human review")
+}
 
 /// True when the body reads as an operational log: it carries an ISO date AND
 /// at least one operational keyword. Both are required so durable guidance
@@ -99,6 +152,52 @@ mod tests {
         assert!(looks_operational(
             "2026-06-06 ROOT CAUSE: leaked daemons",
             OPERATIONAL_KEYWORDS.iter().copied()
+        ));
+    }
+
+    #[test]
+    fn preference_language_is_behavioral() {
+        assert!(reads_as_preference(
+            "the maintainer prefers agent-agnostic tools"
+        ));
+        assert!(reads_as_preference("always run the formatter"));
+        assert!(reads_as_preference("when working in shell, prefer rg"));
+        assert!(reads_as_preference(
+            "coding agents should write down durable facts"
+        ));
+        assert!(reads_as_preference(
+            "the user wants coding agents to remember durable facts"
+        ));
+        assert!(reads_as_preference(
+            "add comments that capture non-obvious rationale"
+        ));
+        assert!(reads_as_preference(
+            "write generous code comments that explain why"
+        ));
+
+        // A project/tool fact can contain "should" without being a global
+        // behavior preference. This shape should stay searchable unless it is
+        // explicitly tagged or scoped to a project.
+        assert!(!reads_as_preference(
+            "dotfiles ci should keep workflow-installed packages minimal"
+        ));
+        assert!(!reads_as_preference(
+            "shared ci plan says callers use main and prefer named setup modes"
+        ));
+    }
+
+    #[test]
+    fn transient_status_language_is_narrow() {
+        assert!(looks_transient_status(
+            "all ci-green, open/mergeable, unmerged pending review"
+        ));
+        assert!(looks_transient_status("do not merge without review"));
+
+        assert!(!looks_transient_status(
+            "do not store secrets or credentials"
+        ));
+        assert!(!looks_transient_status(
+            "project releases are cut from main after ci passes"
         ));
     }
 }

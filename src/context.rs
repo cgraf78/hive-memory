@@ -297,6 +297,7 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
             let class = inject::classify(
                 ClassifyInput {
                     scope: &entry.scope,
+                    project_id: entry.project_id.as_deref(),
                     entry_kind: entry.entry_kind,
                     kind: entry.kind,
                     body: &record_body,
@@ -1011,6 +1012,51 @@ mod tests {
         assert_eq!(relevance.sections.len(), 1);
         assert!(relevance.markdown.contains("Prefer fd over find."));
         assert!(!relevance.markdown.contains("root cause"));
+    }
+
+    #[test]
+    fn relevance_strategy_withholds_ambiguous_global_records() {
+        let dir = temp_dir("relevance-ambiguous-global");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(TestRecord {
+            root: &root,
+            entry_kind: note::EntryKind::Remember,
+            scope: "global",
+            body: "Project shdeps rebuilds source-checkout binaries when the recorded version no longer matches checkout HEAD.",
+            created_at: timestamp(1_778_946_153),
+            project_id: None,
+            audience: Vec::new(),
+        });
+        write_record(TestRecord {
+            root: &root,
+            entry_kind: note::EntryKind::Remember,
+            scope: "global",
+            body: "The maintainer prefers agent-agnostic tooling.",
+            created_at: timestamp(1_778_946_200),
+            project_id: None,
+            audience: Vec::new(),
+        });
+        let entries = entries(&root, &cache);
+        let sources = ["remembered".to_owned()];
+        let mut request = input(&root, &entries, &[], &sources);
+        request.inject_strategy = inject::Strategy::Relevance;
+        request.explain = true;
+
+        let relevance = assemble_context(request).expect("context");
+
+        assert_eq!(relevance.sections.len(), 1);
+        assert!(
+            relevance
+                .markdown
+                .contains("The maintainer prefers agent-agnostic tooling.")
+        );
+        assert!(!relevance.markdown.contains("Project shdeps rebuilds"));
+        assert!(
+            relevance.decisions.iter().any(|decision| {
+                decision.action == "skipped" && decision.reason == "search-only"
+            })
+        );
     }
 
     #[test]
