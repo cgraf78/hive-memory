@@ -108,12 +108,19 @@ pub struct RunInput<'a> {
 }
 
 /// Records still owed an LLM review at `verdict_version`.
+///
+/// Audience-restricted (`agent-private`) records are excluded entirely: their
+/// bodies are visible only to the listed agents, while the classifier pipes
+/// bodies to whichever backend CLI wins detection. Skipping them keeps the
+/// classifier consistent with the store's own visibility model; such records
+/// keep write-time/manual kinds and read-time relevance handling.
 pub fn pending_entries(
     entries: &[index::IndexEntry],
     verdict_version: u32,
 ) -> Vec<&index::IndexEntry> {
     let mut pending: Vec<&index::IndexEntry> = entries
         .iter()
+        .filter(|entry| entry.audience.is_empty())
         .filter(|entry| match &entry.classified {
             None => true,
             Some(classified) => match classified.source {
@@ -568,6 +575,22 @@ mod tests {
         let pending = pending_entries(&entries, 1);
 
         assert_eq!(pending.len(), 2);
+    }
+
+    #[test]
+    fn pending_excludes_audience_restricted_records() {
+        let mut agent_private = entry(None, None);
+        agent_private.id = "agent-private".to_owned();
+        agent_private.scope = "agent-private".to_owned();
+        agent_private.audience = vec!["codex".to_owned()];
+        let entries = vec![agent_private, entry(None, None)];
+
+        let pending = pending_entries(&entries, 1);
+
+        // The unrestricted record is still pending; the audience-restricted
+        // one must never be piped to an arbitrary backend CLI.
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].audience.is_empty());
     }
 
     #[test]

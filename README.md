@@ -504,6 +504,9 @@ mode = "off"
 ```
 
 Secret stores are never sent to any classifier backend, regardless of config.
+Audience-restricted (`agent-private`) records are also excluded: their bodies
+are visible only to the listed agents, so they are never piped to a backend
+CLI and keep their write-time or manually retagged kind.
 
 ## Trust and Privacy
 
