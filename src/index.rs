@@ -40,6 +40,9 @@ pub struct IndexEntry {
     /// Optional explicit memory kind, used by inject classification.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<note::MemoryKind>,
+    /// Classification provenance; used to derive pending LLM review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classified: Option<note::ClassifiedBy>,
     /// Agent that wrote the record.
     pub agent_id: String,
     /// Host that wrote the record.
@@ -430,6 +433,13 @@ fn entry_from_note(
             // Prefer the event's kind, falling back to the note's so a note that
             // carries kind without an event copy is still classified correctly.
             kind: event.kind.or(front_matter.kind),
+            // Provenance follows the same machine-metadata preference as kind:
+            // event sidecars are the structured contract, with note front
+            // matter as the repair/fallback source for note-only history.
+            classified: event
+                .classified
+                .clone()
+                .or_else(|| front_matter.classified.clone()),
             agent_id: event.agent_id.clone(),
             host_id: event.host_id.clone(),
             created_at: event.created_at.clone(),
@@ -450,6 +460,7 @@ fn entry_from_note(
         subject: front_matter.subject.clone(),
         confidence: front_matter.confidence,
         kind: front_matter.kind,
+        classified: front_matter.classified.clone(),
         agent_id: front_matter.agent_id.clone(),
         host_id: front_matter.host_id.clone(),
         created_at: front_matter.created_at.clone(),
@@ -514,8 +525,8 @@ fn canonical_fingerprint(store_root: &Path) -> Result<IndexFingerprint, IndexErr
         ));
     }
     Ok(IndexFingerprint {
-        // v4: entries carry `host_id` for per-host sync diagnostics.
-        schema_version: 4,
+        // v5: entries carry `classified` provenance for the LLM review queue.
+        schema_version: 5,
         store_root: store_root.display().to_string(),
         canonical_dirs: dirs.len(),
         latest_directory_modified_nanos,

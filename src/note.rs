@@ -45,6 +45,53 @@ pub enum MemoryKind {
     Reference,
 }
 
+/// Return the stable persisted label for a memory kind.
+///
+/// The string vocabulary is part of the note/event schema and CLI contract, so
+/// it lives with `MemoryKind` instead of being duplicated by each caller that
+/// needs to render or prompt with labels.
+pub fn kind_label(kind: MemoryKind) -> &'static str {
+    match kind {
+        MemoryKind::Preference => "preference",
+        MemoryKind::ProjectFact => "project-fact",
+        MemoryKind::Incident => "incident",
+        MemoryKind::Reference => "reference",
+    }
+}
+
+/// Who issued a persisted kind verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClassifierSource {
+    /// Automated LLM classification pass.
+    Llm,
+    /// Explicit human verdict (`hm retag`); never overridden by the LLM pass.
+    Manual,
+}
+
+/// Provenance for a persisted kind verdict.
+///
+/// Pending LLM review is derived from this field's absence instead of a local
+/// queue. That keeps synced notes authoritative: any machine can classify a
+/// record, and other machines see the settled verdict without coordinating
+/// ephemeral worker state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClassifiedBy {
+    /// Verdict origin.
+    pub source: ClassifierSource,
+    /// Backend label such as `claude`; diagnostics only, never control flow.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    /// RFC3339 timestamp of the verdict.
+    pub at: String,
+    /// Prompt/policy version. LLM verdicts older than the current version can
+    /// be re-reviewed; manual verdicts are version-exempt.
+    pub verdict_version: u32,
+    /// Model-reported confidence for LLM verdicts. `None` for manual verdicts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
+}
+
 /// Confidence assigned to a note.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -117,6 +164,9 @@ pub struct NoteFrontMatter {
     /// Optional explicit memory kind driving inject selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<MemoryKind>,
+    /// Optional provenance for the persisted `kind` verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classified: Option<ClassifiedBy>,
     /// Explicit allowed agents for `agent-private` notes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub audience: Vec<String>,
@@ -176,6 +226,8 @@ pub struct NoteWriteInput {
     pub expires_at: Option<String>,
     /// Optional explicit memory kind driving inject selection.
     pub kind: Option<MemoryKind>,
+    /// Optional provenance for the persisted `kind` verdict.
+    pub classified: Option<ClassifiedBy>,
     /// Explicit allowed agents for `agent-private` notes.
     pub audience: Vec<String>,
 }
@@ -270,6 +322,7 @@ impl NoteWriteInput {
             related_event_id: self.related_event_id.clone(),
             expires_at: self.expires_at.clone(),
             kind: self.kind,
+            classified: self.classified.clone(),
             audience: if self.scope == "agent-private" {
                 self.audience.clone()
             } else {
@@ -409,6 +462,9 @@ fn validate_front_matter(front_matter: &NoteFrontMatter) -> Result<(), NoteError
     if let Some(expires_at) = &front_matter.expires_at {
         validate_rfc3339("expires_at", expires_at)?;
     }
+    if let Some(classified) = &front_matter.classified {
+        validate_rfc3339("classified.at", &classified.at)?;
+    }
     if front_matter.scope == "agent-private" && front_matter.audience.is_empty() {
         return Err(NoteError::MissingAudienceForAgentPrivate);
     }
@@ -484,6 +540,7 @@ mod tests {
             related_event_id: None,
             expires_at: None,
             kind: None,
+            classified: None,
             audience: Vec::new(),
         }
     }
@@ -591,6 +648,60 @@ mod tests {
             err,
             NoteError::InvalidTimestamp {
                 field: "created_at",
+                value: "not-a-time".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn classified_provenance_round_trips() {
+        let mut input = input();
+        input.classified = Some(ClassifiedBy {
+            source: ClassifierSource::Llm,
+            backend: Some("claude".to_owned()),
+            at: "2026-06-12T00:00:00Z".to_owned(),
+            verdict_version: 1,
+            confidence: Some("high".to_owned()),
+        });
+
+        let front_matter = input
+            .front_matter("note-id".to_owned())
+            .expect("front matter");
+        let note = MarkdownNote {
+            front_matter,
+            body: "body".to_owned(),
+        };
+        let parsed = parse_note(&render_note(&note).expect("render note")).expect("parse note");
+
+        let classified = parsed.front_matter.classified.expect("classified");
+        assert_eq!(classified.source, ClassifierSource::Llm);
+        assert_eq!(classified.backend.as_deref(), Some("claude"));
+        assert_eq!(classified.verdict_version, 1);
+    }
+
+    #[test]
+    fn rejects_invalid_classified_timestamp() {
+        let mut front_matter = input()
+            .front_matter("note-id".to_owned())
+            .expect("front matter");
+        front_matter.classified = Some(ClassifiedBy {
+            source: ClassifierSource::Llm,
+            backend: Some("claude".to_owned()),
+            at: "not-a-time".to_owned(),
+            verdict_version: 1,
+            confidence: Some("high".to_owned()),
+        });
+        let note = MarkdownNote {
+            front_matter,
+            body: "body".to_owned(),
+        };
+
+        let err = render_note(&note).expect_err("render rejected");
+
+        assert_eq!(
+            err,
+            NoteError::InvalidTimestamp {
+                field: "classified.at",
                 value: "not-a-time".to_owned()
             }
         );

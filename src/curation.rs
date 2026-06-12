@@ -350,6 +350,7 @@ fn write_promotion_event(
         // Carry the source record's kind through promotion so a promoted memory
         // keeps its inject classification.
         kind: source.kind,
+        classified: source.classified.clone(),
         audience: Vec::new(),
         body: format!(
             "source_note_id = \"{}\"\ntarget_path = \"{}\"\n",

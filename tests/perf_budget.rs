@@ -277,6 +277,7 @@ fn write_notes(root: &Path) {
                 related_event_id: None,
                 expires_at: None,
                 kind: None,
+                classified: None,
                 audience: Vec::new(),
             },
             &options,

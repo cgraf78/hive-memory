@@ -1371,12 +1371,7 @@ fn parse_memory_kind(input: &str) -> std::result::Result<note::MemoryKind, Strin
 }
 
 fn memory_kind_label(kind: note::MemoryKind) -> &'static str {
-    match kind {
-        note::MemoryKind::Preference => "preference",
-        note::MemoryKind::ProjectFact => "project-fact",
-        note::MemoryKind::Incident => "incident",
-        note::MemoryKind::Reference => "reference",
-    }
+    note::kind_label(kind)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1842,6 +1837,7 @@ fn enqueue_outbox_memory(
         related_event_id: write_event.then(|| id.clone()),
         expires_at: None,
         kind: input.kind,
+        classified: None,
         audience: input.audience.clone(),
     };
     let note = note::render_note(&note::MarkdownNote {
@@ -1865,6 +1861,7 @@ fn enqueue_outbox_memory(
                 tags: input.tags,
                 confidence: input.confidence,
                 kind: input.kind,
+                classified: None,
                 audience: input.audience,
                 body: input.body,
                 note_path: Some(note_relative_path.clone()),
@@ -2593,24 +2590,7 @@ fn context_cache_is_fresh(created_at: &str, max_age: &str) -> bool {
 
 /// Parse compact max-age durations used by config, such as `10m` or `2h`.
 fn parse_context_cache_max_age(input: &str) -> Option<time::Duration> {
-    // Keep this grammar intentionally tiny and explicit. Hook fallback policy
-    // should be auditable from config, not dependent on a permissive duration
-    // parser whose accepted syntax changes under us.
-    let trimmed = input.trim();
-    let unit = trimmed.chars().last()?;
-    let number = trimmed[..trimmed.len().saturating_sub(unit.len_utf8())]
-        .parse::<i64>()
-        .ok()?;
-    if number < 0 {
-        return None;
-    }
-    match unit {
-        'd' => Some(time::Duration::days(number)),
-        'h' => Some(time::Duration::hours(number)),
-        'm' => Some(time::Duration::minutes(number)),
-        's' => Some(time::Duration::seconds(number)),
-        _ => None,
-    }
+    config::parse_duration_time(input)
 }
 
 fn cached_trust(value: &str) -> memory_context::TrustLevel {
@@ -2852,10 +2832,21 @@ fn run_retag(args: RetagArgs, context: CliContext) -> Result<()> {
         fsync: config.storage.fsync.into(),
         ..write::AtomicWriteOptions::default()
     };
+    let classified = match kind {
+        Some(_) => memory::ClassifiedUpdate::Set(note::ClassifiedBy {
+            source: note::ClassifierSource::Manual,
+            backend: None,
+            at: now_rfc3339(),
+            verdict_version: 0,
+            confidence: None,
+        }),
+        None => memory::ClassifiedUpdate::Clear,
+    };
     let result = memory::retag_record(memory::RetagRecordInput {
         root: &store_config.root,
         note_path: &entry.note_path,
         kind,
+        classified,
         options,
     })?;
 
@@ -4370,17 +4361,16 @@ fn validate_memory_kind_context(
     scope: &str,
     project_id: Option<&str>,
 ) -> Result<()> {
-    if kind != Some(note::MemoryKind::ProjectFact) {
-        return Ok(());
-    }
+    memory::validate_kind_context(kind, scope, project_id).map_err(|err| {
+        PrivacyRefusal {
+            message: err.to_string(),
+        }
+        .into()
+    })
+}
 
-    if scope == "project" && project_id.is_some() {
-        return Ok(());
-    }
-
-    Err(PrivacyRefusal {
-        message: "`--kind project-fact` requires `--scope project` and a resolved project id"
-            .to_owned(),
-    }
-    .into())
+fn now_rfc3339() -> String {
+    OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("RFC3339 formatting is infallible for UTC timestamps")
 }
