@@ -102,6 +102,9 @@ pub struct MemoryEvent {
     /// the event copy, so it must be carried here too, not only on the note.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<crate::note::MemoryKind>,
+    /// Optional provenance for the persisted `kind` verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classified: Option<crate::note::ClassifiedBy>,
     /// Explicit allowed agents for `agent-private` events.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub audience: Vec<String>,
@@ -211,6 +214,7 @@ impl MemoryEvent {
             tags: input.tags,
             confidence: input.confidence,
             kind: input.kind,
+            classified: input.classified,
             audience,
             body: input.body,
             note_path: input.note_path.map(path_to_event_string),
@@ -255,6 +259,8 @@ pub struct EventObservationInput {
     pub confidence: Confidence,
     /// Optional explicit memory kind, mirrored from the note.
     pub kind: Option<crate::note::MemoryKind>,
+    /// Optional provenance for the persisted `kind` verdict.
+    pub classified: Option<crate::note::ClassifiedBy>,
     /// Explicit allowed agents for `agent-private` events.
     pub audience: Vec<String>,
     /// Machine-readable copy of the note body for indexing and dedupe.
@@ -325,6 +331,9 @@ fn validate_event(event: &MemoryEvent) -> Result<(), EventError> {
     require_non_empty("scope", &event.scope)?;
     require_non_empty("body", &event.body)?;
     parse_rfc3339("created_at", &event.created_at)?;
+    if let Some(classified) = &event.classified {
+        parse_rfc3339("classified.at", &classified.at)?;
+    }
     if event.scope == "agent-private" && event.audience.is_empty() {
         return Err(EventError::MissingAudienceForAgentPrivate);
     }
@@ -437,6 +446,7 @@ mod tests {
             tags: vec!["preference".to_owned(), "workflow".to_owned()],
             confidence: Confidence::High,
             kind: None,
+            classified: None,
             audience: Vec::new(),
             body: "Chris prefers concise summaries.".to_owned(),
             note_path: Some(note::note_relative_path("event-id", timestamp())),
@@ -470,6 +480,27 @@ mod tests {
         assert_eq!(parsed, event);
         assert!(rendered.contains("\"type\": \"memory.observation\""));
         assert!(rendered.ends_with('\n'));
+    }
+
+    #[test]
+    fn classified_provenance_round_trips() {
+        let mut input = input();
+        input.classified = Some(note::ClassifiedBy {
+            source: note::ClassifierSource::Llm,
+            backend: Some("claude".to_owned()),
+            at: "2026-06-12T00:00:00Z".to_owned(),
+            verdict_version: 1,
+            confidence: Some("high".to_owned()),
+        });
+        let event = MemoryEvent::observation(input).expect("event");
+
+        let rendered = render_event(&event).expect("render event");
+        let parsed = parse_event(&rendered).expect("parse event");
+
+        let classified = parsed.classified.expect("classified");
+        assert_eq!(classified.source, note::ClassifierSource::Llm);
+        assert_eq!(classified.backend.as_deref(), Some("claude"));
+        assert_eq!(classified.verdict_version, 1);
     }
 
     #[test]

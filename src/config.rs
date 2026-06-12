@@ -13,6 +13,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration as StdDuration;
 
 const TOP_LEVEL_KEYS: &[&str] = &[
     "schema_version",
@@ -29,6 +30,7 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "privacy",
     "offline",
     "performance",
+    "classifier",
 ];
 
 const STORE_KEYS: &[&str] = &["root", "expected_id", "description", "sensitivity"];
@@ -59,6 +61,16 @@ const PERFORMANCE_KEYS: &[&str] = &[
     "context_warm_p95_ms",
     "context_cold_p95_ms",
     "context_store_size_target",
+];
+const CLASSIFIER_KEYS: &[&str] = &[
+    "mode",
+    "backend",
+    "command",
+    "model",
+    "batch_limit",
+    "min_interval",
+    "timeout_seconds",
+    "apply_confidence",
 ];
 const CLOUD_ROOT_PREFIXES: &[&str] = &[
     "${HOME}/gdrive",
@@ -133,6 +145,8 @@ pub struct Config {
     pub offline: OfflineConfig,
     /// Performance budgets used by benchmark and doctor tooling.
     pub performance: PerformanceConfig,
+    /// Background LLM classification policy.
+    pub classifier: ClassifierConfig,
 }
 
 /// Storage behavior from config.
@@ -197,6 +211,32 @@ pub struct DefaultsConfig {
     /// unrecognized value degrades to legacy behavior instead of failing the
     /// hook path; resolved via `inject::Strategy::from_config`.
     pub context_strategy: String,
+}
+
+/// Background LLM classification policy.
+///
+/// `mode = "auto"` (the default) lets the detached worker run when an allowed
+/// backend is detected and silently do nothing otherwise. Hot paths only use
+/// this config for local spawn/stamp decisions; backend probing belongs to the
+/// worker process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassifierConfig {
+    /// `auto` | `on` | `off`.
+    pub mode: String,
+    /// Optional explicit backend: `claude` | `codex` | `gemini` | `command`.
+    pub backend: Option<String>,
+    /// Custom argv when `backend = "command"`; prompt is written to stdin.
+    pub command: Vec<String>,
+    /// Optional model override passed to known backends.
+    pub model: Option<String>,
+    /// Max records judged per worker run.
+    pub batch_limit: u32,
+    /// Minimum interval between automatic runs, such as `6h`.
+    pub min_interval: String,
+    /// Hard timeout per LLM subprocess.
+    pub timeout_seconds: u64,
+    /// Apply verdicts at/above this confidence: `high` | `medium`.
+    pub apply_confidence: String,
 }
 
 /// Sidecar policy for note writes.
@@ -461,6 +501,15 @@ pub enum ConfigError {
     },
     /// Hook secret writes cannot be broader than normal secret writes.
     HookSecretWritesRequireSecretWrites,
+    /// A config key carried a value outside its allowed set.
+    InvalidValue {
+        /// Dotted key, e.g. `classifier.mode`.
+        key: String,
+        /// The rejected value.
+        value: String,
+        /// Allowed values, for the error message.
+        allowed: &'static [&'static str],
+    },
     /// A `${...` path expansion was missing its closing brace.
     UnterminatedExpansion(String),
 }
@@ -492,6 +541,15 @@ impl Display for ConfigError {
             Self::HookSecretWritesRequireSecretWrites => write!(
                 f,
                 "privacy.allow_hook_secret_writes requires privacy.allow_secret_writes"
+            ),
+            Self::InvalidValue {
+                key,
+                value,
+                allowed,
+            } => write!(
+                f,
+                "invalid config value for {key}: {value}; expected one of: {}",
+                allowed.join(", ")
             ),
             Self::UnterminatedExpansion(input) => {
                 write!(f, "unterminated variable expansion in {input}")
@@ -711,6 +769,11 @@ impl Config {
             })
     }
 
+    /// Parsed `[classifier] min_interval`, for local stamp-age checks.
+    pub fn classifier_min_interval(&self) -> StdDuration {
+        parse_duration_std(&self.classifier.min_interval).expect("validated at load")
+    }
+
     fn from_raw<F>(raw: RawConfig, env: &F) -> Result<Self, ConfigError>
     where
         F: Fn(&str) -> Option<String>,
@@ -810,6 +873,7 @@ impl Config {
             privacy,
             offline: OfflineConfig::from_raw(raw.offline),
             performance: PerformanceConfig::from_raw(raw.performance),
+            classifier: ClassifierConfig::from_raw(raw.classifier)?,
         })
     }
 }
@@ -898,6 +962,71 @@ impl PerformanceConfig {
     }
 }
 
+impl ClassifierConfig {
+    fn from_raw(raw: RawClassifierConfig) -> Result<Self, ConfigError> {
+        const MODES: &[&str] = &["auto", "on", "off"];
+        const BACKENDS: &[&str] = &["claude", "codex", "gemini", "command"];
+        const CONFIDENCE: &[&str] = &["high", "medium"];
+
+        let mode = raw.mode.unwrap_or_else(|| "auto".to_owned());
+        validate_allowed("classifier.mode", &mode, MODES)?;
+
+        if let Some(backend) = raw.backend.as_deref() {
+            validate_allowed("classifier.backend", backend, BACKENDS)?;
+        }
+
+        let command = raw.command.unwrap_or_default();
+        if raw.backend.as_deref() == Some("command") && command.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                key: "classifier.command".to_owned(),
+                value: "[]".to_owned(),
+                allowed: &["non-empty argv when backend = \"command\""],
+            });
+        }
+
+        let batch_limit = raw.batch_limit.unwrap_or(25);
+        if batch_limit == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "classifier.batch_limit".to_owned(),
+                value: batch_limit.to_string(),
+                allowed: &["positive integer"],
+            });
+        }
+
+        let min_interval = raw.min_interval.unwrap_or_else(|| "6h".to_owned());
+        if parse_duration_std(&min_interval).is_none() {
+            return Err(ConfigError::InvalidValue {
+                key: "classifier.min_interval".to_owned(),
+                value: min_interval,
+                allowed: &["duration like 6h, 30m, 10s, or 1d"],
+            });
+        }
+
+        let timeout_seconds = raw.timeout_seconds.unwrap_or(60);
+        if timeout_seconds == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "classifier.timeout_seconds".to_owned(),
+                value: timeout_seconds.to_string(),
+                allowed: &["positive integer"],
+            });
+        }
+
+        let apply_confidence = raw.apply_confidence.unwrap_or_else(|| "high".to_owned());
+        validate_allowed("classifier.apply_confidence", &apply_confidence, CONFIDENCE)?;
+
+        Ok(Self {
+            mode,
+            backend: raw.backend,
+            command,
+            model: raw.model,
+            batch_limit,
+            min_interval,
+            timeout_seconds,
+            apply_confidence,
+        })
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 struct RawConfig {
@@ -915,6 +1044,7 @@ struct RawConfig {
     privacy: RawPrivacyConfig,
     offline: RawOfflineConfig,
     performance: RawPerformanceConfig,
+    classifier: RawClassifierConfig,
 }
 
 impl Default for RawConfig {
@@ -934,6 +1064,7 @@ impl Default for RawConfig {
             privacy: RawPrivacyConfig::default(),
             offline: RawOfflineConfig::default(),
             performance: RawPerformanceConfig::default(),
+            classifier: RawClassifierConfig::default(),
         }
     }
 }
@@ -1002,6 +1133,19 @@ struct RawPerformanceConfig {
     context_store_size_target: Option<u32>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawClassifierConfig {
+    mode: Option<String>,
+    backend: Option<String>,
+    command: Option<Vec<String>>,
+    model: Option<String>,
+    batch_limit: Option<u32>,
+    min_interval: Option<String>,
+    timeout_seconds: Option<u64>,
+    apply_confidence: Option<String>,
+}
+
 fn collect_warnings(table: &toml::Table) -> Vec<ConfigWarning> {
     let allowed = TOP_LEVEL_KEYS.iter().copied().collect::<BTreeSet<_>>();
     let mut warnings = Vec::new();
@@ -1020,8 +1164,54 @@ fn collect_warnings(table: &toml::Table) -> Vec<ConfigWarning> {
     collect_table_warnings(&mut warnings, table, "privacy", PRIVACY_KEYS);
     collect_table_warnings(&mut warnings, table, "offline", OFFLINE_KEYS);
     collect_table_warnings(&mut warnings, table, "performance", PERFORMANCE_KEYS);
+    collect_table_warnings(&mut warnings, table, "classifier", CLASSIFIER_KEYS);
 
     warnings
+}
+
+fn validate_allowed(
+    key: &'static str,
+    value: &str,
+    allowed: &'static [&'static str],
+) -> Result<(), ConfigError> {
+    if allowed.contains(&value) {
+        Ok(())
+    } else {
+        Err(ConfigError::InvalidValue {
+            key: key.to_owned(),
+            value: value.to_owned(),
+            allowed,
+        })
+    }
+}
+
+/// Parse compact config durations such as `10m`, `2h`, or `1d`.
+///
+/// Keep this grammar intentionally tiny and explicit. Hook fallback policy and
+/// classifier retry cadence should be auditable from config, not dependent on a
+/// permissive parser whose accepted syntax changes under us.
+pub fn parse_duration_time(input: &str) -> Option<time::Duration> {
+    let trimmed = input.trim();
+    let unit = trimmed.chars().last()?;
+    let number = trimmed[..trimmed.len().saturating_sub(unit.len_utf8())]
+        .parse::<i64>()
+        .ok()?;
+    if number < 0 {
+        return None;
+    }
+    match unit {
+        'd' => Some(time::Duration::days(number)),
+        'h' => Some(time::Duration::hours(number)),
+        'm' => Some(time::Duration::minutes(number)),
+        's' => Some(time::Duration::seconds(number)),
+        _ => None,
+    }
+}
+
+/// Parse compact config durations into std durations for filesystem stamps.
+pub fn parse_duration_std(input: &str) -> Option<StdDuration> {
+    let duration = parse_duration_time(input)?;
+    StdDuration::try_from(duration).ok()
 }
 
 fn collect_table_warnings(
@@ -1238,6 +1428,19 @@ mod tests {
                 context_store_size_target: 5000,
             }
         );
+        assert_eq!(
+            loaded.config.classifier,
+            ClassifierConfig {
+                mode: "auto".to_owned(),
+                backend: None,
+                command: Vec::new(),
+                model: None,
+                batch_limit: 25,
+                min_interval: "6h".to_owned(),
+                timeout_seconds: 60,
+                apply_confidence: "high".to_owned(),
+            }
+        );
         assert!(loaded.warnings.is_empty());
     }
 
@@ -1271,6 +1474,15 @@ mod tests {
             context_warm_p95_ms = 111
             context_cold_p95_ms = 333
             context_store_size_target = 42
+
+            [classifier]
+            mode = "on"
+            backend = "claude"
+            model = "claude-haiku-4-5-20251001"
+            batch_limit = 5
+            min_interval = "12h"
+            timeout_seconds = 30
+            apply_confidence = "medium"
             "#,
             env,
         )
@@ -1302,6 +1514,19 @@ mod tests {
                 context_warm_p95_ms: 111,
                 context_cold_p95_ms: 333,
                 context_store_size_target: 42,
+            }
+        );
+        assert_eq!(
+            loaded.config.classifier,
+            ClassifierConfig {
+                mode: "on".to_owned(),
+                backend: Some("claude".to_owned()),
+                command: Vec::new(),
+                model: Some("claude-haiku-4-5-20251001".to_owned()),
+                batch_limit: 5,
+                min_interval: "12h".to_owned(),
+                timeout_seconds: 30,
+                apply_confidence: "medium".to_owned(),
             }
         );
     }
@@ -1469,6 +1694,73 @@ mod tests {
         .expect_err("config fails");
 
         assert_eq!(err, ConfigError::InvalidStoreName("Bad".to_owned()));
+    }
+
+    #[test]
+    fn classifier_unknown_key_warns() {
+        let loaded = LoadedConfig::from_str_with_env(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "/tmp/personal"
+
+            [classifier]
+            bogus = true
+            "#,
+            env,
+        )
+        .expect("config loads");
+
+        assert_eq!(
+            loaded.warnings,
+            vec![ConfigWarning::UnknownSubkey("classifier.bogus".to_owned())]
+        );
+    }
+
+    #[test]
+    fn classifier_invalid_mode_errors() {
+        let err = LoadedConfig::from_str_with_env(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "/tmp/personal"
+
+            [classifier]
+            mode = "sometimes"
+            "#,
+            env,
+        )
+        .expect_err("config fails");
+
+        assert!(matches!(
+            err,
+            ConfigError::InvalidValue { key, value, .. }
+                if key == "classifier.mode" && value == "sometimes"
+        ));
+    }
+
+    #[test]
+    fn classifier_command_backend_requires_command() {
+        let err = LoadedConfig::from_str_with_env(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "/tmp/personal"
+
+            [classifier]
+            backend = "command"
+            "#,
+            env,
+        )
+        .expect_err("config fails");
+
+        assert!(matches!(
+            err,
+            ConfigError::InvalidValue { key, .. } if key == "classifier.command"
+        ));
     }
 
     #[test]

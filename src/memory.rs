@@ -80,6 +80,8 @@ pub enum MemoryError {
     Note(String),
     /// Event rendering or writing failed after the note path was selected.
     Event(String),
+    /// A memory kind was incompatible with its record scope/project metadata.
+    InvalidKindContext(String),
 }
 
 impl Display for MemoryError {
@@ -88,6 +90,7 @@ impl Display for MemoryError {
             Self::CollisionLimit => write!(f, "could not find a unique memory id"),
             Self::Note(message) => write!(f, "failed to write note: {message}"),
             Self::Event(message) => write!(f, "failed to write event: {message}"),
+            Self::InvalidKindContext(message) => write!(f, "{message}"),
         }
     }
 }
@@ -133,6 +136,7 @@ pub fn write_record(input: WriteRecordInput<'_>) -> Result<WriteRecordResult, Me
                     tags: input.tags.clone(),
                     confidence: input.confidence,
                     kind: input.kind,
+                    classified: None,
                     audience: input.audience.clone(),
                     body: input.body.clone(),
                     note_path: Some(note_relative_path.clone()),
@@ -167,6 +171,7 @@ pub fn write_record(input: WriteRecordInput<'_>) -> Result<WriteRecordResult, Me
             related_event_id: input.write_event.then(|| id.clone()),
             expires_at: None,
             kind: input.kind,
+            classified: None,
             audience: input.audience.clone(),
         };
         let note_result =
@@ -195,6 +200,40 @@ pub fn write_record(input: WriteRecordInput<'_>) -> Result<WriteRecordResult, Me
     Err(MemoryError::CollisionLimit)
 }
 
+/// Validate that a persisted kind is compatible with record metadata.
+///
+/// `project-fact` only has safe injection semantics when a project filter is
+/// available. Centralizing the check keeps write, retag, and background LLM
+/// classification from drifting into subtly different definitions.
+pub fn validate_kind_context(
+    kind: Option<note::MemoryKind>,
+    scope: &str,
+    project_id: Option<&str>,
+) -> Result<(), MemoryError> {
+    if kind != Some(note::MemoryKind::ProjectFact) {
+        return Ok(());
+    }
+
+    if scope == "project" && project_id.is_some() {
+        return Ok(());
+    }
+
+    Err(MemoryError::InvalidKindContext(
+        "`--kind project-fact` requires `--scope project` and a resolved project id".to_owned(),
+    ))
+}
+
+/// How to update stored provenance alongside a kind verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClassifiedUpdate {
+    /// Leave existing provenance untouched.
+    Keep,
+    /// Remove provenance entirely.
+    Clear,
+    /// Persist this provenance.
+    Set(note::ClassifiedBy),
+}
+
 /// Input for retagging one existing record's memory kind.
 ///
 /// Retag exists so a wrong write-time inference is correctable: kind is a
@@ -208,6 +247,8 @@ pub struct RetagRecordInput<'a> {
     pub note_path: &'a str,
     /// New kind; `None` clears the tag so read-time classification applies.
     pub kind: Option<note::MemoryKind>,
+    /// Provenance update applied together with the kind.
+    pub classified: ClassifiedUpdate,
     /// Atomic write durability options.
     pub options: write::AtomicWriteOptions,
 }
@@ -241,8 +282,14 @@ pub fn retag_record(input: RetagRecordInput<'_>) -> Result<RetagRecordResult, Me
         .map_err(|err| MemoryError::Note(format!("read {}: {err}", note_path.display())))?;
     let mut parsed =
         note::parse_note(&contents).map_err(|err| MemoryError::Note(err.to_string()))?;
+    validate_kind_context(
+        input.kind,
+        &parsed.front_matter.scope,
+        parsed.front_matter.project_id.as_deref(),
+    )?;
     let previous_kind = parsed.front_matter.kind;
     parsed.front_matter.kind = input.kind;
+    apply_classified_update(&mut parsed.front_matter.classified, &input.classified);
     let rendered = note::render_note(&parsed).map_err(|err| MemoryError::Note(err.to_string()))?;
     write::write_atomic(&note_path, rendered.as_bytes(), &input.options)
         .map_err(|err| MemoryError::Note(err.to_string()))?;
@@ -261,6 +308,7 @@ pub fn retag_record(input: RetagRecordInput<'_>) -> Result<RetagRecordResult, Me
             let mut event = event::parse_event(&event_contents)
                 .map_err(|err| MemoryError::Event(err.to_string()))?;
             event.kind = input.kind;
+            apply_classified_update(&mut event.classified, &input.classified);
             let rendered_event =
                 event::render_event(&event).map_err(|err| MemoryError::Event(err.to_string()))?;
             write::write_atomic(&event_path, rendered_event.as_bytes(), &input.options)
@@ -283,6 +331,14 @@ pub fn retag_record(input: RetagRecordInput<'_>) -> Result<RetagRecordResult, Me
         note_path,
         event_path,
     })
+}
+
+fn apply_classified_update(target: &mut Option<note::ClassifiedBy>, update: &ClassifiedUpdate) {
+    match update {
+        ClassifiedUpdate::Keep => {}
+        ClassifiedUpdate::Clear => *target = None,
+        ClassifiedUpdate::Set(classified) => *target = Some(classified.clone()),
+    }
 }
 
 #[cfg(test)]
@@ -365,6 +421,7 @@ mod tests {
             root: &root,
             note_path: &relative(&root, &written.note_path),
             kind: Some(note::MemoryKind::Incident),
+            classified: ClassifiedUpdate::Keep,
             options: options(),
         })
         .expect("retag");
@@ -391,6 +448,7 @@ mod tests {
             root: &root,
             note_path: &relative(&root, &written.note_path),
             kind: None,
+            classified: ClassifiedUpdate::Clear,
             options: options(),
         })
         .expect("retag");
@@ -411,6 +469,7 @@ mod tests {
             root: &root,
             note_path: &relative(&root, &written.note_path),
             kind: Some(note::MemoryKind::Reference),
+            classified: ClassifiedUpdate::Keep,
             options: options(),
         })
         .expect("retag");
@@ -429,8 +488,93 @@ mod tests {
             root: &root,
             note_path: "inbox/notes/2026-05-16/missing.md",
             kind: Some(note::MemoryKind::Incident),
+            classified: ClassifiedUpdate::Keep,
             options: options(),
         });
         assert!(matches!(result, Err(MemoryError::Note(_))));
+    }
+
+    #[test]
+    fn retag_persists_provenance_on_note_and_event() {
+        let root = temp_dir("retag-provenance");
+        let written = write(&root, None, true);
+        let classified = note::ClassifiedBy {
+            source: note::ClassifierSource::Manual,
+            backend: None,
+            at: "2026-06-12T00:00:00Z".to_owned(),
+            verdict_version: 0,
+            confidence: None,
+        };
+
+        retag_record(RetagRecordInput {
+            root: &root,
+            note_path: &relative(&root, &written.note_path),
+            kind: Some(note::MemoryKind::Preference),
+            classified: ClassifiedUpdate::Set(classified.clone()),
+            options: options(),
+        })
+        .expect("retag");
+
+        let note = note::parse_note(&fs::read_to_string(&written.note_path).expect("read note"))
+            .expect("parse note");
+        assert_eq!(note.front_matter.classified, Some(classified.clone()));
+        let created_at = OffsetDateTime::parse(
+            &note.front_matter.created_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("created_at");
+        let event_path = root.join(event::event_relative_path(
+            &note.front_matter.id,
+            created_at,
+        ));
+        let event = event::parse_event(&fs::read_to_string(event_path).expect("read event"))
+            .expect("parse event");
+        assert_eq!(event.classified, Some(classified));
+    }
+
+    #[test]
+    fn retag_clears_provenance_on_note_and_event() {
+        let root = temp_dir("retag-clear-provenance");
+        let written = write(&root, None, true);
+        let classified = note::ClassifiedBy {
+            source: note::ClassifierSource::Manual,
+            backend: None,
+            at: "2026-06-12T00:00:00Z".to_owned(),
+            verdict_version: 0,
+            confidence: None,
+        };
+        retag_record(RetagRecordInput {
+            root: &root,
+            note_path: &relative(&root, &written.note_path),
+            kind: Some(note::MemoryKind::Preference),
+            classified: ClassifiedUpdate::Set(classified),
+            options: options(),
+        })
+        .expect("set provenance");
+
+        retag_record(RetagRecordInput {
+            root: &root,
+            note_path: &relative(&root, &written.note_path),
+            kind: None,
+            classified: ClassifiedUpdate::Clear,
+            options: options(),
+        })
+        .expect("clear provenance");
+
+        let note = note::parse_note(&fs::read_to_string(&written.note_path).expect("read note"))
+            .expect("parse note");
+        assert_eq!(note.front_matter.classified, None);
+        let created_at = OffsetDateTime::parse(
+            &note.front_matter.created_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("created_at");
+        let event_path = root.join(event::event_relative_path(
+            &note.front_matter.id,
+            created_at,
+        ));
+        let event = event::parse_event(&fs::read_to_string(event_path).expect("read event"))
+            .expect("parse event");
+        assert_eq!(event.classified, None);
     }
 }

@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Fake LLM backend for tests. Reads the prompt on stdin, answers from env:
+#   FAKE_LLM_KIND        verdict kind (default "incident")
+#   FAKE_LLM_CONFIDENCE  verdict confidence (default "high")
+#   FAKE_LLM_MODE        ok | garbage | fail | hang
+set -u
+cat >/dev/null
+case "${FAKE_LLM_MODE:-ok}" in
+  ok)
+    printf 'Here is my analysis.\n{"kind": "%s", "confidence": "%s"}\n' \
+      "${FAKE_LLM_KIND:-incident}" "${FAKE_LLM_CONFIDENCE:-high}"
+    ;;
+  garbage) printf 'no json here\n' ;;
+  fail)
+    echo "backend exploded" >&2
+    exit 1
+    ;;
+  hang) sleep 600 ;;
+esac
