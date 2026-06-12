@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Fake LLM backend that refuses poisoned records. Reads the prompt on stdin;
+# when it contains the marker POISON it fails like a crashing backend,
+# otherwise it answers with a fixed verdict. This lets in-process tests steer
+# per-record failures without mutating process-wide environment variables.
+set -u
+prompt="$(cat)"
+case "$prompt" in
+  *POISON*)
+    echo "poisoned record refused" >&2
+    exit 1
+    ;;
+esac
+printf '{"kind": "incident", "confidence": "high"}\n'

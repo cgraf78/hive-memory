@@ -14,6 +14,12 @@ use time::OffsetDateTime;
 
 const STALE_LOCK: Duration = Duration::from_secs(60 * 60);
 
+/// Attempts one record gets per run before the worker moves past it. Without
+/// this cap a single poisoned record (oversized body hitting the timeout, a
+/// body that crashes the CLI) would sit at the head of the oldest-first queue
+/// and re-abort every future run, permanently blocking everything behind it.
+const MAX_ENTRY_ATTEMPTS: usize = 2;
+
 #[derive(Debug, Clone, Copy, Default)]
 struct ReportCounts {
     pending: usize,
@@ -58,6 +64,11 @@ pub struct RunReport {
     pub marked_only: usize,
     /// Failed backend invocations.
     pub errors: usize,
+    /// Diagnostic text from the most recent backend failure, so doctor and
+    /// JSON consumers can distinguish quota/auth exhaustion from crashes.
+    /// `default` keeps stamps written before this field readable.
+    #[serde(default)]
+    pub last_error: Option<String>,
     /// RFC3339 timestamp for the run.
     pub at: String,
 }
@@ -236,15 +247,21 @@ pub fn run(input: RunInput<'_>) -> RunReport {
 
     let mut backend_index = 0usize;
     let mut consecutive_errors = 0usize;
+    let mut entry_attempts = 0usize;
     let mut judged = 0usize;
     let mut applied = 0usize;
     let mut marked_only = 0usize;
     let mut errors = 0usize;
+    let mut last_error: Option<String> = None;
     let mut last_backend = input.backends.first().map(|backend| backend.label.clone());
     let mut outcome = Outcome::Ran;
 
     let mut index = 0usize;
     while index < batch.len() {
+        // A slow run with retries can legitimately outlive STALE_LOCK
+        // (batch_limit * timeout alone can exceed it), so refresh the lock
+        // mtime each iteration to keep other workers from stealing it.
+        lock.touch();
         let backend = &input.backends[backend_index];
         last_backend = Some(backend.label.clone());
         let entry = batch[index];
@@ -260,9 +277,19 @@ pub fn run(input: RunInput<'_>) -> RunReport {
                 consecutive_errors = 0;
                 verdict
             }
-            Err(_) => {
+            Err(err) => {
                 errors += 1;
                 consecutive_errors += 1;
+                entry_attempts += 1;
+                last_error = Some(format!("{}: {err}", backend.label));
+                if entry_attempts >= MAX_ENTRY_ATTEMPTS {
+                    // Move past a likely poisoned record; it stays pending for
+                    // future runs but no longer blocks the rest of the queue.
+                    // Deliberately do NOT reset consecutive_errors here: a dead
+                    // backend must still rotate instead of burning the batch.
+                    index += 1;
+                    entry_attempts = 0;
+                }
                 if consecutive_errors >= 3 {
                     backend_index += 1;
                     consecutive_errors = 0;
@@ -306,9 +333,10 @@ pub fn run(input: RunInput<'_>) -> RunReport {
             }
         }
         index += 1;
+        entry_attempts = 0;
     }
 
-    let output = report(
+    let mut output = report(
         outcome,
         last_backend,
         ReportCounts {
@@ -320,6 +348,7 @@ pub fn run(input: RunInput<'_>) -> RunReport {
         },
         now,
     );
+    output.last_error = last_error;
     write_stamp_if_needed(&stamp, &output, input.dry_run, &input.options);
     drop(lock);
     output
@@ -401,6 +430,7 @@ fn report(
         applied: counts.applied,
         marked_only: counts.marked_only,
         errors: counts.errors,
+        last_error: None,
         at: rfc3339(at),
     }
 }
@@ -435,6 +465,15 @@ impl LockGuard {
             }
             Err(err) => Err(err),
         }
+    }
+
+    /// Refresh the lock mtime so `lock_is_stale` keeps seeing a live worker.
+    ///
+    /// Staleness is mtime-based and the file is otherwise only written at
+    /// acquire time, so a long run must heartbeat or a second worker would
+    /// steal the lock mid-run and judge the same records concurrently.
+    fn touch(&self) {
+        let _ = fs::write(&self.path, format!("{}\n", std::process::id()));
     }
 }
 
@@ -629,5 +668,149 @@ mod tests {
             "personal",
             now
         ));
+    }
+
+    fn poison_config(dir: &Path) -> config::Config {
+        let fixture = format!(
+            "{}/tests/fixtures/fake-llm-poison",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        config::LoadedConfig::from_str_with_env(
+            &format!(
+                r#"
+                default_store = "personal"
+                state_dir = "{state}"
+                cache_dir = "{cache}"
+
+                [stores.personal]
+                root = "{root}"
+
+                [classifier]
+                mode = "on"
+                backend = "command"
+                command = ["{fixture}"]
+                timeout_seconds = 5
+                "#,
+                state = dir.join("state").display(),
+                cache = dir.join("cache").display(),
+                root = dir.join("store").display(),
+            ),
+            |_| None,
+        )
+        .expect("config loads")
+        .config
+    }
+
+    fn run_input<'a>(
+        config: &'a config::Config,
+        store_root: &'a Path,
+        entries: &'a [index::IndexEntry],
+    ) -> RunInput<'a> {
+        RunInput {
+            config,
+            store_name: "personal",
+            store_root,
+            store_sensitivity: config::Sensitivity::Private,
+            entries,
+            backends: configured_backends(config),
+            force: true,
+            dry_run: false,
+            limit: None,
+            options: write::AtomicWriteOptions {
+                fsync: write::FsyncPolicy::Never,
+                ..write::AtomicWriteOptions::default()
+            },
+        }
+    }
+
+    #[test]
+    fn run_skips_poisoned_record_and_continues() {
+        let dir = temp_dir("poison-skip");
+        let config = poison_config(&dir);
+        let mut poisoned = entry(None, None);
+        poisoned.id = "poisoned".to_owned();
+        poisoned.created_at = "2026-06-10T00:00:00Z".to_owned();
+        poisoned.body = "POISON record the backend cannot judge".to_owned();
+        let mut healthy = entry(None, None);
+        healthy.id = "healthy".to_owned();
+        healthy.created_at = "2026-06-11T00:00:00Z".to_owned();
+        let entries = vec![poisoned, healthy];
+
+        let report = run(run_input(&config, &dir.join("store"), &entries));
+
+        // The poisoned head of the queue burns MAX_ENTRY_ATTEMPTS errors,
+        // then the worker moves on and still judges the record behind it.
+        assert_eq!(report.outcome, Outcome::Ran);
+        assert_eq!(report.errors, MAX_ENTRY_ATTEMPTS);
+        assert_eq!(report.judged, 1);
+        assert_eq!(report.applied, 1);
+        assert_eq!(report.pending, 2);
+        let last_error = report.last_error.expect("last error");
+        assert!(
+            last_error.contains("poisoned record refused"),
+            "missing stderr excerpt: {last_error}"
+        );
+    }
+
+    #[test]
+    fn run_aborts_when_every_record_fails_on_all_backends() {
+        let dir = temp_dir("poison-abort");
+        let config = poison_config(&dir);
+        let mut first = entry(None, None);
+        first.id = "poisoned-1".to_owned();
+        first.created_at = "2026-06-10T00:00:00Z".to_owned();
+        first.body = "POISON one".to_owned();
+        let mut second = entry(None, None);
+        second.id = "poisoned-2".to_owned();
+        second.created_at = "2026-06-11T00:00:00Z".to_owned();
+        second.body = "POISON two".to_owned();
+        let entries = vec![first, second];
+
+        let report = run(run_input(&config, &dir.join("store"), &entries));
+
+        // Entry skips must not reset the consecutive-error counter, or a dead
+        // backend would burn the whole batch instead of rotating/aborting.
+        assert_eq!(report.outcome, Outcome::Aborted);
+        assert_eq!(report.errors, 3);
+        assert_eq!(report.judged, 0);
+        assert!(report.last_error.is_some());
+    }
+
+    #[test]
+    fn lock_touch_refreshes_staleness() {
+        let state = temp_dir("lock-touch");
+        let lock = LockGuard::acquire(&state, "personal")
+            .expect("acquire io")
+            .expect("acquire lock");
+        let path = lock_path(&state, "personal");
+
+        backdate(&path, STALE_LOCK + Duration::from_secs(60));
+        assert!(lock_is_stale(&path));
+
+        lock.touch();
+        assert!(!lock_is_stale(&path));
+    }
+
+    /// Set a file's mtime into the past without sleeping in the test.
+    fn backdate(path: &Path, age: Duration) {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("path without NUL");
+        let then = SystemTime::now() - age;
+        let secs = then
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("after epoch")
+            .as_secs() as libc::time_t;
+        let times = [
+            libc::timeval {
+                tv_sec: secs,
+                tv_usec: 0,
+            },
+            libc::timeval {
+                tv_sec: secs,
+                tv_usec: 0,
+            },
+        ];
+        let result = unsafe { libc::utimes(c_path.as_ptr(), times.as_ptr()) };
+        assert_eq!(result, 0, "utimes failed");
     }
 }

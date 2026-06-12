@@ -2984,10 +2984,15 @@ fn run_classify(args: ClassifyArgs, context: CliContext) -> Result<()> {
             run_report.marked_only,
             run_report.errors
         ),
-        classify::Outcome::Aborted => println!(
-            "classifier aborted after {} backend errors; records remain pending",
-            run_report.errors
-        ),
+        classify::Outcome::Aborted => {
+            println!(
+                "classifier aborted after {} backend errors; records remain pending",
+                run_report.errors
+            );
+            if let Some(last_error) = &run_report.last_error {
+                println!("last error: {last_error}");
+            }
+        }
         classify::Outcome::SkippedDisabled => println!("classifier: disabled"),
         classify::Outcome::SkippedNoBackend => println!("classifier: no backend detected"),
         classify::Outcome::SkippedLocked => println!("classifier: already running"),

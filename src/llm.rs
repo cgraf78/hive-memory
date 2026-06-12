@@ -124,6 +124,16 @@ pub enum LlmError {
     InvalidOutput,
 }
 
+impl std::fmt::Display for LlmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout => write!(f, "backend timed out"),
+            Self::Backend(message) => write!(f, "{message}"),
+            Self::InvalidOutput => write!(f, "backend produced no parseable verdict"),
+        }
+    }
+}
+
 /// Pick one backend: explicit config first, then PATH probe in adapter order.
 ///
 /// `path_override` exists for tests; production passes `None` to use `$PATH`.
@@ -213,7 +223,7 @@ pub fn invoke_with_env(
         .args(&backend.argv[1..])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
@@ -234,27 +244,42 @@ pub fn invoke_with_env(
 
     let output = wait_with_timeout(child, timeout)?;
     if !output.status.success() {
-        return Err(LlmError::Backend(format!(
-            "exit status {:?}",
-            output.status.code()
-        )));
+        // Surface a stderr excerpt: quota/auth failures from agent CLIs are
+        // textual, and a bare exit code makes the doctor report unactionable.
+        let stderr = stderr_excerpt(&output.stderr);
+        return Err(LlmError::Backend(if stderr.is_empty() {
+            format!("exit status {:?}", output.status.code())
+        } else {
+            format!("exit status {:?}: {stderr}", output.status.code())
+        }));
     }
     parse_verdict(&String::from_utf8_lossy(&output.stdout)).ok_or(LlmError::InvalidOutput)
+}
+
+/// Collapse backend stderr into a short single-line diagnostic excerpt.
+fn stderr_excerpt(stderr: &[u8]) -> String {
+    const MAX_LEN: usize = 240;
+    let text = String::from_utf8_lossy(stderr);
+    let mut excerpt: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if excerpt.len() > MAX_LEN {
+        let cut = (0..=MAX_LEN)
+            .rev()
+            .find(|index| excerpt.is_char_boundary(*index))
+            .unwrap_or(0);
+        excerpt.truncate(cut);
+        excerpt.push('…');
+    }
+    excerpt
 }
 
 fn wait_with_timeout(
     mut child: std::process::Child,
     timeout: Duration,
 ) -> Result<std::process::Output, LlmError> {
-    let stdout = child.stdout.take();
-    let reader = std::thread::spawn(move || -> Vec<u8> {
-        use std::io::Read;
-        let mut buffer = Vec::new();
-        if let Some(mut stdout) = stdout {
-            let _ = stdout.read_to_end(&mut buffer);
-        }
-        buffer
-    });
+    // Both pipes get dedicated reader threads so a backend that fills either
+    // buffer cannot deadlock against the timeout poll below.
+    let stdout_reader = spawn_pipe_reader(child.stdout.take());
+    let stderr_reader = spawn_pipe_reader(child.stderr.take());
 
     let deadline = std::time::Instant::now() + timeout;
     let status = loop {
@@ -265,47 +290,79 @@ fn wait_with_timeout(
                 // leave helper descendants holding stdout open after timeout.
                 unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
                 let _ = child.wait();
-                let _ = reader.join();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
                 return Err(LlmError::Timeout);
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(50)),
             Err(err) => return Err(LlmError::Backend(format!("wait: {err}"))),
         }
     };
-    let stdout = reader.join().unwrap_or_default();
     Ok(std::process::Output {
         status,
-        stdout,
-        stderr: Vec::new(),
+        stdout: stdout_reader.join().unwrap_or_default(),
+        stderr: stderr_reader.join().unwrap_or_default(),
     })
 }
 
-/// Extract and validate the first JSON object found in backend stdout.
-pub fn parse_verdict(stdout: &str) -> Option<Verdict> {
-    #[derive(Deserialize)]
-    struct RawVerdict {
-        kind: String,
-        confidence: String,
-    }
+fn spawn_pipe_reader<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || -> Vec<u8> {
+        let mut buffer = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut buffer);
+        }
+        buffer
+    })
+}
 
-    let start = stdout.find('{')?;
+/// Extract and validate the first JSON verdict object found in backend stdout.
+///
+/// Chatty backends can print non-verdict JSON (progress events, envelopes)
+/// before or around the answer, so every `{` is a candidate start: scanning
+/// resumes one character past a failed candidate, which also reaches verdicts
+/// nested inside a larger JSON envelope.
+pub fn parse_verdict(stdout: &str) -> Option<Verdict> {
+    let mut search_from = 0;
+    while let Some(offset) = stdout[search_from..].find('{') {
+        let start = search_from + offset;
+        if let Some(end) = object_end(stdout, start)
+            && let Some(verdict) = parse_verdict_object(&stdout[start..end])
+        {
+            return Some(verdict);
+        }
+        search_from = start + 1;
+    }
+    None
+}
+
+/// Find the end (exclusive) of the brace-balanced span starting at `start`.
+fn object_end(stdout: &str, start: usize) -> Option<usize> {
     let mut depth = 0usize;
-    let mut end = None;
     for (offset, ch) in stdout[start..].char_indices() {
         match ch {
             '{' => depth += 1,
             '}' => {
                 depth = depth.checked_sub(1)?;
                 if depth == 0 {
-                    end = Some(start + offset + 1);
-                    break;
+                    return Some(start + offset + 1);
                 }
             }
             _ => {}
         }
     }
+    None
+}
 
-    let raw: RawVerdict = serde_json::from_str(&stdout[start..end?]).ok()?;
+fn parse_verdict_object(candidate: &str) -> Option<Verdict> {
+    #[derive(Deserialize)]
+    struct RawVerdict {
+        kind: String,
+        confidence: String,
+    }
+
+    let raw: RawVerdict = serde_json::from_str(candidate).ok()?;
     let kind = match raw.kind.as_str() {
         "preference" => VerdictKind::Kind(note::MemoryKind::Preference),
         "project-fact" => VerdictKind::Kind(note::MemoryKind::ProjectFact),
@@ -393,6 +450,37 @@ mod tests {
     }
 
     #[test]
+    fn skips_leading_non_verdict_json_object() {
+        let verdict = parse_verdict(
+            "{\"event\": \"start\"}\n{\"kind\": \"incident\", \"confidence\": \"medium\"}\n",
+        )
+        .expect("verdict");
+
+        assert_eq!(verdict.kind, VerdictKind::Kind(note::MemoryKind::Incident));
+        assert_eq!(verdict.confidence, VerdictConfidence::Medium);
+    }
+
+    #[test]
+    fn finds_verdict_nested_in_json_envelope() {
+        let verdict = parse_verdict(
+            "{\"result\": {\"kind\": \"reference\", \"confidence\": \"high\"}, \"ok\": true}",
+        )
+        .expect("verdict");
+
+        assert_eq!(verdict.kind, VerdictKind::Kind(note::MemoryKind::Reference));
+    }
+
+    #[test]
+    fn stderr_excerpt_collapses_and_truncates() {
+        assert_eq!(stderr_excerpt(b"  quota \n exceeded \n"), "quota exceeded");
+
+        let long = "x".repeat(500);
+        let excerpt = stderr_excerpt(long.as_bytes());
+        assert_eq!(excerpt.chars().count(), 241);
+        assert!(excerpt.ends_with('…'));
+    }
+
+    #[test]
     fn invoke_runs_fake_backend() {
         let backend = Backend::command(vec![fixture_path("fake-llm")]);
         let verdict =
@@ -418,15 +506,22 @@ mod tests {
     fn invoke_surfaces_nonzero_exit_and_garbage() {
         let backend = Backend::command(vec![fixture_path("fake-llm")]);
 
-        assert!(matches!(
-            invoke_with_env(
-                &backend,
-                "p",
-                Duration::from_secs(10),
-                &[("FAKE_LLM_MODE", "fail")]
-            ),
-            Err(LlmError::Backend(_))
-        ));
+        // Backend errors must carry the stderr excerpt: quota and auth
+        // failures from agent CLIs are only diagnosable from that text.
+        match invoke_with_env(
+            &backend,
+            "p",
+            Duration::from_secs(10),
+            &[("FAKE_LLM_MODE", "fail")],
+        ) {
+            Err(LlmError::Backend(message)) => {
+                assert!(
+                    message.contains("backend exploded"),
+                    "missing stderr excerpt: {message}"
+                );
+            }
+            other => panic!("expected backend error, got {other:?}"),
+        }
         assert!(matches!(
             invoke_with_env(
                 &backend,

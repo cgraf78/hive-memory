@@ -251,13 +251,19 @@ fn check_classifier(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
         let stamp_path = classify::stamp_path(&config.state_dir, store_name);
         match read_classifier_stamp(&stamp_path) {
             Some(report) => {
-                let message = format!(
+                let mut message = format!(
                     "classifier last run for store {store_name}: outcome={} judged={} applied={} errors={}",
                     outcome_label(report.outcome),
                     report.judged,
                     report.applied,
                     report.errors
                 );
+                // The stamp's error excerpt is the only place quota/auth
+                // failure text survives the detached worker; without it this
+                // warning is unactionable.
+                if let Some(last_error) = &report.last_error {
+                    message.push_str(&format!("; last error: {last_error}"));
+                }
                 if report.outcome == classify::Outcome::Aborted
                     || (report.outcome == classify::Outcome::Ran
                         && report.errors > 0
@@ -266,7 +272,10 @@ fn check_classifier(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
                     checks.push(warn(
                         format!("classifier.{store_name}.last-run"),
                         message,
-                        vec![stamp_path.display().to_string()],
+                        vec![
+                            stamp_path.display().to_string(),
+                            "reproduce with: hm classify --dry-run --limit 1".to_owned(),
+                        ],
                     ));
                 } else {
                     checks.push(pass(
