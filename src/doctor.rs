@@ -210,25 +210,27 @@ fn check_classifier(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
         Vec::new(),
     ));
 
-    let backends = classify::configured_backends(config);
     if config.classifier.mode == "off" {
         checks.push(pass(
             "classifier.backend",
-            "classifier disabled; backend probing skipped",
-            Vec::new(),
-        ));
-    } else if let Some(backend) = backends.first() {
-        checks.push(pass(
-            "classifier.backend",
-            format!("classifier backend available: {}", backend.label),
+            "automatic classifier disabled; backend probing skipped",
             Vec::new(),
         ));
     } else {
-        checks.push(pass(
-            "classifier.backend",
-            "classifier backend: none detected (classification idle)",
-            Vec::new(),
-        ));
+        let backends = classify::configured_backends(config);
+        if let Some(backend) = backends.first() {
+            checks.push(pass(
+                "classifier.backend",
+                format!("classifier backend available: {}", backend.label),
+                Vec::new(),
+            ));
+        } else {
+            checks.push(pass(
+                "classifier.backend",
+                "classifier backend: none detected (classification idle)",
+                Vec::new(),
+            ));
+        }
     }
 
     for (store_name, store_config) in &config.stores {

@@ -115,7 +115,7 @@ context_cold_p95_ms = 500
 context_store_size_target = 5000  # notes; budget is calibrated against this size
 
 [classifier]
-mode = "auto"          # auto|on|off
+mode = "off"           # auto|on|off
 batch_limit = 25
 min_interval = "6h"
 timeout_seconds = 60
@@ -145,7 +145,7 @@ Validation rules:
   `write_stores = [default_store]`, which preserves simple single-store installs.
 - local override config may replace scalar values and merge tables.
 - CLI flags and environment variables override merged config, not source files.
-- `[classifier]` defaults to `mode = "auto"`. Invalid `mode`, `backend`,
+- `[classifier]` defaults to `mode = "off"`. Invalid `mode`, `backend`,
   `apply_confidence`, non-positive limits/timeouts, invalid `min_interval`, or
   `backend = "command"` with an empty `command` are config errors.
 - In `mode = "auto"`, backend auto-detection only considers known backend labels

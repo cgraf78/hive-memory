@@ -222,7 +222,7 @@ context_cold_p95_ms = 500
 context_store_size_target = 5000
 
 [classifier]
-mode = "auto"          # auto|on|off
+mode = "off"           # auto|on|off
 batch_limit = 25
 min_interval = "6h"
 timeout_seconds = 60
@@ -446,17 +446,28 @@ Default config:
 
 ```toml
 [classifier]
-mode = "auto"
+mode = "off"
 batch_limit = 25
 min_interval = "6h"
 timeout_seconds = 60
 apply_confidence = "high"
 ```
 
+`mode = "off"` disables hook-spawned background classification. An explicit
+`hm classify` command can still run a foreground pass when a backend is
+available.
+
 In `mode = "auto"`, Hive Memory only auto-detects backend CLIs whose labels also
 appear in `[agents]` (`claude`, `codex`, or `gemini`). Those agents already
 receive memory through context injection, so classification does not create a
-new implicit reader. To use another installed CLI, opt in explicitly:
+new implicit reader. Enable detached hook-spawned classification with:
+
+```toml
+[classifier]
+mode = "auto"
+```
+
+To use another installed CLI, opt in explicitly:
 
 ```toml
 [classifier]
@@ -473,13 +484,19 @@ backend = "command"
 command = ["/path/to/classifier"]
 ```
 
-Preview without writing:
+Inspect pending records without invoking an LLM:
+
+```sh
+hm classify --pending --json
+```
+
+Judge through the configured backend without writing verdicts or stamps:
 
 ```sh
 hm classify --dry-run --json
 ```
 
-Disable completely:
+Disable hook-spawned classification:
 
 ```toml
 [classifier]

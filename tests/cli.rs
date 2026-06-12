@@ -3806,7 +3806,6 @@ fn classify_updates_relevance_selection_and_respects_manual_retag() {
             context_strategy = "relevance"
 
             [classifier]
-            mode = "on"
             backend = "command"
             command = ["{}"]
             batch_limit = 10
@@ -3858,6 +3857,26 @@ fn classify_updates_relevance_selection_and_respects_manual_retag() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Repo alpha deploy window"));
+
+    let auto_skipped = cargo_bin_cmd!("hm")
+        .env("FAKE_LLM_MODE", "fail")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "classify",
+            "--auto",
+            "--json",
+        ])
+        .output()
+        .expect("run auto classify with default mode");
+    assert!(
+        auto_skipped.status.success(),
+        "auto classify failed: {auto_skipped:?}"
+    );
+    let auto_skipped: serde_json::Value =
+        serde_json::from_slice(&auto_skipped.stdout).expect("auto classify json");
+    assert_eq!(auto_skipped["outcome"], "skipped-disabled");
+    assert_eq!(auto_skipped["judged"], 0);
 
     let classified = cargo_bin_cmd!("hm")
         .env("FAKE_LLM_KIND", "incident")
@@ -3964,6 +3983,23 @@ fn classify_updates_relevance_selection_and_respects_manual_retag() {
         ])
         .assert()
         .success();
+
+    let pending = cargo_bin_cmd!("hm")
+        .env("FAKE_LLM_MODE", "fail")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "classify",
+            "--pending",
+            "--json",
+        ])
+        .output()
+        .expect("run pending classify preview");
+    assert!(pending.status.success(), "pending failed: {pending:?}");
+    let pending: serde_json::Value = serde_json::from_slice(&pending.stdout).expect("pending json");
+    assert_eq!(pending["backend_invoked"], false);
+    assert_eq!(pending["pending"], 1);
+    assert_eq!(pending["records"][0]["id"], id.as_str());
 
     let dry_run = cargo_bin_cmd!("hm")
         .env("FAKE_LLM_KIND", "incident")

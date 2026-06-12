@@ -520,11 +520,14 @@ struct RetagArgs {
 #[derive(Debug, Args)]
 struct ClassifyArgs {
     /// Respect mode/interval/lock policy for hook-spawned runs.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "pending")]
     auto: bool,
-    /// Judge and report without persisting verdicts or stamps.
-    #[arg(long)]
+    /// Judge through the configured backend without persisting verdicts or stamps.
+    #[arg(long, conflicts_with = "pending")]
     dry_run: bool,
+    /// Show pending classifier records without invoking a backend.
+    #[arg(long)]
+    pending: bool,
     /// Override the per-run batch limit.
     #[arg(long)]
     limit: Option<u32>,
@@ -2807,6 +2810,36 @@ struct RetagJsonOutput {
     event_updated: bool,
 }
 
+/// JSON envelope for `hm classify --pending`.
+#[derive(Debug, Serialize)]
+struct ClassifyPendingJsonOutput {
+    /// Store inspected for pending records.
+    store: String,
+    /// Whether a backend was invoked. Always false for this read-only mode.
+    backend_invoked: bool,
+    /// Pending records before applying the display limit.
+    pending: usize,
+    /// Optional display cap supplied by `--limit`.
+    limit: Option<u32>,
+    /// Pending records shown in this response.
+    records: Vec<ClassifyPendingRecord>,
+}
+
+/// One pending classifier record in JSON output.
+#[derive(Debug, Serialize)]
+struct ClassifyPendingRecord {
+    /// Durable memory record id.
+    id: String,
+    /// Store-relative note path.
+    note_path: String,
+    /// Current persisted kind, when any.
+    kind: Option<&'static str>,
+    /// Memory scope.
+    scope: String,
+    /// Project id for project-scoped records.
+    project_id: Option<String>,
+}
+
 /// Correct the persisted kind on one existing record.
 ///
 /// This is the recovery path for wrong write-time inference: kind is a
@@ -2899,15 +2932,26 @@ fn run_retag(args: RetagArgs, context: CliContext) -> Result<()> {
 fn run_classify(args: ClassifyArgs, context: CliContext) -> Result<()> {
     let config = load_config(context.config_path.as_deref())?;
     let agent_id = resolve_agent_id(context.as_agent.clone());
+    let store_access = if args.pending {
+        StoreAccess::Read
+    } else {
+        StoreAccess::Write
+    };
     let resolved_store = resolve_store(
         &config,
         context.store.as_deref(),
         None,
         agent_id.as_deref(),
-        StoreAccess::Write,
+        store_access,
     )?;
     let store_config = &config.stores[resolved_store.name.as_str()];
     let report = rebuild_store_index(&config, &resolved_store.name)?;
+
+    if args.pending {
+        emit_classify_pending(&args, &resolved_store.name, &report.entries)?;
+        return Ok(());
+    }
+
     let backends = classify::configured_backends(&config);
     let options = write::AtomicWriteOptions {
         fsync: config.storage.fsync.into(),
@@ -2948,6 +2992,49 @@ fn run_classify(args: ClassifyArgs, context: CliContext) -> Result<()> {
         classify::Outcome::SkippedNoBackend => println!("classifier: no backend detected"),
         classify::Outcome::SkippedLocked => println!("classifier: already running"),
         classify::Outcome::SkippedFresh => println!("classifier: interval not elapsed"),
+    }
+    Ok(())
+}
+
+fn emit_classify_pending(
+    args: &ClassifyArgs,
+    store_name: &str,
+    entries: &[index::IndexEntry],
+) -> Result<()> {
+    let pending = classify::pending_entries(entries, hive_memory::llm::VERDICT_VERSION);
+    let limit = args.limit.map(|value| value as usize).unwrap_or(usize::MAX);
+    let records: Vec<ClassifyPendingRecord> = pending
+        .iter()
+        .take(limit)
+        .map(|entry| ClassifyPendingRecord {
+            id: entry.id.clone(),
+            note_path: entry.note_path.clone(),
+            kind: entry.kind.map(memory_kind_label),
+            scope: entry.scope.clone(),
+            project_id: entry.project_id.clone(),
+        })
+        .collect();
+
+    if args.json {
+        let output = ClassifyPendingJsonOutput {
+            store: store_name.to_owned(),
+            backend_invoked: false,
+            pending: pending.len(),
+            limit: args.limit,
+            records,
+        };
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("classifier pending: {}", pending.len());
+        for record in records {
+            println!(
+                "{}\t{}\t{}\t{}",
+                record.id,
+                record.kind.unwrap_or("none"),
+                record.scope,
+                record.note_path
+            );
+        }
     }
     Ok(())
 }

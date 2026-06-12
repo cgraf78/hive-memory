@@ -187,7 +187,7 @@ pub fn configured_backends(config: &config::Config) -> Vec<llm::Backend> {
 /// Run one bounded classification pass.
 pub fn run(input: RunInput<'_>) -> RunReport {
     let now = OffsetDateTime::now_utc();
-    if input.config.classifier.mode == "off"
+    if (!input.force && input.config.classifier.mode == "off")
         || input.store_sensitivity == config::Sensitivity::Secret
     {
         return report(Outcome::SkippedDisabled, None, ReportCounts::default(), now);
