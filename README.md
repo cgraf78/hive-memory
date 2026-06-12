@@ -220,6 +220,13 @@ archive_retention_days = 30
 context_warm_p95_ms = 200
 context_cold_p95_ms = 500
 context_store_size_target = 5000
+
+[classifier]
+mode = "auto"          # auto|on|off
+batch_limit = 25
+min_interval = "6h"
+timeout_seconds = 60
+apply_confidence = "high"
 ```
 
 Supported store sensitivity values are `public`, `internal`, `private`, and
@@ -416,9 +423,70 @@ hm doctor --json
 `hm doctor` checks config, store availability, required layout, generated
 gitignore files, sensitive-store permissions, cloud-root policy, project
 bindings, agent policies, outbox state, event pairing, agent-private audience,
-secret-looking note content, and prompt-risk patterns. `--quick` skips the
-heavier note/content checks for hook-safe use. `--fix` performs safe layout
-repairs, but does not initialize missing stores or rewrite user memory.
+classifier status, secret-looking note content, and prompt-risk patterns.
+`--quick` skips the heavier note/content checks for hook-safe use. `--fix`
+performs safe layout repairs, but does not initialize missing stores or rewrite
+user memory.
+
+## Automatic LLM Classification
+
+`hm classify` can run an optional background pass that asks an agent CLI to set
+the durable memory kind for remembered records. The result affects relevance
+mode context selection: for example, a project-scoped status note can be marked
+`incident` and stop appearing in every project session, while remaining
+searchable.
+
+The worker is deliberately outside hot paths. `hm remember`, `hm context`,
+`hm search`, and hook output do not invoke or probe an LLM. `hm hook stop` may
+spawn `hm classify --auto` as a detached child after checking only local stamp
+and lock files; the worker exits quietly when disabled, already running, fresh,
+or missing a backend.
+
+Default config:
+
+```toml
+[classifier]
+mode = "auto"
+batch_limit = 25
+min_interval = "6h"
+timeout_seconds = 60
+apply_confidence = "high"
+```
+
+In `mode = "auto"`, Hive Memory only auto-detects backend CLIs whose labels also
+appear in `[agents]` (`claude`, `codex`, or `gemini`). Those agents already
+receive memory through context injection, so classification does not create a
+new implicit reader. To use another installed CLI, opt in explicitly:
+
+```toml
+[classifier]
+mode = "on"
+backend = "gemini"
+```
+
+or provide a command that reads the prompt from stdin and prints a JSON verdict:
+
+```toml
+[classifier]
+mode = "on"
+backend = "command"
+command = ["/path/to/classifier"]
+```
+
+Preview without writing:
+
+```sh
+hm classify --dry-run --json
+```
+
+Disable completely:
+
+```toml
+[classifier]
+mode = "off"
+```
+
+Secret stores are never sent to any classifier backend, regardless of config.
 
 ## Trust and Privacy
 

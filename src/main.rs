@@ -8,9 +8,9 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use hive_memory::config::{Config, ConfigPaths, EventSidecarPolicy, Sensitivity, StoreConfig};
 use hive_memory::{
-    config, context as memory_context, curation, doctor, event, hook as memory_hook, id, index,
-    inject, memory, note, outbox, path as memory_path, project, search, secret, store, write,
-    write_classify,
+    classify, config, context as memory_context, curation, doctor, event, hook as memory_hook, id,
+    index, inject, memory, note, outbox, path as memory_path, project, search, secret, store,
+    write, write_classify,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -68,6 +68,8 @@ enum Command {
     SyncStatus(SyncStatusArgs),
     /// Correct the persisted memory kind on an existing record.
     Retag(RetagArgs),
+    /// Run the background LLM classification pass now.
+    Classify(ClassifyArgs),
     /// Refresh local outbox and indexes.
     Refresh(RefreshArgs),
     /// Flush local outbox writes to reachable stores.
@@ -514,6 +516,23 @@ struct RetagArgs {
     json: bool,
 }
 
+/// Arguments for `hm classify`.
+#[derive(Debug, Args)]
+struct ClassifyArgs {
+    /// Respect mode/interval/lock policy for hook-spawned runs.
+    #[arg(long)]
+    auto: bool,
+    /// Judge and report without persisting verdicts or stamps.
+    #[arg(long)]
+    dry_run: bool,
+    /// Override the per-run batch limit.
+    #[arg(long)]
+    limit: Option<u32>,
+    /// Emit machine-readable output.
+    #[arg(long)]
+    json: bool,
+}
+
 /// Arguments for `hm refresh`.
 #[derive(Debug, Args)]
 struct RefreshArgs {
@@ -625,6 +644,7 @@ fn run(cli: Cli) -> Result<()> {
         Some(Command::Context(args)) => run_context(args, context),
         Some(Command::SyncStatus(args)) => run_sync_status(args, context),
         Some(Command::Retag(args)) => run_retag(args, context),
+        Some(Command::Classify(args)) => run_classify(args, context),
         Some(Command::Refresh(args)) => run_refresh(args, context),
         Some(Command::Flush(args)) => run_flush(args, context),
         Some(Command::Outbox(OutboxCommand::Flush(args))) => run_flush(args, context),
@@ -655,6 +675,7 @@ impl Cli {
             Some(Command::Context(args)) => args.json,
             Some(Command::SyncStatus(args)) => args.json,
             Some(Command::Retag(args)) => args.json,
+            Some(Command::Classify(args)) => args.json,
             Some(Command::Refresh(args)) => args.json,
             Some(Command::Flush(args)) | Some(Command::Outbox(OutboxCommand::Flush(args))) => {
                 args.json
@@ -2875,6 +2896,62 @@ fn run_retag(args: RetagArgs, context: CliContext) -> Result<()> {
     Ok(())
 }
 
+fn run_classify(args: ClassifyArgs, context: CliContext) -> Result<()> {
+    let config = load_config(context.config_path.as_deref())?;
+    let agent_id = resolve_agent_id(context.as_agent.clone());
+    let resolved_store = resolve_store(
+        &config,
+        context.store.as_deref(),
+        None,
+        agent_id.as_deref(),
+        StoreAccess::Write,
+    )?;
+    let store_config = &config.stores[resolved_store.name.as_str()];
+    let report = rebuild_store_index(&config, &resolved_store.name)?;
+    let backends = classify::configured_backends(&config);
+    let options = write::AtomicWriteOptions {
+        fsync: config.storage.fsync.into(),
+        ..write::AtomicWriteOptions::default()
+    };
+    let run_report = classify::run(classify::RunInput {
+        config: &config,
+        store_name: &resolved_store.name,
+        store_root: &store_config.root,
+        store_sensitivity: store_config.sensitivity,
+        entries: &report.entries,
+        backends,
+        force: !args.auto,
+        dry_run: args.dry_run,
+        limit: args.limit,
+        options,
+    });
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&run_report)?);
+        return Ok(());
+    }
+
+    match run_report.outcome {
+        classify::Outcome::Ran => println!(
+            "classified: pending={} judged={} applied={} marked_only={} errors={}",
+            run_report.pending,
+            run_report.judged,
+            run_report.applied,
+            run_report.marked_only,
+            run_report.errors
+        ),
+        classify::Outcome::Aborted => println!(
+            "classifier aborted after {} backend errors; records remain pending",
+            run_report.errors
+        ),
+        classify::Outcome::SkippedDisabled => println!("classifier: disabled"),
+        classify::Outcome::SkippedNoBackend => println!("classifier: no backend detected"),
+        classify::Outcome::SkippedLocked => println!("classifier: already running"),
+        classify::Outcome::SkippedFresh => println!("classifier: interval not elapsed"),
+    }
+    Ok(())
+}
+
 fn run_sync_status(args: SyncStatusArgs, context: CliContext) -> Result<()> {
     let config = load_config(context.config_path.as_deref())?;
     let agent_id = resolve_agent_id(context.as_agent.clone());
@@ -3506,8 +3583,57 @@ fn run_hook_stop(args: HookStopArgs, context: CliContext) -> Result<()> {
         refresh: None,
     };
     emit_hook_response(&response, args.json)?;
+    maybe_spawn_classifier(&config, &context);
 
     Ok(())
+}
+
+fn maybe_spawn_classifier(config: &Config, context: &CliContext) {
+    let agent_id = resolve_agent_id(context.as_agent.clone());
+    let store_name = resolve_store(
+        config,
+        context.store.as_deref(),
+        None,
+        agent_id.as_deref(),
+        StoreAccess::Write,
+    )
+    .map(|resolved| resolved.name)
+    .unwrap_or_else(|_| config.default_store.clone());
+
+    if !classify::should_spawn(
+        &config.classifier.mode,
+        config.classifier_min_interval(),
+        &config.state_dir,
+        &store_name,
+        OffsetDateTime::now_utc(),
+    ) {
+        return;
+    }
+
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut command = std::process::Command::new(exe);
+    if let Some(config_path) = &context.config_path {
+        command.arg("--config").arg(config_path);
+    }
+    if let Some(store) = &context.store {
+        command.arg("--store").arg(store);
+    }
+    if let Some(agent) = &context.as_agent {
+        command.arg("--as-agent").arg(agent);
+    }
+    command
+        .arg("classify")
+        .arg("--auto")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let _ = command.spawn();
 }
 
 #[derive(Debug, Serialize)]

@@ -4,6 +4,7 @@
 //! future integrations need the same policy and storage behavior as the CLI
 //! without reimplementing context detection or shelling out to `hm`.
 
+pub mod classify;
 pub mod config;
 pub mod context;
 pub mod curated;
