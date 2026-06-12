@@ -7,7 +7,7 @@
 [[record]]
 id = "global-preference"
 scope = "global"
-body = "Chris prefers deterministic agent tooling over runtime-specific magic."
+body = "The maintainer prefers deterministic agent tooling over runtime-specific magic."
 expected_kind = "preference"
 
 [[record]]
@@ -105,5 +105,5 @@ high_value = true
 
 [[scope_record]]
 id = "generic-preference"
-body = "Chris prefers deterministic agent tooling."
+body = "The maintainer prefers deterministic agent tooling."
 expected_scope = ""

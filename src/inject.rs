@@ -6,18 +6,16 @@
 //! note body; it never writes, mutates, or reclassifies stored data, so it is
 //! fully reversible and safe to run against a cloud-synced, append-only store.
 //!
-//! Why a content heuristic at all: the existing store has no per-record "kind"
-//! signal, and we deliberately do NOT mutate it to add one (that would fight the
-//! mtime-based index and multi-machine sync). So legacy records must be judged
-//! from what they already carry. The heuristic is therefore intentionally
-//! CONSERVATIVE and asymmetric: it only withholds a record when it is clearly
-//! operational, and defaults to injecting otherwise. Dropping a preference the
-//! agent needed is far worse than leaving one stale incident in the context, so
-//! the classifier is tuned to never drop on ambiguity. A clearly marked
-//! incident gets caught; a marker-less one is left in (a miss), not a
-//! preference thrown out (a regression). An explicit `kind` field, added for
-//! new writes in a later change, is the durable fix that closes the residual
-//! gap safely; this heuristic is the bridge for untagged history.
+//! Why a content heuristic at all: the existing store has legacy records with
+//! no per-record "kind" signal, and we deliberately do NOT mutate them in
+//! place (that would fight the mtime-based index and multi-machine sync). So
+//! legacy records must be judged from what they already carry.
+//!
+//! The current asymmetric rule is: keep legacy global records only when they
+//! clearly read as durable behavior guidance, keep project-scoped records in
+//! their own project, and leave ambiguous global facts searchable rather than
+//! injecting them into every startup. Explicit `kind` remains authoritative and
+//! is the preferred long-term path for new writes.
 
 use crate::note::{EntryKind, MemoryKind};
 use crate::signals;
@@ -88,6 +86,8 @@ impl Default for IncidentMarkers {
 pub struct ClassifyInput<'a> {
     /// Memory scope (`global`, `project`, ...).
     pub scope: &'a str,
+    /// Project identity attached to the record, when present.
+    pub project_id: Option<&'a str>,
     /// Whether the record is a durable `remember` or a raw `note`.
     pub entry_kind: EntryKind,
     /// Explicit memory kind when the writer set one. Authoritative over the
@@ -99,24 +99,37 @@ pub struct ClassifyInput<'a> {
 
 /// Classify a candidate for session-start injection.
 ///
-/// Order matters and encodes the conservative bias:
+/// Order matters and encodes the startup-context bias:
 /// 1. Raw `note` material is search-only (mirrors the default that `hm note`
 ///    entries do not auto-inject).
-/// 2. An explicit `kind` is authoritative: the writer told us what this is, so
-///    trust it and skip the heuristic entirely. This is the safe way to catch
-///    records the content heuristic cannot (a marker-less incident, a plain
-///    reference) without guessing.
-/// 3. Otherwise fall back: project-scoped records defer to the project filter,
-///    and a global record is withheld ONLY when it reads as operational (a date
-///    AND an operational keyword), so a dated *preference* is not misread.
+/// 2. Point-in-time workflow state is search-only even if a legacy write tagged
+///    it otherwise; stale "do not merge" context is worse than having to search
+///    for old PR coordination.
+/// 3. An explicit `kind` is authoritative for search-only kinds and for
+///    project-scoped facts. Legacy preference tags attached to a specific
+///    project still need to read like behavior guidance; older inference was
+///    broader and mis-tagged some repo facts as always-on preferences.
+/// 4. Otherwise fall back: project-scoped records defer to the project filter,
+///    global records that clearly read as behavior guidance stay always-on, and
+///    all other ambiguous global records remain available through search.
 pub fn classify(input: ClassifyInput<'_>, markers: &IncidentMarkers) -> InjectClass {
     if input.entry_kind == EntryKind::Note {
         return InjectClass::SearchOnly;
     }
+    let lower = input.body.to_lowercase();
+    if signals::looks_transient_status(&lower) {
+        return InjectClass::SearchOnly;
+    }
     if let Some(kind) = input.kind {
         return match kind {
-            MemoryKind::Preference => InjectClass::AlwaysOn,
-            MemoryKind::ProjectFact => InjectClass::ProjectScoped,
+            MemoryKind::Preference
+                if input.project_id.is_none() || signals::reads_as_preference(&lower) =>
+            {
+                InjectClass::AlwaysOn
+            }
+            MemoryKind::Preference => InjectClass::SearchOnly,
+            MemoryKind::ProjectFact if input.scope == "project" => InjectClass::ProjectScoped,
+            MemoryKind::ProjectFact => InjectClass::SearchOnly,
             MemoryKind::Incident | MemoryKind::Reference => InjectClass::SearchOnly,
         };
     }
@@ -126,7 +139,10 @@ pub fn classify(input: ClassifyInput<'_>, markers: &IncidentMarkers) -> InjectCl
     if looks_operational(input.body, markers) {
         return InjectClass::SearchOnly;
     }
-    InjectClass::AlwaysOn
+    if signals::reads_as_preference(&lower) {
+        return InjectClass::AlwaysOn;
+    }
+    InjectClass::SearchOnly
 }
 
 /// True when the body reads as an operational log; see `signals` for the
@@ -142,6 +158,7 @@ mod tests {
     fn global(body: &str) -> ClassifyInput<'_> {
         ClassifyInput {
             scope: "global",
+            project_id: None,
             entry_kind: EntryKind::Remember,
             kind: None,
             body,
@@ -152,6 +169,7 @@ mod tests {
     fn raw_notes_are_search_only() {
         let input = ClassifyInput {
             scope: "global",
+            project_id: None,
             entry_kind: EntryKind::Note,
             kind: None,
             body: "a stray idea",
@@ -166,6 +184,7 @@ mod tests {
     fn project_scope_defers_to_project_filter() {
         let input = ClassifyInput {
             scope: "project",
+            project_id: Some("repo-alpha"),
             entry_kind: EntryKind::Remember,
             kind: None,
             body: "repo alpha deploys on tag push",
@@ -183,6 +202,7 @@ mod tests {
         // withheld once tagged.
         let tagged_incident = ClassifyInput {
             scope: "global",
+            project_id: None,
             entry_kind: EntryKind::Remember,
             kind: Some(MemoryKind::Incident),
             body: "the installer now rebuilds when the version is stale",
@@ -192,11 +212,57 @@ mod tests {
         // An explicit preference stays always-on even if it reads operational.
         let tagged_pref = ClassifyInput {
             scope: "global",
+            project_id: None,
             entry_kind: EntryKind::Remember,
             kind: Some(MemoryKind::Preference),
             body: "2026-06-06 root cause taught us to always run the linter",
         };
         assert_eq!(classify(tagged_pref, &markers), InjectClass::AlwaysOn);
+    }
+
+    #[test]
+    fn global_project_fact_kind_is_search_only() {
+        let tagged_global_fact = ClassifyInput {
+            scope: "global",
+            project_id: Some("repo-alpha"),
+            entry_kind: EntryKind::Remember,
+            kind: Some(MemoryKind::ProjectFact),
+            body: "Project alpha deploys on tag push.",
+        };
+        assert_eq!(
+            classify(tagged_global_fact, &IncidentMarkers::default()),
+            InjectClass::SearchOnly
+        );
+    }
+
+    #[test]
+    fn stale_inferred_preference_with_project_id_is_search_only() {
+        let stale_inferred = ClassifyInput {
+            scope: "global",
+            project_id: Some("repo-alpha"),
+            entry_kind: EntryKind::Remember,
+            kind: Some(MemoryKind::Preference),
+            body: "Project alpha PR #8 fixes nested hook state attribution.",
+        };
+        assert_eq!(
+            classify(stale_inferred, &IncidentMarkers::default()),
+            InjectClass::SearchOnly
+        );
+    }
+
+    #[test]
+    fn transient_pr_status_is_search_only() {
+        let stale_status = ClassifyInput {
+            scope: "project",
+            project_id: Some("repo-alpha"),
+            entry_kind: EntryKind::Remember,
+            kind: Some(MemoryKind::ProjectFact),
+            body: "PR stack is all CI-green, OPEN/MERGEABLE, UNMERGED pending review; do NOT merge without review.",
+        };
+        assert_eq!(
+            classify(stale_status, &IncidentMarkers::default()),
+            InjectClass::SearchOnly
+        );
     }
 
     #[test]
@@ -242,30 +308,37 @@ mod tests {
     }
 
     #[test]
-    fn untagged_design_sketch_is_a_known_residual() {
-        // Honest residual, mirrored from a real store: a long design sketch
-        // carries a date ("discussed 2026-06-09") but no operational keyword,
-        // so the conservative heuristic leaves it always-on rather than risk
-        // withholding durable guidance. The explicit kind (see the tagged
-        // design-sketch corpus record) is the safe withhold for this shape.
+    fn untagged_design_sketch_is_search_only() {
+        // A long design sketch carries project/tool detail but does not tell
+        // the agent how to behave in every future session. Keep it searchable
+        // unless it is explicitly scoped/tagged for startup injection.
         let body = "Detailed design sketch for an automated review gate in CI \
                     (discussed 2026-06-09, not built): a reusable workflow each \
                     repo opts into, gating on severity.";
         assert_eq!(
             classify(global(body), &IncidentMarkers::default()),
-            InjectClass::AlwaysOn
+            InjectClass::SearchOnly
         );
     }
 
     #[test]
-    fn marker_less_incident_is_left_in() {
-        // Honest residual: an operational note with no date is NOT withheld. We
-        // accept this miss rather than risk dropping real guidance; the explicit
-        // kind field is what closes this gap safely.
+    fn marker_less_incident_is_search_only() {
+        // Ambiguous global facts are now withheld by default. This catches the
+        // common legacy shape where an incident/fix lacks enough markers for
+        // the date-plus-keyword operational rule.
         let body = "The installer now rebuilds when the recorded version is stale.";
         assert_eq!(
             classify(global(body), &IncidentMarkers::default()),
-            InjectClass::AlwaysOn
+            InjectClass::SearchOnly
+        );
+    }
+
+    #[test]
+    fn untagged_global_project_fact_is_search_only() {
+        let body = "Project shdeps rebuilds source-checkout binaries when the recorded version no longer matches checkout HEAD.";
+        assert_eq!(
+            classify(global(body), &IncidentMarkers::default()),
+            InjectClass::SearchOnly
         );
     }
 

@@ -75,7 +75,7 @@ pub fn infer_scope(input: InferScopeInput<'_>) -> Option<ScopeInference> {
     if lower.is_empty() {
         return None;
     }
-    if input.explicit_kind == Some(MemoryKind::Preference) || reads_as_preference(&lower) {
+    if input.explicit_kind == Some(MemoryKind::Preference) || signals::reads_as_preference(&lower) {
         return None;
     }
     if reads_as_repo_local(&lower) {
@@ -102,7 +102,7 @@ pub fn infer_kind(input: InferKindInput<'_>) -> Option<KindInference> {
     }
     let lower = body.to_lowercase();
 
-    if reads_as_preference(&lower) {
+    if signals::reads_as_preference(&lower) {
         return Some(KindInference {
             kind: MemoryKind::Preference,
             reason: "preference-language",
@@ -128,18 +128,6 @@ pub fn infer_kind(input: InferKindInput<'_>) -> Option<KindInference> {
     }
 
     None
-}
-
-fn reads_as_preference(lower: &str) -> bool {
-    lower.contains("prefer ")
-        || lower.contains("prefers ")
-        || lower.starts_with("always ")
-        || lower.contains(" always ")
-        || lower.starts_with("never ")
-        || lower.contains(" never ")
-        || lower.contains(" use ")
-        || lower.starts_with("use ")
-        || lower.contains(" should ")
 }
 
 fn reads_as_incident(lower: &str) -> bool {
@@ -243,7 +231,8 @@ mod tests {
     #[test]
     fn doc_mention_without_pointer_stays_untagged() {
         // Mentioning a file name in passing is not reference language; an
-        // untagged global write keeps injecting (conservative direction).
+        // untagged global write stays unclassified. Read-time relevance decides
+        // whether that ambiguous legacy shape belongs in startup context.
         assert!(infer("The guidelines file is AGENTS.md, kept at the repo root.").is_none());
     }
 
