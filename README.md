@@ -460,7 +460,9 @@ available.
 In `mode = "auto"`, Hive Memory only auto-detects backend CLIs whose labels also
 appear in `[agents]` (`claude`, `codex`, or `gemini`). Those agents already
 receive memory through context injection, so classification does not create a
-new implicit reader. Enable detached hook-spawned classification with:
+new implicit reader. When multiple allowed CLIs are installed, auto-detection
+prefers `codex`, then `claude`, then `gemini`. Enable detached hook-spawned
+classification with:
 
 ```toml
 [classifier]
