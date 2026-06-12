@@ -215,10 +215,9 @@ pub struct DefaultsConfig {
 
 /// Background LLM classification policy.
 ///
-/// `mode = "auto"` (the default) lets the detached worker run when an allowed
-/// backend is detected and silently do nothing otherwise. Hot paths only use
-/// this config for local spawn/stamp decisions; backend probing belongs to the
-/// worker process.
+/// `mode = "off"` keeps LLM classification opt-in. Hot paths only use this
+/// config for local spawn/stamp decisions; backend probing belongs to the worker
+/// process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassifierConfig {
     /// `auto` | `on` | `off`.
@@ -968,7 +967,7 @@ impl ClassifierConfig {
         const BACKENDS: &[&str] = &["claude", "codex", "gemini", "command"];
         const CONFIDENCE: &[&str] = &["high", "medium"];
 
-        let mode = raw.mode.unwrap_or_else(|| "auto".to_owned());
+        let mode = raw.mode.unwrap_or_else(|| "off".to_owned());
         validate_allowed("classifier.mode", &mode, MODES)?;
 
         if let Some(backend) = raw.backend.as_deref() {
@@ -1431,7 +1430,7 @@ mod tests {
         assert_eq!(
             loaded.config.classifier,
             ClassifierConfig {
-                mode: "auto".to_owned(),
+                mode: "off".to_owned(),
                 backend: None,
                 command: Vec::new(),
                 model: None,
