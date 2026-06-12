@@ -114,6 +114,13 @@ context_warm_p95_ms = 200
 context_cold_p95_ms = 500
 context_store_size_target = 5000  # notes; budget is calibrated against this size
 
+[classifier]
+mode = "off"           # auto|on|off
+batch_limit = 25
+min_interval = "6h"
+timeout_seconds = 60
+apply_confidence = "high" # high|medium
+
 ```
 
 Validation rules:
@@ -138,6 +145,13 @@ Validation rules:
   `write_stores = [default_store]`, which preserves simple single-store installs.
 - local override config may replace scalar values and merge tables.
 - CLI flags and environment variables override merged config, not source files.
+- `[classifier]` defaults to `mode = "off"`. Invalid `mode`, `backend`,
+  `apply_confidence`, non-positive limits/timeouts, invalid `min_interval`, or
+  `backend = "command"` with an empty `command` are config errors.
+- In `mode = "auto"`, backend auto-detection only considers known backend labels
+  that also exist under `[agents]`; `mode = "on"` or explicit `backend = ...`
+  opts into the selected adapter. `sensitivity = "secret"` stores are never sent
+  to classifier backends.
 
 Why this shape: humans get one readable TOML file; launchers get deterministic
 overrides; agents get explicit store affinity; and future schema migration has
@@ -255,7 +269,15 @@ source_kind = "session"
 source_ref = "abc123"
 related_event_id = "20260516T154233.184921Z_taylor_12345_codex_a8f31c"
 expires_at = ""              # RFC3339 or empty
+kind = "preference"          # preference|project-fact|incident|reference
 audience = ["codex"]         # see "Audience and agent-private" below
+
+[classified]
+source = "llm"                # llm|manual
+backend = "claude"            # optional; diagnostics only
+at = "2026-06-12T00:00:00Z"  # RFC3339
+verdict_version = 1
+confidence = "high"          # optional; high|medium|low for llm verdicts
 ```
 
 Note: `project_path` is intentionally NOT a recommended field. Absolute paths
@@ -268,6 +290,12 @@ Rules:
 - The Markdown body is the durable human-readable record.
 - Front matter must be parseable enough for `hm search`, `hm context`, and
   future compaction/proposal workflows to filter by store/scope/project/tags/audience.
+- `kind` is a durable memory-kind verdict that drives relevance-mode injection.
+  `classified` records who issued that verdict. Missing `classified` means the
+  record is eligible for background LLM review; `source = "manual"` means an
+  explicit human retag and MUST NOT be overridden by the LLM worker.
+- LLM verdicts carry `verdict_version`; bumping the classifier prompt/policy
+  version re-queues older LLM verdicts, while manual verdicts are version-exempt.
 - Agents should write concise, factual notes; promotion (`hm promote`) is the
   bridge into curated memory files.
 - Notes are immutable by convention once written. Corrections should be new
@@ -574,7 +602,8 @@ Local triage index:
 
 - `cache/indexes/<store-alias>.jsonl` — one line per inbox note containing
   `{id, store_id, entry_kind, scope, project_id, audience, tags, subject,
-  confidence, agent_id, created_at, note_path, event_path}`.
+  confidence, kind, classified, agent_id, host_id, created_at, body, note_path,
+  event_path}`.
 - Rebuilt on `hm flush` and lazily on read commands when the inbox directory's
   recursive mtime/inode marker has changed since the last build.
 - NOT full-text search — search still reads matched lines from the underlying

@@ -1,0 +1,633 @@
+//! Background LLM classification worker.
+//!
+//! The worker derives its queue from durable note/index provenance, takes a
+//! per-store local lock to avoid overlapping work on one machine, and applies
+//! every verdict through the same retag rewrite path as human corrections.
+
+use crate::{config, index, llm, memory, note, write};
+use serde::{Deserialize, Serialize};
+use std::fs::{self, OpenOptions};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+use time::OffsetDateTime;
+
+const STALE_LOCK: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ReportCounts {
+    pending: usize,
+    judged: usize,
+    applied: usize,
+    marked_only: usize,
+    errors: usize,
+}
+
+/// Why a run did or did not do work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Outcome {
+    /// Worker ran normally, even if there was no pending work.
+    Ran,
+    /// All candidate backends failed repeatedly.
+    Aborted,
+    /// Classifier is disabled by config or non-configurable store policy.
+    SkippedDisabled,
+    /// No allowed backend was available.
+    SkippedNoBackend,
+    /// Another local worker holds the per-store lock.
+    SkippedLocked,
+    /// Last run stamp is newer than the configured interval.
+    SkippedFresh,
+}
+
+/// Per-run report for JSON output, stamps, and doctor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunReport {
+    /// Run outcome.
+    pub outcome: Outcome,
+    /// Backend that produced successful verdicts or last failed.
+    pub backend: Option<String>,
+    /// Pending records observed before the batch cap.
+    pub pending: usize,
+    /// Records that received a parseable verdict.
+    pub judged: usize,
+    /// Records whose kind changed.
+    pub applied: usize,
+    /// Records marked reviewed without changing kind.
+    pub marked_only: usize,
+    /// Failed backend invocations.
+    pub errors: usize,
+    /// RFC3339 timestamp for the run.
+    pub at: String,
+}
+
+/// Decide what to persist for one verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyDecision {
+    /// Persist the new kind plus LLM provenance.
+    Apply(note::MemoryKind),
+    /// Persist LLM provenance only.
+    MarkOnly,
+}
+
+/// Input for one worker run.
+#[derive(Debug)]
+pub struct RunInput<'a> {
+    /// Effective config.
+    pub config: &'a config::Config,
+    /// Local store alias.
+    pub store_name: &'a str,
+    /// Store root.
+    pub store_root: &'a Path,
+    /// Configured store sensitivity.
+    pub store_sensitivity: config::Sensitivity,
+    /// Current index entries for this store.
+    pub entries: &'a [index::IndexEntry],
+    /// Candidate backends in failover order.
+    pub backends: Vec<llm::Backend>,
+    /// Ignore freshness stamp when true.
+    pub force: bool,
+    /// Report what would happen without writing notes or stamps.
+    pub dry_run: bool,
+    /// Optional batch limit override.
+    pub limit: Option<u32>,
+    /// Atomic write options for note/event/stamp rewrites.
+    pub options: write::AtomicWriteOptions,
+}
+
+/// Records still owed an LLM review at `verdict_version`.
+pub fn pending_entries(
+    entries: &[index::IndexEntry],
+    verdict_version: u32,
+) -> Vec<&index::IndexEntry> {
+    let mut pending: Vec<&index::IndexEntry> = entries
+        .iter()
+        .filter(|entry| match &entry.classified {
+            None => true,
+            Some(classified) => match classified.source {
+                note::ClassifierSource::Manual => false,
+                note::ClassifierSource::Llm => classified.verdict_version < verdict_version,
+            },
+        })
+        .collect();
+    pending.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    pending
+}
+
+/// Map a structured verdict onto a persistence decision.
+pub fn apply_policy(
+    verdict: llm::Verdict,
+    current_kind: Option<note::MemoryKind>,
+    apply_confidence: llm::VerdictConfidence,
+) -> ApplyDecision {
+    match verdict.kind {
+        llm::VerdictKind::Unclear => ApplyDecision::MarkOnly,
+        llm::VerdictKind::Kind(kind) => {
+            if verdict.confidence < apply_confidence || Some(kind) == current_kind {
+                ApplyDecision::MarkOnly
+            } else {
+                ApplyDecision::Apply(kind)
+            }
+        }
+    }
+}
+
+/// Lock path under `<state_dir>/classifier/<store_name>/`.
+pub fn lock_path(state_dir: &Path, store_name: &str) -> PathBuf {
+    state_dir
+        .join("classifier")
+        .join(store_name)
+        .join("classifier.lock")
+}
+
+/// Last-run stamp path under `<state_dir>/classifier/<store_name>/`.
+pub fn stamp_path(state_dir: &Path, store_name: &str) -> PathBuf {
+    state_dir
+        .join("classifier")
+        .join(store_name)
+        .join("last-run.json")
+}
+
+/// Return whether `hm hook stop` should spawn a detached worker.
+pub fn should_spawn(
+    mode: &str,
+    min_interval: Duration,
+    state_dir: &Path,
+    store_name: &str,
+    now: OffsetDateTime,
+) -> bool {
+    if mode == "off" || lock_path(state_dir, store_name).exists() {
+        return false;
+    }
+    !stamp_is_fresh(&stamp_path(state_dir, store_name), min_interval, now)
+}
+
+/// Resolve candidate backends under the classifier privacy policy.
+///
+/// In plain `mode = "auto"`, only CLIs with matching `[agents]` entries are
+/// considered because those agents already receive memory context. Explicit
+/// `backend = ...` or `mode = "on"` is an opt-in to the selected adapter.
+pub fn configured_backends(config: &config::Config) -> Vec<llm::Backend> {
+    let backends = llm::detect_all(
+        config.classifier.backend.as_deref(),
+        &config.classifier.command,
+        config.classifier.model.as_deref(),
+        None,
+    );
+    if config.classifier.mode != "auto" || config.classifier.backend.is_some() {
+        return backends;
+    }
+    backends
+        .into_iter()
+        .filter(|backend| config.agents.contains_key(&backend.label))
+        .collect()
+}
+
+/// Run one bounded classification pass.
+pub fn run(input: RunInput<'_>) -> RunReport {
+    let now = OffsetDateTime::now_utc();
+    if (!input.force && input.config.classifier.mode == "off")
+        || input.store_sensitivity == config::Sensitivity::Secret
+    {
+        return report(Outcome::SkippedDisabled, None, ReportCounts::default(), now);
+    }
+
+    let stamp = stamp_path(&input.config.state_dir, input.store_name);
+    if !input.force
+        && stamp_is_fresh(
+            &stamp,
+            input.config.classifier_min_interval(),
+            OffsetDateTime::now_utc(),
+        )
+    {
+        return report(Outcome::SkippedFresh, None, ReportCounts::default(), now);
+    }
+
+    let lock = match LockGuard::acquire(&input.config.state_dir, input.store_name) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return report(Outcome::SkippedLocked, None, ReportCounts::default(), now),
+        Err(_) => return report(Outcome::SkippedLocked, None, ReportCounts::default(), now),
+    };
+
+    if input.backends.is_empty() {
+        let output = report(
+            Outcome::SkippedNoBackend,
+            None,
+            ReportCounts::default(),
+            now,
+        );
+        write_stamp_if_needed(&stamp, &output, input.dry_run, &input.options);
+        drop(lock);
+        return output;
+    }
+
+    let apply_confidence =
+        llm::VerdictConfidence::from_label(&input.config.classifier.apply_confidence)
+            .expect("validated classifier confidence");
+    let timeout = Duration::from_secs(input.config.classifier.timeout_seconds);
+    let limit = input
+        .limit
+        .unwrap_or(input.config.classifier.batch_limit)
+        .try_into()
+        .unwrap_or(usize::MAX);
+    let pending = pending_entries(input.entries, llm::VERDICT_VERSION);
+    let batch: Vec<&index::IndexEntry> = pending.iter().copied().take(limit).collect();
+
+    let mut backend_index = 0usize;
+    let mut consecutive_errors = 0usize;
+    let mut judged = 0usize;
+    let mut applied = 0usize;
+    let mut marked_only = 0usize;
+    let mut errors = 0usize;
+    let mut last_backend = input.backends.first().map(|backend| backend.label.clone());
+    let mut outcome = Outcome::Ran;
+
+    let mut index = 0usize;
+    while index < batch.len() {
+        let backend = &input.backends[backend_index];
+        last_backend = Some(backend.label.clone());
+        let entry = batch[index];
+        let prompt = llm::classification_prompt(
+            &entry.body,
+            &entry.scope,
+            entry.project_id.as_deref(),
+            entry.kind,
+        );
+
+        let verdict = match llm::invoke(backend, &prompt, timeout) {
+            Ok(verdict) => {
+                consecutive_errors = 0;
+                verdict
+            }
+            Err(_) => {
+                errors += 1;
+                consecutive_errors += 1;
+                if consecutive_errors >= 3 {
+                    backend_index += 1;
+                    consecutive_errors = 0;
+                    if backend_index >= input.backends.len() {
+                        outcome = Outcome::Aborted;
+                        break;
+                    }
+                }
+                continue;
+            }
+        };
+
+        judged += 1;
+        let mut decision = apply_policy(verdict, entry.kind, apply_confidence);
+        if let ApplyDecision::Apply(kind) = decision
+            && memory::validate_kind_context(Some(kind), &entry.scope, entry.project_id.as_deref())
+                .is_err()
+        {
+            decision = ApplyDecision::MarkOnly;
+        }
+        let classified = note::ClassifiedBy {
+            source: note::ClassifierSource::Llm,
+            backend: Some(backend.label.clone()),
+            at: rfc3339(OffsetDateTime::now_utc()),
+            verdict_version: llm::VERDICT_VERSION,
+            confidence: Some(verdict.confidence.label().to_owned()),
+        };
+
+        match decision {
+            ApplyDecision::Apply(kind) => {
+                applied += 1;
+                if !input.dry_run {
+                    apply_update(&input, entry, Some(kind), classified);
+                }
+            }
+            ApplyDecision::MarkOnly => {
+                marked_only += 1;
+                if !input.dry_run {
+                    apply_update(&input, entry, entry.kind, classified);
+                }
+            }
+        }
+        index += 1;
+    }
+
+    let output = report(
+        outcome,
+        last_backend,
+        ReportCounts {
+            pending: pending.len(),
+            judged,
+            applied,
+            marked_only,
+            errors,
+        },
+        now,
+    );
+    write_stamp_if_needed(&stamp, &output, input.dry_run, &input.options);
+    drop(lock);
+    output
+}
+
+fn apply_update(
+    input: &RunInput<'_>,
+    entry: &index::IndexEntry,
+    kind: Option<note::MemoryKind>,
+    classified: note::ClassifiedBy,
+) {
+    let Ok(contents) = fs::read_to_string(input.store_root.join(&entry.note_path)) else {
+        return;
+    };
+    let Ok(parsed) = note::parse_note(&contents) else {
+        return;
+    };
+    if parsed.front_matter.kind != entry.kind || parsed.front_matter.classified != entry.classified
+    {
+        return;
+    }
+    let _ = memory::retag_record(memory::RetagRecordInput {
+        root: input.store_root,
+        note_path: &entry.note_path,
+        kind,
+        classified: memory::ClassifiedUpdate::Set(classified),
+        options: input.options.clone(),
+    });
+}
+
+fn stamp_is_fresh(path: &Path, min_interval: Duration, now: OffsetDateTime) -> bool {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(report) = serde_json::from_str::<RunReport>(&contents) else {
+        return false;
+    };
+    let Ok(at) = OffsetDateTime::parse(&report.at, &time::format_description::well_known::Rfc3339)
+    else {
+        return false;
+    };
+    let Ok(age) = Duration::try_from(now - at) else {
+        return false;
+    };
+    age < min_interval
+}
+
+fn write_stamp_if_needed(
+    path: &Path,
+    report: &RunReport,
+    dry_run: bool,
+    options: &write::AtomicWriteOptions,
+) {
+    if dry_run {
+        return;
+    }
+    if !matches!(
+        report.outcome,
+        Outcome::Ran | Outcome::Aborted | Outcome::SkippedNoBackend
+    ) {
+        return;
+    }
+    if let Ok(json) = serde_json::to_string_pretty(report) {
+        let _ = write::write_atomic(path, format!("{json}\n").as_bytes(), options);
+    }
+}
+
+fn report(
+    outcome: Outcome,
+    backend: Option<String>,
+    counts: ReportCounts,
+    at: OffsetDateTime,
+) -> RunReport {
+    RunReport {
+        outcome,
+        backend,
+        pending: counts.pending,
+        judged: counts.judged,
+        applied: counts.applied,
+        marked_only: counts.marked_only,
+        errors: counts.errors,
+        at: rfc3339(at),
+    }
+}
+
+fn rfc3339(value: OffsetDateTime) -> String {
+    value
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("RFC3339 formatting is infallible for UTC timestamps")
+}
+
+struct LockGuard {
+    path: PathBuf,
+}
+
+impl LockGuard {
+    fn acquire(state_dir: &Path, store_name: &str) -> std::io::Result<Option<Self>> {
+        let path = lock_path(state_dir, store_name);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                let _ = writeln!(file, "{}", std::process::id());
+                Ok(Some(Self { path }))
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                if lock_is_stale(&path) {
+                    let _ = fs::remove_file(&path);
+                    return Self::acquire(state_dir, store_name);
+                }
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+}
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn lock_is_stale(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return true;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    SystemTime::now()
+        .duration_since(modified)
+        .map(|age| age > STALE_LOCK)
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::note::MemoryKind;
+
+    fn entry(
+        kind: Option<MemoryKind>,
+        classified: Option<note::ClassifiedBy>,
+    ) -> index::IndexEntry {
+        index::IndexEntry {
+            id: format!("id-{}", classified.is_some()),
+            store_id: "store-id".to_owned(),
+            entry_kind: note::EntryKind::Remember,
+            scope: "global".to_owned(),
+            project_id: None,
+            audience: Vec::new(),
+            tags: Vec::new(),
+            subject: None,
+            confidence: note::Confidence::High,
+            kind,
+            classified,
+            agent_id: "codex".to_owned(),
+            host_id: "taylor".to_owned(),
+            created_at: "2026-06-12T00:00:00Z".to_owned(),
+            body: "body".to_owned(),
+            note_path: "inbox/notes/2026/06/12/id.md".to_owned(),
+            event_path: None,
+        }
+    }
+
+    fn llm_classified(version: u32) -> note::ClassifiedBy {
+        note::ClassifiedBy {
+            source: note::ClassifierSource::Llm,
+            backend: Some("fake".to_owned()),
+            at: "2026-06-12T00:00:00Z".to_owned(),
+            verdict_version: version,
+            confidence: Some("high".to_owned()),
+        }
+    }
+
+    fn manual() -> note::ClassifiedBy {
+        note::ClassifiedBy {
+            source: note::ClassifierSource::Manual,
+            backend: None,
+            at: "2026-06-12T00:00:00Z".to_owned(),
+            verdict_version: 0,
+            confidence: None,
+        }
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "hive-memory-classify-{name}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    #[test]
+    fn pending_selects_unreviewed_and_stale_llm_versions() {
+        let entries = vec![
+            entry(None, None),
+            entry(None, Some(llm_classified(1))),
+            entry(None, Some(llm_classified(0))),
+            entry(Some(MemoryKind::Preference), Some(manual())),
+        ];
+
+        let pending = pending_entries(&entries, 1);
+
+        assert_eq!(pending.len(), 2);
+    }
+
+    #[test]
+    fn apply_policy_respects_confidence_and_unclear() {
+        assert_eq!(
+            apply_policy(
+                llm::Verdict {
+                    kind: llm::VerdictKind::Kind(MemoryKind::Incident),
+                    confidence: llm::VerdictConfidence::High,
+                },
+                None,
+                llm::VerdictConfidence::High,
+            ),
+            ApplyDecision::Apply(MemoryKind::Incident)
+        );
+        assert_eq!(
+            apply_policy(
+                llm::Verdict {
+                    kind: llm::VerdictKind::Kind(MemoryKind::Incident),
+                    confidence: llm::VerdictConfidence::Medium,
+                },
+                None,
+                llm::VerdictConfidence::High,
+            ),
+            ApplyDecision::MarkOnly
+        );
+        assert_eq!(
+            apply_policy(
+                llm::Verdict {
+                    kind: llm::VerdictKind::Unclear,
+                    confidence: llm::VerdictConfidence::High,
+                },
+                None,
+                llm::VerdictConfidence::High,
+            ),
+            ApplyDecision::MarkOnly
+        );
+        assert_eq!(
+            apply_policy(
+                llm::Verdict {
+                    kind: llm::VerdictKind::Kind(MemoryKind::Incident),
+                    confidence: llm::VerdictConfidence::High,
+                },
+                Some(MemoryKind::Incident),
+                llm::VerdictConfidence::High,
+            ),
+            ApplyDecision::MarkOnly
+        );
+    }
+
+    #[test]
+    fn should_spawn_uses_only_local_checks() {
+        let state = temp_dir("spawn");
+        let now = OffsetDateTime::now_utc();
+
+        assert!(!should_spawn(
+            "off",
+            Duration::from_secs(60),
+            &state,
+            "personal",
+            now
+        ));
+        assert!(should_spawn(
+            "auto",
+            Duration::from_secs(60),
+            &state,
+            "personal",
+            now
+        ));
+
+        let stamp = stamp_path(&state, "personal");
+        let report = report(Outcome::Ran, None, ReportCounts::default(), now);
+        write_stamp_if_needed(
+            &stamp,
+            &report,
+            false,
+            &write::AtomicWriteOptions {
+                fsync: write::FsyncPolicy::Never,
+                ..write::AtomicWriteOptions::default()
+            },
+        );
+        assert!(!should_spawn(
+            "auto",
+            Duration::from_secs(60),
+            &state,
+            "personal",
+            now
+        ));
+
+        fs::remove_file(&stamp).expect("remove stamp");
+        let lock = lock_path(&state, "personal");
+        fs::create_dir_all(lock.parent().expect("parent")).expect("create parent");
+        fs::write(&lock, "pid").expect("write lock");
+        assert!(!should_spawn(
+            "auto",
+            Duration::from_secs(60),
+            &state,
+            "personal",
+            now
+        ));
+    }
+}

@@ -3784,6 +3784,253 @@ fn retag_updates_kind_and_relevance_selection() {
 }
 
 #[test]
+fn classify_updates_relevance_selection_and_respects_manual_retag() {
+    let dir = temp_dir("classify-e2e");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let state = dir.join("state");
+    let cache = dir.join("cache");
+    let fake_llm = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-llm");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            state_dir = "{}"
+            cache_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+
+            [defaults]
+            context_strategy = "relevance"
+
+            [classifier]
+            backend = "command"
+            command = ["{}"]
+            batch_limit = 10
+            min_interval = "6h"
+            timeout_seconds = 5
+            "#,
+            state.display(),
+            cache.display(),
+            personal.display(),
+            fake_llm.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    let remembered = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Repo alpha deploy window is Friday afternoons.",
+            "--scope",
+            "project",
+            "--project-id",
+            "repo-alpha",
+            "--no-infer-kind",
+            "--json",
+        ])
+        .output()
+        .expect("run remember");
+    assert!(
+        remembered.status.success(),
+        "remember failed: {remembered:?}"
+    );
+    let remembered: serde_json::Value =
+        serde_json::from_slice(&remembered.stdout).expect("remember json");
+    let id = remembered["id"].as_str().expect("memory id").to_owned();
+    assert!(remembered["kind"].is_null());
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "context",
+            "--project-id",
+            "repo-alpha",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Repo alpha deploy window"));
+
+    let auto_skipped = cargo_bin_cmd!("hm")
+        .env("FAKE_LLM_MODE", "fail")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "classify",
+            "--auto",
+            "--json",
+        ])
+        .output()
+        .expect("run auto classify with default mode");
+    assert!(
+        auto_skipped.status.success(),
+        "auto classify failed: {auto_skipped:?}"
+    );
+    let auto_skipped: serde_json::Value =
+        serde_json::from_slice(&auto_skipped.stdout).expect("auto classify json");
+    assert_eq!(auto_skipped["outcome"], "skipped-disabled");
+    assert_eq!(auto_skipped["judged"], 0);
+
+    let classified = cargo_bin_cmd!("hm")
+        .env("FAKE_LLM_KIND", "incident")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "classify",
+            "--json",
+        ])
+        .output()
+        .expect("run classify");
+    assert!(
+        classified.status.success(),
+        "classify failed: {classified:?}"
+    );
+    let classified: serde_json::Value =
+        serde_json::from_slice(&classified.stdout).expect("classify json");
+    assert_eq!(classified["outcome"], "ran");
+    assert_eq!(classified["pending"], 1);
+    assert_eq!(classified["judged"], 1);
+    assert_eq!(classified["applied"], 1);
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "context",
+            "--project-id",
+            "repo-alpha",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Repo alpha deploy window").not());
+
+    let second = cargo_bin_cmd!("hm")
+        .env("FAKE_LLM_KIND", "reference")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "classify",
+            "--json",
+        ])
+        .output()
+        .expect("run second classify");
+    assert!(
+        second.status.success(),
+        "second classify failed: {second:?}"
+    );
+    let second: serde_json::Value =
+        serde_json::from_slice(&second.stdout).expect("second classify json");
+    assert_eq!(second["pending"], 0);
+    assert_eq!(second["judged"], 0);
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "retag",
+            &id,
+            "--kind",
+            "project-fact",
+        ])
+        .assert()
+        .success();
+
+    let manual_attempt = cargo_bin_cmd!("hm")
+        .env("FAKE_LLM_KIND", "incident")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "classify",
+            "--json",
+        ])
+        .output()
+        .expect("run classify after manual retag");
+    assert!(
+        manual_attempt.status.success(),
+        "manual classify failed: {manual_attempt:?}"
+    );
+    let manual_attempt: serde_json::Value =
+        serde_json::from_slice(&manual_attempt.stdout).expect("manual classify json");
+    assert_eq!(manual_attempt["pending"], 0);
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "context",
+            "--project-id",
+            "repo-alpha",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Repo alpha deploy window"));
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "retag",
+            &id,
+            "--kind",
+            "none",
+        ])
+        .assert()
+        .success();
+
+    let pending = cargo_bin_cmd!("hm")
+        .env("FAKE_LLM_MODE", "fail")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "classify",
+            "--pending",
+            "--json",
+        ])
+        .output()
+        .expect("run pending classify preview");
+    assert!(pending.status.success(), "pending failed: {pending:?}");
+    let pending: serde_json::Value = serde_json::from_slice(&pending.stdout).expect("pending json");
+    assert_eq!(pending["backend_invoked"], false);
+    assert_eq!(pending["pending"], 1);
+    assert_eq!(pending["records"][0]["id"], id.as_str());
+
+    let dry_run = cargo_bin_cmd!("hm")
+        .env("FAKE_LLM_KIND", "incident")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "classify",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .expect("run dry-run classify");
+    assert!(dry_run.status.success(), "dry-run failed: {dry_run:?}");
+    let dry_run: serde_json::Value = serde_json::from_slice(&dry_run.stdout).expect("dry-run json");
+    assert_eq!(dry_run["pending"], 1);
+    assert_eq!(dry_run["applied"], 1);
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "context",
+            "--project-id",
+            "repo-alpha",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Repo alpha deploy window"));
+}
+
+#[test]
 fn retag_rejects_project_fact_for_global_record() {
     let dir = temp_dir("retag-project-fact");
     let config = dir.join("config.toml");

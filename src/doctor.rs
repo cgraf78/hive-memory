@@ -5,7 +5,7 @@
 //! the configured stores and local project bindings be trusted before an agent
 //! relies on them?
 
-use crate::{config, event, note, outbox, project, secret, store, write};
+use crate::{classify, config, event, index, note, outbox, project, secret, store, write};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -188,6 +188,7 @@ pub fn run(input: DoctorInput<'_>) -> DoctorReport {
     check_project_bindings(input.config, &mut checks);
     check_agent_policies(input.config, &mut checks);
     check_outbox(input.config, &mut checks);
+    check_classifier(input.config, &mut checks);
     // Secret scanning is deliberately kept off the quick path. Hooks and
     // update-time health checks need cheap structural validation, while this
     // audit walks note content and is intended for explicit human review.
@@ -200,6 +201,120 @@ pub fn run(input: DoctorInput<'_>) -> DoctorReport {
     }
 
     summarize(checks)
+}
+
+fn check_classifier(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
+    checks.push(pass(
+        "classifier.mode",
+        format!("classifier mode is {}", config.classifier.mode),
+        Vec::new(),
+    ));
+
+    if config.classifier.mode == "off" {
+        checks.push(pass(
+            "classifier.backend",
+            "automatic classifier disabled; backend probing skipped",
+            Vec::new(),
+        ));
+    } else {
+        let backends = classify::configured_backends(config);
+        if let Some(backend) = backends.first() {
+            checks.push(pass(
+                "classifier.backend",
+                format!("classifier backend available: {}", backend.label),
+                Vec::new(),
+            ));
+        } else {
+            checks.push(pass(
+                "classifier.backend",
+                "classifier backend: none detected (classification idle)",
+                Vec::new(),
+            ));
+        }
+    }
+
+    for (store_name, store_config) in &config.stores {
+        let index_path =
+            index::scoped_index_path(&config.cache_dir, store_name, &store_config.root);
+        let pending = index::read_index(&index_path)
+            .map(|entries| classify::pending_entries(&entries, crate::llm::VERDICT_VERSION).len())
+            .ok();
+        let pending_text = pending
+            .map(|pending| pending.to_string())
+            .unwrap_or_else(|| "unknown; index not built".to_owned());
+        checks.push(pass(
+            format!("classifier.{store_name}.pending"),
+            format!("classifier pending for store {store_name}: {pending_text}"),
+            vec![index_path.display().to_string()],
+        ));
+
+        let stamp_path = classify::stamp_path(&config.state_dir, store_name);
+        match read_classifier_stamp(&stamp_path) {
+            Some(report) => {
+                let message = format!(
+                    "classifier last run for store {store_name}: outcome={} judged={} applied={} errors={}",
+                    outcome_label(report.outcome),
+                    report.judged,
+                    report.applied,
+                    report.errors
+                );
+                if report.outcome == classify::Outcome::Aborted
+                    || (report.outcome == classify::Outcome::Ran
+                        && report.errors > 0
+                        && stamp_within(&report, time::Duration::days(1)))
+                {
+                    checks.push(warn(
+                        format!("classifier.{store_name}.last-run"),
+                        message,
+                        vec![stamp_path.display().to_string()],
+                    ));
+                } else {
+                    checks.push(pass(
+                        format!("classifier.{store_name}.last-run"),
+                        message,
+                        vec![stamp_path.display().to_string()],
+                    ));
+                }
+            }
+            None => checks.push(pass(
+                format!("classifier.{store_name}.last-run"),
+                format!("classifier has no last-run stamp for store {store_name}"),
+                vec![stamp_path.display().to_string()],
+            )),
+        }
+
+        if store_config.sensitivity == config::Sensitivity::Secret {
+            checks.push(pass(
+                format!("classifier.{store_name}.secret-gate"),
+                format!("classifier disabled for secret store {store_name}"),
+                vec![store_config.root.display().to_string()],
+            ));
+        }
+    }
+}
+
+fn read_classifier_stamp(path: &Path) -> Option<classify::RunReport> {
+    let contents = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+fn outcome_label(outcome: classify::Outcome) -> &'static str {
+    match outcome {
+        classify::Outcome::Ran => "ran",
+        classify::Outcome::Aborted => "aborted",
+        classify::Outcome::SkippedDisabled => "skipped-disabled",
+        classify::Outcome::SkippedNoBackend => "skipped-no-backend",
+        classify::Outcome::SkippedLocked => "skipped-locked",
+        classify::Outcome::SkippedFresh => "skipped-fresh",
+    }
+}
+
+fn stamp_within(report: &classify::RunReport, max_age: time::Duration) -> bool {
+    let Ok(at) = OffsetDateTime::parse(&report.at, &Rfc3339) else {
+        return false;
+    };
+    let age = OffsetDateTime::now_utc() - at;
+    !age.is_negative() && age <= max_age
 }
 
 /// Run the explicit doctor repair path.

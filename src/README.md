@@ -12,6 +12,10 @@ This directory owns the `hm` CLI and library implementation.
   semantics.
 - `store.rs`, `index.rs`, `search.rs`, and `id.rs` own persistence and lookup.
 - `curated.rs` and `curation.rs` own injected-context selection.
+- `llm.rs` owns backend detection, prompt construction, subprocess deadlines,
+  and structured verdict parsing for classifier workers.
+- `classify.rs` owns the background classifier worker: pending selection,
+  lock/stamp policy, backend failover, and provenance updates.
 - `doctor.rs`, `secret.rs`, and `hook.rs` own operational checks and integration
   helpers.
 - `outbox.rs` and cloud-sync related modules own sync state and deferred remote
