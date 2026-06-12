@@ -150,8 +150,12 @@ Validation rules:
   `backend = "command"` with an empty `command` are config errors.
 - In `mode = "auto"`, backend auto-detection only considers known backend labels
   that also exist under `[agents]`; `mode = "on"` or explicit `backend = ...`
-  opts into the selected adapter. `sensitivity = "secret"` stores are never sent
-  to classifier backends.
+  opts into the selected adapter. When multiple allowed backends are installed,
+  auto-detection prefers `codex`, then `claude`, then `gemini`. Secret stores
+  are never sent to classifier backends, and audience-restricted
+  (`agent-private`) records are never part of the classifier queue: their bodies
+  are visible only to the listed agents, not to whichever backend CLI wins
+  detection.
 
 Why this shape: humans get one readable TOML file; launchers get deterministic
 overrides; agents get explicit store affinity; and future schema migration has

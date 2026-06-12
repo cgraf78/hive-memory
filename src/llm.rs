@@ -22,13 +22,13 @@ pub const VERDICT_VERSION: u32 = 1;
 /// escape hatch if a vendor CLI changes its non-interactive contract.
 const ADAPTERS: &[Adapter] = &[
     Adapter {
-        label: "claude",
-        argv: &["claude", "-p"],
+        label: "codex",
+        argv: &["codex", "exec", "-"],
         model_flag: Some("--model"),
     },
     Adapter {
-        label: "codex",
-        argv: &["codex", "exec", "-"],
+        label: "claude",
+        argv: &["claude", "-p"],
         model_flag: Some("--model"),
     },
     Adapter {
@@ -549,10 +549,10 @@ mod tests {
         let path = temp.to_string_lossy();
 
         let detected = detect(None, &[], None, Some(&path)).expect("detect");
-        assert_eq!(detected.label, "claude");
-
-        let detected = detect(Some("codex"), &[], None, Some(&path)).expect("detect codex");
         assert_eq!(detected.label, "codex");
+
+        let detected = detect(Some("claude"), &[], None, Some(&path)).expect("detect claude");
+        assert_eq!(detected.label, "claude");
 
         assert!(detect(None, &[], None, Some("")).is_none());
     }
