@@ -1840,6 +1840,23 @@ fn resolve_project_id(
     project_hint: Option<&str>,
 ) -> Result<Option<String>> {
     let env_project_id = std::env::var("HIVE_MEMORY_PROJECT_ID").ok();
+    let project_hint = project_hint.filter(|value| !value.trim().is_empty());
+    if let Some(project_id) = explicit_project_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        && project_hint.is_none()
+    {
+        return Ok(Some(project_id.to_owned()));
+    }
+    if let Some(project_id) = env_project_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        && explicit_project_id.is_none()
+        && project_hint.is_none()
+    {
+        return Ok(Some(project_id.to_owned()));
+    }
+
     let hint = project_hint
         .map(PathBuf::from)
         .or_else(|| std::env::var("HIVE_MEMORY_PROJECT").ok().map(PathBuf::from));
@@ -2541,9 +2558,13 @@ fn assemble_cli_context(
     // cache key so a strategy change invalidates any cached context.
     let strategy_label = config.defaults.context_strategy.clone();
     let inject_strategy = inject::Strategy::from_config(&strategy_label);
-    let path_hint = selection
-        .path_hint
-        .or_else(|| std::env::var("HIVE_MEMORY_PROJECT").ok());
+    let path_hint = selection.path_hint.or_else(|| {
+        selection
+            .project_id
+            .is_none()
+            .then(|| std::env::var("HIVE_MEMORY_PROJECT").ok())
+            .flatten()
+    });
     // Hooks often know an active buffer or tool path but not a precomputed
     // project id. Resolve here so hook adapters can stay policy-light while
     // still benefiting from project-scoped memory and local store bindings.
@@ -3956,13 +3977,6 @@ fn run_hook_tool_complete(args: HookToolCompleteArgs, context: CliContext) -> Re
     let mut actions = Vec::new();
     let mut refresh = None;
 
-    let path_hint = args
-        .project
-        .or_else(|| std::env::var("HIVE_MEMORY_PROJECT").ok());
-    // Tool completion may refresh generated context, so use the same
-    // project-aware store selection that the refreshable context path uses.
-    validate_hook_context_read_policy(&config, &context, path_hint.as_deref())?;
-
     let session_id = hook_session_id(&mut warnings);
     let mut memory_pending = if let Some(session_id) = session_id.as_deref() {
         memory_hook::load_state(&config.state_dir, session_id)?.memory_pending
@@ -3970,24 +3984,6 @@ fn run_hook_tool_complete(args: HookToolCompleteArgs, context: CliContext) -> Re
         false
     };
     let mut context_emitted = false;
-    // Tool-complete is often called without project context so it can stay on
-    // the cheap receipt/refresh path after every tool. Treat that as "no
-    // context update" rather than a move to the global/no-project selection;
-    // otherwise prompt hooks and tool hooks bounce the agent between project
-    // context and `project: none`, making Codex show the full memory block
-    // after nearly every prompt/tool boundary.
-    if path_hint.is_some()
-        && let Some(action) = hook_context_action_if_changed(
-            &config,
-            &context,
-            path_hint.as_deref(),
-            session_id.as_deref(),
-            false,
-        )?
-    {
-        context_emitted = true;
-        actions.push(action);
-    }
 
     if args.status == 0
         && let Some(session_id) = session_id.as_deref()
@@ -3997,6 +3993,12 @@ fn run_hook_tool_complete(args: HookToolCompleteArgs, context: CliContext) -> Re
         let unrefreshed_receipts = receipts.len().saturating_sub(state.refreshed_receipts);
 
         if unrefreshed_receipts > 0 {
+            let receipt_project_id = receipts
+                .iter()
+                .skip(state.refreshed_receipts)
+                .rev()
+                .find_map(|receipt| receipt.project_id.clone());
+
             let mut report = perform_refresh(&config, false)?;
             report.write_receipts = unrefreshed_receipts;
             refresh = Some(report);
@@ -4008,6 +4010,25 @@ fn run_hook_tool_complete(args: HookToolCompleteArgs, context: CliContext) -> Re
                 true,
                 &hook_options(&config),
             )?;
+
+            // Tool completion is a high-frequency hook. Ignore process cwd or
+            // payload cwd here; in home-launched multi-project sessions those
+            // hints are often stale. A successful memory write receipt carries
+            // the project id that was actually written, so use that as the
+            // only project-aware context-refresh signal.
+            if let Some(project_id) = receipt_project_id
+                && let Some(action) = hook_context_action_if_changed_for_project(
+                    &config,
+                    &context,
+                    Some(project_id),
+                    None,
+                    Some(session_id),
+                    false,
+                )?
+            {
+                context_emitted = true;
+                actions.push(action);
+            }
         }
 
         memory_pending = state.memory_pending;
@@ -4247,6 +4268,24 @@ fn hook_context_action_if_changed(
     session_id: Option<&str>,
     emit_initial: bool,
 ) -> Result<Option<HookAction>> {
+    hook_context_action_if_changed_for_project(
+        config,
+        context,
+        None,
+        path_hint,
+        session_id,
+        emit_initial,
+    )
+}
+
+fn hook_context_action_if_changed_for_project(
+    config: &Config,
+    context: &CliContext,
+    project_id: Option<String>,
+    path_hint: Option<&str>,
+    session_id: Option<&str>,
+    emit_initial: bool,
+) -> Result<Option<HookAction>> {
     let Some(session_id) = session_id else {
         return Ok(None);
     };
@@ -4254,7 +4293,7 @@ fn hook_context_action_if_changed(
     // Long-lived agents can move between projects while the process stays
     // alive. Cache the resolved selection, not just "context was already sent",
     // so hooks can reinject when path/project/store policy changes.
-    let context_key = hook_context_key(config, context, path_hint)?;
+    let context_key = hook_context_key_for_project(config, context, project_id.clone(), path_hint)?;
     let state = memory_hook::load_state(&config.state_dir, session_id)?;
     // SessionStart owns initial context injection. Prompt/tool hooks should only
     // reinject after an existing session selection changes; otherwise hook
@@ -4278,7 +4317,7 @@ fn hook_context_action_if_changed(
             explain: false,
             scopes: Vec::new(),
             sources: Vec::new(),
-            project_id: std::env::var("HIVE_MEMORY_PROJECT_ID").ok(),
+            project_id: project_id.or_else(|| std::env::var("HIVE_MEMORY_PROJECT_ID").ok()),
             path_hint: path_hint.map(str::to_owned),
         },
     )?;
@@ -4608,9 +4647,18 @@ fn hook_context_key(
     context: &CliContext,
     path_hint: Option<&str>,
 ) -> Result<String> {
+    hook_context_key_for_project(config, context, None, path_hint)
+}
+
+fn hook_context_key_for_project(
+    config: &Config,
+    context: &CliContext,
+    project_id: Option<String>,
+    path_hint: Option<&str>,
+) -> Result<String> {
     let agent_id = resolve_agent_id(context.as_agent.clone());
     let agent_label = agent_id.clone().unwrap_or_else(|| "unknown".to_owned());
-    let project_id = resolve_project_id(None, path_hint)?;
+    let project_id = resolve_project_id(project_id, path_hint)?;
     let project_binding = project_binding_store(config, project_id.as_deref())?;
     let resolved_store = resolve_store(
         config,
