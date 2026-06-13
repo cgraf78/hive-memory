@@ -37,6 +37,18 @@ pub struct HookState {
     /// Last context selection emitted to the agent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_key: Option<String>,
+    /// Memory ids emitted in startup/project-selection context.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub startup_memory_ids: Vec<String>,
+    /// Last prompt-specific recall selection emitted to the agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_recall_key: Option<String>,
+    /// Memory ids emitted by prompt-specific recall.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prompt_recall_memory_ids: Vec<String>,
+    /// RFC3339 timestamp of the last prompt recall update.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_recall_updated_at: Option<String>,
 }
 
 /// Ephemeral receipt for a successful session memory write.
@@ -264,6 +276,49 @@ pub fn mark_context_key(
     state.updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
     save_state(state_dir, session_id, &state, options)?;
     Ok(state)
+}
+
+/// Record startup/project-selection context emitted to a session.
+pub fn mark_startup_context(
+    state_dir: &Path,
+    session_id: &str,
+    context_key: impl Into<String>,
+    memory_ids: Vec<String>,
+    options: &write::AtomicWriteOptions,
+) -> Result<HookState, HookStateError> {
+    let mut state = load_state(state_dir, session_id)?;
+    state.context_key = Some(context_key.into());
+    state.startup_memory_ids = memory_ids;
+    state.updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
+    save_state(state_dir, session_id, &state, options)?;
+    Ok(state)
+}
+
+/// Record prompt-specific recall emitted to a session.
+pub fn mark_prompt_recall(
+    state_dir: &Path,
+    session_id: &str,
+    recall_key: impl Into<String>,
+    memory_ids: Vec<String>,
+    options: &write::AtomicWriteOptions,
+) -> Result<HookState, HookStateError> {
+    let mut state = load_state(state_dir, session_id)?;
+    state.prompt_recall_key = Some(recall_key.into());
+    state.prompt_recall_memory_ids = memory_ids;
+    state.prompt_recall_updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
+    state.updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
+    save_state(state_dir, session_id, &state, options)?;
+    Ok(state)
+}
+
+/// Return memory ids already sent to the session.
+pub fn known_session_memory_ids(state: &HookState) -> std::collections::BTreeSet<String> {
+    state
+        .startup_memory_ids
+        .iter()
+        .chain(state.prompt_recall_memory_ids.iter())
+        .cloned()
+        .collect()
 }
 
 /// Append a successful write receipt for the active session.

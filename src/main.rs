@@ -18,7 +18,7 @@ use std::error::Error;
 use std::fmt::{self, Display};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 use time::OffsetDateTime;
 
 // Clap derives user-facing help from doc comments, so keep implementation
@@ -3489,10 +3489,16 @@ fn run_hook_session_start(args: HookContextArgs, mut context: CliContext) -> Res
         },
     )?;
     if let Some(session_id) = hook_session_id(&mut warnings) {
-        memory_hook::mark_context_key(
+        memory_hook::mark_startup_context(
             &config.state_dir,
             &session_id,
             hook_context_key(&config, &context, path_hint.as_deref())?,
+            assembly
+                .output
+                .sections
+                .iter()
+                .map(|section| section.id.clone())
+                .collect(),
             &hook_options(&config),
         )?;
     }
@@ -3504,6 +3510,7 @@ fn run_hook_session_start(args: HookContextArgs, mut context: CliContext) -> Res
         memory_pending: false,
         context_emitted: true,
         refresh: None,
+        recall: None,
     };
     emit_hook_response(&response, args.json)?;
 
@@ -3542,6 +3549,23 @@ fn run_hook_prompt_submit(args: HookPromptSubmitArgs, context: CliContext) -> Re
         actions.push(action);
     }
 
+    let recall = if context_emitted {
+        Some(HookRecallReport::skipped("context-selection-changed"))
+    } else {
+        let (action, report) = hook_prompt_recall_action(
+            &config,
+            &context,
+            path_hint.as_deref(),
+            session_id.as_deref(),
+            &args.text,
+        )?;
+        if let Some(action) = action {
+            context_emitted = true;
+            actions.push(action);
+        }
+        Some(report)
+    };
+
     if memory_hook::prompt_has_memory_intent(&args.text) {
         let reminder = memory_intent_reminder();
         actions.push(HookAction::new("remind", reminder));
@@ -3564,6 +3588,7 @@ fn run_hook_prompt_submit(args: HookPromptSubmitArgs, context: CliContext) -> Re
         memory_pending,
         context_emitted,
         refresh: None,
+        recall,
     };
     emit_hook_response(&response, args.json)?;
 
@@ -3645,6 +3670,7 @@ fn run_hook_tool_complete(args: HookToolCompleteArgs, context: CliContext) -> Re
         memory_pending,
         context_emitted,
         refresh,
+        recall: None,
     };
     emit_hook_response(&response, args.json)?;
 
@@ -3673,6 +3699,7 @@ fn run_hook_stop(args: HookStopArgs, context: CliContext) -> Result<()> {
         memory_pending,
         context_emitted: false,
         refresh: None,
+        recall: None,
     };
     emit_hook_response(&response, args.json)?;
     maybe_spawn_classifier(&config, &context);
@@ -3742,6 +3769,8 @@ struct HookResponse {
     context_emitted: bool,
     /// Refresh status when this hook ran post-write maintenance.
     refresh: Option<HookRefreshReport>,
+    /// Prompt-specific recall diagnostics.
+    recall: Option<HookRecallReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3766,6 +3795,41 @@ struct HookRefreshReport {
     refreshed: bool,
     /// Whether another hook refresh was already running for this session.
     coalesced: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct HookRecallReport {
+    /// Stable fingerprint for the prompt recall selection.
+    query_fingerprint: Option<String>,
+    /// Candidates returned by search before session dedupe and caps.
+    candidate_count: usize,
+    /// Memories selected for prompt-specific context.
+    selected_count: usize,
+    /// Selected memory ids.
+    selected_ids: Vec<String>,
+    /// Stable reason key.
+    reason: &'static str,
+    /// Whether the previous prompt recall cursor already covered this result.
+    reused_previous: bool,
+    /// Whether recall was skipped because it exceeded the hook budget.
+    timed_out: bool,
+    /// Retrieval duration in milliseconds.
+    retrieval_ms: u128,
+}
+
+impl HookRecallReport {
+    fn skipped(reason: &'static str) -> Self {
+        Self {
+            query_fingerprint: None,
+            candidate_count: 0,
+            selected_count: 0,
+            selected_ids: Vec::new(),
+            reason,
+            reused_previous: false,
+            timed_out: false,
+            retrieval_ms: 0,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -3868,10 +3932,17 @@ fn hook_context_action_if_changed(
             path_hint: path_hint.map(str::to_owned),
         },
     )?;
-    memory_hook::mark_context_key(
+    let section_ids = assembly
+        .output
+        .sections
+        .iter()
+        .map(|section| section.id.clone())
+        .collect();
+    memory_hook::mark_startup_context(
         &config.state_dir,
         session_id,
         context_key,
+        section_ids,
         &hook_options(config),
     )?;
 
@@ -3879,6 +3950,252 @@ fn hook_context_action_if_changed(
         "inject_context",
         assembly.output.markdown,
     )))
+}
+
+fn hook_prompt_recall_action(
+    config: &Config,
+    context: &CliContext,
+    path_hint: Option<&str>,
+    session_id: Option<&str>,
+    prompt: &str,
+) -> Result<(Option<HookAction>, HookRecallReport)> {
+    let Some(session_id) = session_id else {
+        return Ok((None, HookRecallReport::skipped("no-session-id")));
+    };
+    let Some(query) = prompt_recall_query(prompt, path_hint) else {
+        return Ok((None, HookRecallReport::skipped("budget-empty")));
+    };
+
+    let started = Instant::now();
+    let agent_id = resolve_agent_id(context.as_agent.clone());
+    let project_id = resolve_project_id(None, path_hint)?;
+    let project_binding = project_binding_store(config, project_id.as_deref())?;
+    let resolved_store = resolve_store(
+        config,
+        context.store.as_deref(),
+        project_binding.as_deref(),
+        agent_id.as_deref(),
+        StoreAccess::Read,
+    )?;
+    let store_name = resolved_store.name.clone();
+    let store_config = &config.stores[store_name.as_str()];
+    let report = match rebuild_store_index(config, &store_name) {
+        Ok(report) => report,
+        Err(err) => {
+            let mut recall = HookRecallReport::skipped("index-unavailable");
+            recall.retrieval_ms = started.elapsed().as_millis();
+            eprintln!("warning: prompt recall skipped: {err}");
+            return Ok((None, recall));
+        }
+    };
+    let hits = match search::search(search::SearchInput {
+        store_root: &store_config.root,
+        entries: &report.entries,
+        query: &query,
+        scopes: &config.defaults.search_scopes,
+        sources: &["remembered".to_owned()],
+        include_inbox: false,
+        agent_id: agent_id.as_deref(),
+        project_id: project_id.as_deref(),
+        limit: 10,
+    }) {
+        Ok(hits) => hits,
+        Err(search::SearchError::EmptyQuery) => {
+            return Ok((None, HookRecallReport::skipped("budget-empty")));
+        }
+        Err(err) => {
+            let mut recall = HookRecallReport::skipped("index-unavailable");
+            recall.retrieval_ms = started.elapsed().as_millis();
+            eprintln!("warning: prompt recall skipped: {err}");
+            return Ok((None, recall));
+        }
+    };
+
+    let state = memory_hook::load_state(&config.state_dir, session_id)?;
+    let known_ids = memory_hook::known_session_memory_ids(&state);
+    let selected_entries = hits
+        .iter()
+        .filter(|hit| !known_ids.contains(&hit.entry.id))
+        .take(3)
+        .map(|hit| hit.entry.clone())
+        .collect::<Vec<_>>();
+    let selected_ids = selected_entries
+        .iter()
+        .map(|entry| entry.id.clone())
+        .collect::<Vec<_>>();
+    let recall_key = prompt_recall_key(&query, project_id.as_deref(), &store_name, &selected_ids);
+    let mut recall = HookRecallReport {
+        query_fingerprint: Some(recall_key.clone()),
+        candidate_count: hits.len(),
+        selected_count: selected_ids.len(),
+        selected_ids: selected_ids.clone(),
+        reason: "selected",
+        reused_previous: false,
+        timed_out: false,
+        retrieval_ms: started.elapsed().as_millis(),
+    };
+
+    if selected_entries.is_empty() {
+        recall.reason = if hits.is_empty() {
+            "below-threshold"
+        } else {
+            "unchanged"
+        };
+        recall.selected_count = 0;
+        recall.selected_ids.clear();
+        return Ok((None, recall));
+    }
+    if state.prompt_recall_key.as_deref() == Some(recall_key.as_str()) {
+        recall.reason = "unchanged";
+        recall.reused_previous = true;
+        return Ok((None, recall));
+    }
+
+    let max_tokens = usize::try_from(config.defaults.hook_context_max_tokens)?.clamp(200, 1_200);
+    let output = memory_context::assemble_context(memory_context::ContextInput {
+        store_name: store_name.as_str(),
+        store_root: &store_config.root,
+        entries: &selected_entries,
+        scopes: &config.defaults.search_scopes,
+        sources: &["remembered".to_owned()],
+        include_inbox: false,
+        include_search_only: true,
+        agent_id: agent_id.as_deref(),
+        project_id: project_id.as_deref(),
+        path_hint,
+        max_tokens,
+        inject_strategy: inject::Strategy::from_config(&config.defaults.context_strategy),
+        explain: false,
+    })?;
+    if output.sections.is_empty() {
+        recall.reason = "below-threshold";
+        recall.selected_count = 0;
+        recall.selected_ids.clear();
+        return Ok((None, recall));
+    }
+
+    let emitted_ids = output
+        .sections
+        .iter()
+        .map(|section| section.id.clone())
+        .collect::<Vec<_>>();
+    memory_hook::mark_prompt_recall(
+        &config.state_dir,
+        session_id,
+        recall_key,
+        emitted_ids.clone(),
+        &hook_options(config),
+    )?;
+    recall.selected_count = emitted_ids.len();
+    recall.selected_ids = emitted_ids;
+    recall.retrieval_ms = started.elapsed().as_millis();
+
+    Ok((
+        Some(HookAction::new("inject_context", output.markdown)),
+        recall,
+    ))
+}
+
+fn prompt_recall_key(
+    query: &str,
+    project_id: Option<&str>,
+    store_name: &str,
+    ids: &[String],
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(query.as_bytes());
+    digest.update(b"\0");
+    digest.update(project_id.unwrap_or_default().as_bytes());
+    digest.update(b"\0");
+    digest.update(store_name.as_bytes());
+    for id in ids {
+        digest.update(b"\0");
+        digest.update(id.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn prompt_recall_query(prompt: &str, path_hint: Option<&str>) -> Option<String> {
+    let mut code_terms = Vec::new();
+    let mut plain_terms = Vec::new();
+    for token in prompt
+        .split(|ch: char| {
+            ch.is_whitespace() || matches!(ch, ',' | ';' | ':' | '(' | ')' | '[' | ']')
+        })
+        .map(normalize_prompt_token)
+        .filter(|token| !token.is_empty())
+    {
+        if is_prompt_stopword(&token) {
+            continue;
+        }
+        if is_code_prompt_term(&token) {
+            push_unique(&mut code_terms, token);
+        } else if token.len() >= 4 {
+            push_unique(&mut plain_terms, token);
+        }
+    }
+    if code_terms.is_empty()
+        && let Some(path_hint) = path_hint
+        && let Some(file_name) = Path::new(path_hint)
+            .file_name()
+            .and_then(|name| name.to_str())
+    {
+        let token = normalize_prompt_token(file_name);
+        if is_code_prompt_term(&token) {
+            push_unique(&mut code_terms, token);
+        }
+    }
+
+    let terms = if !code_terms.is_empty() {
+        code_terms.into_iter().take(3).collect::<Vec<_>>()
+    } else {
+        plain_terms.into_iter().take(2).collect::<Vec<_>>()
+    };
+    (!terms.is_empty()).then(|| terms.join(" "))
+}
+
+fn normalize_prompt_token(token: &str) -> String {
+    token
+        .trim_matches(|ch: char| {
+            !(ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '/' | '<' | '>'))
+        })
+        .to_ascii_lowercase()
+}
+
+fn is_code_prompt_term(token: &str) -> bool {
+    matches!(token, "agents.md" | "cargo.toml" | "checkrun" | "sley")
+        || token.contains('/')
+        || token.contains('.')
+        || token.contains('<')
+}
+
+fn is_prompt_stopword(token: &str) -> bool {
+    matches!(
+        token,
+        "about"
+            | "after"
+            | "again"
+            | "also"
+            | "could"
+            | "from"
+            | "into"
+            | "please"
+            | "remember"
+            | "should"
+            | "that"
+            | "this"
+            | "what"
+            | "when"
+            | "where"
+            | "with"
+            | "would"
+    )
+}
+
+fn push_unique(terms: &mut Vec<String>, token: String) {
+    if !terms.iter().any(|existing| existing == &token) {
+        terms.push(token);
+    }
 }
 
 fn context_selection_key_from_assembly(assembly: &CliContextAssembly) -> String {

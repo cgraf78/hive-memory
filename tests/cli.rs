@@ -4936,6 +4936,168 @@ fn hook_prompt_submit_emits_context_only_when_selection_changes() {
 }
 
 #[test]
+fn hook_prompt_submit_recalls_relevant_search_only_project_memory_once() {
+    let dir = temp_dir("hook-prompt-recall");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    let state = dir.join("state");
+    let repo = dir.join("repo");
+    fs::create_dir_all(repo.join("src")).expect("repo");
+    fs::write(
+        repo.join(".hive-memory-project"),
+        "id = \"hook-recall-project\"\n",
+    )
+    .expect("marker");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            state_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+
+            [stores.work]
+            root = "{}"
+
+            [defaults]
+            context_strategy = "relevance"
+            "#,
+            state.display(),
+            personal.display(),
+            work.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "remember",
+            "--project",
+            repo.to_str().expect("utf8 repo"),
+            "--scope",
+            "project",
+            "--kind",
+            "reference",
+            "--text",
+            "AGENTS.md documents the checkrun rules for hook retrieval.",
+        ])
+        .assert()
+        .success();
+
+    let mut raw = cargo_bin_cmd!("hm");
+    raw.args([
+        "--config",
+        config.to_str().expect("utf8 config"),
+        "--as-agent",
+        "codex",
+        "note",
+        "--project",
+        repo.to_str().expect("utf8 repo"),
+        "--scope",
+        "project",
+        "--text",
+        "Raw note mentioning AGENTS.md and checkrun should not recall.",
+    ])
+    .assert()
+    .success();
+
+    let mut start = cargo_bin_cmd!("hm");
+    let start_output = start
+        .env("HIVE_MEMORY_SESSION_ID", "session-prompt-recall")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "session-start",
+            "--project",
+            repo.join("src/main.rs").to_str().expect("utf8 project"),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let start_stdout = String::from_utf8(start_output).expect("utf8 stdout");
+    assert!(!start_stdout.contains("AGENTS.md documents the checkrun rules"));
+
+    let mut prompt = cargo_bin_cmd!("hm");
+    let prompt_output = prompt
+        .env("HIVE_MEMORY_SESSION_ID", "session-prompt-recall")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "prompt-submit",
+            "--project",
+            repo.join("src/main.rs").to_str().expect("utf8 project"),
+            "--text",
+            "Where are AGENTS.md checkrun rules documented?",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let prompt_stdout = String::from_utf8(prompt_output).expect("utf8 stdout");
+    assert!(
+        prompt_stdout.contains("\"kind\": \"inject_context\""),
+        "prompt stdout:\n{prompt_stdout}"
+    );
+    assert!(
+        prompt_stdout.contains("\"reason\": \"selected\""),
+        "prompt stdout:\n{prompt_stdout}"
+    );
+    assert!(
+        prompt_stdout.contains("AGENTS.md documents the checkrun rules"),
+        "prompt stdout:\n{prompt_stdout}"
+    );
+    assert!(
+        !prompt_stdout.contains("Raw note mentioning AGENTS.md"),
+        "prompt stdout:\n{prompt_stdout}"
+    );
+
+    let mut repeated = cargo_bin_cmd!("hm");
+    let repeated_output = repeated
+        .env("HIVE_MEMORY_SESSION_ID", "session-prompt-recall")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "prompt-submit",
+            "--project",
+            repo.join("src/main.rs").to_str().expect("utf8 project"),
+            "--text",
+            "Where are AGENTS.md checkrun rules documented?",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let repeated_stdout = String::from_utf8(repeated_output).expect("utf8 stdout");
+    assert!(repeated_stdout.contains("\"reason\": \"unchanged\""));
+    assert!(!repeated_stdout.contains("\"kind\": \"inject_context\""));
+}
+
+#[test]
 fn hook_tool_complete_without_project_does_not_clear_context_selection() {
     let dir = temp_dir("hook-tool-complete-projectless");
     let config = dir.join("config.toml");
