@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+usage: scripts/download-longmemeval-fixture [--output PATH]
+
+Download the cleaned LongMemEval-S JSON fixture used by the ignored public
+retrieval eval. The downloaded dataset is external test data and should not be
+committed.
+
+Options:
+  --output PATH   destination path
+                  default: target/public-evals/longmemeval_s_cleaned.json
+USAGE
+}
+
+output="target/public-evals/longmemeval_s_cleaned.json"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --output)
+      [[ $# -ge 2 ]] || {
+        echo "error: --output requires a path" >&2
+        exit 2
+      }
+      output="$2"
+      shift 2
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "error: unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+url="https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json"
+mkdir -p "$(dirname "$output")"
+curl --fail --location --show-error "$url" --output "$output"
+
+cat <<EOF
+downloaded: $output
+
+Run the eval with:
+
+  HIVE_MEMORY_LONGMEMEVAL_S_JSON="$output" \\
+    cargo test --test public_longmemeval -- --ignored --nocapture
+EOF
