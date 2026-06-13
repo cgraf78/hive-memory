@@ -53,8 +53,43 @@ pub struct SearchHit {
     pub entry: IndexEntry,
     /// Simple occurrence count used for deterministic ranking.
     pub score: usize,
+    /// Structured scoring components used to produce `score`.
+    pub trace: SearchScoreTrace,
     /// First matching line, trimmed for display.
     pub snippet: String,
+}
+
+/// Structured scoring components for one search hit.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchScoreTrace {
+    /// Phrase match score from canonical body text.
+    pub body_phrase: usize,
+    /// Term/alias match score from canonical body text.
+    pub body_terms: usize,
+    /// Phrase match score from subject/tags metadata.
+    pub metadata_phrase: usize,
+    /// Term/alias match score from subject/tags metadata.
+    pub metadata_terms: usize,
+    /// Phrase match score from the combined metadata/body fallback.
+    pub combined_phrase: usize,
+    /// Term/alias match score from the combined metadata/body fallback.
+    pub combined_terms: usize,
+    /// Entity overlap boost.
+    pub entity: usize,
+}
+
+impl SearchScoreTrace {
+    /// Total deterministic score used for ranking.
+    #[must_use]
+    pub fn total(&self) -> usize {
+        self.body_phrase
+            + self.body_terms
+            + self.metadata_phrase
+            + self.metadata_terms
+            + self.combined_phrase
+            + self.combined_terms
+            + self.entity
+    }
 }
 
 /// Search failure.
@@ -154,13 +189,20 @@ pub fn search(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
             if !curated_scope_allowed(&curated, input.scopes) {
                 continue;
             }
-            let score = score_text(&curated.body, &query);
+            let text_score = score_text_trace(&curated.body, &query);
+            let trace = SearchScoreTrace {
+                body_phrase: text_score.phrase,
+                body_terms: text_score.terms,
+                ..SearchScoreTrace::default()
+            };
+            let score = trace.total();
             if score == 0 {
                 continue;
             }
             hits.push(SearchHit {
                 entry: curated_entry(&curated, input.project_id),
                 score,
+                trace,
                 snippet: curated_snippet(&curated.body, &query),
             });
         }
@@ -181,13 +223,15 @@ pub fn search(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
         }
 
         let body = indexed_body(input.store_root, entry)?;
-        let score = score_entry(entry, &body, &query);
+        let trace = score_entry(entry, &body, &query);
+        let score = trace.total();
         if score == 0 {
             continue;
         }
         hits.push(SearchHit {
             entry: entry.clone(),
             score,
+            trace,
             snippet: snippet(entry, &body, &query),
         });
     }
@@ -440,23 +484,45 @@ impl QueryTerm {
 }
 
 fn score_text(body: &str, query: &SearchQuery) -> usize {
+    score_text_trace(body, query).total()
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TextScoreTrace {
+    phrase: usize,
+    terms: usize,
+}
+
+impl TextScoreTrace {
+    fn total(&self) -> usize {
+        self.phrase + self.terms
+    }
+}
+
+fn score_text_trace(body: &str, query: &SearchQuery) -> TextScoreTrace {
     let lower = body.to_ascii_lowercase();
     let exact = count_pattern_matches(&lower, &query.phrase, query.has_required_terms());
     if exact > 0 {
         // Keep phrase hits clearly above keyword-only hits without making the
         // scoring model clever. Exact recall should remain the most predictable
         // path for humans, while agents can still use natural token queries.
-        return exact * (query.terms.len() * 20 + 100);
+        return TextScoreTrace {
+            phrase: exact * (query.terms.len() * 20 + 100),
+            terms: 0,
+        };
     }
 
     let coverage = term_coverage(&lower, query);
     if coverage.required_matched == coverage.required_total
         && coverage.matched >= query.min_matching_terms()
     {
-        return coverage.matched * 10 + coverage.score;
+        return TextScoreTrace {
+            phrase: 0,
+            terms: coverage.matched * 10 + coverage.score,
+        };
     }
 
-    0
+    TextScoreTrace::default()
 }
 
 fn normalize_query_token(token: &str) -> Option<String> {
@@ -744,7 +810,7 @@ fn pattern_boundary_allows(
     left_ok && right_ok
 }
 
-fn score_entry(entry: &IndexEntry, body: &str, query: &SearchQuery) -> usize {
+fn score_entry(entry: &IndexEntry, body: &str, query: &SearchQuery) -> SearchScoreTrace {
     let metadata = entry
         .subject
         .as_deref()
@@ -752,20 +818,27 @@ fn score_entry(entry: &IndexEntry, body: &str, query: &SearchQuery) -> usize {
         .chain(entry.tags.iter().map(String::as_str))
         .collect::<Vec<_>>()
         .join(" ");
-    let body_score = score_text(body, query);
-    let metadata_score = score_text(&metadata, query);
+    let body_score = score_text_trace(body, query);
+    let metadata_score = score_text_trace(&metadata, query);
     // Natural recall queries can span metadata and body text, for example a
     // subject naming the workflow and a body naming the concrete preference.
     // Only use the combined view as a fallback so ordinary body/metadata hits
     // are not double-counted.
-    let combined_score = if body_score == 0 && metadata_score == 0 && !query.has_required_terms() {
-        score_text(&format!("{metadata} {body}"), query)
-    } else {
-        0
-    };
-    let entity_score = score_entities(entry, query);
-
-    body_score + metadata_score + combined_score + entity_score
+    let combined_score =
+        if body_score.total() == 0 && metadata_score.total() == 0 && !query.has_required_terms() {
+            score_text_trace(&format!("{metadata} {body}"), query)
+        } else {
+            TextScoreTrace::default()
+        };
+    SearchScoreTrace {
+        body_phrase: body_score.phrase,
+        body_terms: body_score.terms,
+        metadata_phrase: metadata_score.phrase,
+        metadata_terms: metadata_score.terms,
+        combined_phrase: combined_score.phrase,
+        combined_terms: combined_score.terms,
+        entity: score_entities(entry, query),
+    }
 }
 
 fn score_entities(entry: &IndexEntry, query: &SearchQuery) -> usize {
@@ -2005,6 +2078,49 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert!(hits[0].entry.body.contains("sley ready"));
         assert_eq!(hits[0].entry.project_id.as_deref(), Some("proj-alpha"));
+        assert_eq!(hits[0].score, hits[0].trace.total());
+        assert!(
+            hits[0].trace.entity > 0,
+            "alias-only recall should expose the entity boost in the score trace: {:?}",
+            hits[0].trace
+        );
+    }
+
+    #[test]
+    fn search_score_trace_explains_body_components() {
+        let dir = temp_dir("score-trace");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "Use concise summaries for release notes.",
+            timestamp(1_778_946_153),
+            Vec::new(),
+        );
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "release notes",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].score, hits[0].trace.total());
+        assert!(
+            hits[0].trace.body_terms > 0 || hits[0].trace.body_phrase > 0,
+            "body match should be visible in trace: {:?}",
+            hits[0].trace
+        );
+        assert_eq!(hits[0].trace.entity, 0);
     }
 
     #[test]
