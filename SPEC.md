@@ -1115,11 +1115,16 @@ Behavior:
   itself. `HIVE_MEMORY_HOOK_ACTIVE=1` remains supported for hook scripts that
   call lower-level primitives directly.
 - `session-start`: resolves agent/project/store policy, emits initial context,
-  records the session context selection, and returns an `inject_context` action.
+  records the session context selection and emitted memory ids, and returns an
+  `inject_context` action.
 - `prompt-submit`: resolves the current project/store selection, emits context
-  only when the selection changed, runs the durable-memory intent heuristic, and
-  records `memory-pending` when the heuristic matches. It returns `inject_context`
-  and/or `remind` actions as needed.
+  when the selection changed, otherwise runs bounded prompt-specific lexical
+  recall against remembered memory. Prompt recall excludes raw inbox records,
+  suppresses memories already emitted to the session, and returns an
+  `inject_context` action only when it selects new useful context. It also runs
+  the durable-memory intent heuristic and records `memory-pending` when the
+  heuristic matches. It returns `inject_context` and/or `remind` actions as
+  needed.
 - `tool-complete`: resolves the current project/store selection when the hook
   supplies a project/path hint, emits context only when that hinted selection
   changed, runs receipt-aware refresh after successful tool events, and clears
@@ -1139,7 +1144,11 @@ Output:
 - human: concise action summaries suitable for hook logs.
 - JSON: ordered actions for hook adapters. Dotfiles hooks translate these actions
   into the host-specific injection/warning surfaces; they do not inspect memory
-  policy state themselves.
+  policy state themselves. `prompt-submit` responses may include a `recall`
+  object with stable diagnostic fields such as `query_fingerprint`,
+  `candidate_count`, `selected_count`, `selected_ids`, `reason`,
+  `reused_previous`, `timed_out`, and `retrieval_ms`; hook adapters may ignore
+  this metadata and continue applying only `actions`.
 
 ### `hm promote`
 
@@ -1906,7 +1915,10 @@ Test categories per module:
 - `hm hook prompt-submit --text ... --json` records memory-pending and returns a
   reminder action for durable-memory intent, without writing canonical memory.
 - `hm hook prompt-submit` emits context only when the resolved
-  project/store/scope/source selection changed.
+  project/store/scope/source selection changed, or when prompt-specific lexical
+  recall finds remembered memory that was not already emitted to the session.
+  Repeated equivalent prompt recall returns valid JSON with
+  `recall.reason = "unchanged"` and no duplicate `inject_context` action.
 - `hm hook tool-complete` emits context only when it receives a project/path hint
   and the resolved project/store/scope/source selection changed; projectless
   completions leave the prior context selection intact.

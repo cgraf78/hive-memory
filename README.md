@@ -406,8 +406,9 @@ hm hook stop
 ```
 
 Hook behavior uses session-local state under `state_dir`. It can detect memory
-intent in prompts, emit startup context, coalesce refresh work with a local lock,
-and remind the agent at session end when a memory request was never satisfied.
+intent in prompts, emit startup context, inject prompt-specific recalled memory,
+coalesce refresh work with a local lock, and remind the agent at session end
+when a memory request was never satisfied.
 
 ### Doctor
 
