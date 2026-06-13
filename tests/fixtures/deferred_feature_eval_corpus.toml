@@ -1,0 +1,129 @@
+[[record]]
+subject = "alpha-agent-rules-checkrun"
+entry_kind = "remember"
+scope = "project"
+project_id = "project-alpha"
+confidence = "high"
+kind = "project-fact"
+body = "Project alpha keeps coding agent instructions in AGENTS.md and verifies local changes with checkrun format and checkrun lint."
+
+[[record]]
+subject = "alpha-validation-command"
+entry_kind = "remember"
+scope = "project"
+project_id = "project-alpha"
+confidence = "high"
+kind = "project-fact"
+body = "Before committing in Project alpha, run checkrun format and checkrun lint to validate local changes."
+
+[[record]]
+subject = "beta-cargo-publish"
+entry_kind = "remember"
+scope = "project"
+project_id = "project-beta"
+confidence = "high"
+kind = "project-fact"
+body = "Project beta publishes Rust crates from Cargo.toml metadata on release tags."
+
+[[record]]
+subject = "ops-storage-host"
+entry_kind = "remember"
+scope = "global"
+confidence = "high"
+kind = "reference"
+body = "storage-primary is the operations storage host; read docs/ops/storage.md before investigating it."
+
+[[record]]
+subject = "old-cargo-fmt"
+entry_kind = "remember"
+scope = "project"
+project_id = "project-alpha"
+confidence = "medium"
+kind = "project-fact"
+body = "Project alpha used to run cargo fmt before committing."
+
+[[record]]
+subject = "new-checkrun-format-lint"
+entry_kind = "remember"
+scope = "project"
+project_id = "project-alpha"
+confidence = "high"
+kind = "project-fact"
+body = "Project alpha now uses checkrun format and checkrun lint before committing."
+
+[[record]]
+subject = "stacked-pr-preference"
+entry_kind = "remember"
+scope = "global"
+confidence = "high"
+kind = "preference"
+body = "The user prefers stacked PRs for related Hive Memory implementation work."
+
+[[retrieval_case]]
+name = "semantic paraphrase finds agent instructions"
+feature = "semantic"
+query = "where are coding agent rules documented"
+project_id = "project-alpha"
+expected = ["alpha-agent-rules-checkrun"]
+forbidden = ["beta-cargo-publish"]
+target_recall_at_5 = 1.0
+target_precision_at_5 = 1.0
+note = "The baseline lexical path misses this because the prompt says rules documented while the memory says AGENTS.md."
+
+[[retrieval_case]]
+name = "semantic paraphrase finds validation command"
+feature = "semantic"
+query = "what validates changes before shipping"
+project_id = "project-alpha"
+expected = ["alpha-validation-command"]
+forbidden = ["beta-cargo-publish"]
+target_recall_at_5 = 1.0
+target_precision_at_5 = 1.0
+note = "The useful feature is conceptual recall of validate/checkrun, not exact token overlap."
+
+[[retrieval_case]]
+name = "entity query stays scoped to operations host"
+feature = "entity"
+query = "operations storage host storage-primary"
+project_id = "project-alpha"
+expected = ["ops-storage-host"]
+forbidden = ["alpha-agent-rules-checkrun", "beta-cargo-publish"]
+target_recall_at_5 = 1.0
+target_precision_at_5 = 1.0
+note = "Entity work should improve scoping without injecting unrelated project facts."
+
+[[retrieval_case]]
+name = "project scoping blocks inactive repository"
+feature = "scope"
+query = "Cargo.toml release tags"
+project_id = "project-alpha"
+expected = []
+forbidden = ["beta-cargo-publish"]
+target_recall_at_5 = 1.0
+target_precision_at_5 = 1.0
+note = "A guard case: future semantic/entity changes must not pierce project scope."
+
+[[supersession_case]]
+name = "new commit validation replaces old cargo fmt"
+project_id = "project-alpha"
+old = "old-cargo-fmt"
+new = "new-checkrun-format-lint"
+expected_active = ["new-checkrun-format-lint"]
+expected_suppressed = ["old-cargo-fmt"]
+note = "A useful supersession feature suppresses stale advice without deleting history."
+
+[[extraction_case]]
+name = "extract durable project command and reject speculation"
+project_id = "project-alpha"
+input = "For this repo, use checkrun format and checkrun lint before commits. I might rename the branch later."
+expected_facts = ["use checkrun format and checkrun lint before commits"]
+reject_terms = ["might rename the branch later"]
+note = "Extraction is only useful if it separates stable facts from temporary speculation."
+
+[[extraction_case]]
+name = "do not store secrets from noisy input"
+project_id = "project-alpha"
+input = "Remember that Project alpha uses checkrun. The fake API key should-not-be-stored is in my shell history."
+expected_facts = ["Project alpha uses checkrun"]
+reject_terms = ["should-not-be-stored", "shell history"]
+note = "Any extraction feature must keep secret-like content out of durable memory."
