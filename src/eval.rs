@@ -71,9 +71,19 @@ pub struct RetrievalMetrics {
 #[derive(Debug)]
 pub enum EvalError {
     /// Corpus could not be read.
-    ReadCorpus { path: PathBuf, message: String },
+    ReadCorpus {
+        /// Corpus path that failed to load.
+        path: PathBuf,
+        /// Human-readable read failure.
+        message: String,
+    },
     /// Corpus TOML could not be parsed.
-    ParseCorpus { path: PathBuf, message: String },
+    ParseCorpus {
+        /// Corpus path that failed to parse.
+        path: PathBuf,
+        /// Human-readable parser failure.
+        message: String,
+    },
     /// Fixture memory could not be written.
     WriteMemory(String),
     /// Index rebuild failed.
