@@ -171,18 +171,12 @@ fn deferred_feature_targets_are_actionable() {
 }
 
 #[test]
-fn deferred_supersession_eval_documents_current_gap() {
+fn deferred_supersession_eval_suppresses_stale_replacements() {
     let corpus = load_corpus();
     let materialized = materialize(&corpus);
     let subjects = subjects_by_name(&corpus);
 
     for case in &corpus.supersession_case {
-        let old = subjects
-            .get(&case.old)
-            .unwrap_or_else(|| panic!("unknown old subject {}", case.old));
-        let new = subjects
-            .get(&case.new)
-            .unwrap_or_else(|| panic!("unknown new subject {}", case.new));
         let hits = search(SearchInput {
             store_root: &materialized.root,
             entries: &materialized.entries,
@@ -196,11 +190,26 @@ fn deferred_supersession_eval_documents_current_gap() {
         })
         .unwrap_or_else(|err| panic!("supersession case {} search failed: {err}", case.name));
         let hit_subjects = hit_subjects(&hits);
-        assert!(
-            hit_subjects.contains(old) && hit_subjects.contains(new),
-            "baseline intentionally shows both stale and replacement memories for {}; hits={hit_subjects:?}",
-            case.name
-        );
+        for expected in &case.expected_active {
+            let subject = subjects
+                .get(expected)
+                .unwrap_or_else(|| panic!("unknown active subject {expected}"));
+            assert!(
+                hit_subjects.contains(subject),
+                "supersession case {} missing active subject {expected}; hits={hit_subjects:?}",
+                case.name
+            );
+        }
+        for suppressed in &case.expected_suppressed {
+            let subject = subjects
+                .get(suppressed)
+                .unwrap_or_else(|| panic!("unknown suppressed subject {suppressed}"));
+            assert!(
+                !hit_subjects.contains(subject),
+                "supersession case {} included suppressed subject {suppressed}; hits={hit_subjects:?}",
+                case.name
+            );
+        }
     }
 }
 
