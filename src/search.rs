@@ -344,7 +344,7 @@ struct SearchQuery {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct QueryTerm {
     value: String,
-    aliases: Vec<&'static str>,
+    alternatives: Vec<String>,
 }
 
 impl SearchQuery {
@@ -369,24 +369,41 @@ impl SearchQuery {
         let terms = meaningful_terms
             .into_iter()
             .filter(|term| !term.is_empty())
-            .map(|term| QueryTerm {
-                aliases: concept_aliases(&term),
-                value: term,
-            })
+            .map(QueryTerm::new)
             .collect::<Vec<_>>();
         let terms = if terms.is_empty() {
             raw_terms
                 .into_iter()
-                .map(|term| QueryTerm {
-                    aliases: concept_aliases(&term),
-                    value: term,
-                })
+                .map(QueryTerm::new)
                 .collect::<Vec<_>>()
         } else {
             terms
         };
 
         Ok(Self { phrase, terms })
+    }
+
+    fn min_matching_terms(&self) -> usize {
+        match self.terms.len() {
+            0 => 0,
+            1..=3 => self.terms.len(),
+            len => ((len * 3).div_ceil(5)).clamp(3, 8),
+        }
+    }
+}
+
+impl QueryTerm {
+    fn new(value: String) -> Self {
+        let mut alternatives = Vec::new();
+        alternatives.extend(concept_aliases(&value).into_iter().map(str::to_owned));
+        alternatives.extend(morphological_alternatives(&value));
+        alternatives.sort();
+        alternatives.dedup();
+        alternatives.retain(|alternative| alternative != &value);
+        Self {
+            value,
+            alternatives,
+        }
     }
 }
 
@@ -400,13 +417,9 @@ fn score_text(body: &str, query: &SearchQuery) -> usize {
         return exact * 10;
     }
 
-    if query.terms.iter().all(|term| term_matches(&lower, term)) {
-        return query
-            .terms
-            .iter()
-            .map(|term| term_score(&lower, term))
-            .sum::<usize>()
-            .max(1);
+    let coverage = term_coverage(&lower, query);
+    if coverage.matched >= query.min_matching_terms() {
+        return coverage.score + coverage.matched;
     }
 
     0
@@ -424,15 +437,24 @@ fn normalize_query_token(token: &str) -> Option<String> {
 fn is_query_stopword(term: &str) -> bool {
     matches!(
         term,
-        "a" | "an"
+        "a" | "am"
+            | "an"
             | "and"
             | "are"
             | "as"
             | "at"
             | "be"
             | "before"
+            | "can"
+            | "could"
+            | "did"
+            | "do"
+            | "does"
             | "for"
             | "from"
+            | "had"
+            | "has"
+            | "have"
             | "how"
             | "i"
             | "in"
@@ -447,8 +469,12 @@ fn is_query_stopword(term: &str) -> bool {
             | "what"
             | "when"
             | "where"
+            | "was"
+            | "were"
             | "which"
+            | "will"
             | "with"
+            | "would"
     )
 }
 
@@ -461,21 +487,75 @@ fn concept_aliases(term: &str) -> Vec<&'static str> {
         "validate" | "validates" | "validation" | "verify" | "verifies" => {
             vec!["checkrun", "lint", "format"]
         }
+        "buy" | "bought" | "order" | "ordered" | "purchase" | "purchased" => {
+            vec!["shopping", "payment"]
+        }
+        "favorite" | "favourite" | "prefer" | "preferred" | "prefers" | "preference"
+        | "preferences" => vec!["likes", "like", "favorite", "prefer"],
+        "recommend" | "recommendation" | "recommendations" | "recommended" | "suggest"
+        | "suggested" | "suggestion" | "suggestions" => {
+            vec!["recommend", "suggest", "advice"]
+        }
+        "tell" | "told" | "said" | "say" => vec!["mentioned", "said"],
         _ => Vec::new(),
     }
-}
-
-fn term_matches(lower: &str, term: &QueryTerm) -> bool {
-    lower.contains(&term.value) || term.aliases.iter().any(|alias| lower.contains(alias))
 }
 
 fn term_score(lower: &str, term: &QueryTerm) -> usize {
     lower.matches(&term.value).count()
         + term
-            .aliases
+            .alternatives
             .iter()
-            .map(|alias| lower.matches(alias).count())
+            .map(|alternative| lower.matches(alternative).count())
             .sum::<usize>()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TermCoverage {
+    matched: usize,
+    score: usize,
+}
+
+fn term_coverage(lower: &str, query: &SearchQuery) -> TermCoverage {
+    query.terms.iter().fold(
+        TermCoverage {
+            matched: 0,
+            score: 0,
+        },
+        |coverage, term| {
+            let score = term_score(lower, term);
+            if score == 0 {
+                coverage
+            } else {
+                TermCoverage {
+                    matched: coverage.matched + 1,
+                    score: coverage.score + score,
+                }
+            }
+        },
+    )
+}
+
+fn morphological_alternatives(term: &str) -> Vec<String> {
+    let mut alternatives = Vec::new();
+    if let Some(stem) = term.strip_suffix("ies").filter(|stem| stem.len() >= 3) {
+        alternatives.push(format!("{stem}y"));
+    }
+    if let Some(stem) = term.strip_suffix("es").filter(|stem| stem.len() >= 4) {
+        alternatives.push(stem.to_owned());
+    }
+    if let Some(stem) = term.strip_suffix('s').filter(|stem| stem.len() >= 4) {
+        alternatives.push(stem.to_owned());
+    }
+    if let Some(stem) = term.strip_suffix("ed").filter(|stem| stem.len() >= 4) {
+        alternatives.push(stem.to_owned());
+        alternatives.push(format!("{stem}e"));
+    }
+    if let Some(stem) = term.strip_suffix("ing").filter(|stem| stem.len() >= 4) {
+        alternatives.push(stem.to_owned());
+        alternatives.push(format!("{stem}e"));
+    }
+    alternatives
 }
 
 fn score_entry(entry: &IndexEntry, body: &str, query: &SearchQuery) -> usize {
@@ -557,7 +637,7 @@ fn matching_body_line<'a>(body: &'a str, query: &SearchQuery) -> Option<&'a str>
         .or_else(|| {
             body.lines().find(|line| {
                 let lower = line.to_ascii_lowercase();
-                query.terms.iter().all(|term| term_matches(&lower, term))
+                term_coverage(&lower, query).matched >= query.min_matching_terms()
             })
         })
         .map(str::trim)
@@ -855,6 +935,113 @@ mod tests {
         .expect("search");
 
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn search_long_natural_queries_require_core_term_coverage() {
+        let dir = temp_dir("keyword-coverage");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "Chris prefers dark roast coffee for morning brewing.",
+            timestamp(1_778_946_153),
+            Vec::new(),
+        );
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "what kind of coffee does chris usually prefer in the morning",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].snippet,
+            "Chris prefers dark roast coffee for morning brewing."
+        );
+    }
+
+    #[test]
+    fn search_long_queries_reject_insufficient_term_coverage() {
+        let dir = temp_dir("keyword-insufficient-coverage");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "Plain `hm` commands are the normal path for agent ergonomics.",
+            timestamp(1_778_946_153),
+            Vec::new(),
+        );
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "agent ergonomics missing unrelated banana",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn search_expands_preference_and_recommendation_terms() {
+        let dir = temp_dir("keyword-expansion");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "The user likes Delta for regional flights and asked for advice on window seats.",
+            timestamp(1_778_946_153),
+            Vec::new(),
+        );
+
+        let preference_hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "which airline was preferred for regional flights",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+        let recommendation_hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "seat recommendation regional flights",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+
+        assert_eq!(preference_hits.len(), 1);
+        assert_eq!(recommendation_hits.len(), 1);
     }
 
     #[test]
