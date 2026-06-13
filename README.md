@@ -339,6 +339,18 @@ aliases = ["deployctl", "release promotion gate"]
 Use `hm search --explain` to inspect how body, metadata, combined text, and
 entity signals contributed to each hit.
 
+Retrieval changes should be measured against labeled corpuses:
+
+```sh
+hm eval retrieval --corpus tests/fixtures/deferred_feature_eval_corpus.toml
+hm eval retrieval --corpus tests/fixtures/deferred_feature_eval_corpus.toml --json
+```
+
+The default report scores two candidates over the same records and queries:
+`no-entity-baseline` strips entity links from the index, while `entity-linked`
+uses the current search pipeline. Each feature bucket reports recall, precision,
+MRR, forbidden hits, and p95 latency.
+
 Each rendered memory block is labeled with a trust level:
 
 ```text

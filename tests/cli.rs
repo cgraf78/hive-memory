@@ -267,6 +267,27 @@ fn eval_capture_bad_hit_can_append_and_emit_json() {
 }
 
 #[test]
+fn eval_retrieval_reports_candidate_metrics() {
+    let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/deferred_feature_eval_corpus.toml");
+    let mut cmd = cargo_bin_cmd!("hm");
+
+    cmd.args([
+        "eval",
+        "retrieval",
+        "--corpus",
+        corpus.to_str().expect("utf8 corpus path"),
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("candidate: no-entity-baseline"))
+    .stdout(predicate::str::contains("candidate: entity-linked"))
+    .stdout(predicate::str::contains(
+        "entity cases=3 recall@5=1.000 precision@5=1.000",
+    ));
+}
+
+#[test]
 fn stores_init_creates_manifest() {
     let root = temp_dir("stores-init").join("personal");
     let mut cmd = cargo_bin_cmd!("hm");

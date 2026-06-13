@@ -8,9 +8,9 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use hive_memory::config::{Config, ConfigPaths, EventSidecarPolicy, Sensitivity, StoreConfig};
 use hive_memory::{
-    classify, config, context as memory_context, curation, doctor, event, hook as memory_hook, id,
-    index, inject, memory, note, outbox, path as memory_path, project, search, secret, store,
-    write, write_classify,
+    classify, config, context as memory_context, curation, doctor, eval as memory_eval, event,
+    hook as memory_hook, id, index, inject, memory, note, outbox, path as memory_path, project,
+    search, secret, store, write, write_classify,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -149,10 +149,26 @@ enum InboxCommand {
 /// Eval fixture helper commands.
 #[derive(Debug, Subcommand)]
 enum EvalCommand {
+    /// Run a retrieval corpus and report A/B metrics.
+    Retrieval(EvalRetrievalArgs),
     /// Capture a recall miss as a retrieval eval case.
     CaptureMiss(EvalCaptureMissArgs),
     /// Capture an irrelevant retrieval hit as a retrieval eval case.
     CaptureBadHit(EvalCaptureBadHitArgs),
+}
+
+/// Arguments for `hm eval retrieval`.
+#[derive(Debug, Args)]
+struct EvalRetrievalArgs {
+    /// TOML corpus file containing records and retrieval_case labels.
+    #[arg(long)]
+    corpus: PathBuf,
+    /// Search limit used for each retrieval case.
+    #[arg(long, default_value_t = 5)]
+    limit: usize,
+    /// Emit machine-readable output.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Shared arguments for `hm eval capture-*`.
@@ -1350,8 +1366,43 @@ fn run_inbox_show(args: InboxShowArgs, context: CliContext) -> Result<()> {
 
 fn run_eval(command: EvalCommand, _context: CliContext) -> Result<()> {
     match command {
+        EvalCommand::Retrieval(args) => run_eval_retrieval(args),
         EvalCommand::CaptureMiss(args) => run_eval_capture_miss(args),
         EvalCommand::CaptureBadHit(args) => run_eval_capture_bad_hit(args),
+    }
+}
+
+fn run_eval_retrieval(args: EvalRetrievalArgs) -> Result<()> {
+    let report = memory_eval::run_retrieval_eval(memory_eval::RetrievalEvalInput {
+        corpus_path: args.corpus,
+        limit: args.limit,
+    })?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_retrieval_eval_report(&report, args.limit);
+    }
+    Ok(())
+}
+
+fn print_retrieval_eval_report(report: &memory_eval::RetrievalEvalReport, limit: usize) {
+    println!("corpus: {}", report.corpus);
+    for candidate in &report.candidates {
+        println!("candidate: {}", candidate.name);
+        for metric in &candidate.features {
+            println!(
+                "  {} cases={} recall@{}={:.3} precision@{}={:.3} mrr={:.3} forbidden_hits={} p95_ms={}",
+                metric.feature,
+                metric.cases,
+                limit,
+                metric.recall_at_k,
+                limit,
+                metric.precision_at_k,
+                metric.mrr,
+                metric.forbidden_hits,
+                metric.p95_ms
+            );
+        }
     }
 }
 
