@@ -142,6 +142,7 @@ struct IndexFingerprint {
     store_root: String,
     canonical_dirs: usize,
     latest_directory_modified_nanos: u128,
+    entity_registry_modified_nanos: u128,
 }
 
 /// Non-fatal index rebuild warning.
@@ -174,6 +175,8 @@ pub enum IndexError {
         /// Invalid timestamp value.
         value: String,
     },
+    /// Entity registry could not be loaded.
+    EntityRegistry(String),
 }
 
 impl Display for IndexError {
@@ -188,6 +191,7 @@ impl Display for IndexError {
             Self::InvalidTimestamp { path, value } => {
                 write!(f, "invalid note timestamp in {}: {value}", path.display())
             }
+            Self::EntityRegistry(message) => write!(f, "{message}"),
         }
     }
 }
@@ -244,6 +248,8 @@ pub fn load_or_rebuild_index(input: LoadIndexInput<'_>) -> Result<LoadIndexRepor
 pub fn rebuild_index(input: RebuildIndexInput<'_>) -> Result<RebuildIndexReport, IndexError> {
     let mut entries = Vec::new();
     let mut warnings = Vec::new();
+    let registry = entity::EntityRegistry::load_for_store(input.store_root)
+        .map_err(|err| IndexError::EntityRegistry(err.to_string()))?;
     let notes_root = input.store_root.join("inbox/notes");
     for note_path in note_paths(&notes_root)? {
         let relative_note_path = relative_path(input.store_root, &note_path, input.path_case);
@@ -283,6 +289,7 @@ pub fn rebuild_index(input: RebuildIndexInput<'_>) -> Result<RebuildIndexReport,
             &relative_note_path,
             event.as_ref().map(|_| relative_event_path.as_str()),
             event.as_ref(),
+            &registry,
         ));
     }
 
@@ -422,6 +429,7 @@ fn entry_from_note(
     note_path: &str,
     event_path: Option<&str>,
     event: Option<&event::MemoryEvent>,
+    registry: &entity::EntityRegistry,
 ) -> IndexEntry {
     if let Some(event) = event {
         // Event sidecars are the structured machine contract. The Markdown note
@@ -433,6 +441,7 @@ fn entry_from_note(
             &event.tags,
             event.kind.or(front_matter.kind),
             body,
+            registry,
         );
         return IndexEntry {
             id: event.id.clone(),
@@ -469,6 +478,7 @@ fn entry_from_note(
         &front_matter.tags,
         front_matter.kind,
         body,
+        registry,
     );
     IndexEntry {
         id: front_matter.id.clone(),
@@ -497,14 +507,16 @@ fn entry_entities(
     tags: &[String],
     kind: Option<note::MemoryKind>,
     body: &str,
+    registry: &entity::EntityRegistry,
 ) -> Vec<entity::EntityId> {
     let kind_label = kind.map(note::kind_label);
-    entity::extract_fields(
+    entity::extract_fields_with_registry(
         subject
             .into_iter()
             .chain(tags.iter().map(String::as_str))
             .chain(kind_label)
             .chain(std::iter::once(body)),
+        registry,
     )
 }
 
@@ -563,12 +575,24 @@ fn canonical_fingerprint(store_root: &Path) -> Result<IndexFingerprint, IndexErr
         ));
     }
     Ok(IndexFingerprint {
-        // v6: entries carry extracted canonical entities for retrieval.
-        schema_version: 6,
+        // v7: entries carry extracted canonical entities from built-in aliases
+        // plus the optional store-level entity registry.
+        schema_version: 7,
         store_root: store_root.display().to_string(),
         canonical_dirs: dirs.len(),
         latest_directory_modified_nanos,
+        entity_registry_modified_nanos: optional_modified_nanos(&store_root.join("entities.toml"))?,
     })
+}
+
+fn optional_modified_nanos(path: &Path) -> Result<u128, IndexError> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(modified_nanos(metadata.modified().map_err(|err| {
+            io_error("read entity registry modified time", path, err)
+        })?)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(err) => Err(io_error("read entity registry metadata", path, err)),
+    }
 }
 
 fn collect_canonical_dirs(root: &Path, paths: &mut Vec<PathBuf>) -> Result<(), IndexError> {

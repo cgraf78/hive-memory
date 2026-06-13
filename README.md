@@ -116,6 +116,7 @@ source, audience, and token budget. Context output is not the source of truth.
 ```text
 <store-root>/
   manifest.toml
+  entities.toml        # optional search alias registry
   people/
   rules/
   memories/
@@ -321,6 +322,22 @@ hm context --if-changed
 By default, context includes curated memory and remembered records. Raw `hm
 note` entries are excluded unless `--include-inbox`, `--source inbox`, or
 `--source all` is used.
+
+Store-level `entities.toml` can add durable aliases for search recall. Entity
+links are cache metadata: the canonical memories remain the Markdown notes and
+JSON events, and the local index recomputes entity ids when the registry
+changes.
+
+```toml
+schema_version = 1
+
+[[entity]]
+id = "tool:deployctl"
+aliases = ["deployctl", "release promotion gate"]
+```
+
+Use `hm search --explain` to inspect how body, metadata, combined text, and
+entity signals contributed to each hit.
 
 Each rendered memory block is labeled with a trust level:
 

@@ -7,29 +7,75 @@
 //! `sley ready` without relaxing project/scope filters.
 
 use std::collections::BTreeSet;
+use std::error::Error;
+use std::fmt::{self, Display};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
 
 /// Canonical entity id extracted from memory text or a recall query.
 pub type EntityId = String;
 
-struct EntityDef {
-    id: &'static str,
-    aliases: &'static [&'static str],
+/// User-editable entity alias registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntityRegistry {
+    entities: Vec<EntityDef>,
 }
 
-const ENTITIES: &[EntityDef] = &[
-    EntityDef {
-        id: "file:agents.md",
-        aliases: &[
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EntityDef {
+    id: String,
+    aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntityRegistryError {
+    Read { path: PathBuf, message: String },
+    Parse { path: PathBuf, message: String },
+    Invalid { path: PathBuf, message: String },
+}
+
+impl Display for EntityRegistryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read { path, message } => {
+                write!(
+                    f,
+                    "failed to read entity registry {}: {message}",
+                    path.display()
+                )
+            }
+            Self::Parse { path, message } => {
+                write!(
+                    f,
+                    "failed to parse entity registry {}: {message}",
+                    path.display()
+                )
+            }
+            Self::Invalid { path, message } => {
+                write!(f, "invalid entity registry {}: {message}", path.display())
+            }
+        }
+    }
+}
+
+impl Error for EntityRegistryError {}
+
+const BUILTIN_ENTITIES: &[(&str, &[&str])] = &[
+    (
+        "file:agents.md",
+        &[
             "agents.md",
             "agent instructions",
             "agent rules",
             "coding agent instructions",
             "coding agent rules",
         ],
-    },
-    EntityDef {
-        id: "tool:checkrun",
-        aliases: &[
+    ),
+    (
+        "tool:checkrun",
+        &[
             "checkrun",
             "checkrun format",
             "checkrun lint",
@@ -43,10 +89,10 @@ const ENTITIES: &[EntityDef] = &[
             "verification command",
             "verification commands",
         ],
-    },
-    EntityDef {
-        id: "tool:sley",
-        aliases: &[
+    ),
+    (
+        "tool:sley",
+        &[
             "sley",
             "sley ready",
             "commit gate",
@@ -57,30 +103,135 @@ const ENTITIES: &[EntityDef] = &[
             "pre-landing verification",
             "ready gate",
         ],
-    },
-    EntityDef {
-        id: "file:cargo.toml",
-        aliases: &[
+    ),
+    (
+        "file:cargo.toml",
+        &[
             "cargo.toml",
             "cargo metadata",
             "crate metadata",
             "rust crate metadata",
         ],
-    },
+    ),
 ];
+
+impl EntityRegistry {
+    /// Built-in aliases for common agent workflow entities.
+    #[must_use]
+    pub fn builtin() -> Self {
+        Self {
+            entities: BUILTIN_ENTITIES
+                .iter()
+                .map(|(id, aliases)| EntityDef {
+                    id: (*id).to_owned(),
+                    aliases: aliases.iter().map(|alias| (*alias).to_owned()).collect(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Load the built-in registry plus optional `entities.toml` from a store.
+    pub fn load_for_store(store_root: &Path) -> Result<Self, EntityRegistryError> {
+        let mut registry = Self::builtin();
+        let path = store_root.join("entities.toml");
+        registry.extend_from_optional_file(&path)?;
+        Ok(registry)
+    }
+
+    fn extend_from_optional_file(&mut self, path: &Path) -> Result<(), EntityRegistryError> {
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(EntityRegistryError::Read {
+                    path: path.to_path_buf(),
+                    message: err.to_string(),
+                });
+            }
+        };
+        let parsed = toml::from_str::<EntityRegistryFile>(&contents).map_err(|err| {
+            EntityRegistryError::Parse {
+                path: path.to_path_buf(),
+                message: err.to_string(),
+            }
+        })?;
+        if parsed.schema_version != 1 {
+            return Err(EntityRegistryError::Invalid {
+                path: path.to_path_buf(),
+                message: format!("unsupported schema_version {}", parsed.schema_version),
+            });
+        }
+        for entity in parsed.entity {
+            let id = entity.id.trim();
+            if id.is_empty() {
+                return Err(EntityRegistryError::Invalid {
+                    path: path.to_path_buf(),
+                    message: "entity id must not be empty".to_owned(),
+                });
+            }
+            let aliases = entity
+                .aliases
+                .into_iter()
+                .map(|alias| alias.trim().to_ascii_lowercase())
+                .filter(|alias| !alias.is_empty())
+                .collect::<Vec<_>>();
+            if aliases.is_empty() {
+                return Err(EntityRegistryError::Invalid {
+                    path: path.to_path_buf(),
+                    message: format!("entity {id} must define at least one alias"),
+                });
+            }
+            self.entities.push(EntityDef {
+                id: id.to_owned(),
+                aliases,
+            });
+        }
+        self.normalize();
+        Ok(())
+    }
+
+    fn normalize(&mut self) {
+        self.entities.sort_by(|left, right| left.id.cmp(&right.id));
+        for entity in &mut self.entities {
+            entity.aliases.sort();
+            entity.aliases.dedup();
+        }
+        self.entities
+            .dedup_by(|left, right| left.id == right.id && left.aliases == right.aliases);
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct EntityRegistryFile {
+    schema_version: u32,
+    #[serde(default)]
+    entity: Vec<EntityRegistryEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EntityRegistryEntry {
+    id: String,
+    #[serde(default)]
+    aliases: Vec<String>,
+}
 
 /// Extract canonical entities from free text.
 pub fn extract(text: &str) -> Vec<EntityId> {
+    extract_with_registry(text, &EntityRegistry::builtin())
+}
+
+/// Extract canonical entities from free text with the supplied registry.
+pub fn extract_with_registry(text: &str, registry: &EntityRegistry) -> Vec<EntityId> {
     let lower = text.to_ascii_lowercase();
     let mut ids = BTreeSet::new();
 
-    for def in ENTITIES {
+    for def in &registry.entities {
         if def
             .aliases
             .iter()
-            .any(|alias| contains_phrase(&lower, alias))
+            .any(|alias| contains_phrase(&lower, alias.as_str()))
         {
-            ids.insert(def.id.to_owned());
+            ids.insert(def.id.clone());
         }
     }
 
@@ -113,9 +264,17 @@ pub fn extract(text: &str) -> Vec<EntityId> {
 
 /// Extract from multiple text fields as one canonical set.
 pub fn extract_fields<'a>(fields: impl IntoIterator<Item = &'a str>) -> Vec<EntityId> {
+    extract_fields_with_registry(fields, &EntityRegistry::builtin())
+}
+
+/// Extract from multiple text fields as one canonical set with a registry.
+pub fn extract_fields_with_registry<'a>(
+    fields: impl IntoIterator<Item = &'a str>,
+    registry: &EntityRegistry,
+) -> Vec<EntityId> {
     let mut ids = BTreeSet::new();
     for field in fields {
-        ids.extend(extract(field));
+        ids.extend(extract_with_registry(field, registry));
     }
     ids.into_iter().collect()
 }
@@ -158,6 +317,20 @@ fn boundary_allows(bytes: &[u8], start: usize, end: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "hive-memory-entity-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
 
     #[test]
     fn extracts_known_agent_workflow_entities() {
@@ -180,5 +353,45 @@ mod tests {
 
         assert!(ids.contains(&"file:agents.md".to_owned()));
         assert!(!ids.contains(&"file:agents.mdx".to_owned()));
+    }
+
+    #[test]
+    fn loads_store_registry_aliases() {
+        let root = temp_dir("store-registry");
+        fs::write(
+            root.join("entities.toml"),
+            r#"
+schema_version = 1
+
+[[entity]]
+id = "tool:deployctl"
+aliases = ["DeployCtl", "release promotion gate"]
+"#,
+        )
+        .expect("write registry");
+
+        let registry = EntityRegistry::load_for_store(&root).expect("load registry");
+        let ids = extract_with_registry("run the release promotion gate", &registry);
+
+        assert_eq!(ids, vec!["tool:deployctl".to_owned()]);
+    }
+
+    #[test]
+    fn rejects_registry_entities_without_aliases() {
+        let root = temp_dir("bad-registry");
+        fs::write(
+            root.join("entities.toml"),
+            r#"
+schema_version = 1
+
+[[entity]]
+id = "tool:deployctl"
+"#,
+        )
+        .expect("write registry");
+
+        let err = EntityRegistry::load_for_store(&root).expect_err("registry should be invalid");
+
+        assert!(err.to_string().contains("at least one alias"));
     }
 }
