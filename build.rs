@@ -1,3 +1,5 @@
+//! Build-time version metadata for the `hm` binary.
+
 use std::env;
 use std::fs;
 use std::process::Command;
