@@ -143,11 +143,16 @@ pub fn run_retrieval_eval(input: RetrievalEvalInput) -> Result<RetrievalEvalRepo
         candidates: vec![
             RetrievalCandidateMetrics {
                 name: "no-entity-baseline".to_owned(),
-                features: score_retrieval(&corpus, &baseline, input.limit)?,
+                features: score_retrieval(&corpus, &materialized.root, &baseline, input.limit)?,
             },
             RetrievalCandidateMetrics {
                 name: "entity-linked".to_owned(),
-                features: score_retrieval(&corpus, &materialized, input.limit)?,
+                features: score_retrieval(
+                    &corpus,
+                    &materialized.root,
+                    &materialized.entries,
+                    input.limit,
+                )?,
             },
         ],
     })
@@ -186,19 +191,18 @@ struct RetrievalCase {
 #[derive(Debug)]
 struct Materialized {
     root: PathBuf,
+    _workspace: EvalTempDir,
+    _cache: EvalTempDir,
     entries: Vec<IndexEntry>,
 }
 
 impl Materialized {
-    fn without_entities(&self) -> Self {
+    fn without_entities(&self) -> Vec<IndexEntry> {
         let mut entries = self.entries.clone();
         for entry in &mut entries {
             entry.entities.clear();
         }
-        Self {
-            root: self.root.clone(),
-            entries,
-        }
+        entries
     }
 }
 
@@ -214,7 +218,8 @@ fn load_corpus(path: &Path) -> Result<Corpus, EvalError> {
 }
 
 fn materialize(corpus: &Corpus) -> Result<Materialized, EvalError> {
-    let root = temp_dir("retrieval-eval").join("personal");
+    let workspace = temp_dir("retrieval-eval")?;
+    let root = workspace.path().join("personal");
     fs::create_dir_all(&root).map_err(|err| EvalError::WriteMemory(err.to_string()))?;
     let manifest = StoreManifest::with_identity(
         "personal",
@@ -257,32 +262,35 @@ fn materialize(corpus: &Corpus) -> Result<Materialized, EvalError> {
         .map_err(|err| EvalError::WriteMemory(err.to_string()))?;
     }
 
-    let cache = temp_dir("retrieval-eval-cache");
+    let cache = temp_dir("retrieval-eval-cache")?;
     let report = index::rebuild_index(RebuildIndexInput {
         store_name: "personal",
         store_root: &root,
-        cache_dir: &cache,
+        cache_dir: cache.path(),
         options,
         path_case: PathCase::Sensitive,
     })?;
 
     Ok(Materialized {
         root,
+        _workspace: workspace,
+        _cache: cache,
         entries: report.entries,
     })
 }
 
 fn score_retrieval(
     corpus: &Corpus,
-    materialized: &Materialized,
+    root: &Path,
+    entries: &[IndexEntry],
     limit: usize,
 ) -> Result<Vec<RetrievalMetrics>, EvalError> {
     let mut by_feature = BTreeMap::<String, Vec<CaseResult>>::new();
     for case in &corpus.retrieval_case {
         let start = Instant::now();
         let hits = search::search(SearchInput {
-            store_root: &materialized.root,
-            entries: &materialized.entries,
+            store_root: root,
+            entries,
             query: &case.query,
             scopes: &["global".to_owned(), "project".to_owned()],
             sources: &["remembered".to_owned()],
@@ -393,13 +401,47 @@ fn p95(mut values: Vec<Duration>) -> Duration {
     values[index.saturating_sub(1).min(values.len() - 1)]
 }
 
-fn temp_dir(name: &str) -> PathBuf {
+#[derive(Debug)]
+struct EvalTempDir {
+    path: PathBuf,
+}
+
+impl EvalTempDir {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for EvalTempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn temp_dir(name: &str) -> Result<EvalTempDir, EvalError> {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("system clock after epoch")
+        .map_err(|err| EvalError::Time(err.to_string()))?
         .as_nanos();
     let path =
         std::env::temp_dir().join(format!("hive-memory-{name}-{}-{nanos}", std::process::id()));
-    fs::create_dir_all(&path).expect("create temp dir");
-    path
+    fs::create_dir_all(&path).map_err(|err| EvalError::WriteMemory(err.to_string()))?;
+    Ok(EvalTempDir { path })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn temp_dir_removes_workspace_on_drop() {
+        let path = {
+            let dir = temp_dir("retrieval-eval-drop-test").expect("temp dir");
+            let path = dir.path().to_path_buf();
+            assert!(path.exists());
+            path
+        };
+
+        assert!(!path.exists());
+    }
 }
