@@ -204,6 +204,69 @@ fn help_describes_project() {
 }
 
 #[test]
+fn eval_capture_miss_prints_retrieval_case() {
+    let mut cmd = cargo_bin_cmd!("hm");
+
+    cmd.args([
+        "eval",
+        "capture-miss",
+        "--prompt",
+        "Where are coding agent rules documented?",
+        "--expected",
+        "alpha-agent-rules-checkrun",
+        "--forbidden",
+        "beta-cargo-publish",
+        "--project-id",
+        "project-alpha",
+        "--name",
+        "captured semantic rules miss",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("[[retrieval_case]]"))
+    .stdout(predicate::str::contains(
+        "name = \"captured semantic rules miss\"",
+    ))
+    .stdout(predicate::str::contains(
+        "expected = [\"alpha-agent-rules-checkrun\"]",
+    ))
+    .stdout(predicate::str::contains(
+        "forbidden = [\"beta-cargo-publish\"]",
+    ))
+    .stdout(predicate::str::contains("project_id = \"project-alpha\""));
+}
+
+#[test]
+fn eval_capture_bad_hit_can_append_and_emit_json() {
+    let fixture = temp_dir("eval-capture").join("corpus.toml");
+    let mut cmd = cargo_bin_cmd!("hm");
+
+    cmd.args([
+        "eval",
+        "capture-bad-hit",
+        "--prompt",
+        "Cargo.toml release tags",
+        "--bad",
+        "beta-cargo-publish",
+        "--expected",
+        "alpha-release-process",
+        "--to",
+        fixture.to_str().expect("utf8 fixture path"),
+        "--json",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("\"appended\": true"))
+    .stdout(predicate::str::contains("\"path\":"));
+
+    let contents = fs::read_to_string(&fixture).expect("read appended fixture");
+    assert!(contents.contains("[[retrieval_case]]"));
+    assert!(contents.contains("query = \"Cargo.toml release tags\""));
+    assert!(contents.contains("expected = [\"alpha-release-process\"]"));
+    assert!(contents.contains("forbidden = [\"beta-cargo-publish\"]"));
+}
+
+#[test]
 fn stores_init_creates_manifest() {
     let root = temp_dir("stores-init").join("personal");
     let mut cmd = cargo_bin_cmd!("hm");

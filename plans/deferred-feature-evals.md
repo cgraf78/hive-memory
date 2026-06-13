@@ -29,3 +29,28 @@ The eval runner reports:
 The initial baseline intentionally exposes known gaps. Follow-up feature
 branches should update the runner with candidate implementations and only ship
 when the candidate clears the gate that motivated it.
+
+## Capturing Real Misses
+
+Use `hm eval capture-miss` when a prompt should have recalled a memory but did
+not:
+
+```console
+hm eval capture-miss \
+  --prompt "Where are coding agent rules documented?" \
+  --expected alpha-agent-rules-checkrun \
+  --project-id project-alpha \
+  --to tests/fixtures/deferred_feature_eval_corpus.toml
+```
+
+Use `hm eval capture-bad-hit` when recall included an irrelevant memory:
+
+```console
+hm eval capture-bad-hit \
+  --prompt "Cargo.toml release tags" \
+  --bad beta-cargo-publish \
+  --to tests/fixtures/deferred_feature_eval_corpus.toml
+```
+
+Without `--to`, both commands print a TOML snippet instead of writing a file.
+Every captured case should be reviewed before it becomes a gate.
