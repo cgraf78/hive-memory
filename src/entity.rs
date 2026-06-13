@@ -29,11 +29,30 @@ struct EntityDef {
     aliases: Vec<String>,
 }
 
+/// Failure while loading a user-editable entity alias registry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntityRegistryError {
-    Read { path: PathBuf, message: String },
-    Parse { path: PathBuf, message: String },
-    Invalid { path: PathBuf, message: String },
+    /// Registry file could not be read from disk.
+    Read {
+        /// Registry path that failed to load.
+        path: PathBuf,
+        /// Human-readable read failure.
+        message: String,
+    },
+    /// Registry TOML could not be parsed.
+    Parse {
+        /// Registry path that failed to parse.
+        path: PathBuf,
+        /// Human-readable parser failure.
+        message: String,
+    },
+    /// Registry contents were syntactically valid but semantically unusable.
+    Invalid {
+        /// Registry path that contained invalid data.
+        path: PathBuf,
+        /// Human-readable validation failure.
+        message: String,
+    },
 }
 
 impl Display for EntityRegistryError {
