@@ -192,12 +192,17 @@ pub fn search(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
         });
     }
 
+    let temporal_intent = query.temporal_intent();
     hits.sort_by(|left, right| {
         right
             .score
             .cmp(&left.score)
             .then_with(|| {
                 confidence_rank(right.entry.confidence).cmp(&confidence_rank(left.entry.confidence))
+            })
+            .then_with(|| {
+                temporal_rank(temporal_intent, &right.entry.created_at)
+                    .cmp(&temporal_rank(temporal_intent, &left.entry.created_at))
             })
             .then_with(|| {
                 timestamp_rank(&right.entry.created_at).cmp(&timestamp_rank(&left.entry.created_at))
@@ -390,6 +395,16 @@ impl SearchQuery {
             len => ((len * 3).div_ceil(5)).clamp(3, 8),
         }
     }
+
+    fn temporal_intent(&self) -> Option<TemporalIntent> {
+        if contains_temporal_indicator(&self.phrase, NEWEST_TERMS) {
+            return Some(TemporalIntent::Newest);
+        }
+        if contains_temporal_indicator(&self.phrase, OLDEST_TERMS) {
+            return Some(TemporalIntent::Oldest);
+        }
+        None
+    }
 }
 
 impl QueryTerm {
@@ -469,6 +484,25 @@ fn is_query_stopword(term: &str) -> bool {
             | "what"
             | "when"
             | "where"
+            | "after"
+            | "current"
+            | "currently"
+            | "earliest"
+            | "first"
+            | "former"
+            | "formerly"
+            | "initial"
+            | "last"
+            | "latest"
+            | "later"
+            | "newest"
+            | "now"
+            | "oldest"
+            | "original"
+            | "previous"
+            | "previously"
+            | "recent"
+            | "recently"
             | "was"
             | "were"
             | "which"
@@ -476,6 +510,42 @@ fn is_query_stopword(term: &str) -> bool {
             | "with"
             | "would"
     )
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum TemporalIntent {
+    Newest,
+    Oldest,
+}
+
+const NEWEST_TERMS: &[&str] = &[
+    "current",
+    "currently",
+    "last",
+    "latest",
+    "later",
+    "newest",
+    "now",
+    "recent",
+    "recently",
+];
+const OLDEST_TERMS: &[&str] = &[
+    "earliest",
+    "first",
+    "former",
+    "formerly",
+    "initial",
+    "oldest",
+    "original",
+    "previous",
+    "previously",
+];
+
+fn contains_temporal_indicator(phrase: &str, terms: &[&str]) -> bool {
+    phrase
+        .split_whitespace()
+        .filter_map(normalize_query_token)
+        .any(|term| terms.iter().any(|candidate| *candidate == term))
 }
 
 fn concept_aliases(term: &str) -> Vec<&'static str> {
@@ -647,6 +717,14 @@ fn timestamp_rank(value: &str) -> i128 {
     OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
         .map(|timestamp| timestamp.unix_timestamp_nanos())
         .unwrap_or_default()
+}
+
+fn temporal_rank(intent: Option<TemporalIntent>, created_at: &str) -> i128 {
+    match intent {
+        Some(TemporalIntent::Newest) => timestamp_rank(created_at),
+        Some(TemporalIntent::Oldest) => -timestamp_rank(created_at),
+        None => 0,
+    }
 }
 
 fn confidence_rank(confidence: note::Confidence) -> u8 {
@@ -1042,6 +1120,82 @@ mod tests {
 
         assert_eq!(preference_hits.len(), 1);
         assert_eq!(recommendation_hits.len(), 1);
+    }
+
+    #[test]
+    fn search_ranks_newest_hits_for_current_temporal_queries() {
+        let dir = temp_dir("temporal-newest");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_project_record_at(
+            &root,
+            "Project alpha status update says deploys use manual checks.",
+            "proj-alpha",
+            timestamp(1_778_946_153),
+        );
+        write_project_record_at(
+            &root,
+            "Project alpha status update says deploys use checkrun gates.",
+            "proj-alpha",
+            timestamp(1_778_946_200),
+        );
+        let entries = entries(&root, &cache);
+        let scopes = vec!["project".to_owned()];
+        let sources = vec!["remembered".to_owned()];
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries,
+            query: "latest status update",
+            scopes: &scopes,
+            sources: &sources,
+            include_inbox: false,
+            agent_id: None,
+            project_id: Some("proj-alpha"),
+            limit: 20,
+        })
+        .expect("search");
+
+        assert_eq!(hits.len(), 2);
+        assert!(hits[0].entry.body.contains("checkrun gates"));
+    }
+
+    #[test]
+    fn search_ranks_oldest_hits_for_initial_temporal_queries() {
+        let dir = temp_dir("temporal-oldest");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_project_record_at(
+            &root,
+            "Project alpha status update says deploys use manual checks.",
+            "proj-alpha",
+            timestamp(1_778_946_153),
+        );
+        write_project_record_at(
+            &root,
+            "Project alpha status update says deploys use checkrun gates.",
+            "proj-alpha",
+            timestamp(1_778_946_200),
+        );
+        let entries = entries(&root, &cache);
+        let scopes = vec!["project".to_owned()];
+        let sources = vec!["remembered".to_owned()];
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries,
+            query: "first status update",
+            scopes: &scopes,
+            sources: &sources,
+            include_inbox: false,
+            agent_id: None,
+            project_id: Some("proj-alpha"),
+            limit: 20,
+        })
+        .expect("search");
+
+        assert_eq!(hits.len(), 2);
+        assert!(hits[0].entry.body.contains("manual checks"));
     }
 
     #[test]
