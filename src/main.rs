@@ -725,10 +725,12 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    let hook_active = matches!(cli.command, Some(Command::Hook(_)));
     let context = CliContext {
         config_path: cli.config,
         store: cli.store,
         as_agent: cli.as_agent,
+        hook_active,
     };
     match cli.command {
         Some(Command::Stores(command)) => run_stores(command, context),
@@ -896,6 +898,11 @@ struct CliContext {
     config_path: Option<PathBuf>,
     store: Option<String>,
     as_agent: Option<String>,
+    hook_active: bool,
+}
+
+fn hook_active(context: &CliContext) -> bool {
+    context.hook_active || std::env::var("HIVE_MEMORY_HOOK_ACTIVE").ok().as_deref() == Some("1")
 }
 
 fn run_doctor(args: DoctorArgs, context: CliContext) -> Result<()> {
@@ -1892,7 +1899,7 @@ fn run_write_memory(
     context: CliContext,
 ) -> Result<()> {
     let config = load_config(context.config_path.as_deref())?;
-    let agent_id = resolve_agent_id(context.as_agent);
+    let agent_id = resolve_agent_id(context.as_agent.clone());
     let writer_agent_id = agent_id.clone().unwrap_or_else(|| "human".to_owned());
     let project_hint = args
         .project
@@ -1930,7 +1937,13 @@ fn run_write_memory(
         StoreAccess::Write,
     )?;
     let store_config = &config.stores[resolved_store.name.as_str()];
-    validate_secret_write(&config, store_config, args.allow_secret_write, &args.text)?;
+    validate_secret_write(
+        &config,
+        &context,
+        store_config,
+        args.allow_secret_write,
+        &args.text,
+    )?;
     let created_at = OffsetDateTime::now_utc();
     let host_id = resolve_host_id(&config);
     let audience = resolve_audience(&args, &scope, &writer_agent_id)?;
@@ -2594,7 +2607,7 @@ fn assemble_cli_context(
             strategy: &strategy_label,
         },
     );
-    let hook_active = std::env::var("HIVE_MEMORY_HOOK_ACTIVE").ok().as_deref() == Some("1");
+    let hook_active = hook_active(context);
     if hook_active
         && let Err(store::StoreError::Io { .. }) = store::read_manifest(&store_config.root)
     {
@@ -3597,6 +3610,24 @@ fn rebuild_store_index(config: &Config, store_name: &str) -> Result<index::LoadI
     Ok(report)
 }
 
+fn load_fresh_store_index(
+    config: &Config,
+    store_name: &str,
+) -> Result<Option<index::LoadIndexReport>> {
+    let store_config = &config.stores[store_name];
+    let options = write::AtomicWriteOptions {
+        fsync: config.storage.fsync.into(),
+        ..write::AtomicWriteOptions::default()
+    };
+    Ok(index::load_fresh_index(&index::LoadIndexInput {
+        store_name,
+        store_root: &store_config.root,
+        cache_dir: &config.cache_dir,
+        options,
+        path_case: memory_path::resolve_case(&config.storage.case_sensitive, &store_config.root),
+    })?)
+}
+
 fn run_refresh(args: RefreshArgs, context: CliContext) -> Result<()> {
     let config = load_config(context.config_path.as_deref())?;
     let receipt_cursor = refresh_receipt_cursor(&config, &context)?;
@@ -3685,7 +3716,7 @@ fn refresh_receipt_cursor(
     config: &Config,
     context: &CliContext,
 ) -> Result<Option<RefreshReceiptCursor>> {
-    if std::env::var("HIVE_MEMORY_HOOK_ACTIVE").ok().as_deref() != Some("1") {
+    if !hook_active(context) {
         return Ok(None);
     }
     let Some(session_id) = context_session_id() else {
@@ -4369,8 +4400,13 @@ fn hook_prompt_recall_action(
     )?;
     let store_name = resolved_store.name.clone();
     let store_config = &config.stores[store_name.as_str()];
-    let report = match rebuild_store_index(config, &store_name) {
-        Ok(report) => report,
+    let report = match load_fresh_store_index(config, &store_name) {
+        Ok(Some(report)) => report,
+        Ok(None) => {
+            let mut recall = HookRecallReport::skipped("index-not-fresh");
+            recall.retrieval_ms = started.elapsed().as_millis();
+            return Ok((None, recall));
+        }
         Err(err) => {
             let mut recall = HookRecallReport::skipped("index-unavailable");
             recall.retrieval_ms = started.elapsed().as_millis();
@@ -5234,6 +5270,7 @@ fn resolve_host_id(config: &Config) -> String {
 
 fn validate_secret_write(
     config: &Config,
+    context: &CliContext,
     store: &StoreConfig,
     allow_secret_write: bool,
     text: &str,
@@ -5275,9 +5312,7 @@ fn validate_secret_write(
         }
         .into());
     }
-    if std::env::var("HIVE_MEMORY_HOOK_ACTIVE").ok().as_deref() == Some("1")
-        && !config.privacy.allow_hook_secret_writes
-    {
+    if hook_active(context) && !config.privacy.allow_hook_secret_writes {
         return Err(PrivacyRefusal {
             message: format!(
                 "hook secret writes require privacy.allow_hook_secret_writes = true; detectors: {detector_ids}"

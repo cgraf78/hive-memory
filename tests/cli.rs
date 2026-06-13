@@ -3338,6 +3338,66 @@ fn hook_context_falls_back_to_cache_on_assembly_error() {
 }
 
 #[test]
+fn hook_session_start_uses_hook_cache_fallback_without_env_flag() {
+    let dir = temp_dir("hook-session-start-cache-fallback");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "remember",
+            "--text",
+            "Hook subcommands should use stale cache fallback automatically.",
+        ])
+        .assert()
+        .success();
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "context",
+            "--path",
+            "/repo/src/main.rs",
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    fs::rename(&personal, dir.join("personal-offline")).expect("move store offline");
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", "session-hook-active-fallback")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "session-start",
+            "--project",
+            "/repo/src/main.rs",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"event\": \"session-start\""))
+        .stdout(predicate::str::contains("\"kind\": \"inject_context\""))
+        .stdout(predicate::str::contains(
+            "Hook subcommands should use stale cache fallback automatically.",
+        ));
+}
+
+#[test]
 fn context_json_explain_reports_included_and_skipped_decisions() {
     let dir = temp_dir("context-explain");
     let config = dir.join("config.toml");
@@ -5334,6 +5394,68 @@ fn hook_prompt_submit_recalls_relevant_search_only_project_memory_once() {
         tests_stdout.contains("Project maintainers inspect tests"),
         "tests stdout:\n{tests_stdout}"
     );
+}
+
+#[test]
+fn hook_prompt_submit_skips_recall_when_index_is_not_fresh() {
+    let dir = temp_dir("hook-prompt-stale-index");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    let state = dir.join("state");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            state_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+
+            [stores.work]
+            root = "{}"
+            "#,
+            state.display(),
+            personal.display(),
+            work.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "remember",
+            "--text",
+            "Prompt hooks must not rebuild indexes while the user waits.",
+        ])
+        .assert()
+        .success();
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", "session-stale-index")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "prompt-submit",
+            "--text",
+            "What should prompt hooks avoid rebuilding?",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"event\": \"prompt-submit\""))
+        .stdout(predicate::str::contains("\"reason\": \"index-not-fresh\""))
+        .stdout(predicate::str::contains("\"context_emitted\": false"))
+        .stdout(predicate::str::contains("\"actions\": []"));
 }
 
 #[test]

@@ -216,21 +216,8 @@ impl Error for IndexError {}
 /// edits rely on explicit `hm refresh`, which is the same maintenance path hooks
 /// already run after writes.
 pub fn load_or_rebuild_index(input: LoadIndexInput<'_>) -> Result<LoadIndexReport, IndexError> {
-    let path = scoped_index_path(input.cache_dir, input.store_name, input.store_root);
-    let fingerprint_path =
-        index_fingerprint_path(input.cache_dir, input.store_name, input.store_root);
-    let current = canonical_fingerprint(input.store_root)?;
-    if let Ok(cached) = read_fingerprint(&fingerprint_path)
-        && cached == current
-        && path.is_file()
-        && let Ok(entries) = read_index(&path)
-    {
-        return Ok(LoadIndexReport {
-            path,
-            entries,
-            warnings: Vec::new(),
-            rebuilt: false,
-        });
+    if let Some(report) = load_fresh_index(&input)? {
+        return Ok(report);
     }
 
     let report = rebuild_index(RebuildIndexInput {
@@ -246,6 +233,31 @@ pub fn load_or_rebuild_index(input: LoadIndexInput<'_>) -> Result<LoadIndexRepor
         warnings: report.warnings,
         rebuilt: true,
     })
+}
+
+/// Read a fresh cached index without rebuilding stale or missing cache files.
+///
+/// Prompt hooks need this stricter contract: a cache miss should degrade recall,
+/// not turn a latency-sensitive agent boundary into a full store scan.
+pub fn load_fresh_index(input: &LoadIndexInput<'_>) -> Result<Option<LoadIndexReport>, IndexError> {
+    let path = scoped_index_path(input.cache_dir, input.store_name, input.store_root);
+    let fingerprint_path =
+        index_fingerprint_path(input.cache_dir, input.store_name, input.store_root);
+    let current = canonical_fingerprint(input.store_root)?;
+    if let Ok(cached) = read_fingerprint(&fingerprint_path)
+        && cached == current
+        && path.is_file()
+        && let Ok(entries) = read_index(&path)
+    {
+        return Ok(Some(LoadIndexReport {
+            path,
+            entries,
+            warnings: Vec::new(),
+            rebuilt: false,
+        }));
+    }
+
+    Ok(None)
 }
 
 /// Rebuild one store's JSONL triage index from canonical inbox files.

@@ -598,7 +598,7 @@ adapter path.
 - [ ] Do not make shell hooks parse recall metadata.
   Store policy, retrieval policy, and reason keys stay in `hm`.
 
-- [ ] Keep `AGENTGUARD_HIVE_MEMORY_HOOK_ACTIVE=1` / `HIVE_MEMORY_HOOK_ACTIVE=1`
+- [ ] Keep `HIVE_MEMORY_HOOK_ACTIVE=1`
   recursion guards intact.
 
 ### Phase 3I: End-To-End Hook Tests
