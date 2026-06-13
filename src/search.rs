@@ -7,7 +7,7 @@
 
 use crate::curated::CuratedFile;
 use crate::index::IndexEntry;
-use crate::{note, project, visibility};
+use crate::{note, project, supersession, visibility};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -204,9 +204,25 @@ pub fn search(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
             })
             .then_with(|| left.entry.note_path.cmp(&right.entry.note_path))
     });
+    suppress_superseded_hits(&mut hits, &query, input.limit);
     collapse_duplicate_hits(&mut hits);
     hits.truncate(input.limit);
     Ok(hits)
+}
+
+fn suppress_superseded_hits(hits: &mut Vec<SearchHit>, query: &SearchQuery, limit: usize) {
+    let scan_len = hits.len().min(limit.saturating_mul(4).clamp(16, 128));
+    let mut suppressed = BTreeSet::new();
+    for older in hits.iter().take(scan_len) {
+        for newer in hits.iter().take(scan_len) {
+            if supersession::should_suppress_older(&older.entry, &newer.entry, Some(&query.phrase))
+            {
+                suppressed.insert(older.entry.id.clone());
+                break;
+            }
+        }
+    }
+    hits.retain(|hit| !suppressed.contains(&hit.entry.id));
 }
 
 fn collapse_duplicate_hits(hits: &mut Vec<SearchHit>) {
@@ -666,11 +682,20 @@ mod tests {
     }
 
     fn write_project_record(root: &Path, body: &str, project_id: &str) {
+        write_project_record_at(root, body, project_id, timestamp(1_778_946_153));
+    }
+
+    fn write_project_record_at(
+        root: &Path,
+        body: &str,
+        project_id: &str,
+        created_at: OffsetDateTime,
+    ) {
         memory::write_record(memory::WriteRecordInput {
             root,
             manifest: &manifest(),
             entry_kind: note::EntryKind::Remember,
-            created_at: timestamp(1_778_946_153),
+            created_at,
             agent_id: "codex".to_owned(),
             host_id: "taylor".to_owned(),
             user_id: "chris".to_owned(),
@@ -1217,5 +1242,80 @@ mod tests {
         });
 
         assert_eq!(result, Err(SearchError::EmptyQuery));
+    }
+    #[test]
+    fn search_suppresses_superseded_records_for_broad_recall() {
+        let dir = temp_dir("superseded-broad");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_project_record_at(
+            &root,
+            "Project alpha used to run cargo fmt before committing.",
+            "proj-alpha",
+            timestamp(1_778_946_153),
+        );
+        write_project_record_at(
+            &root,
+            "Project alpha now uses checkrun format and checkrun lint before committing.",
+            "proj-alpha",
+            timestamp(1_778_946_154),
+        );
+        let entries = entries(&root, &cache);
+        let scopes = vec!["project".to_owned()];
+        let sources = vec!["remembered".to_owned()];
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries,
+            query: "before committing",
+            scopes: &scopes,
+            sources: &sources,
+            include_inbox: false,
+            agent_id: None,
+            project_id: Some("proj-alpha"),
+            limit: 20,
+        })
+        .expect("search");
+
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].entry.body.contains("now uses checkrun"));
+    }
+
+    #[test]
+    fn search_keeps_superseded_records_for_explicit_historical_query() {
+        let dir = temp_dir("superseded-explicit");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_project_record_at(
+            &root,
+            "Project alpha used to run cargo fmt before committing.",
+            "proj-alpha",
+            timestamp(1_778_946_153),
+        );
+        write_project_record_at(
+            &root,
+            "Project alpha now uses checkrun format and checkrun lint before committing.",
+            "proj-alpha",
+            timestamp(1_778_946_154),
+        );
+        let entries = entries(&root, &cache);
+        let scopes = vec!["project".to_owned()];
+        let sources = vec!["remembered".to_owned()];
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries,
+            query: "cargo fmt",
+            scopes: &scopes,
+            sources: &sources,
+            include_inbox: false,
+            agent_id: None,
+            project_id: Some("proj-alpha"),
+            limit: 20,
+        })
+        .expect("search");
+
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].entry.body.contains("used to run cargo fmt"));
     }
 }
