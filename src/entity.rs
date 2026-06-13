@@ -277,6 +277,8 @@ pub fn extract_with_registry(text: &str, registry: &EntityRegistry) -> Vec<Entit
             ids.insert(format!("issue:{number}"));
         }
     }
+    ids.extend(extract_quoted_phrases(text));
+    ids.extend(extract_proper_name_phrases(text));
 
     ids.into_iter().collect()
 }
@@ -311,6 +313,104 @@ fn is_likely_filename(token: &str) -> bool {
     matches!(
         token.rsplit_once('.').map(|(_, ext)| ext),
         Some("md" | "toml" | "json" | "yaml" | "yml" | "rs" | "sh" | "py")
+    )
+}
+
+fn extract_quoted_phrases(text: &str) -> Vec<EntityId> {
+    let mut ids = BTreeSet::new();
+    for quote in ['\'', '"'] {
+        let mut remainder = text;
+        while let Some(start) = remainder.find(quote) {
+            let after_start = &remainder[start + quote.len_utf8()..];
+            let Some(end) = after_start.find(quote) else {
+                break;
+            };
+            insert_phrase_entity(&mut ids, &after_start[..end]);
+            remainder = &after_start[end + quote.len_utf8()..];
+        }
+    }
+    ids.into_iter().collect()
+}
+
+fn extract_proper_name_phrases(text: &str) -> Vec<EntityId> {
+    let mut ids = BTreeSet::new();
+    let mut current = Vec::<String>::new();
+    let mut significant = 0usize;
+
+    for raw in text.split_whitespace() {
+        let Some(token) = phrase_token(raw) else {
+            flush_phrase_entity(&mut ids, &mut current, &mut significant);
+            continue;
+        };
+        if is_capitalized_phrase_token(&token) {
+            current.push(token);
+            significant += 1;
+        } else if is_name_connector(&token) && !current.is_empty() {
+            current.push(token);
+        } else {
+            flush_phrase_entity(&mut ids, &mut current, &mut significant);
+        }
+    }
+    flush_phrase_entity(&mut ids, &mut current, &mut significant);
+
+    ids.into_iter().collect()
+}
+
+fn flush_phrase_entity(
+    ids: &mut BTreeSet<EntityId>,
+    current: &mut Vec<String>,
+    significant: &mut usize,
+) {
+    while current.last().is_some_and(|token| is_name_connector(token)) {
+        current.pop();
+    }
+    if *significant >= 2 {
+        insert_phrase_entity(ids, &current.join(" "));
+    }
+    current.clear();
+    *significant = 0;
+}
+
+fn insert_phrase_entity(ids: &mut BTreeSet<EntityId>, phrase: &str) {
+    let normalized = normalize_phrase_entity(phrase);
+    if normalized
+        .split_whitespace()
+        .filter(|term| !is_name_connector(term))
+        .count()
+        >= 1
+        && normalized.len() >= 3
+    {
+        ids.insert(format!("phrase:{normalized}"));
+    }
+}
+
+fn normalize_phrase_entity(phrase: &str) -> String {
+    phrase
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn phrase_token(token: &str) -> Option<String> {
+    let trimmed = token
+        .trim_matches(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '\'' | '-' | '.')));
+    let trimmed = trimmed.trim_matches(|ch: char| matches!(ch, '\'' | '-' | '.'));
+    (!trimmed.is_empty()).then_some(trimmed.to_owned())
+}
+
+fn is_capitalized_phrase_token(token: &str) -> bool {
+    token
+        .chars()
+        .find(|ch| ch.is_ascii_alphabetic())
+        .is_some_and(|ch| ch.is_ascii_uppercase())
+}
+
+fn is_name_connector(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "and" | "de" | "of" | "the"
     )
 }
 
@@ -364,6 +464,22 @@ mod tests {
         let ids = extract("what is the pre landing verification gate?");
 
         assert_eq!(ids, vec!["tool:sley".to_owned()]);
+    }
+
+    #[test]
+    fn extracts_quoted_title_entities() {
+        let ids = extract("I finished 'The Nightingale' before starting \"Dune\".");
+
+        assert!(ids.contains(&"phrase:the nightingale".to_owned()));
+        assert!(ids.contains(&"phrase:dune".to_owned()));
+    }
+
+    #[test]
+    fn extracts_proper_name_phrase_entities() {
+        let ids = extract("We visited the Museum of Modern Art with Kristin Hannah.");
+
+        assert!(ids.contains(&"phrase:museum of modern art".to_owned()));
+        assert!(ids.contains(&"phrase:kristin hannah".to_owned()));
     }
 
     #[test]
