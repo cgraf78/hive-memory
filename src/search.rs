@@ -344,7 +344,8 @@ struct SearchQuery {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct QueryTerm {
     value: String,
-    aliases: Vec<&'static str>,
+    alternatives: Vec<String>,
+    required: bool,
 }
 
 impl SearchQuery {
@@ -369,18 +370,12 @@ impl SearchQuery {
         let terms = meaningful_terms
             .into_iter()
             .filter(|term| !term.is_empty())
-            .map(|term| QueryTerm {
-                aliases: concept_aliases(&term),
-                value: term,
-            })
+            .map(QueryTerm::new)
             .collect::<Vec<_>>();
         let terms = if terms.is_empty() {
             raw_terms
                 .into_iter()
-                .map(|term| QueryTerm {
-                    aliases: concept_aliases(&term),
-                    value: term,
-                })
+                .map(QueryTerm::new)
                 .collect::<Vec<_>>()
         } else {
             terms
@@ -388,25 +383,51 @@ impl SearchQuery {
 
         Ok(Self { phrase, terms })
     }
+
+    fn min_matching_terms(&self) -> usize {
+        match self.terms.len() {
+            0 => 0,
+            1..=3 => self.terms.len(),
+            len => ((len * 3).div_ceil(5)).max(3),
+        }
+    }
+
+    fn has_required_terms(&self) -> bool {
+        self.terms.iter().any(|term| term.required)
+    }
+}
+
+impl QueryTerm {
+    fn new(value: String) -> Self {
+        let mut alternatives = Vec::new();
+        alternatives.extend(concept_aliases(&value).into_iter().map(str::to_owned));
+        alternatives.extend(morphological_alternatives(&value));
+        alternatives.sort();
+        alternatives.dedup();
+        alternatives.retain(|alternative| alternative != &value);
+        Self {
+            required: is_required_query_term(&value) || is_required_intent_term(&value),
+            value,
+            alternatives,
+        }
+    }
 }
 
 fn score_text(body: &str, query: &SearchQuery) -> usize {
     let lower = body.to_ascii_lowercase();
-    let exact = lower.matches(&query.phrase).count();
+    let exact = count_pattern_matches(&lower, &query.phrase, query.has_required_terms());
     if exact > 0 {
         // Keep phrase hits clearly above keyword-only hits without making the
         // scoring model clever. Exact recall should remain the most predictable
         // path for humans, while agents can still use natural token queries.
-        return exact * 10;
+        return exact * (query.terms.len() * 20 + 100);
     }
 
-    if query.terms.iter().all(|term| term_matches(&lower, term)) {
-        return query
-            .terms
-            .iter()
-            .map(|term| term_score(&lower, term))
-            .sum::<usize>()
-            .max(1);
+    let coverage = term_coverage(&lower, query);
+    if coverage.required_matched == coverage.required_total
+        && coverage.matched >= query.min_matching_terms()
+    {
+        return coverage.matched * 10 + coverage.score;
     }
 
     0
@@ -424,15 +445,24 @@ fn normalize_query_token(token: &str) -> Option<String> {
 fn is_query_stopword(term: &str) -> bool {
     matches!(
         term,
-        "a" | "an"
+        "a" | "am"
+            | "an"
             | "and"
             | "are"
             | "as"
             | "at"
             | "be"
             | "before"
+            | "can"
+            | "could"
+            | "did"
+            | "do"
+            | "does"
             | "for"
             | "from"
+            | "had"
+            | "has"
+            | "have"
             | "how"
             | "i"
             | "in"
@@ -447,8 +477,45 @@ fn is_query_stopword(term: &str) -> bool {
             | "what"
             | "when"
             | "where"
+            | "was"
+            | "were"
             | "which"
             | "with"
+            | "would"
+    )
+}
+
+fn is_required_query_term(term: &str) -> bool {
+    matches!(
+        term,
+        "not" | "no" | "never" | "without" | "except" | "exclude"
+    )
+}
+
+fn is_required_intent_term(term: &str) -> bool {
+    matches!(
+        term,
+        "buy"
+            | "bought"
+            | "favorite"
+            | "favourite"
+            | "order"
+            | "ordered"
+            | "prefer"
+            | "preferred"
+            | "prefers"
+            | "preference"
+            | "preferences"
+            | "purchase"
+            | "purchased"
+            | "recommend"
+            | "recommendation"
+            | "recommendations"
+            | "recommended"
+            | "suggest"
+            | "suggested"
+            | "suggestion"
+            | "suggestions"
     )
 }
 
@@ -461,21 +528,139 @@ fn concept_aliases(term: &str) -> Vec<&'static str> {
         "validate" | "validates" | "validation" | "verify" | "verifies" => {
             vec!["checkrun", "lint", "format"]
         }
+        "buy" | "bought" | "order" | "ordered" | "purchase" | "purchased" => {
+            vec!["shopping", "payment"]
+        }
+        "favorite" | "favourite" | "prefer" | "preferred" | "prefers" | "preference"
+        | "preferences" => vec![
+            "likes",
+            "like",
+            "favorite",
+            "prefer",
+            "prefers",
+            "preferred",
+            "preference",
+            "preferences",
+        ],
+        "recommend" | "recommendation" | "recommendations" | "recommended" | "suggest"
+        | "suggested" | "suggestion" | "suggestions" => {
+            vec!["recommend", "suggest", "advice"]
+        }
+        "tell" | "told" | "said" | "say" => vec!["mentioned", "said"],
         _ => Vec::new(),
     }
 }
 
-fn term_matches(lower: &str, term: &QueryTerm) -> bool {
-    lower.contains(&term.value) || term.aliases.iter().any(|alias| lower.contains(alias))
+fn term_score(lower: &str, term: &QueryTerm) -> usize {
+    let score = count_pattern_matches(lower, &term.value, term.required)
+        + term
+            .alternatives
+            .iter()
+            .map(|alternative| count_pattern_matches(lower, alternative, term.required))
+            .sum::<usize>();
+    score.min(3)
 }
 
-fn term_score(lower: &str, term: &QueryTerm) -> usize {
-    lower.matches(&term.value).count()
-        + term
-            .aliases
-            .iter()
-            .map(|alias| lower.matches(alias).count())
-            .sum::<usize>()
+#[derive(Debug, Clone, Copy)]
+struct TermCoverage {
+    matched: usize,
+    required_matched: usize,
+    required_total: usize,
+    score: usize,
+}
+
+fn term_coverage(lower: &str, query: &SearchQuery) -> TermCoverage {
+    query.terms.iter().fold(
+        TermCoverage {
+            matched: 0,
+            required_matched: 0,
+            required_total: 0,
+            score: 0,
+        },
+        |coverage, term| {
+            let score = term_score(lower, term);
+            let required_total = coverage.required_total + usize::from(term.required);
+            if score == 0 {
+                TermCoverage {
+                    required_total,
+                    ..coverage
+                }
+            } else {
+                TermCoverage {
+                    matched: coverage.matched + 1,
+                    required_matched: coverage.required_matched + usize::from(term.required),
+                    required_total,
+                    score: coverage.score + score,
+                }
+            }
+        },
+    )
+}
+
+fn morphological_alternatives(term: &str) -> Vec<String> {
+    let mut alternatives = Vec::new();
+    if term.len() >= 4 {
+        alternatives.push(format!("{term}s"));
+        alternatives.push(format!("{term}ed"));
+        alternatives.push(format!("{term}ing"));
+        if let Some(stem) = term.strip_suffix('y').filter(|stem| !stem.is_empty()) {
+            alternatives.push(format!("{stem}ies"));
+        } else {
+            alternatives.push(format!("{term}es"));
+        }
+        if let Some(stem) = term.strip_suffix('e').filter(|stem| stem.len() >= 3) {
+            alternatives.push(format!("{stem}ed"));
+            alternatives.push(format!("{stem}ing"));
+        }
+    }
+    if let Some(stem) = term.strip_suffix("ies").filter(|stem| stem.len() >= 3) {
+        alternatives.push(format!("{stem}y"));
+    }
+    if let Some(stem) = term.strip_suffix("es").filter(|stem| stem.len() >= 4) {
+        alternatives.push(stem.to_owned());
+    }
+    if let Some(stem) = term.strip_suffix('s').filter(|stem| stem.len() >= 4) {
+        alternatives.push(stem.to_owned());
+    }
+    if let Some(stem) = term.strip_suffix("ed").filter(|stem| stem.len() >= 4) {
+        alternatives.push(stem.to_owned());
+        alternatives.push(format!("{stem}e"));
+    }
+    if let Some(stem) = term.strip_suffix("ing").filter(|stem| stem.len() >= 4) {
+        alternatives.push(stem.to_owned());
+        alternatives.push(format!("{stem}e"));
+    }
+    alternatives
+}
+
+fn count_pattern_matches(lower: &str, pattern: &str, require_right_boundary: bool) -> usize {
+    if pattern.is_empty() {
+        return 0;
+    }
+
+    let mut count = 0usize;
+    let mut offset = 0usize;
+    while let Some(relative_index) = lower[offset..].find(pattern) {
+        let index = offset + relative_index;
+        let end = index + pattern.len();
+        if pattern_boundary_allows(lower.as_bytes(), index, end, require_right_boundary) {
+            count += 1;
+        }
+        offset = end;
+    }
+    count
+}
+
+fn pattern_boundary_allows(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    require_right_boundary: bool,
+) -> bool {
+    let left_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+    let right_ok =
+        !require_right_boundary || end >= bytes.len() || !bytes[end].is_ascii_alphanumeric();
+    left_ok && right_ok
 }
 
 fn score_entry(entry: &IndexEntry, body: &str, query: &SearchQuery) -> usize {
@@ -492,7 +677,7 @@ fn score_entry(entry: &IndexEntry, body: &str, query: &SearchQuery) -> usize {
     // subject naming the workflow and a body naming the concrete preference.
     // Only use the combined view as a fallback so ordinary body/metadata hits
     // are not double-counted.
-    let combined_score = if body_score == 0 && metadata_score == 0 {
+    let combined_score = if body_score == 0 && metadata_score == 0 && !query.has_required_terms() {
         score_text(&format!("{metadata} {body}"), query)
     } else {
         0
@@ -557,7 +742,7 @@ fn matching_body_line<'a>(body: &'a str, query: &SearchQuery) -> Option<&'a str>
         .or_else(|| {
             body.lines().find(|line| {
                 let lower = line.to_ascii_lowercase();
-                query.terms.iter().all(|term| term_matches(&lower, term))
+                term_coverage(&lower, query).matched >= query.min_matching_terms()
             })
         })
         .map(str::trim)
@@ -855,6 +1040,383 @@ mod tests {
         .expect("search");
 
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn search_long_natural_queries_require_core_term_coverage() {
+        let dir = temp_dir("keyword-coverage");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "Chris prefers dark roast coffee for morning brewing.",
+            timestamp(1_778_946_153),
+            Vec::new(),
+        );
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "what kind of coffee does chris usually prefer in the morning",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].snippet,
+            "Chris prefers dark roast coffee for morning brewing."
+        );
+    }
+
+    #[test]
+    fn search_long_queries_reject_insufficient_term_coverage() {
+        let dir = temp_dir("keyword-insufficient-coverage");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "Plain `hm` commands are the normal path for agent ergonomics.",
+            timestamp(1_778_946_153),
+            Vec::new(),
+        );
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "agent ergonomics missing unrelated banana",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn search_long_query_threshold_scales_past_eight_terms() {
+        let query = SearchQuery::parse(
+            "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november",
+        )
+        .expect("query");
+
+        assert_eq!(query.terms.len(), 14);
+        assert_eq!(query.min_matching_terms(), 9);
+    }
+
+    #[test]
+    fn search_caps_repeated_term_score_contribution() {
+        let term = QueryTerm::new("repeat".to_owned());
+
+        assert_eq!(
+            term_score(
+                "repeat repeat repeat repeat repeat repeat repeat repeat",
+                &term
+            ),
+            3
+        );
+    }
+
+    #[test]
+    fn search_long_queries_require_negation_terms() {
+        let dir = temp_dir("keyword-negation");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "Chris prefers Delta airline for regional flights.",
+            timestamp(1_778_946_153),
+            Vec::new(),
+        );
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "which airline does chris not prefer",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn search_negation_terms_require_full_token_boundaries() {
+        let dir = temp_dir("keyword-negation-boundary");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "Note: Chris prefers Delta airline for regional flights.",
+            timestamp(1_778_946_153),
+            Vec::new(),
+        );
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "Normal preference record: Chris prefers United airline for regional flights.",
+            timestamp(1_778_946_154),
+            Vec::new(),
+        );
+
+        let not_hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "which airline does chris not prefer",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+        let no_hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "which airline does chris no prefer",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+
+        assert!(not_hits.is_empty());
+        assert!(no_hits.is_empty());
+    }
+
+    #[test]
+    fn search_does_not_match_positive_preference_inside_dislike() {
+        let dir = temp_dir("keyword-dislike");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "Chris dislikes Delta airline for regional flights.",
+            timestamp(1_778_946_153),
+            Vec::new(),
+        );
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "which airline was preferred for regional flights",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn search_matches_inflections_without_substring_fallback() {
+        let dir = temp_dir("keyword-inflections");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "Chris watched several documentaries and enjoyed replaying the archived talks.",
+            timestamp(1_778_946_153),
+            Vec::new(),
+        );
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "which documentary did chris replay archive talk",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].snippet,
+            "Chris watched several documentaries and enjoyed replaying the archived talks."
+        );
+    }
+
+    #[test]
+    fn search_required_terms_cannot_be_satisfied_across_metadata_and_body() {
+        let dir = temp_dir("keyword-metadata-required");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record_with_metadata(TestRecord {
+            root: &root,
+            entry_kind: note::EntryKind::Remember,
+            scope: "global",
+            body: "Chris dislikes Delta airline for regional flights.",
+            created_at: timestamp(1_778_946_153),
+            audience: Vec::new(),
+            subject: Some("travel.preference"),
+            tags: Vec::new(),
+        });
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "which airline was preferred for regional flights",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn search_prefers_broader_term_coverage_over_repetition() {
+        let dir = temp_dir("keyword-coverage-ranking");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "alpha bravo charlie delta alpha bravo charlie delta alpha bravo charlie delta",
+            timestamp(1_778_946_153),
+            Vec::new(),
+        );
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "alpha bravo charlie delta echo foxtrot",
+            timestamp(1_778_946_154),
+            Vec::new(),
+        );
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "alpha bravo charlie delta echo foxtrot",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].snippet, "alpha bravo charlie delta echo foxtrot");
+    }
+
+    #[test]
+    fn search_preserves_will_as_a_name() {
+        let dir = temp_dir("keyword-will-name");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "Ada has a payment status update for the group.",
+            timestamp(1_778_946_153),
+            Vec::new(),
+        );
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "what did Will order for Ada",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn search_expands_preference_and_recommendation_terms() {
+        let dir = temp_dir("keyword-expansion");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "The user likes Delta for regional flights and asked for advice on window seats.",
+            timestamp(1_778_946_153),
+            Vec::new(),
+        );
+
+        let preference_hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "which airline was preferred for regional flights",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+        let recommendation_hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "seat recommendation regional flights",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+
+        assert_eq!(preference_hits.len(), 1);
+        assert_eq!(recommendation_hits.len(), 1);
     }
 
     #[test]
