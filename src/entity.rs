@@ -319,17 +319,47 @@ fn is_likely_filename(token: &str) -> bool {
 fn extract_quoted_phrases(text: &str) -> Vec<EntityId> {
     let mut ids = BTreeSet::new();
     for quote in ['\'', '"'] {
-        let mut remainder = text;
-        while let Some(start) = remainder.find(quote) {
-            let after_start = &remainder[start + quote.len_utf8()..];
-            let Some(end) = after_start.find(quote) else {
+        let mut offset = 0usize;
+        while let Some(start) = find_opening_quote(text, quote, offset) {
+            let content_start = start + quote.len_utf8();
+            let Some(end) = find_closing_quote(text, quote, content_start) else {
                 break;
             };
-            insert_phrase_entity(&mut ids, &after_start[..end]);
-            remainder = &after_start[end + quote.len_utf8()..];
+            insert_phrase_entity(&mut ids, &text[content_start..end]);
+            offset = end + quote.len_utf8();
         }
     }
     ids.into_iter().collect()
+}
+
+fn find_opening_quote(text: &str, quote: char, offset: usize) -> Option<usize> {
+    text[offset..]
+        .char_indices()
+        .map(|(index, ch)| (offset + index, ch))
+        .find_map(|(index, ch)| {
+            (ch == quote && quote_boundary_allows_open(text.as_bytes(), index)).then_some(index)
+        })
+}
+
+fn find_closing_quote(text: &str, quote: char, offset: usize) -> Option<usize> {
+    text[offset..]
+        .char_indices()
+        .map(|(index, ch)| (offset + index, ch))
+        .find_map(|(index, ch)| {
+            (ch == quote && quote_boundary_allows_close(text.as_bytes(), index)).then_some(index)
+        })
+}
+
+fn quote_boundary_allows_open(bytes: &[u8], index: usize) -> bool {
+    let left_ok = index == 0 || !bytes[index - 1].is_ascii_alphanumeric();
+    let right_ok = index + 1 < bytes.len() && bytes[index + 1].is_ascii_alphanumeric();
+    left_ok && right_ok
+}
+
+fn quote_boundary_allows_close(bytes: &[u8], index: usize) -> bool {
+    let left_ok = index > 0 && bytes[index - 1].is_ascii_alphanumeric();
+    let right_ok = index + 1 >= bytes.len() || !bytes[index + 1].is_ascii_alphanumeric();
+    left_ok && right_ok
 }
 
 fn extract_proper_name_phrases(text: &str) -> Vec<EntityId> {
@@ -472,6 +502,16 @@ mod tests {
 
         assert!(ids.contains(&"phrase:the nightingale".to_owned()));
         assert!(ids.contains(&"phrase:dune".to_owned()));
+    }
+
+    #[test]
+    fn ignores_possessive_apostrophes_as_quote_boundaries() {
+        let ids = extract("I helped my friend's birthday setup before my cousin's shower.");
+
+        assert!(
+            !ids.iter().any(|id| id.contains("birthday setup")),
+            "possessives should not create synthetic quoted phrase entities: {ids:?}"
+        );
     }
 
     #[test]
