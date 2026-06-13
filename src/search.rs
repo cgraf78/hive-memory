@@ -7,7 +7,7 @@
 
 use crate::curated::CuratedFile;
 use crate::index::IndexEntry;
-use crate::{note, project, supersession, visibility};
+use crate::{entity, note, project, supersession, visibility};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -344,6 +344,7 @@ fn project_allowed(entry: &IndexEntry, project_ids: Option<&BTreeSet<String>>) -
 struct SearchQuery {
     phrase: String,
     terms: Vec<QueryTerm>,
+    entities: Vec<entity::EntityId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -386,7 +387,13 @@ impl SearchQuery {
             terms
         };
 
-        Ok(Self { phrase, terms })
+        let entities = entity::extract(input);
+
+        Ok(Self {
+            phrase,
+            terms,
+            entities,
+        })
     }
 
     fn min_matching_terms(&self) -> usize {
@@ -409,6 +416,10 @@ impl SearchQuery {
 
     fn has_required_terms(&self) -> bool {
         self.terms.iter().any(|term| term.required)
+    }
+
+    fn has_entities(&self) -> bool {
+        !self.entities.is_empty()
     }
 }
 
@@ -752,7 +763,30 @@ fn score_entry(entry: &IndexEntry, body: &str, query: &SearchQuery) -> usize {
     } else {
         0
     };
-    body_score + metadata_score + combined_score
+    let entity_score = score_entities(entry, query);
+
+    body_score + metadata_score + combined_score + entity_score
+}
+
+fn score_entities(entry: &IndexEntry, query: &SearchQuery) -> usize {
+    if !query.has_entities() || entry.entities.is_empty() || query.has_required_terms() {
+        return 0;
+    }
+
+    let overlap = query
+        .entities
+        .iter()
+        .filter(|entity| entry.entities.contains(*entity))
+        .count();
+    if overlap == 0 {
+        return 0;
+    }
+
+    // Entity overlap is strong enough to recall an alias-only hit, but still
+    // below exact phrase matches. This lets "pre landing verification" recover
+    // a `sley ready` memory without allowing one broad entity to dominate
+    // obvious textual matches.
+    overlap * 45
 }
 
 fn curated_entry(curated: &CuratedFile, project_id: Option<&str>) -> IndexEntry {
@@ -767,6 +801,7 @@ fn curated_entry(curated: &CuratedFile, project_id: Option<&str>) -> IndexEntry 
         subject: None,
         confidence: note::Confidence::High,
         kind: None,
+        entities: entity::extract(&curated.body),
         classified: None,
         agent_id: "human".to_owned(),
         host_id: String::new(),
@@ -1929,6 +1964,47 @@ mod tests {
         assert!(rule_hits[0].entry.body.contains("AGENTS.md"));
         assert_eq!(validation_hits.len(), 1);
         assert!(validation_hits[0].entry.body.contains("checkrun format"));
+    }
+
+    #[test]
+    fn search_uses_entity_links_for_alias_only_recall() {
+        let dir = temp_dir("entity-links");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_project_record(
+            &root,
+            "Project alpha requires `sley ready` before landing PRs.",
+            "proj-alpha",
+        );
+        write_project_record(
+            &root,
+            "Project beta requires `sley ready` before release reviews.",
+            "proj-beta",
+        );
+        let entries = entries(&root, &cache);
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.entities.contains(&"tool:sley".to_owned())),
+            "index should carry extracted sley entity links: {entries:?}"
+        );
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries,
+            query: "pre landing verification gate",
+            scopes: &["project".to_owned()],
+            sources: &["remembered".to_owned()],
+            include_inbox: false,
+            agent_id: None,
+            project_id: Some("proj-alpha"),
+            limit: 20,
+        })
+        .expect("search");
+
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].entry.body.contains("sley ready"));
+        assert_eq!(hits[0].entry.project_id.as_deref(), Some("proj-alpha"));
     }
 
     #[test]

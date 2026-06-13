@@ -523,6 +523,7 @@ mod tests {
             subject: None,
             confidence: note::Confidence::High,
             kind,
+            entities: Vec::new(),
             classified,
             agent_id: "codex".to_owned(),
             host_id: "taylor".to_owned(),

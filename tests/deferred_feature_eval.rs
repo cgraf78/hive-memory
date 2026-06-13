@@ -83,6 +83,19 @@ struct Materialized {
     entries: Vec<IndexEntry>,
 }
 
+impl Materialized {
+    fn without_entities(&self) -> Self {
+        let mut entries = self.entries.clone();
+        for entry in &mut entries {
+            entry.entities.clear();
+        }
+        Self {
+            root: self.root.clone(),
+            entries,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct RetrievalMetrics {
     feature: String,
@@ -98,10 +111,24 @@ struct RetrievalMetrics {
 fn deferred_retrieval_scoreboard_measures_candidate_quality() {
     let corpus = load_corpus();
     let materialized = materialize(&corpus);
-    let metrics = score_retrieval(&corpus, &materialized, "lexical-baseline");
+    let baseline = materialized.without_entities();
+    let baseline_metrics = score_retrieval(&corpus, &baseline, "no-entity-baseline");
+    let metrics = score_retrieval(&corpus, &materialized, "entity-linked");
+    for metric in &baseline_metrics {
+        eprintln!(
+            "deferred retrieval no-entity {} cases={} recall@5={:.3} precision@5={:.3} mrr={:.3} forbidden_hits={} p95_ms={}",
+            metric.feature,
+            metric.cases,
+            metric.recall_at_5,
+            metric.precision_at_5,
+            metric.mrr,
+            metric.forbidden_hits,
+            metric.p95_ms
+        );
+    }
     for metric in &metrics {
         eprintln!(
-            "deferred retrieval {} cases={} recall@5={:.3} precision@5={:.3} mrr={:.3} forbidden_hits={} p95_ms={}",
+            "deferred retrieval entity-linked {} cases={} recall@5={:.3} precision@5={:.3} mrr={:.3} forbidden_hits={} p95_ms={}",
             metric.feature,
             metric.cases,
             metric.recall_at_5,
@@ -120,6 +147,24 @@ fn deferred_retrieval_scoreboard_measures_candidate_quality() {
     assert_eq!(
         semantic.forbidden_hits, 0,
         "semantic candidate must not add forbidden hits"
+    );
+    let entity_baseline = feature_metric(&baseline_metrics, "entity");
+    let entity = feature_metric(&metrics, "entity");
+    assert!(
+        entity.recall_at_5 > entity_baseline.recall_at_5,
+        "entity linking should improve entity recall: baseline={entity_baseline:?} candidate={entity:?}"
+    );
+    assert!(
+        entity.mrr > entity_baseline.mrr,
+        "entity linking should improve entity ranking: baseline={entity_baseline:?} candidate={entity:?}"
+    );
+    assert!(
+        entity.recall_at_5 >= 1.0 && entity.precision_at_5 >= 1.0,
+        "entity candidate must clear the labeled entity gate: {entity:?}"
+    );
+    assert_eq!(
+        entity.forbidden_hits, 0,
+        "entity candidate must not add forbidden hits"
     );
     assert_eq!(
         feature_metric(&metrics, "scope").forbidden_hits,

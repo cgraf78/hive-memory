@@ -5,7 +5,7 @@
 //! bodies. If it is deleted or stale, it can always be rebuilt from notes and
 //! paired JSON events in the store root.
 
-use crate::note;
+use crate::{entity, note};
 use crate::{event, path as memory_path, write};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -40,6 +40,14 @@ pub struct IndexEntry {
     /// Optional explicit memory kind, used by inject classification.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<note::MemoryKind>,
+    /// Canonical entity ids extracted from subject, tags, kind, and body.
+    ///
+    /// This is cache metadata, not canonical user-authored memory. Rebuilds can
+    /// recompute it from durable note/event fields whenever extraction rules
+    /// change, and search can use it as one ranking signal without reparsing
+    /// Markdown on the hot hook path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entities: Vec<entity::EntityId>,
     /// Classification provenance; used to derive pending LLM review.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub classified: Option<note::ClassifiedBy>,
@@ -420,6 +428,12 @@ fn entry_from_note(
         // remains the human-readable canonical record, but paired event fields
         // are preferred for filters so future migrations/repairs can update
         // machine metadata without rewriting user prose.
+        let entities = entry_entities(
+            event.subject.as_deref().or(front_matter.subject.as_deref()),
+            &event.tags,
+            event.kind.or(front_matter.kind),
+            body,
+        );
         return IndexEntry {
             id: event.id.clone(),
             store_id: event.store_id.clone(),
@@ -433,6 +447,7 @@ fn entry_from_note(
             // Prefer the event's kind, falling back to the note's so a note that
             // carries kind without an event copy is still classified correctly.
             kind: event.kind.or(front_matter.kind),
+            entities,
             // Provenance follows the same machine-metadata preference as kind:
             // event sidecars are the structured contract, with note front
             // matter as the repair/fallback source for note-only history.
@@ -449,6 +464,12 @@ fn entry_from_note(
         };
     }
 
+    let entities = entry_entities(
+        front_matter.subject.as_deref(),
+        &front_matter.tags,
+        front_matter.kind,
+        body,
+    );
     IndexEntry {
         id: front_matter.id.clone(),
         store_id: front_matter.store_id.clone(),
@@ -460,6 +481,7 @@ fn entry_from_note(
         subject: front_matter.subject.clone(),
         confidence: front_matter.confidence,
         kind: front_matter.kind,
+        entities,
         classified: front_matter.classified.clone(),
         agent_id: front_matter.agent_id.clone(),
         host_id: front_matter.host_id.clone(),
@@ -468,6 +490,22 @@ fn entry_from_note(
         note_path: note_path.to_owned(),
         event_path: None,
     }
+}
+
+fn entry_entities(
+    subject: Option<&str>,
+    tags: &[String],
+    kind: Option<note::MemoryKind>,
+    body: &str,
+) -> Vec<entity::EntityId> {
+    let kind_label = kind.map(note::kind_label);
+    entity::extract_fields(
+        subject
+            .into_iter()
+            .chain(tags.iter().map(String::as_str))
+            .chain(kind_label)
+            .chain(std::iter::once(body)),
+    )
 }
 
 fn render_jsonl(entries: &[IndexEntry]) -> Result<String, IndexError> {
@@ -525,8 +563,8 @@ fn canonical_fingerprint(store_root: &Path) -> Result<IndexFingerprint, IndexErr
         ));
     }
     Ok(IndexFingerprint {
-        // v5: entries carry `classified` provenance for the LLM review queue.
-        schema_version: 5,
+        // v6: entries carry extracted canonical entities for retrieval.
+        schema_version: 6,
         store_root: store_root.display().to_string(),
         canonical_dirs: dirs.len(),
         latest_directory_modified_nanos,

@@ -176,6 +176,7 @@ mod tests {
             subject: Some(id.to_owned()),
             confidence: note::Confidence::High,
             kind: Some(note::MemoryKind::ProjectFact),
+            entities: Vec::new(),
             classified: None,
             agent_id: "eval".to_owned(),
             host_id: "ci".to_owned(),

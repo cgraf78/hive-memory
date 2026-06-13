@@ -10,6 +10,7 @@ pub mod context;
 pub mod curated;
 pub mod curation;
 pub mod doctor;
+pub mod entity;
 pub mod event;
 pub mod hook;
 pub mod id;
