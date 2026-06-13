@@ -16,6 +16,7 @@ const RUNS: usize = 30;
 // costs every time they ask Hive Memory for context.
 const CONTEXT_WARM_BUDGET_MS: u128 = 200;
 const SEARCH_WARM_BUDGET_MS: u128 = 300;
+const HOOK_PROMPT_BASELINE_WARM_BUDGET_MS: u128 = 300;
 const SYNTHETIC_OUTBOX_ITEMS: usize = 100;
 const FLUSH_RUNS: usize = 10;
 const FLUSH_100_ITEM_BUDGET_MS: u128 = 2_000;
@@ -83,6 +84,40 @@ fn flush_100_item_outbox_stays_within_budget() {
     assert!(
         flush_p95 <= flush_budget,
         "hm flush 100-item p95 {flush_p95}ms exceeded {flush_budget}ms"
+    );
+}
+
+#[test]
+#[ignore = "CI runs this explicitly because it measures full hook CLI latency"]
+fn hook_prompt_submit_baseline_stays_within_warm_budget() {
+    let fixture = SyntheticStore::new();
+    fixture.refresh_index();
+
+    let prompt_p95 = p95_ms(repeat(RUNS, || {
+        hm_command(
+            &fixture.config,
+            [
+                "--as-agent",
+                "codex",
+                "hook",
+                "prompt-submit",
+                "--project",
+                "/tmp/hive-memory-perf-project/src/main.rs",
+                "--text",
+                "Please inspect the project tests.",
+                "--json",
+            ],
+        )
+        .env("HIVE_MEMORY_SESSION_ID", "perf-prompt-baseline")
+        .assert()
+        .success();
+    }));
+    eprintln!("hm hook prompt-submit baseline warm p95: {prompt_p95}ms");
+
+    let prompt_budget = budget_ms(HOOK_PROMPT_BASELINE_WARM_BUDGET_MS);
+    assert!(
+        prompt_p95 <= prompt_budget,
+        "hm hook prompt-submit baseline p95 {prompt_p95}ms exceeded {prompt_budget}ms"
     );
 }
 
