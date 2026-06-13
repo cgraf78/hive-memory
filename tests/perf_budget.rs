@@ -18,6 +18,7 @@ const CONTEXT_WARM_BUDGET_MS: u128 = 200;
 const SEARCH_WARM_BUDGET_MS: u128 = 300;
 const HOOK_PROMPT_BASELINE_WARM_BUDGET_MS: u128 = 300;
 const HOOK_PROMPT_RECALL_WARM_BUDGET_MS: u128 = 350;
+const HOOK_TOOL_COMPLETE_NO_RECEIPT_WARM_BUDGET_MS: u128 = 200;
 const SYNTHETIC_OUTBOX_ITEMS: usize = 100;
 const FLUSH_RUNS: usize = 10;
 const FLUSH_100_ITEM_BUDGET_MS: u128 = 2_000;
@@ -183,6 +184,57 @@ fn hook_prompt_submit_recall_stays_within_warm_budget() {
     assert!(
         prompt_p95 <= prompt_budget,
         "hm hook prompt-submit recall p95 {prompt_p95}ms exceeded {prompt_budget}ms"
+    );
+}
+
+#[test]
+#[ignore = "CI runs this explicitly because it measures full hook CLI latency"]
+fn hook_tool_complete_without_receipts_stays_within_warm_budget() {
+    let fixture = SyntheticStore::new();
+    fixture.refresh_index();
+
+    hm_command(
+        &fixture.config,
+        [
+            "--as-agent",
+            "codex",
+            "hook",
+            "session-start",
+            "--project",
+            "/tmp/hive-memory-perf-project/src/main.rs",
+            "--json",
+        ],
+    )
+    .env("HIVE_MEMORY_SESSION_ID", "perf-tool-complete")
+    .assert()
+    .success();
+
+    let tool_p95 = p95_ms(repeat(RUNS, || {
+        hm_command(
+            &fixture.config,
+            [
+                "--as-agent",
+                "codex",
+                "hook",
+                "tool-complete",
+                "--project",
+                "/tmp",
+                "--status",
+                "0",
+                "--json",
+            ],
+        )
+        .env("HIVE_MEMORY_SESSION_ID", "perf-tool-complete")
+        .env("HIVE_MEMORY_PROJECT", "/tmp")
+        .assert()
+        .success();
+    }));
+    eprintln!("hm hook tool-complete no-receipt warm p95: {tool_p95}ms");
+
+    let tool_budget = budget_ms(HOOK_TOOL_COMPLETE_NO_RECEIPT_WARM_BUDGET_MS);
+    assert!(
+        tool_p95 <= tool_budget,
+        "hm hook tool-complete no-receipt p95 {tool_p95}ms exceeded {tool_budget}ms"
     );
 }
 

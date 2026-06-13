@@ -436,7 +436,7 @@ the adapter passes the event shape, and `hm` returns context or actions.
 ```sh
 hm hook session-start --project ~/git/hive-memory
 hm hook prompt-submit --project ~/git/hive-memory --text "remember this preference"
-hm hook tool-complete --project ~/git/hive-memory --status 0
+hm hook tool-complete --status 0
 hm hook stop
 ```
 
@@ -444,6 +444,12 @@ Hook behavior uses session-local state under `state_dir`. It can detect memory
 intent in prompts, emit startup context, inject prompt-specific recalled memory,
 coalesce refresh work with a local lock, and remind the agent at session end
 when a memory request was never satisfied.
+
+`tool-complete` is optimized for high-frequency post-tool hooks. It does not use
+process cwd or payload cwd as the active project; after a successful memory
+write it refreshes context from the session write receipt's project id. This
+keeps home-launched, multi-project agent sessions from treating `$HOME` as the
+current project after every tool call.
 
 ### Doctor
 
