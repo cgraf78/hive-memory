@@ -220,6 +220,7 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
     let mut warnings = Vec::new();
     let mut estimated_tokens = estimate_tokens(&markdown);
     let project_ids = project_filter_ids(input.store_root, input.project_id)?;
+    let mut seen_bodies = BTreeSet::new();
 
     if curated_source_allowed(input.sources) {
         for curated in crate::curated::collect(input.store_root, input.project_id)? {
@@ -309,6 +310,10 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
                 continue;
             }
         }
+        if !seen_bodies.insert(duplicate_key(&record_body)) {
+            push_decision(&mut decisions, &input, entry, "skipped", "duplicate");
+            continue;
+        }
         let trust = trust_for(entry.entry_kind);
         let body = escape_memory_body(&record_body);
         let block = render_memory_block(input.store_name, entry, trust, &record_body);
@@ -355,6 +360,13 @@ fn read_note_body(note_path: &Path) -> Result<String, String> {
     note::parse_note(&contents)
         .map(|parsed| parsed.body)
         .map_err(|err| format!("parse note: {err}"))
+}
+
+fn duplicate_key(body: &str) -> String {
+    body.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 fn push_decision(
