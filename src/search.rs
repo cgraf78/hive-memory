@@ -2078,6 +2078,7 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert!(hits[0].entry.body.contains("sley ready"));
         assert_eq!(hits[0].entry.project_id.as_deref(), Some("proj-alpha"));
+<<<<<<< HEAD
         assert_eq!(hits[0].score, hits[0].trace.total());
         assert!(
             hits[0].trace.entity > 0,
