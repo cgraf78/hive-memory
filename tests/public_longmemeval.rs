@@ -36,6 +36,7 @@ struct LongMemEvalCase {
     question_type: String,
     question: String,
     answer_session_ids: Vec<String>,
+    haystack_dates: Vec<String>,
     haystack_session_ids: Vec<String>,
     haystack_sessions: Vec<Vec<Turn>>,
 }
@@ -54,6 +55,12 @@ struct Materialized {
     ingest_mode: IngestMode,
     entries_by_session_id: BTreeMap<String, Vec<IndexEntry>>,
     session_id_by_item_id: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+struct SessionFixture {
+    date: String,
+    turns: Vec<Turn>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -180,6 +187,18 @@ impl Score {
     fn p95_ms(&self) -> u128 {
         p95(self.latencies.clone()).as_millis()
     }
+}
+
+#[test]
+fn parses_longmemeval_fixture_dates_as_utc() {
+    let timestamp = parse_longmemeval_date("2023/05/20 (Sat) 02:21");
+
+    assert_eq!(timestamp.year(), 2023);
+    assert_eq!(u8::from(timestamp.month()), 5);
+    assert_eq!(timestamp.day(), 20);
+    assert_eq!(timestamp.hour(), 2);
+    assert_eq!(timestamp.minute(), 21);
+    assert_eq!(timestamp.offset(), time::UtcOffset::UTC);
 }
 
 #[test]
@@ -316,7 +335,7 @@ fn materialize(cases: &[LongMemEvalCase]) -> Materialized {
         fsync: FsyncPolicy::Never,
         ..AtomicWriteOptions::default()
     };
-    let mut sessions = BTreeMap::<String, Vec<Turn>>::new();
+    let mut sessions = BTreeMap::<String, SessionFixture>::new();
     for case in cases {
         assert_eq!(
             case.haystack_session_ids.len(),
@@ -324,26 +343,38 @@ fn materialize(cases: &[LongMemEvalCase]) -> Materialized {
             "case {} haystack ids/sessions length mismatch",
             case.question_id
         );
-        for (session_id, session) in case
+        assert_eq!(
+            case.haystack_session_ids.len(),
+            case.haystack_dates.len(),
+            "case {} haystack ids/dates length mismatch",
+            case.question_id
+        );
+        for ((session_id, session), date) in case
             .haystack_session_ids
             .iter()
             .zip(case.haystack_sessions.iter())
+            .zip(case.haystack_dates.iter())
         {
             sessions
                 .entry(session_id.clone())
-                .or_insert_with(|| session.clone());
+                .or_insert_with(|| SessionFixture {
+                    date: date.clone(),
+                    turns: session.clone(),
+                });
         }
     }
 
     let items = sessions
         .iter()
-        .flat_map(|(session_id, session)| eval_items(ingest_mode, session_id, session))
+        .flat_map(|(session_id, session)| eval_items(ingest_mode, session_id, &session.turns))
         .collect::<Vec<_>>();
 
     for (index, item) in items.iter().enumerate() {
+        let session_date = sessions
+            .get(&item.parent_session_id)
+            .unwrap_or_else(|| panic!("missing fixture for {}", item.parent_session_id));
         let created_at =
-            OffsetDateTime::from_unix_timestamp(1_778_946_153 + i64::try_from(index).unwrap())
-                .expect("timestamp");
+            parse_longmemeval_date(&session_date.date) + time::Duration::seconds(index as i64);
         let mut tags = vec![
             "longmemeval-s".to_owned(),
             format!("kind:{}", item.item_kind.as_str()),
@@ -531,6 +562,20 @@ fn render_item(item: &EvalMemoryItem) -> String {
     }
     parts.push(item.body.clone());
     parts.join("\n")
+}
+
+fn parse_longmemeval_date(value: &str) -> OffsetDateTime {
+    let mut parts = value.split_whitespace();
+    let date = parts
+        .next()
+        .unwrap_or_else(|| panic!("LongMemEval date missing date: {value}"));
+    let time = value
+        .split_whitespace()
+        .last()
+        .unwrap_or_else(|| panic!("LongMemEval date missing time: {value}"));
+    let rfc3339 = format!("{}T{time}:00Z", date.replace('/', "-"));
+    OffsetDateTime::parse(&rfc3339, &time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|err| panic!("parse LongMemEval date {value:?}: {err}"))
 }
 
 fn unique_session_hits(
