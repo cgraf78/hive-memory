@@ -14,6 +14,7 @@ use hive_memory::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{self, Display};
 use std::io::Write;
@@ -1918,6 +1919,8 @@ fn run_write_memory(
     let audience = resolve_audience(&args, &scope, &writer_agent_id)?;
     validate_optional_rfc3339("--valid-from", args.valid_from.as_deref())?;
     validate_optional_rfc3339("--valid-to", args.valid_to.as_deref())?;
+    validate_validity_window(args.valid_from.as_deref(), args.valid_to.as_deref())?;
+    let supersedes = normalize_supersedes(args.supersedes)?;
     let should_write_event = match entry_kind {
         note::EntryKind::Remember => true,
         note::EntryKind::Note => {
@@ -1944,7 +1947,7 @@ fn run_write_memory(
         kind: kind_decision.kind,
         valid_from: args.valid_from,
         valid_to: args.valid_to,
-        supersedes: args.supersedes,
+        supersedes,
         tags: args.tags,
         audience: audience.clone(),
         source_kind: args.source_kind,
@@ -4634,7 +4637,7 @@ fn hook_context_key(
 
 #[cfg(test)]
 mod tests {
-    use super::context_selection_key;
+    use super::{context_selection_key, normalize_supersedes, validate_validity_window};
 
     #[test]
     fn context_key_tracks_inbox_and_search_only_policy() {
@@ -4671,6 +4674,29 @@ mod tests {
         assert_ne!(strict, inbox);
         assert!(strict.contains("include_inbox=false"));
         assert!(inbox.contains("include_search_only=true"));
+    }
+
+    #[test]
+    fn validity_window_rejects_inverted_range() {
+        let err =
+            validate_validity_window(Some("2030-01-01T00:00:00Z"), Some("2020-01-01T00:00:00Z"))
+                .expect_err("inverted window rejected");
+
+        assert!(err.to_string().contains("--valid-from must be earlier"));
+    }
+
+    #[test]
+    fn supersedes_ids_are_trimmed_deduplicated_and_non_empty() {
+        assert_eq!(
+            normalize_supersedes(vec![
+                " old-id ".to_owned(),
+                "old-id".to_owned(),
+                "new-id".to_owned(),
+            ])
+            .expect("supersedes"),
+            vec!["old-id".to_owned(), "new-id".to_owned()]
+        );
+        assert!(normalize_supersedes(vec![" ".to_owned()]).is_err());
     }
 }
 
@@ -5221,6 +5247,43 @@ fn validate_optional_rfc3339(label: &str, value: Option<&str>) -> Result<()> {
     OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
         .map(|_| ())
         .map_err(|err| anyhow::anyhow!("{label} must be RFC3339: {err}"))
+}
+
+fn parse_optional_rfc3339(label: &str, value: Option<&str>) -> Result<Option<OffsetDateTime>> {
+    value
+        .map(|value| {
+            OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+                .map_err(|err| anyhow::anyhow!("{label} must be RFC3339: {err}"))
+        })
+        .transpose()
+}
+
+fn validate_validity_window(valid_from: Option<&str>, valid_to: Option<&str>) -> Result<()> {
+    let valid_from_time = parse_optional_rfc3339("--valid-from", valid_from)?;
+    let valid_to_time = parse_optional_rfc3339("--valid-to", valid_to)?;
+    if let (Some(valid_from_time), Some(valid_to_time)) = (valid_from_time, valid_to_time)
+        && valid_from_time >= valid_to_time
+    {
+        return Err(anyhow::anyhow!(
+            "--valid-from must be earlier than --valid-to"
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_supersedes(values: Vec<String>) -> Result<Vec<String>> {
+    let mut seen = BTreeSet::new();
+    let mut normalized = Vec::new();
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(anyhow::anyhow!("--supersedes must not be empty"));
+        }
+        if seen.insert(value.to_owned()) {
+            normalized.push(value.to_owned());
+        }
+    }
+    Ok(normalized)
 }
 
 fn resolve_audience(

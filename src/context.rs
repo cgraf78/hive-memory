@@ -7,7 +7,7 @@
 use crate::curated::CuratedFile;
 use crate::index::IndexEntry;
 use crate::inject::{self, ClassifyInput, IncidentMarkers, InjectClass};
-use crate::{note, project, visibility};
+use crate::{note, project, validity, visibility};
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{self, Display};
@@ -266,6 +266,10 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
         }
         if !visibility::audience_allows(entry, input.agent_id) {
             push_decision(&mut decisions, &input, entry, "skipped", "audience");
+            continue;
+        }
+        if !validity::allows_current(entry) {
+            push_decision(&mut decisions, &input, entry, "skipped", "validity");
             continue;
         }
 
@@ -871,6 +875,71 @@ mod tests {
         assert_eq!(
             assemble_context(request).expect("context").sections.len(),
             1
+        );
+    }
+
+    #[test]
+    fn context_suppresses_expired_and_future_records() {
+        let dir = temp_dir("validity");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(TestRecord {
+            root: &root,
+            entry_kind: note::EntryKind::Remember,
+            scope: "global",
+            body: "Expired memory.",
+            created_at: timestamp(1_778_946_153),
+            project_id: None,
+            audience: Vec::new(),
+        });
+        write_record(TestRecord {
+            root: &root,
+            entry_kind: note::EntryKind::Remember,
+            scope: "global",
+            body: "Current memory.",
+            created_at: timestamp(1_778_946_154),
+            project_id: None,
+            audience: Vec::new(),
+        });
+        write_record(TestRecord {
+            root: &root,
+            entry_kind: note::EntryKind::Remember,
+            scope: "global",
+            body: "Future memory.",
+            created_at: timestamp(1_778_946_155),
+            project_id: None,
+            audience: Vec::new(),
+        });
+        let mut entries = entries(&root, &cache);
+        for entry in &mut entries {
+            match entry.body.as_str() {
+                "Expired memory." => {
+                    entry.valid_to = Some("2000-01-01T00:00:00Z".to_owned());
+                }
+                "Future memory." => {
+                    entry.valid_from = Some("2999-01-01T00:00:00Z".to_owned());
+                }
+                _ => {}
+            }
+        }
+        let sources = ["remembered".to_owned()];
+        let mut request = input(&root, &entries, &[], &sources);
+        request.explain = true;
+
+        let output = assemble_context(request).expect("context");
+
+        assert_eq!(output.sections.len(), 1);
+        assert_eq!(output.sections[0].body, "Current memory.");
+        assert!(output.markdown.contains("Current memory."));
+        assert!(!output.markdown.contains("Expired memory."));
+        assert!(!output.markdown.contains("Future memory."));
+        assert_eq!(
+            output
+                .decisions
+                .iter()
+                .filter(|decision| decision.reason == "validity")
+                .count(),
+            2
         );
     }
 

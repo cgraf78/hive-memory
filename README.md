@@ -301,8 +301,9 @@ Useful write flags:
 
 `hm remember` always writes a JSON event sidecar. `hm note` follows
 `defaults.event_sidecar`, unless `--event` or `--no-event` overrides it.
-Expired or not-yet-valid records are excluded from ordinary search, but
-historical queries such as "old" or "previous" can still retrieve them.
+Expired or not-yet-valid records are excluded from ordinary search and context
+injection. Historical queries such as "old" or "previous" can still retrieve
+expired records, but not records whose `valid_from` is still in the future.
 
 ### Search and Context
 

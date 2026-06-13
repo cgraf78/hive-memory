@@ -7,7 +7,7 @@
 
 use crate::curated::CuratedFile;
 use crate::index::IndexEntry;
-use crate::{entity, note, project, supersession, visibility};
+use crate::{entity, note, project, supersession, validity, visibility};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -393,27 +393,10 @@ fn project_allowed(entry: &IndexEntry, project_ids: Option<&BTreeSet<String>>) -
 }
 
 fn validity_allows(entry: &IndexEntry, query: &SearchQuery) -> bool {
-    if query.temporal_intent() == Some(TemporalIntent::Oldest) {
-        return true;
-    }
-    let now = OffsetDateTime::now_utc();
-    if let Some(valid_from) = entry.valid_from.as_deref()
-        && let Some(valid_from) = parse_time(valid_from)
-        && valid_from > now
-    {
-        return false;
-    }
-    if let Some(valid_to) = entry.valid_to.as_deref()
-        && let Some(valid_to) = parse_time(valid_to)
-        && valid_to <= now
-    {
-        return false;
-    }
-    true
-}
-
-fn parse_time(value: &str) -> Option<OffsetDateTime> {
-    OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok()
+    validity::allows_search(
+        entry,
+        query.temporal_intent() == Some(TemporalIntent::Oldest),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -614,6 +597,7 @@ fn is_query_stopword(term: &str) -> bool {
             | "later"
             | "newest"
             | "now"
+            | "old"
             | "oldest"
             | "original"
             | "previous"
@@ -1137,6 +1121,7 @@ mod tests {
         root: &Path,
         body: &str,
         project_id: &str,
+        valid_from: Option<&str>,
         valid_to: Option<&str>,
         supersedes: Vec<String>,
     ) -> String {
@@ -1155,7 +1140,7 @@ mod tests {
             project_id: Some(project_id.to_owned()),
             subject: None,
             kind: None,
-            valid_from: None,
+            valid_from: valid_from.map(str::to_owned),
             valid_to: valid_to.map(str::to_owned),
             supersedes,
             tags: Vec::new(),
@@ -1388,6 +1373,22 @@ mod tests {
 
         assert_eq!(query.terms.len(), 14);
         assert_eq!(query.min_matching_terms(), 9);
+    }
+
+    #[test]
+    fn old_triggers_historical_intent_without_scored_term() {
+        let query = SearchQuery::parse("old launch gate", &entity::EntityRegistry::builtin())
+            .expect("query");
+
+        assert_eq!(query.temporal_intent(), Some(TemporalIntent::Oldest));
+        assert_eq!(
+            query
+                .terms
+                .iter()
+                .map(|term| term.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["launch", "gate"]
+        );
     }
 
     #[test]
@@ -2340,6 +2341,7 @@ aliases = ["deployctl", "release promotion gate"]
             &root,
             "Project alpha deploys with the old launch gate.",
             "proj-alpha",
+            None,
             Some("2000-01-01T00:00:00Z"),
             Vec::new(),
         );
@@ -2347,6 +2349,15 @@ aliases = ["deployctl", "release promotion gate"]
             &root,
             "Project alpha deploys with the current launch gate.",
             "proj-alpha",
+            None,
+            None,
+            Vec::new(),
+        );
+        write_project_record_with_validity(
+            &root,
+            "Project alpha will deploy with the future launch gate.",
+            "proj-alpha",
+            Some("2999-01-01T00:00:00Z"),
             None,
             Vec::new(),
         );
@@ -2387,6 +2398,10 @@ aliases = ["deployctl", "release promotion gate"]
             hit_bodies(&historical_hits)
                 .contains(&"Project alpha deploys with the old launch gate.".to_owned())
         );
+        assert!(
+            !hit_bodies(&historical_hits)
+                .contains(&"Project alpha will deploy with the future launch gate.".to_owned())
+        );
     }
 
     #[test]
@@ -2399,12 +2414,14 @@ aliases = ["deployctl", "release promotion gate"]
             "Project alpha deployment gate is launchctl.",
             "proj-alpha",
             None,
+            None,
             Vec::new(),
         );
         write_project_record_with_validity(
             &root,
             "Project alpha deployment gate is deployctl.",
             "proj-alpha",
+            None,
             None,
             vec![old_id],
         );

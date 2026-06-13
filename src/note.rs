@@ -276,6 +276,13 @@ pub enum NoteError {
         /// Invalid timestamp value.
         value: String,
     },
+    /// `valid_from` must be earlier than `valid_to` when both are present.
+    InvalidValidityWindow {
+        /// Parsed `valid_from` value.
+        valid_from: String,
+        /// Parsed `valid_to` value.
+        valid_to: String,
+    },
     /// `agent-private` notes must declare which agents may read them.
     MissingAudienceForAgentPrivate,
     /// Filesystem publish failed.
@@ -299,6 +306,13 @@ impl Display for NoteError {
             Self::InvalidTimestamp { field, value } => {
                 write!(f, "note front matter field {field} is not RFC3339: {value}")
             }
+            Self::InvalidValidityWindow {
+                valid_from,
+                valid_to,
+            } => write!(
+                f,
+                "note front matter valid_from must be earlier than valid_to: {valid_from} >= {valid_to}"
+            ),
             Self::MissingAudienceForAgentPrivate => {
                 write!(f, "agent-private notes require an explicit audience")
             }
@@ -480,12 +494,10 @@ fn validate_front_matter(front_matter: &NoteFrontMatter) -> Result<(), NoteError
     if let Some(expires_at) = &front_matter.expires_at {
         validate_rfc3339("expires_at", expires_at)?;
     }
-    if let Some(valid_from) = &front_matter.valid_from {
-        validate_rfc3339("valid_from", valid_from)?;
-    }
-    if let Some(valid_to) = &front_matter.valid_to {
-        validate_rfc3339("valid_to", valid_to)?;
-    }
+    validate_validity_window(
+        front_matter.valid_from.as_deref(),
+        front_matter.valid_to.as_deref(),
+    )?;
     if let Some(classified) = &front_matter.classified {
         validate_rfc3339("classified.at", &classified.at)?;
     }
@@ -504,12 +516,40 @@ fn require_non_empty(field: &'static str, value: &str) -> Result<(), NoteError> 
 }
 
 fn validate_rfc3339(field: &'static str, value: &str) -> Result<(), NoteError> {
-    OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
-        .map(|_| ())
-        .map_err(|_| NoteError::InvalidTimestamp {
+    parse_rfc3339(field, value).map(|_| ())
+}
+
+fn parse_rfc3339(field: &'static str, value: &str) -> Result<OffsetDateTime, NoteError> {
+    OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).map_err(|_| {
+        NoteError::InvalidTimestamp {
             field,
             value: value.to_owned(),
-        })
+        }
+    })
+}
+
+fn validate_validity_window(
+    valid_from: Option<&str>,
+    valid_to: Option<&str>,
+) -> Result<(), NoteError> {
+    let Some(valid_from_value) = valid_from else {
+        if let Some(valid_to_value) = valid_to {
+            parse_rfc3339("valid_to", valid_to_value)?;
+        }
+        return Ok(());
+    };
+    let valid_from_time = parse_rfc3339("valid_from", valid_from_value)?;
+    let Some(valid_to_value) = valid_to else {
+        return Ok(());
+    };
+    let valid_to_time = parse_rfc3339("valid_to", valid_to_value)?;
+    if valid_from_time >= valid_to_time {
+        return Err(NoteError::InvalidValidityWindow {
+            valid_from: valid_from_value.to_owned(),
+            valid_to: valid_to_value.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn note_day_dir(store_root: &Path, created_at: OffsetDateTime) -> PathBuf {
@@ -688,6 +728,29 @@ mod tests {
             NoteError::InvalidTimestamp {
                 field: "created_at",
                 value: "not-a-time".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_inverted_validity_window() {
+        let mut front_matter = input()
+            .front_matter("note-id".to_owned())
+            .expect("front matter");
+        front_matter.valid_from = Some("2030-01-01T00:00:00Z".to_owned());
+        front_matter.valid_to = Some("2020-01-01T00:00:00Z".to_owned());
+        let note = MarkdownNote {
+            front_matter,
+            body: "body".to_owned(),
+        };
+
+        let err = render_note(&note).expect_err("render rejected");
+
+        assert_eq!(
+            err,
+            NoteError::InvalidValidityWindow {
+                valid_from: "2030-01-01T00:00:00Z".to_owned(),
+                valid_to: "2020-01-01T00:00:00Z".to_owned(),
             }
         );
     }
