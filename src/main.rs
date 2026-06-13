@@ -3996,8 +3996,9 @@ fn run_hook_tool_complete(args: HookToolCompleteArgs, context: CliContext) -> Re
             let receipt_project_id = receipts
                 .iter()
                 .skip(state.refreshed_receipts)
-                .rev()
-                .find_map(|receipt| receipt.project_id.clone());
+                .last()
+                .and_then(|receipt| receipt.project_id.clone())
+                .filter(|project_id| !project_id.trim().is_empty());
 
             let mut report = perform_refresh(&config, false)?;
             report.write_receipts = unrefreshed_receipts;

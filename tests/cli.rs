@@ -5636,6 +5636,103 @@ fn hook_tool_complete_receipt_allows_project_context_refresh() {
 }
 
 #[test]
+fn hook_tool_complete_latest_global_receipt_does_not_reuse_older_project_context() {
+    let dir = temp_dir("hook-tool-complete-global-receipt");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let state = dir.join("state");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            state_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+            "#,
+            state.display(),
+            personal.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    let mut start = cargo_bin_cmd!("hm");
+    start
+        .env("HIVE_MEMORY_SESSION_ID", "session-global-receipt")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "session-start",
+            "--project",
+            "/repo-a/src/main.rs",
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    let mut project_remember = cargo_bin_cmd!("hm");
+    project_remember
+        .env("HIVE_MEMORY_SESSION_ID", "session-global-receipt")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--scope",
+            "project",
+            "--project-id",
+            "repo-b",
+            "--text",
+            "This project uses release trains.",
+        ])
+        .assert()
+        .success();
+
+    let mut global_remember = cargo_bin_cmd!("hm");
+    global_remember
+        .env("HIVE_MEMORY_SESSION_ID", "session-global-receipt")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--no-infer-scope",
+            "--text",
+            "Chris prefers concise answers.",
+        ])
+        .assert()
+        .success();
+
+    let mut tool = cargo_bin_cmd!("hm");
+    let output = tool
+        .env("HIVE_MEMORY_SESSION_ID", "session-global-receipt")
+        .env("HIVE_MEMORY_PROJECT", "/tmp/home-launched-session")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "tool-complete",
+            "--status",
+            "0",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).expect("utf8 stdout");
+    assert!(stdout.contains("\"context_emitted\": false"));
+    assert!(stdout.contains("\"write_receipts\": 2"));
+    assert!(!stdout.contains("\"kind\": \"inject_context\""));
+}
+
+#[test]
 fn hook_tool_complete_nonzero_status_does_not_clear_pending() {
     let dir = temp_dir("hook-tool-complete-fail");
     let config = dir.join("config.toml");
