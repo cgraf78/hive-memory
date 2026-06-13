@@ -744,9 +744,12 @@ Do not implement this phase just because Mem0 uses semantic search. Implement it
 only if:
 
 - lexical + deterministic entity retrieval fails named eval cases,
+
 - the failed cases matter to real agent workflows,
+
 - semantic retrieval fixes those cases without adding unacceptable latency or
   noise, and
+
 - the optional provider/cache can be disabled with no behavior breakage.
 
 - [ ] Add `[retrieval.semantic]` config.

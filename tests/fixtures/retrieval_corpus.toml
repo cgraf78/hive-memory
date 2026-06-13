@@ -1,0 +1,72 @@
+[[record]]
+subject = "global-small-patches"
+entry_kind = "remember"
+scope = "global"
+confidence = "high"
+kind = "preference"
+body = "Prefer small focused patches with tests before broad refactors."
+
+[[record]]
+subject = "active-agents-checkrun"
+entry_kind = "remember"
+scope = "project"
+project_id = "project-alpha"
+confidence = "high"
+kind = "project-fact"
+body = "Project alpha keeps agent instructions in AGENTS.md and verifies local changes with checkrun format and checkrun lint."
+
+[[record]]
+subject = "inactive-cargo-release"
+entry_kind = "remember"
+scope = "project"
+project_id = "project-beta"
+confidence = "high"
+kind = "project-fact"
+body = "Project beta publishes Rust crates from Cargo.toml metadata on release tags."
+
+[[record]]
+subject = "stale-do-not-merge"
+entry_kind = "remember"
+scope = "project"
+project_id = "project-alpha"
+confidence = "medium"
+kind = "incident"
+body = "2026-06-01 PR #42 was temporarily blocked; do not merge until the flaky test is fixed."
+
+[[record]]
+subject = "raw-debug-note"
+entry_kind = "note"
+scope = "project"
+project_id = "project-alpha"
+confidence = "low"
+body = "Raw debugging scratch says maybe check AGENTS.md later."
+
+[[record]]
+subject = "duplicate-active-agents-checkrun"
+entry_kind = "remember"
+scope = "project"
+project_id = "project-alpha"
+confidence = "medium"
+kind = "project-fact"
+body = "Project alpha keeps agent instructions in AGENTS.md and verifies local changes with checkrun format and checkrun lint."
+
+[[search_case]]
+name = "active lexical project recall"
+query = "AGENTS.md checkrun"
+project_id = "project-alpha"
+include = ["active-agents-checkrun"]
+exclude = ["inactive-cargo-release", "raw-debug-note"]
+
+[[search_case]]
+name = "semantic gap baseline"
+query = "where are coding agent rules documented"
+project_id = "project-alpha"
+include = []
+exclude = ["inactive-cargo-release"]
+note = "Current lexical search is not expected to match this paraphrase; semantic/entity phases need an eval delta before implementation."
+
+[[context_case]]
+name = "active project startup context"
+project_id = "project-alpha"
+include = ["global-small-patches", "active-agents-checkrun"]
+exclude = ["inactive-cargo-release", "raw-debug-note", "stale-do-not-merge"]
