@@ -345,6 +345,7 @@ struct SearchQuery {
 struct QueryTerm {
     value: String,
     alternatives: Vec<String>,
+    required: bool,
 }
 
 impl SearchQuery {
@@ -387,7 +388,7 @@ impl SearchQuery {
         match self.terms.len() {
             0 => 0,
             1..=3 => self.terms.len(),
-            len => ((len * 3).div_ceil(5)).clamp(3, 8),
+            len => ((len * 3).div_ceil(5)).max(3),
         }
     }
 }
@@ -401,6 +402,7 @@ impl QueryTerm {
         alternatives.dedup();
         alternatives.retain(|alternative| alternative != &value);
         Self {
+            required: is_required_query_term(&value) || is_required_intent_term(&value),
             value,
             alternatives,
         }
@@ -409,7 +411,7 @@ impl QueryTerm {
 
 fn score_text(body: &str, query: &SearchQuery) -> usize {
     let lower = body.to_ascii_lowercase();
-    let exact = lower.matches(&query.phrase).count();
+    let exact = count_pattern_matches(&lower, &query.phrase);
     if exact > 0 {
         // Keep phrase hits clearly above keyword-only hits without making the
         // scoring model clever. Exact recall should remain the most predictable
@@ -418,7 +420,9 @@ fn score_text(body: &str, query: &SearchQuery) -> usize {
     }
 
     let coverage = term_coverage(&lower, query);
-    if coverage.matched >= query.min_matching_terms() {
+    if coverage.required_matched == coverage.required_total
+        && coverage.matched >= query.min_matching_terms()
+    {
         return coverage.score + coverage.matched;
     }
 
@@ -472,9 +476,42 @@ fn is_query_stopword(term: &str) -> bool {
             | "was"
             | "were"
             | "which"
-            | "will"
             | "with"
             | "would"
+    )
+}
+
+fn is_required_query_term(term: &str) -> bool {
+    matches!(
+        term,
+        "not" | "no" | "never" | "without" | "except" | "exclude"
+    )
+}
+
+fn is_required_intent_term(term: &str) -> bool {
+    matches!(
+        term,
+        "buy"
+            | "bought"
+            | "favorite"
+            | "favourite"
+            | "order"
+            | "ordered"
+            | "prefer"
+            | "preferred"
+            | "prefers"
+            | "preference"
+            | "preferences"
+            | "purchase"
+            | "purchased"
+            | "recommend"
+            | "recommendation"
+            | "recommendations"
+            | "recommended"
+            | "suggest"
+            | "suggested"
+            | "suggestion"
+            | "suggestions"
     )
 }
 
@@ -491,7 +528,16 @@ fn concept_aliases(term: &str) -> Vec<&'static str> {
             vec!["shopping", "payment"]
         }
         "favorite" | "favourite" | "prefer" | "preferred" | "prefers" | "preference"
-        | "preferences" => vec!["likes", "like", "favorite", "prefer"],
+        | "preferences" => vec![
+            "likes",
+            "like",
+            "favorite",
+            "prefer",
+            "prefers",
+            "preferred",
+            "preference",
+            "preferences",
+        ],
         "recommend" | "recommendation" | "recommendations" | "recommended" | "suggest"
         | "suggested" | "suggestion" | "suggestions" => {
             vec!["recommend", "suggest", "advice"]
@@ -502,17 +548,20 @@ fn concept_aliases(term: &str) -> Vec<&'static str> {
 }
 
 fn term_score(lower: &str, term: &QueryTerm) -> usize {
-    lower.matches(&term.value).count()
+    let score = count_pattern_matches(lower, &term.value)
         + term
             .alternatives
             .iter()
-            .map(|alternative| lower.matches(alternative).count())
-            .sum::<usize>()
+            .map(|alternative| count_pattern_matches(lower, alternative))
+            .sum::<usize>();
+    score.min(3)
 }
 
 #[derive(Debug, Clone, Copy)]
 struct TermCoverage {
     matched: usize,
+    required_matched: usize,
+    required_total: usize,
     score: usize,
 }
 
@@ -520,15 +569,23 @@ fn term_coverage(lower: &str, query: &SearchQuery) -> TermCoverage {
     query.terms.iter().fold(
         TermCoverage {
             matched: 0,
+            required_matched: 0,
+            required_total: 0,
             score: 0,
         },
         |coverage, term| {
             let score = term_score(lower, term);
+            let required_total = coverage.required_total + usize::from(term.required);
             if score == 0 {
-                coverage
+                TermCoverage {
+                    required_total,
+                    ..coverage
+                }
             } else {
                 TermCoverage {
                     matched: coverage.matched + 1,
+                    required_matched: coverage.required_matched + usize::from(term.required),
+                    required_total,
                     score: coverage.score + score,
                 }
             }
@@ -556,6 +613,28 @@ fn morphological_alternatives(term: &str) -> Vec<String> {
         alternatives.push(format!("{stem}e"));
     }
     alternatives
+}
+
+fn count_pattern_matches(lower: &str, pattern: &str) -> usize {
+    if pattern.is_empty() {
+        return 0;
+    }
+
+    let mut count = 0usize;
+    let mut offset = 0usize;
+    while let Some(relative_index) = lower[offset..].find(pattern) {
+        let index = offset + relative_index;
+        let end = index + pattern.len();
+        if pattern_boundary_allows(lower.as_bytes(), index, end) {
+            count += 1;
+        }
+        offset = end;
+    }
+    count
+}
+
+fn pattern_boundary_allows(bytes: &[u8], start: usize, _end: usize) -> bool {
+    start == 0 || !bytes[start - 1].is_ascii_alphanumeric()
 }
 
 fn score_entry(entry: &IndexEntry, body: &str, query: &SearchQuery) -> usize {
@@ -989,6 +1068,120 @@ mod tests {
             store_root: &root,
             entries: &entries(&root, &cache),
             query: "agent ergonomics missing unrelated banana",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn search_long_query_threshold_scales_past_eight_terms() {
+        let query = SearchQuery::parse(
+            "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november",
+        )
+        .expect("query");
+
+        assert_eq!(query.terms.len(), 14);
+        assert_eq!(query.min_matching_terms(), 9);
+    }
+
+    #[test]
+    fn search_caps_repeated_term_score_contribution() {
+        let term = QueryTerm::new("repeat".to_owned());
+
+        assert_eq!(
+            term_score(
+                "repeat repeat repeat repeat repeat repeat repeat repeat",
+                &term
+            ),
+            3
+        );
+    }
+
+    #[test]
+    fn search_long_queries_require_negation_terms() {
+        let dir = temp_dir("keyword-negation");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "Chris prefers Delta airline for regional flights.",
+            timestamp(1_778_946_153),
+            Vec::new(),
+        );
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "which airline does chris not prefer",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn search_does_not_match_positive_preference_inside_dislike() {
+        let dir = temp_dir("keyword-dislike");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "Chris dislikes Delta airline for regional flights.",
+            timestamp(1_778_946_153),
+            Vec::new(),
+        );
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "which airline was preferred for regional flights",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn search_preserves_will_as_a_name() {
+        let dir = temp_dir("keyword-will-name");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "Ada has a payment status update for the group.",
+            timestamp(1_778_946_153),
+            Vec::new(),
+        );
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "what did Will order for Ada",
             scopes: &[],
             sources: &[],
             include_inbox: false,
