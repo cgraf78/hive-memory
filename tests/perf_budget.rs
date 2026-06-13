@@ -67,6 +67,36 @@ fn context_and_search_stay_within_warm_budget() {
 }
 
 #[test]
+#[ignore = "CI runs this explicitly because it creates a 5000-note synthetic store"]
+fn semantic_and_supersession_search_stay_within_warm_budget() {
+    let fixture = SyntheticStore::new();
+    fixture.refresh_index();
+
+    let semantic_p95 = p95_ms(repeat(RUNS, || {
+        fixture.hm([
+            "search",
+            "where are coding agent rules documented",
+            "--json",
+        ])
+    }));
+    let supersession_p95 = p95_ms(repeat(RUNS, || {
+        fixture.hm(["search", "before committing", "--json"])
+    }));
+    eprintln!("hm semantic search warm p95: {semantic_p95}ms");
+    eprintln!("hm supersession search warm p95: {supersession_p95}ms");
+
+    let search_budget = budget_ms(SEARCH_WARM_BUDGET_MS);
+    assert!(
+        semantic_p95 <= search_budget,
+        "hm semantic search p95 {semantic_p95}ms exceeded {search_budget}ms"
+    );
+    assert!(
+        supersession_p95 <= search_budget,
+        "hm supersession search p95 {supersession_p95}ms exceeded {search_budget}ms"
+    );
+}
+
+#[test]
 #[ignore = "CI runs this explicitly because it creates synthetic outbox stores"]
 fn flush_100_item_outbox_stays_within_budget() {
     let flush_p95 = p95_ms(
@@ -354,6 +384,58 @@ fn write_notes(root: &Path) {
             || format!("synthetic-{index:05}"),
         )
         .expect("write synthetic note");
+    }
+
+    for (offset, id, body) in [
+        (
+            0_i64,
+            "feature-agent-rules",
+            "Coding agent instructions live in AGENTS.md and define checkrun rules.",
+        ),
+        (
+            1_i64,
+            "feature-old-cargo-fmt",
+            "Project alpha used to run cargo fmt before committing.",
+        ),
+        (
+            2_i64,
+            "feature-new-checkrun",
+            "Project alpha now uses checkrun format and checkrun lint before committing.",
+        ),
+    ] {
+        let created_at = OffsetDateTime::from_unix_timestamp(
+            1_778_946_153 + i64::try_from(SYNTHETIC_NOTES).unwrap() + offset,
+        )
+        .expect("timestamp");
+        note::write_note_with_id_generator(
+            root,
+            &note::NoteWriteInput {
+                entry_kind: note::EntryKind::Remember,
+                store_id: "synthetic-store-id".to_owned(),
+                store_name: "personal".to_owned(),
+                created_at,
+                agent_id: "perf".to_owned(),
+                host_id: "ci".to_owned(),
+                scope: "global".to_owned(),
+                confidence: Confidence::High,
+                body: body.to_owned(),
+                user_id: None,
+                session_id: None,
+                project_id: None,
+                subject: Some(id.to_owned()),
+                tags: vec!["perf".to_owned(), "feature-perf".to_owned()],
+                source_kind: Some("benchmark".to_owned()),
+                source_ref: None,
+                related_event_id: None,
+                expires_at: None,
+                kind: None,
+                classified: None,
+                audience: Vec::new(),
+            },
+            &options,
+            || id.to_owned(),
+        )
+        .expect("write feature perf note");
     }
 }
 
