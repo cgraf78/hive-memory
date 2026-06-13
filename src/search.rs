@@ -1243,7 +1243,6 @@ mod tests {
 
         assert_eq!(result, Err(SearchError::EmptyQuery));
     }
-
     #[test]
     fn search_suppresses_superseded_records_for_broad_recall() {
         let dir = temp_dir("superseded-broad");
