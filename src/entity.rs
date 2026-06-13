@@ -100,9 +100,10 @@ pub fn extract(text: &str) -> Vec<EntityId> {
                 }
             }
         }
-        if let Some(number) = token.strip_prefix('#').filter(|value| {
-            !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit())
-        }) {
+        if let Some(number) = token
+            .strip_prefix('#')
+            .filter(|value| !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit()))
+        {
             ids.insert(format!("issue:{number}"));
         }
     }
