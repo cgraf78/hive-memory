@@ -95,7 +95,7 @@ struct RetrievalMetrics {
 }
 
 #[test]
-fn deferred_retrieval_scoreboard_pins_current_gaps() {
+fn deferred_retrieval_scoreboard_measures_candidate_quality() {
     let corpus = load_corpus();
     let materialized = materialize(&corpus);
     let metrics = score_retrieval(&corpus, &materialized, "lexical-baseline");
@@ -114,8 +114,12 @@ fn deferred_retrieval_scoreboard_pins_current_gaps() {
 
     let semantic = feature_metric(&metrics, "semantic");
     assert!(
-        semantic.recall_at_5 < 1.0,
-        "semantic eval should expose a baseline paraphrase gap before the feature branch"
+        semantic.recall_at_5 >= 1.0 && semantic.precision_at_5 >= 1.0,
+        "semantic candidate must clear the labeled paraphrase gate: {semantic:?}"
+    );
+    assert_eq!(
+        semantic.forbidden_hits, 0,
+        "semantic candidate must not add forbidden hits"
     );
     assert_eq!(
         feature_metric(&metrics, "scope").forbidden_hits,

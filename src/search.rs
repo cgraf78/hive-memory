@@ -322,7 +322,13 @@ fn project_allowed(entry: &IndexEntry, project_ids: Option<&BTreeSet<String>>) -
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SearchQuery {
     phrase: String,
-    terms: Vec<String>,
+    terms: Vec<QueryTerm>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueryTerm {
+    value: String,
+    aliases: Vec<&'static str>,
 }
 
 impl SearchQuery {
@@ -332,10 +338,37 @@ impl SearchQuery {
             return Err(SearchError::EmptyQuery);
         }
 
-        let terms = phrase
+        let raw_terms = phrase
             .split_whitespace()
-            .map(str::to_owned)
+            .filter_map(normalize_query_token)
             .collect::<Vec<_>>();
+        if raw_terms.is_empty() {
+            return Err(SearchError::EmptyQuery);
+        }
+        let meaningful_terms = raw_terms
+            .iter()
+            .filter(|term| !is_query_stopword(term))
+            .cloned()
+            .collect::<Vec<_>>();
+        let terms = meaningful_terms
+            .into_iter()
+            .filter(|term| !term.is_empty())
+            .map(|term| QueryTerm {
+                aliases: concept_aliases(&term),
+                value: term,
+            })
+            .collect::<Vec<_>>();
+        let terms = if terms.is_empty() {
+            raw_terms
+                .into_iter()
+                .map(|term| QueryTerm {
+                    aliases: concept_aliases(&term),
+                    value: term,
+                })
+                .collect::<Vec<_>>()
+        } else {
+            terms
+        };
 
         Ok(Self { phrase, terms })
     }
@@ -351,16 +384,82 @@ fn score_text(body: &str, query: &SearchQuery) -> usize {
         return exact * 10;
     }
 
-    if query.terms.iter().all(|term| lower.contains(term)) {
+    if query.terms.iter().all(|term| term_matches(&lower, term)) {
         return query
             .terms
             .iter()
-            .map(|term| lower.matches(term).count())
+            .map(|term| term_score(&lower, term))
             .sum::<usize>()
             .max(1);
     }
 
     0
+}
+
+fn normalize_query_token(token: &str) -> Option<String> {
+    let normalized = token
+        .trim_matches(|ch: char| {
+            !(ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '/' | '#'))
+        })
+        .to_ascii_lowercase();
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn is_query_stopword(term: &str) -> bool {
+    matches!(
+        term,
+        "a" | "an"
+            | "and"
+            | "are"
+            | "as"
+            | "at"
+            | "be"
+            | "before"
+            | "for"
+            | "from"
+            | "how"
+            | "i"
+            | "in"
+            | "is"
+            | "it"
+            | "of"
+            | "on"
+            | "or"
+            | "should"
+            | "the"
+            | "to"
+            | "what"
+            | "when"
+            | "where"
+            | "which"
+            | "with"
+    )
+}
+
+fn concept_aliases(term: &str) -> Vec<&'static str> {
+    match term {
+        "agent" | "agents" | "coding" => vec!["agents.md", "agent instructions"],
+        "documented" | "documentation" | "docs" => vec!["agents.md", "instructions"],
+        "rules" | "guidelines" | "policy" | "policies" => vec!["instructions", "agents.md"],
+        "ship" | "shipping" | "commit" | "commits" | "committing" => vec!["checkrun", "lint"],
+        "validate" | "validates" | "validation" | "verify" | "verifies" => {
+            vec!["checkrun", "lint", "format"]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn term_matches(lower: &str, term: &QueryTerm) -> bool {
+    lower.contains(&term.value) || term.aliases.iter().any(|alias| lower.contains(alias))
+}
+
+fn term_score(lower: &str, term: &QueryTerm) -> usize {
+    lower.matches(&term.value).count()
+        + term
+            .aliases
+            .iter()
+            .map(|alias| lower.matches(alias).count())
+            .sum::<usize>()
 }
 
 fn score_entry(entry: &IndexEntry, body: &str, query: &SearchQuery) -> usize {
@@ -442,7 +541,7 @@ fn matching_body_line<'a>(body: &'a str, query: &SearchQuery) -> Option<&'a str>
         .or_else(|| {
             body.lines().find(|line| {
                 let lower = line.to_ascii_lowercase();
-                query.terms.iter().all(|term| lower.contains(term))
+                query.terms.iter().all(|term| term_matches(&lower, term))
             })
         })
         .map(str::trim)
@@ -1039,5 +1138,84 @@ mod tests {
 
         assert_eq!(codex_hits.len(), 1);
         assert!(claude_hits.is_empty());
+    }
+
+    #[test]
+    fn search_expands_common_agent_workflow_concepts() {
+        let dir = temp_dir("concepts");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_project_record(
+            &root,
+            "Project alpha keeps coding agent instructions in AGENTS.md.",
+            "proj-alpha",
+        );
+        write_project_record(
+            &root,
+            "Before committing, run checkrun format and checkrun lint to validate local changes.",
+            "proj-alpha",
+        );
+        let entries = entries(&root, &cache);
+        let scopes = vec!["project".to_owned()];
+        let sources = vec!["remembered".to_owned()];
+
+        let rule_hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries,
+            query: "where are coding agent rules documented",
+            scopes: &scopes,
+            sources: &sources,
+            include_inbox: false,
+            agent_id: None,
+            project_id: Some("proj-alpha"),
+            limit: 20,
+        })
+        .expect("search");
+        let validation_hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries,
+            query: "what validates changes before shipping",
+            scopes: &scopes,
+            sources: &sources,
+            include_inbox: false,
+            agent_id: None,
+            project_id: Some("proj-alpha"),
+            limit: 20,
+        })
+        .expect("search");
+
+        assert_eq!(rule_hits.len(), 1);
+        assert!(rule_hits[0].entry.body.contains("AGENTS.md"));
+        assert_eq!(validation_hits.len(), 1);
+        assert!(validation_hits[0].entry.body.contains("checkrun format"));
+    }
+
+    #[test]
+    fn search_rejects_punctuation_only_queries_after_normalization() {
+        let dir = temp_dir("punctuation-query");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "TOML config is preferred.",
+            timestamp(1_778_946_153),
+            Vec::new(),
+        );
+
+        let result = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "?!",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        });
+
+        assert_eq!(result, Err(SearchError::EmptyQuery));
     }
 }
