@@ -516,6 +516,9 @@ struct SearchArgs {
     /// Active project path or file hint.
     #[arg(long)]
     project: Option<String>,
+    /// Include structured scoring diagnostics.
+    #[arg(long)]
+    explain: bool,
     /// Emit machine-readable output.
     #[arg(long)]
     json: bool,
@@ -2211,7 +2214,7 @@ fn run_search(args: SearchArgs, context: CliContext) -> Result<()> {
     if args.json {
         let output = hits
             .iter()
-            .map(|hit| search_json_hit(&resolved_store.name, &manifest.store.id, hit))
+            .map(|hit| search_json_hit(&resolved_store.name, &manifest.store.id, hit, args.explain))
             .collect::<Vec<_>>();
         println!("{}", serde_json::to_string_pretty(&output)?);
         return Ok(());
@@ -2222,6 +2225,9 @@ fn run_search(args: SearchArgs, context: CliContext) -> Result<()> {
     for hit in hits {
         println!("id: {}", hit.entry.id);
         println!("score: {}", hit.score);
+        if args.explain {
+            print_score_trace(&hit.trace);
+        }
         println!("note: {}", hit.entry.note_path);
         println!("snippet: {}", hit.snippet);
     }
@@ -2240,13 +2246,28 @@ struct SearchJsonHit {
     title: String,
     snippet: String,
     score: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    score_trace: Option<SearchJsonScoreTrace>,
     created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchJsonScoreTrace {
+    body_phrase: usize,
+    body_terms: usize,
+    metadata_phrase: usize,
+    metadata_terms: usize,
+    combined_phrase: usize,
+    combined_terms: usize,
+    entity: usize,
+    total: usize,
 }
 
 fn search_json_hit(
     store_name: &str,
     manifest_store_id: &str,
     hit: &search::SearchHit,
+    explain: bool,
 ) -> SearchJsonHit {
     let entry = &hit.entry;
     SearchJsonHit {
@@ -2267,8 +2288,36 @@ fn search_json_hit(
             .unwrap_or_else(|| entry.note_path.clone()),
         snippet: hit.snippet.clone(),
         score: hit.score,
+        score_trace: explain.then(|| search_json_score_trace(&hit.trace)),
         created_at: entry.created_at.clone(),
     }
+}
+
+fn search_json_score_trace(trace: &search::SearchScoreTrace) -> SearchJsonScoreTrace {
+    SearchJsonScoreTrace {
+        body_phrase: trace.body_phrase,
+        body_terms: trace.body_terms,
+        metadata_phrase: trace.metadata_phrase,
+        metadata_terms: trace.metadata_terms,
+        combined_phrase: trace.combined_phrase,
+        combined_terms: trace.combined_terms,
+        entity: trace.entity,
+        total: trace.total(),
+    }
+}
+
+fn print_score_trace(trace: &search::SearchScoreTrace) {
+    println!(
+        "score_trace: body_phrase={} body_terms={} metadata_phrase={} metadata_terms={} combined_phrase={} combined_terms={} entity={} total={}",
+        trace.body_phrase,
+        trace.body_terms,
+        trace.metadata_phrase,
+        trace.metadata_terms,
+        trace.combined_phrase,
+        trace.combined_terms,
+        trace.entity,
+        trace.total()
+    );
 }
 
 fn search_trust(entry: &index::IndexEntry) -> &'static str {
