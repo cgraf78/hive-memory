@@ -1,7 +1,9 @@
-# Release Scripts
+# Scripts
 
-These scripts support maintainer release work for Hive Memory. Runtime behavior
-belongs in the Rust crate under `src/`.
+These scripts support maintainer and evaluation workflows for Hive Memory.
+Runtime behavior belongs in the Rust crate under `src/`.
+
+## Release
 
 - `release-version.sh` computes the release version from repo state.
 - `release-tag.sh` creates or validates the tag used for a release.
@@ -13,3 +15,8 @@ Keep scripts deterministic and friendly to CI. If a script needs a generated
 artifact, make the artifact path explicit and avoid depending on untracked local
 state. Release archive shape changes should be covered by
 `tests/shell/release-scripts-test`.
+
+## Public Evals
+
+- `download-longmemeval-fixture` downloads the external LongMemEval-S JSON used
+  by the ignored public retrieval eval.
