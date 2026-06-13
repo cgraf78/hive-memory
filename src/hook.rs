@@ -304,7 +304,9 @@ pub fn mark_prompt_recall(
 ) -> Result<HookState, HookStateError> {
     let mut state = load_state(state_dir, session_id)?;
     state.prompt_recall_key = Some(recall_key.into());
-    state.prompt_recall_memory_ids = memory_ids;
+    state.prompt_recall_memory_ids.extend(memory_ids);
+    state.prompt_recall_memory_ids.sort();
+    state.prompt_recall_memory_ids.dedup();
     state.prompt_recall_updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
     state.updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
     save_state(state_dir, session_id, &state, options)?;
