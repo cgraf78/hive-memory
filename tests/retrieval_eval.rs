@@ -131,6 +131,17 @@ fn retrieval_corpus_context_baseline() {
                 case.name
             );
         }
+        if case.name == "active project startup context" {
+            let active_body = bodies_by_subject
+                .get("active-agents-checkrun")
+                .expect("active body");
+            assert_eq!(
+                body.matches(active_body).count(),
+                1,
+                "context case {} should emit the duplicate project fact once; body:\n{body}",
+                case.name
+            );
+        }
     }
 }
 

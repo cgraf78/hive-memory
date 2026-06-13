@@ -55,7 +55,7 @@ name = "active lexical project recall"
 query = "AGENTS.md checkrun"
 project_id = "project-alpha"
 include = ["active-agents-checkrun"]
-exclude = ["inactive-cargo-release", "raw-debug-note"]
+exclude = ["inactive-cargo-release", "raw-debug-note", "duplicate-active-agents-checkrun"]
 
 [[search_case]]
 name = "semantic gap baseline"

@@ -197,12 +197,41 @@ pub fn search(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
             .score
             .cmp(&left.score)
             .then_with(|| {
+                confidence_rank(right.entry.confidence).cmp(&confidence_rank(left.entry.confidence))
+            })
+            .then_with(|| {
                 timestamp_rank(&right.entry.created_at).cmp(&timestamp_rank(&left.entry.created_at))
             })
             .then_with(|| left.entry.note_path.cmp(&right.entry.note_path))
     });
+    collapse_duplicate_hits(&mut hits);
     hits.truncate(input.limit);
     Ok(hits)
+}
+
+fn collapse_duplicate_hits(hits: &mut Vec<SearchHit>) {
+    let mut seen = BTreeSet::new();
+    hits.retain(|hit| {
+        let key = duplicate_key(&hit.entry, &hit.snippet);
+        seen.insert(key)
+    });
+}
+
+fn duplicate_key(entry: &IndexEntry, fallback: &str) -> String {
+    let body = if entry.body.is_empty() {
+        fallback
+    } else {
+        entry.body.as_str()
+    };
+    normalize_duplicate_text(body)
+}
+
+fn normalize_duplicate_text(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 fn indexed_body<'a>(store_root: &Path, entry: &'a IndexEntry) -> Result<Cow<'a, str>, SearchError> {
@@ -423,6 +452,14 @@ fn timestamp_rank(value: &str) -> i128 {
     OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
         .map(|timestamp| timestamp.unix_timestamp_nanos())
         .unwrap_or_default()
+}
+
+fn confidence_rank(confidence: note::Confidence) -> u8 {
+    match confidence {
+        note::Confidence::High => 3,
+        note::Confidence::Medium => 2,
+        note::Confidence::Low => 1,
+    }
 }
 
 #[cfg(test)]
