@@ -30,6 +30,7 @@ pub mod secret;
 pub mod signals;
 pub mod store;
 pub mod supersession;
+pub(crate) mod validity;
 pub mod version;
 pub mod visibility;
 pub mod write;

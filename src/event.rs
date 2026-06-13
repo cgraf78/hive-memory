@@ -98,6 +98,15 @@ pub struct MemoryEvent {
     pub tags: Vec<String>,
     /// Writer confidence used by later rendering and compaction.
     pub confidence: Confidence,
+    /// Optional RFC3339 timestamp when this fact starts being valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<String>,
+    /// Optional RFC3339 timestamp when this fact stops being current.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_to: Option<String>,
+    /// Explicit records superseded by this event.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supersedes: Vec<String>,
     /// Optional explicit memory kind, mirrored from the note. The index prefers
     /// the event copy, so it must be carried here too, not only on the note.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -143,6 +152,13 @@ pub enum EventError {
         /// Invalid timestamp value.
         value: String,
     },
+    /// `valid_from` must be earlier than `valid_to` when both are present.
+    InvalidValidityWindow {
+        /// Parsed `valid_from` value.
+        valid_from: String,
+        /// Parsed `valid_to` value.
+        valid_to: String,
+    },
     /// `agent-private` events must declare which agents may read them.
     MissingAudienceForAgentPrivate,
     /// Store-relative path field was absolute or not normalized for v1.
@@ -169,6 +185,13 @@ impl Display for EventError {
             Self::InvalidTimestamp { field, value } => {
                 write!(f, "event field {field} is not RFC3339: {value}")
             }
+            Self::InvalidValidityWindow {
+                valid_from,
+                valid_to,
+            } => write!(
+                f,
+                "event valid_from must be earlier than valid_to: {valid_from} >= {valid_to}"
+            ),
             Self::MissingAudienceForAgentPrivate => {
                 write!(f, "agent-private events require an explicit audience")
             }
@@ -213,6 +236,9 @@ impl MemoryEvent {
             subject: input.subject,
             tags: input.tags,
             confidence: input.confidence,
+            valid_from: input.valid_from,
+            valid_to: input.valid_to,
+            supersedes: input.supersedes,
             kind: input.kind,
             classified: input.classified,
             audience,
@@ -257,6 +283,12 @@ pub struct EventObservationInput {
     pub tags: Vec<String>,
     /// Writer confidence used by later rendering and compaction.
     pub confidence: Confidence,
+    /// Optional RFC3339 timestamp when this fact starts being valid.
+    pub valid_from: Option<String>,
+    /// Optional RFC3339 timestamp when this fact stops being current.
+    pub valid_to: Option<String>,
+    /// Explicit records superseded by this event.
+    pub supersedes: Vec<String>,
     /// Optional explicit memory kind, mirrored from the note.
     pub kind: Option<crate::note::MemoryKind>,
     /// Optional provenance for the persisted `kind` verdict.
@@ -331,6 +363,7 @@ fn validate_event(event: &MemoryEvent) -> Result<(), EventError> {
     require_non_empty("scope", &event.scope)?;
     require_non_empty("body", &event.body)?;
     parse_rfc3339("created_at", &event.created_at)?;
+    validate_validity_window(event.valid_from.as_deref(), event.valid_to.as_deref())?;
     if let Some(classified) = &event.classified {
         parse_rfc3339("classified.at", &classified.at)?;
     }
@@ -361,6 +394,30 @@ fn parse_rfc3339(field: &'static str, value: &str) -> Result<OffsetDateTime, Eve
             value: value.to_owned(),
         }
     })
+}
+
+fn validate_validity_window(
+    valid_from: Option<&str>,
+    valid_to: Option<&str>,
+) -> Result<(), EventError> {
+    let Some(valid_from_value) = valid_from else {
+        if let Some(valid_to_value) = valid_to {
+            parse_rfc3339("valid_to", valid_to_value)?;
+        }
+        return Ok(());
+    };
+    let valid_from_time = parse_rfc3339("valid_from", valid_from_value)?;
+    let Some(valid_to_value) = valid_to else {
+        return Ok(());
+    };
+    let valid_to_time = parse_rfc3339("valid_to", valid_to_value)?;
+    if valid_from_time >= valid_to_time {
+        return Err(EventError::InvalidValidityWindow {
+            valid_from: valid_from_value.to_owned(),
+            valid_to: valid_to_value.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_relative_path(field: &'static str, value: &str) -> Result<(), EventError> {
@@ -445,6 +502,9 @@ mod tests {
             subject: Some("workflow.preference".to_owned()),
             tags: vec!["preference".to_owned(), "workflow".to_owned()],
             confidence: Confidence::High,
+            valid_from: None,
+            valid_to: None,
+            supersedes: Vec::new(),
             kind: None,
             classified: None,
             audience: Vec::new(),
@@ -472,14 +532,37 @@ mod tests {
 
     #[test]
     fn event_round_trips_as_json() {
-        let event = MemoryEvent::observation(input()).expect("event");
+        let mut input = input();
+        input.valid_from = Some("2026-06-01T00:00:00Z".to_owned());
+        input.valid_to = Some("2026-07-01T00:00:00Z".to_owned());
+        input.supersedes = vec!["old-event-id".to_owned()];
+        let event = MemoryEvent::observation(input).expect("event");
 
         let rendered = render_event(&event).expect("render event");
         let parsed = parse_event(&rendered).expect("parse event");
 
         assert_eq!(parsed, event);
+        assert_eq!(parsed.valid_to.as_deref(), Some("2026-07-01T00:00:00Z"));
+        assert_eq!(parsed.supersedes, vec!["old-event-id".to_owned()]);
         assert!(rendered.contains("\"type\": \"memory.observation\""));
         assert!(rendered.ends_with('\n'));
+    }
+
+    #[test]
+    fn rejects_inverted_validity_window() {
+        let mut input = input();
+        input.valid_from = Some("2030-01-01T00:00:00Z".to_owned());
+        input.valid_to = Some("2020-01-01T00:00:00Z".to_owned());
+
+        let err = MemoryEvent::observation(input).expect_err("event rejected");
+
+        assert_eq!(
+            err,
+            EventError::InvalidValidityWindow {
+                valid_from: "2030-01-01T00:00:00Z".to_owned(),
+                valid_to: "2020-01-01T00:00:00Z".to_owned(),
+            }
+        );
     }
 
     #[test]

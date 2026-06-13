@@ -46,6 +46,12 @@ pub struct WriteRecordInput<'a> {
     pub subject: Option<String>,
     /// Optional explicit memory kind driving inject selection.
     pub kind: Option<note::MemoryKind>,
+    /// Optional RFC3339 timestamp when this fact starts being valid.
+    pub valid_from: Option<String>,
+    /// Optional RFC3339 timestamp when this fact stops being current.
+    pub valid_to: Option<String>,
+    /// Explicit records superseded by this write.
+    pub supersedes: Vec<String>,
     /// Optional tags.
     pub tags: Vec<String>,
     /// Explicit audience for agent-private records.
@@ -135,6 +141,9 @@ pub fn write_record(input: WriteRecordInput<'_>) -> Result<WriteRecordResult, Me
                     subject: input.subject.clone(),
                     tags: input.tags.clone(),
                     confidence: input.confidence,
+                    valid_from: input.valid_from.clone(),
+                    valid_to: input.valid_to.clone(),
+                    supersedes: input.supersedes.clone(),
                     kind: input.kind,
                     classified: None,
                     audience: input.audience.clone(),
@@ -170,6 +179,9 @@ pub fn write_record(input: WriteRecordInput<'_>) -> Result<WriteRecordResult, Me
             source_ref: input.source_ref.clone(),
             related_event_id: input.write_event.then(|| id.clone()),
             expires_at: None,
+            valid_from: input.valid_from.clone(),
+            valid_to: input.valid_to.clone(),
+            supersedes: input.supersedes.clone(),
             kind: input.kind,
             classified: None,
             audience: input.audience.clone(),
@@ -395,6 +407,9 @@ mod tests {
             project_id: None,
             subject: None,
             kind,
+            valid_from: None,
+            valid_to: None,
+            supersedes: Vec::new(),
             tags: Vec::new(),
             audience: Vec::new(),
             source_kind: None,

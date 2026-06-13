@@ -15,8 +15,17 @@ pub fn should_suppress_older(older: &IndexEntry, newer: &IndexEntry, query: Opti
         || older.entry_kind != note::EntryKind::Remember
         || newer.entry_kind != note::EntryKind::Remember
         || !same_scope(older, newer)
-        || !is_newer(newer, older)
     {
+        return false;
+    }
+    if newer.supersedes.iter().any(|id| id == &older.id) {
+        return !explicitly_searches_old_fact(
+            &older.body.to_ascii_lowercase(),
+            &newer.body.to_ascii_lowercase(),
+            query,
+        );
+    }
+    if !is_newer(newer, older) {
         return false;
     }
 
@@ -175,6 +184,9 @@ mod tests {
             tags: Vec::new(),
             subject: Some(id.to_owned()),
             confidence: note::Confidence::High,
+            valid_from: None,
+            valid_to: None,
+            supersedes: Vec::new(),
             kind: Some(note::MemoryKind::ProjectFact),
             entities: Vec::new(),
             classified: None,

@@ -7,7 +7,7 @@
 
 use crate::curated::CuratedFile;
 use crate::index::IndexEntry;
-use crate::{entity, note, project, supersession, visibility};
+use crate::{entity, note, project, supersession, validity, visibility};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -226,6 +226,9 @@ pub fn search(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
         if !visibility::audience_allows(entry, input.agent_id) {
             continue;
         }
+        if !validity_allows(entry, &query) {
+            continue;
+        }
 
         let body = indexed_body(input.store_root, entry)?;
         let trace = score_entry(entry, &body, &query);
@@ -387,6 +390,13 @@ fn project_allowed(entry: &IndexEntry, project_ids: Option<&BTreeSet<String>>) -
         .project_id
         .as_deref()
         .is_some_and(|project_id| project_ids.contains(project_id))
+}
+
+fn validity_allows(entry: &IndexEntry, query: &SearchQuery) -> bool {
+    validity::allows_search(
+        entry,
+        query.temporal_intent() == Some(TemporalIntent::Oldest),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -587,6 +597,7 @@ fn is_query_stopword(term: &str) -> bool {
             | "later"
             | "newest"
             | "now"
+            | "old"
             | "oldest"
             | "original"
             | "previous"
@@ -624,6 +635,7 @@ const OLDEST_TERMS: &[&str] = &[
     "former",
     "formerly",
     "initial",
+    "old",
     "oldest",
     "original",
     "previous",
@@ -882,6 +894,9 @@ fn curated_entry(
         tags: Vec::new(),
         subject: None,
         confidence: note::Confidence::High,
+        valid_from: None,
+        valid_to: None,
+        supersedes: Vec::new(),
         kind: None,
         entities: entity::extract_with_registry(&curated.body, registry),
         classified: None,
@@ -1051,6 +1066,9 @@ mod tests {
             project_id: None,
             subject: record.subject.map(str::to_owned),
             kind: None,
+            valid_from: None,
+            valid_to: None,
+            supersedes: Vec::new(),
             tags: record.tags,
             audience: record.audience,
             source_kind: None,
@@ -1086,6 +1104,9 @@ mod tests {
             project_id: Some(project_id.to_owned()),
             subject: None,
             kind: None,
+            valid_from: None,
+            valid_to: None,
+            supersedes: Vec::new(),
             tags: Vec::new(),
             audience: Vec::new(),
             source_kind: None,
@@ -1094,6 +1115,43 @@ mod tests {
             options: options(),
         })
         .expect("write project memory");
+    }
+
+    fn write_project_record_with_validity(
+        root: &Path,
+        body: &str,
+        project_id: &str,
+        valid_from: Option<&str>,
+        valid_to: Option<&str>,
+        supersedes: Vec<String>,
+    ) -> String {
+        memory::write_record(memory::WriteRecordInput {
+            root,
+            manifest: &manifest(),
+            entry_kind: note::EntryKind::Remember,
+            created_at: timestamp(1_778_946_153),
+            agent_id: "codex".to_owned(),
+            host_id: "taylor".to_owned(),
+            user_id: "chris".to_owned(),
+            session_id: None,
+            scope: "project".to_owned(),
+            confidence: note::Confidence::High,
+            body: body.to_owned(),
+            project_id: Some(project_id.to_owned()),
+            subject: None,
+            kind: None,
+            valid_from: valid_from.map(str::to_owned),
+            valid_to: valid_to.map(str::to_owned),
+            supersedes,
+            tags: Vec::new(),
+            audience: Vec::new(),
+            source_kind: None,
+            source_ref: None,
+            write_event: true,
+            options: options(),
+        })
+        .expect("write project memory")
+        .id
     }
 
     fn entries(root: &Path, cache: &Path) -> Vec<IndexEntry> {
@@ -1106,6 +1164,10 @@ mod tests {
         })
         .expect("rebuild index")
         .entries
+    }
+
+    fn hit_bodies(hits: &[SearchHit]) -> Vec<String> {
+        hits.iter().map(|hit| hit.entry.body.clone()).collect()
     }
 
     #[test]
@@ -1311,6 +1373,22 @@ mod tests {
 
         assert_eq!(query.terms.len(), 14);
         assert_eq!(query.min_matching_terms(), 9);
+    }
+
+    #[test]
+    fn old_triggers_historical_intent_without_scored_term() {
+        let query = SearchQuery::parse("old launch gate", &entity::EntityRegistry::builtin())
+            .expect("query");
+
+        assert_eq!(query.temporal_intent(), Some(TemporalIntent::Oldest));
+        assert_eq!(
+            query
+                .terms
+                .iter()
+                .map(|term| term.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["launch", "gate"]
+        );
     }
 
     #[test]
@@ -2252,6 +2330,119 @@ aliases = ["deployctl", "release promotion gate"]
 
         assert_eq!(hits.len(), 1);
         assert!(hits[0].entry.body.contains("now uses checkrun"));
+    }
+
+    #[test]
+    fn search_suppresses_expired_records_unless_query_is_historical() {
+        let dir = temp_dir("validity");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_project_record_with_validity(
+            &root,
+            "Project alpha deploys with the old launch gate.",
+            "proj-alpha",
+            None,
+            Some("2000-01-01T00:00:00Z"),
+            Vec::new(),
+        );
+        write_project_record_with_validity(
+            &root,
+            "Project alpha deploys with the current launch gate.",
+            "proj-alpha",
+            None,
+            None,
+            Vec::new(),
+        );
+        write_project_record_with_validity(
+            &root,
+            "Project alpha will deploy with the future launch gate.",
+            "proj-alpha",
+            Some("2999-01-01T00:00:00Z"),
+            None,
+            Vec::new(),
+        );
+        let entries = entries(&root, &cache);
+        let scopes = vec!["project".to_owned()];
+        let sources = vec!["remembered".to_owned()];
+
+        let current_hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries,
+            query: "launch gate",
+            scopes: &scopes,
+            sources: &sources,
+            include_inbox: false,
+            agent_id: None,
+            project_id: Some("proj-alpha"),
+            limit: 20,
+        })
+        .expect("search");
+        let historical_hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries,
+            query: "old launch gate",
+            scopes: &scopes,
+            sources: &sources,
+            include_inbox: false,
+            agent_id: None,
+            project_id: Some("proj-alpha"),
+            limit: 20,
+        })
+        .expect("search");
+
+        assert_eq!(
+            hit_bodies(&current_hits),
+            vec!["Project alpha deploys with the current launch gate."]
+        );
+        assert!(
+            hit_bodies(&historical_hits)
+                .contains(&"Project alpha deploys with the old launch gate.".to_owned())
+        );
+        assert!(
+            !hit_bodies(&historical_hits)
+                .contains(&"Project alpha will deploy with the future launch gate.".to_owned())
+        );
+    }
+
+    #[test]
+    fn search_uses_explicit_supersedes_metadata() {
+        let dir = temp_dir("explicit-supersedes");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        let old_id = write_project_record_with_validity(
+            &root,
+            "Project alpha deployment gate is launchctl.",
+            "proj-alpha",
+            None,
+            None,
+            Vec::new(),
+        );
+        write_project_record_with_validity(
+            &root,
+            "Project alpha deployment gate is deployctl.",
+            "proj-alpha",
+            None,
+            None,
+            vec![old_id],
+        );
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "deployment gate",
+            scopes: &["project".to_owned()],
+            sources: &["remembered".to_owned()],
+            include_inbox: false,
+            agent_id: None,
+            project_id: Some("proj-alpha"),
+            limit: 20,
+        })
+        .expect("search");
+
+        assert_eq!(
+            hit_bodies(&hits),
+            vec!["Project alpha deployment gate is deployctl."]
+        );
     }
 
     #[test]
