@@ -820,13 +820,7 @@ fn pattern_boundary_allows(
 }
 
 fn score_entry(entry: &IndexEntry, body: &str, query: &SearchQuery) -> SearchScoreTrace {
-    let metadata = entry
-        .subject
-        .as_deref()
-        .into_iter()
-        .chain(entry.tags.iter().map(String::as_str))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let metadata = searchable_metadata(entry);
     let body_score = score_text_trace(body, query);
     let metadata_score = score_text_trace(&metadata, query);
     // Natural recall queries can span metadata and body text, for example a
@@ -848,6 +842,16 @@ fn score_entry(entry: &IndexEntry, body: &str, query: &SearchQuery) -> SearchSco
         combined_terms: combined_score.terms,
         entity: score_entities(entry, query),
     }
+}
+
+fn searchable_metadata(entry: &IndexEntry) -> String {
+    entry
+        .subject
+        .as_deref()
+        .into_iter()
+        .chain(entry.tags.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn score_entities(entry: &IndexEntry, query: &SearchQuery) -> usize {
@@ -2190,6 +2194,49 @@ mod tests {
         assert!(
             hits[0].trace.entity > 0,
             "alias-only recall should expose the entity boost in the score trace: {:?}",
+            hits[0].trace
+        );
+    }
+
+    #[test]
+    fn search_uses_dynamic_phrase_entities_for_long_title_queries() {
+        let dir = temp_dir("dynamic-phrase-entities");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "I finished 'The Nightingale' after several book club sessions.",
+            timestamp(1_778_946_153),
+            Vec::new(),
+        );
+        let entries = entries(&root, &cache);
+        assert!(
+            entries.iter().any(|entry| entry
+                .entities
+                .contains(&"phrase:the nightingale".to_owned())),
+            "index should carry extracted title phrase entities: {entries:?}"
+        );
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries,
+            query: "how many days did it take me to finish 'The Nightingale' by Kristin Hannah",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].score, hits[0].trace.total());
+        assert!(
+            hits[0].trace.entity > 0,
+            "title phrase recall should expose the entity boost in the score trace: {:?}",
             hits[0].trace
         );
     }

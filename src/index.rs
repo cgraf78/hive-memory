@@ -600,9 +600,9 @@ fn canonical_fingerprint(store_root: &Path) -> Result<IndexFingerprint, IndexErr
         ));
     }
     Ok(IndexFingerprint {
-        // v7: entries carry extracted canonical entities from built-in aliases
-        // plus the optional store-level entity registry.
-        schema_version: 7,
+        // v8: entity extraction includes deterministic quoted/proper-name
+        // phrase links in addition to built-in aliases and the store registry.
+        schema_version: 8,
         store_root: store_root.display().to_string(),
         canonical_dirs: dirs.len(),
         latest_directory_modified_nanos,
