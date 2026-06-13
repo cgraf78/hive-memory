@@ -116,6 +116,7 @@ source, audience, and token budget. Context output is not the source of truth.
 ```text
 <store-root>/
   manifest.toml
+  entities.toml        # optional search alias registry
   people/
   rules/
   memories/
@@ -321,6 +322,22 @@ hm context --if-changed
 By default, context includes curated memory and remembered records. Raw `hm
 note` entries are excluded unless `--include-inbox`, `--source inbox`, or
 `--source all` is used.
+
+Store-level `entities.toml` can add durable aliases for search recall. Entity
+links are cache metadata: the canonical memories remain the Markdown notes and
+JSON events, and the local index recomputes entity ids when the registry
+changes.
+
+```toml
+schema_version = 1
+
+[[entity]]
+id = "tool:deployctl"
+aliases = ["deployctl", "release promotion gate"]
+```
+
+Use `hm search --explain` to inspect how body, metadata, combined text, and
+entity signals contributed to each hit.
 
 Each rendered memory block is labeled with a trust level:
 
@@ -580,15 +597,18 @@ Run the local checks before sending a change:
 cargo fmt --check
 cargo test
 cargo clippy --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS='-D missing-docs' cargo doc --no-deps
 tests/shell/release-scripts-test
 ```
 
 CI runs these checks through the shared `cgraf78/actions` Rust workflow:
 `cargo test` runs on the core portability matrix for push and pull requests,
 and on the full matrix for scheduled or manual runs. Formatting, clippy, and
-public-doc checks run as the Ubuntu quality gate. If a change affects public
-behavior, update [SPEC.md](SPEC.md). If it changes design rationale or
-non-goals, update [PLAN.md](PLAN.md).
+public-doc checks run as the Ubuntu quality gate. The library crate also uses
+`#![deny(missing_docs)]` so local Cargo linting catches undocumented public API
+before the CI rustdoc build. If a change affects public behavior, update
+[SPEC.md](SPEC.md). If it changes design rationale or non-goals, update
+[PLAN.md](PLAN.md).
 
 ## Release
 

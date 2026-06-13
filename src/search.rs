@@ -125,6 +125,8 @@ pub enum SearchError {
         /// Original error rendered for diagnostics.
         message: String,
     },
+    /// Entity registry could not be loaded.
+    EntityRegistry(String),
 }
 
 impl Display for SearchError {
@@ -151,6 +153,7 @@ impl Display for SearchError {
                     path.display()
                 )
             }
+            Self::EntityRegistry(message) => write!(f, "{message}"),
         }
     }
 }
@@ -180,7 +183,9 @@ impl From<crate::curated::CuratedError> for SearchError {
 /// score subject/tags so metadata searches do not need to parse every note
 /// twice.
 pub fn search(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
-    let query = SearchQuery::parse(input.query)?;
+    let registry = entity::EntityRegistry::load_for_store(input.store_root)
+        .map_err(|err| SearchError::EntityRegistry(err.to_string()))?;
+    let query = SearchQuery::parse(input.query, &registry)?;
     let project_ids = project_filter_ids(input.store_root, input.project_id)?;
 
     let mut hits = Vec::new();
@@ -200,7 +205,7 @@ pub fn search(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
                 continue;
             }
             hits.push(SearchHit {
-                entry: curated_entry(&curated, input.project_id),
+                entry: curated_entry(&curated, input.project_id, &registry),
                 score,
                 trace,
                 snippet: curated_snippet(&curated.body, &query),
@@ -399,7 +404,7 @@ struct QueryTerm {
 }
 
 impl SearchQuery {
-    fn parse(input: &str) -> Result<Self, SearchError> {
+    fn parse(input: &str, registry: &entity::EntityRegistry) -> Result<Self, SearchError> {
         let phrase = input.trim().to_ascii_lowercase();
         if phrase.is_empty() {
             return Err(SearchError::EmptyQuery);
@@ -431,7 +436,7 @@ impl SearchQuery {
             terms
         };
 
-        let entities = entity::extract(input);
+        let entities = entity::extract_with_registry(input, registry);
 
         Ok(Self {
             phrase,
@@ -862,7 +867,11 @@ fn score_entities(entry: &IndexEntry, query: &SearchQuery) -> usize {
     overlap * 45
 }
 
-fn curated_entry(curated: &CuratedFile, project_id: Option<&str>) -> IndexEntry {
+fn curated_entry(
+    curated: &CuratedFile,
+    project_id: Option<&str>,
+    registry: &entity::EntityRegistry,
+) -> IndexEntry {
     IndexEntry {
         id: curated.id.clone(),
         store_id: String::new(),
@@ -874,7 +883,7 @@ fn curated_entry(curated: &CuratedFile, project_id: Option<&str>) -> IndexEntry 
         subject: None,
         confidence: note::Confidence::High,
         kind: None,
-        entities: entity::extract(&curated.body),
+        entities: entity::extract_with_registry(&curated.body, registry),
         classified: None,
         agent_id: "human".to_owned(),
         host_id: String::new(),
@@ -1296,6 +1305,7 @@ mod tests {
     fn search_long_query_threshold_scales_past_eight_terms() {
         let query = SearchQuery::parse(
             "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november",
+            &entity::EntityRegistry::builtin(),
         )
         .expect("query");
 
@@ -2121,6 +2131,60 @@ mod tests {
             hits[0].trace
         );
         assert_eq!(hits[0].trace.entity, 0);
+    }
+
+    #[test]
+    fn search_uses_store_entity_registry_aliases() {
+        let dir = temp_dir("entity-registry");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        fs::create_dir_all(&root).expect("create store root");
+        fs::write(
+            root.join("entities.toml"),
+            r#"
+schema_version = 1
+
+[[entity]]
+id = "tool:deployctl"
+aliases = ["deployctl", "release promotion gate"]
+"#,
+        )
+        .expect("write entity registry");
+        write_project_record(
+            &root,
+            "Project alpha uses `deployctl approve` before production release.",
+            "proj-alpha",
+        );
+
+        let entries = entries(&root, &cache);
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.entities.contains(&"tool:deployctl".to_owned())),
+            "index should carry store-registry entity links: {entries:?}"
+        );
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries,
+            query: "release promotion gate",
+            scopes: &["project".to_owned()],
+            sources: &["remembered".to_owned()],
+            include_inbox: false,
+            agent_id: None,
+            project_id: Some("proj-alpha"),
+            limit: 20,
+        })
+        .expect("search");
+
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].entry.body.contains("deployctl approve"));
+        assert_eq!(hits[0].score, hits[0].trace.total());
+        assert!(
+            hits[0].trace.entity > 0,
+            "registry alias should be visible in entity score trace: {:?}",
+            hits[0].trace
+        );
     }
 
     #[test]
