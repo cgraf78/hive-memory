@@ -672,14 +672,6 @@ fn is_required_intent_term(term: &str) -> bool {
             | "preferences"
             | "purchase"
             | "purchased"
-            | "recommend"
-            | "recommendation"
-            | "recommendations"
-            | "recommended"
-            | "suggest"
-            | "suggested"
-            | "suggestion"
-            | "suggestions"
     )
 }
 
@@ -1691,6 +1683,34 @@ mod tests {
 
         assert_eq!(preference_hits.len(), 1);
         assert_eq!(recommendation_hits.len(), 1);
+
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "The user is learning video editing with DaVinci Resolve and wants beginner tutorial resources.",
+            timestamp(1_778_946_154),
+            Vec::new(),
+        );
+        let advice_hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "recommend resources for video editing",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+
+        assert!(
+            hit_bodies(&advice_hits)
+                .iter()
+                .any(|body| body.contains("video editing")),
+            "recommendation query should recover topic memories without requiring recommendation language; hits={advice_hits:?}"
+        );
     }
 
     #[test]
