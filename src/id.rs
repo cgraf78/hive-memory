@@ -30,7 +30,7 @@ pub fn new_write_id(context: &WriteIdContext) -> String {
         std::process::id(),
         &context.host_id,
         &context.agent_id,
-        &Uuid::now_v7().simple().to_string()[..8],
+        &uuid_random_suffix(Uuid::now_v7()),
     )
 }
 
@@ -88,6 +88,11 @@ fn timestamp_prefix(timestamp: OffsetDateTime) -> String {
     )
 }
 
+fn uuid_random_suffix(uuid: Uuid) -> String {
+    let simple = uuid.simple().to_string();
+    simple[simple.len() - 12..].to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +138,12 @@ mod tests {
 
         let id = write_id_with_parts(timestamp, 1, "h", "a", "abcdef12");
         assert!(id.starts_with("20260516T010203.000004Z_"));
+    }
+
+    #[test]
+    fn uuid_suffix_uses_random_tail_bits() {
+        let uuid = Uuid::parse_str("018f5f57-bd9b-7d33-9e21-1f44f0c5a013").expect("uuid");
+
+        assert_eq!(uuid_random_suffix(uuid), "1f44f0c5a013");
     }
 }

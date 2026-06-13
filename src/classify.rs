@@ -822,14 +822,14 @@ mod tests {
         let secs = then
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("after epoch")
-            .as_secs() as libc::time_t;
+            .as_secs();
         let times = [
             libc::timeval {
-                tv_sec: secs,
+                tv_sec: secs.try_into().expect("mtime seconds fit timeval"),
                 tv_usec: 0,
             },
             libc::timeval {
-                tv_sec: secs,
+                tv_sec: secs.try_into().expect("mtime seconds fit timeval"),
                 tv_usec: 0,
             },
         ];
