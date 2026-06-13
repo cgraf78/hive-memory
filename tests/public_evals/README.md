@@ -32,3 +32,13 @@ Hive Memory retrieves the labeled answer sessions. It reports:
 
 Set `HIVE_MEMORY_LONGMEMEVAL_MAX_CASES=0` to run all cases. The default is a
 100-case smoke subset so local iteration stays quick.
+
+Set `HIVE_MEMORY_LONGMEMEVAL_INGEST` to compare corpus-independent memory
+decomposition strategies:
+
+- `session` stores each haystack session as one memory record. This is the
+  default and preserves the original adapter baseline.
+- `turn` stores each conversation turn as one memory record, then collapses
+  retrieved item hits back to benchmark session ids for scoring.
+- `exchange` stores each user-led exchange as one memory record, then scores the
+  same session-level retrieval target.

@@ -15,15 +15,19 @@ use hive_memory::store::StoreManifest;
 use hive_memory::write::{AtomicWriteOptions, FsyncPolicy};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 
 const DATASET_ENV: &str = "HIVE_MEMORY_LONGMEMEVAL_S_JSON";
 const MAX_CASES_ENV: &str = "HIVE_MEMORY_LONGMEMEVAL_MAX_CASES";
+const INGEST_MODE_ENV: &str = "HIVE_MEMORY_LONGMEMEVAL_INGEST";
 const DEFAULT_MAX_CASES: usize = 100;
 const RETRIEVAL_LIMIT: usize = 5;
+const ITEM_RETRIEVAL_LIMIT: usize = RETRIEVAL_LIMIT * 5;
 const P95_BUDGET_MS: u128 = 500;
 
 #[derive(Debug, Deserialize)]
@@ -44,8 +48,79 @@ struct Turn {
 
 #[derive(Debug)]
 struct Materialized {
+    temp_root: PathBuf,
     root: PathBuf,
-    entries_by_session_id: BTreeMap<String, IndexEntry>,
+    cache_root: PathBuf,
+    ingest_mode: IngestMode,
+    entries_by_session_id: BTreeMap<String, Vec<IndexEntry>>,
+    session_id_by_item_id: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum IngestMode {
+    Session,
+    Turn,
+    Exchange,
+}
+
+impl IngestMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Turn => "turn",
+            Self::Exchange => "exchange",
+        }
+    }
+}
+
+impl fmt::Display for IngestMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for IngestMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "session" => Ok(Self::Session),
+            "turn" => Ok(Self::Turn),
+            "exchange" => Ok(Self::Exchange),
+            _ => Err(format!(
+                "unsupported {INGEST_MODE_ENV}={value:?}; expected session, turn, or exchange"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EvalMemoryItem {
+    id: String,
+    answer_session_id: String,
+    parent_session_id: String,
+    item_kind: EvalItemKind,
+    role: Option<String>,
+    turn_index: Option<usize>,
+    body: String,
+    search_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EvalItemKind {
+    Session,
+    Turn,
+    Exchange,
+}
+
+impl EvalItemKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Turn => "turn",
+            Self::Exchange => "exchange",
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -145,14 +220,18 @@ fn longmemeval_s_retrieval_scoreboard() {
         let haystack_entries = case
             .haystack_session_ids
             .iter()
-            .filter_map(|session_id| materialized.entries_by_session_id.get(session_id).cloned())
+            .filter_map(|session_id| materialized.entries_by_session_id.get(session_id))
+            .flatten()
+            .cloned()
             .collect::<Vec<_>>();
-        assert_eq!(
-            haystack_entries.len(),
-            case.haystack_session_ids.len(),
-            "case {} missing haystack entries",
-            case.question_id
-        );
+        for session_id in &case.haystack_session_ids {
+            assert!(
+                materialized.entries_by_session_id.contains_key(session_id),
+                "case {} missing haystack entries for session {}",
+                case.question_id,
+                session_id
+            );
+        }
 
         let expected = case
             .answer_session_ids
@@ -169,14 +248,11 @@ fn longmemeval_s_retrieval_scoreboard() {
             include_inbox: false,
             agent_id: Some("codex"),
             project_id: None,
-            limit: RETRIEVAL_LIMIT,
+            limit: ITEM_RETRIEVAL_LIMIT,
         })
         .unwrap_or_else(|err| panic!("case {} search failed: {err}", case.question_id));
         let elapsed = start.elapsed();
-        let actual = hits
-            .iter()
-            .filter_map(|hit| hit.entry.subject.clone())
-            .collect::<Vec<_>>();
+        let actual = unique_session_hits(&hits, &materialized.session_id_by_item_id);
 
         overall.add(&expected, &actual, elapsed);
         by_type
@@ -186,7 +262,8 @@ fn longmemeval_s_retrieval_scoreboard() {
     }
 
     eprintln!(
-        "LongMemEval-S overall cases={} recall@5={:.3} precision@5={:.3} mrr={:.3} non_answer_hits={} p95_ms={}",
+        "LongMemEval-S mode={} overall cases={} recall@5={:.3} precision@5={:.3} mrr={:.3} non_answer_hits={} p95_ms={}",
+        materialized.ingest_mode,
         overall.cases,
         overall.recall_at_5(),
         overall.precision_at_5(),
@@ -196,7 +273,8 @@ fn longmemeval_s_retrieval_scoreboard() {
     );
     for (question_type, score) in by_type {
         eprintln!(
-            "LongMemEval-S {question_type} cases={} recall@5={:.3} precision@5={:.3} mrr={:.3} non_answer_hits={} p95_ms={}",
+            "LongMemEval-S mode={} {question_type} cases={} recall@5={:.3} precision@5={:.3} mrr={:.3} non_answer_hits={} p95_ms={}",
+            materialized.ingest_mode,
             score.cases,
             score.recall_at_5(),
             score.precision_at_5(),
@@ -206,11 +284,14 @@ fn longmemeval_s_retrieval_scoreboard() {
         );
     }
 
+    let p95_ms = overall.p95_ms();
+    let perf_budget_ms = perf_budget_ms();
+    cleanup_materialized(&materialized);
     assert!(
-        overall.p95_ms() <= perf_budget_ms(),
+        p95_ms <= perf_budget_ms,
         "LongMemEval-S p95 {}ms exceeded {}ms",
-        overall.p95_ms(),
-        perf_budget_ms()
+        p95_ms,
+        perf_budget_ms
     );
 }
 
@@ -220,7 +301,9 @@ fn load_cases(path: &Path) -> Vec<LongMemEvalCase> {
 }
 
 fn materialize(cases: &[LongMemEvalCase]) -> Materialized {
-    let root = temp_dir("public-longmemeval").join("personal");
+    let ingest_mode = ingest_mode();
+    let temp_root = temp_dir("public-longmemeval");
+    let root = temp_root.join("personal");
     fs::create_dir_all(&root).expect("create store root");
     let manifest = StoreManifest::with_identity(
         "personal",
@@ -252,10 +335,25 @@ fn materialize(cases: &[LongMemEvalCase]) -> Materialized {
         }
     }
 
-    for (index, (session_id, session)) in sessions.iter().enumerate() {
+    let items = sessions
+        .iter()
+        .flat_map(|(session_id, session)| eval_items(ingest_mode, session_id, session))
+        .collect::<Vec<_>>();
+
+    for (index, item) in items.iter().enumerate() {
         let created_at =
             OffsetDateTime::from_unix_timestamp(1_778_946_153 + i64::try_from(index).unwrap())
                 .expect("timestamp");
+        let mut tags = vec![
+            "longmemeval-s".to_owned(),
+            format!("kind:{}", item.item_kind.as_str()),
+        ];
+        if let Some(role) = &item.role {
+            tags.push(format!("role:{role}"));
+        }
+        if let Some(turn_index) = item.turn_index {
+            tags.push(format!("turn-index:{turn_index}"));
+        }
         memory::write_record(WriteRecordInput {
             root: &root,
             manifest: &manifest,
@@ -264,21 +362,21 @@ fn materialize(cases: &[LongMemEvalCase]) -> Materialized {
             agent_id: "eval".to_owned(),
             host_id: "ci".to_owned(),
             user_id: "default".to_owned(),
-            session_id: None,
+            session_id: Some(item.parent_session_id.clone()),
             scope: "global".to_owned(),
             confidence: Confidence::High,
-            body: render_session(session),
+            body: render_item(item),
             project_id: None,
-            subject: Some(session_id.clone()),
+            subject: Some(item.id.clone()),
             kind: Some(MemoryKind::Reference),
-            tags: vec!["longmemeval-s".to_owned()],
+            tags,
             audience: Vec::new(),
             source_kind: Some("public-eval".to_owned()),
-            source_ref: Some(session_id.clone()),
-            write_event: true,
+            source_ref: Some(item.parent_session_id.clone()),
+            write_event: false,
             options: options.clone(),
         })
-        .expect("write LongMemEval session");
+        .expect("write LongMemEval eval item");
     }
 
     let cache = temp_dir("public-longmemeval-cache");
@@ -295,21 +393,127 @@ fn materialize(cases: &[LongMemEvalCase]) -> Materialized {
         "index warnings: {:?}",
         report.warnings
     );
-    let entries_by_session_id = report
-        .entries
-        .into_iter()
-        .filter_map(|entry| entry.subject.clone().map(|subject| (subject, entry)))
+    let session_id_by_item_id = items
+        .iter()
+        .map(|item| (item.id.clone(), item.answer_session_id.clone()))
         .collect::<BTreeMap<_, _>>();
+    let mut entries_by_session_id = BTreeMap::<String, Vec<IndexEntry>>::new();
+    for entry in report.entries {
+        let Some(subject) = entry.subject.clone() else {
+            continue;
+        };
+        let Some(session_id) = session_id_by_item_id.get(&subject) else {
+            continue;
+        };
+        entries_by_session_id
+            .entry(session_id.clone())
+            .or_default()
+            .push(entry);
+    }
     assert_eq!(
         entries_by_session_id.len(),
         sessions.len(),
         "indexed session count mismatch"
     );
+    assert_eq!(
+        entries_by_session_id
+            .values()
+            .map(std::vec::Vec::len)
+            .sum::<usize>(),
+        items.len(),
+        "indexed eval item count mismatch"
+    );
 
     Materialized {
+        temp_root,
         root,
+        cache_root: cache,
+        ingest_mode,
         entries_by_session_id,
+        session_id_by_item_id,
     }
+}
+
+fn eval_items(mode: IngestMode, session_id: &str, session: &[Turn]) -> Vec<EvalMemoryItem> {
+    match mode {
+        IngestMode::Session => vec![EvalMemoryItem {
+            id: session_id.to_owned(),
+            answer_session_id: session_id.to_owned(),
+            parent_session_id: session_id.to_owned(),
+            item_kind: EvalItemKind::Session,
+            role: None,
+            turn_index: None,
+            body: render_session(session),
+            search_keys: Vec::new(),
+        }],
+        IngestMode::Turn => session
+            .iter()
+            .enumerate()
+            .map(|(index, turn)| EvalMemoryItem {
+                id: format!("{session_id}#turn-{index}"),
+                answer_session_id: session_id.to_owned(),
+                parent_session_id: session_id.to_owned(),
+                item_kind: EvalItemKind::Turn,
+                role: Some(turn.role.clone()),
+                turn_index: Some(index),
+                body: format!("{}: {}", turn.role, turn.content),
+                search_keys: Vec::new(),
+            })
+            .collect(),
+        IngestMode::Exchange => render_exchanges(session)
+            .into_iter()
+            .enumerate()
+            .map(|(index, exchange)| EvalMemoryItem {
+                id: format!("{session_id}#exchange-{index}"),
+                answer_session_id: session_id.to_owned(),
+                parent_session_id: session_id.to_owned(),
+                item_kind: EvalItemKind::Exchange,
+                role: None,
+                turn_index: Some(exchange.first_turn_index),
+                body: render_session(&exchange.turns),
+                search_keys: Vec::new(),
+            })
+            .collect(),
+    }
+}
+
+#[derive(Debug)]
+struct Exchange {
+    first_turn_index: usize,
+    turns: Vec<Turn>,
+}
+
+fn render_exchanges(session: &[Turn]) -> Vec<Exchange> {
+    let mut exchanges = Vec::<Exchange>::new();
+    let mut current = Vec::<Turn>::new();
+    let mut first_turn_index = 0usize;
+
+    for (index, turn) in session.iter().enumerate() {
+        if is_user_turn(turn) && !current.is_empty() {
+            exchanges.push(Exchange {
+                first_turn_index,
+                turns: current,
+            });
+            current = Vec::new();
+            first_turn_index = index;
+        } else if current.is_empty() {
+            first_turn_index = index;
+        }
+        current.push(turn.clone());
+    }
+
+    if !current.is_empty() {
+        exchanges.push(Exchange {
+            first_turn_index,
+            turns: current,
+        });
+    }
+
+    exchanges
+}
+
+fn is_user_turn(turn: &Turn) -> bool {
+    turn.role.eq_ignore_ascii_case("user")
 }
 
 fn render_session(session: &[Turn]) -> String {
@@ -320,11 +524,60 @@ fn render_session(session: &[Turn]) -> String {
         .join("\n")
 }
 
+fn render_item(item: &EvalMemoryItem) -> String {
+    let mut parts = Vec::new();
+    if !item.search_keys.is_empty() {
+        parts.push(format!("Search keys: {}", item.search_keys.join(", ")));
+    }
+    parts.push(item.body.clone());
+    parts.join("\n")
+}
+
+fn unique_session_hits(
+    hits: &[hive_memory::search::SearchHit],
+    session_id_by_item_id: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut seen = BTreeSet::<String>::new();
+    let mut session_ids = Vec::<String>::new();
+    for hit in hits {
+        let Some(item_id) = &hit.entry.subject else {
+            continue;
+        };
+        let Some(session_id) = session_id_by_item_id.get(item_id) else {
+            continue;
+        };
+        if seen.insert(session_id.clone()) {
+            session_ids.push(session_id.clone());
+        }
+        if session_ids.len() == RETRIEVAL_LIMIT {
+            break;
+        }
+    }
+    session_ids
+}
+
+fn cleanup_materialized(materialized: &Materialized) {
+    for path in [&materialized.temp_root, &materialized.cache_root] {
+        if let Err(err) = fs::remove_dir_all(path) {
+            eprintln!("failed to remove {}: {err}", path.display());
+        }
+    }
+}
+
 fn max_cases() -> usize {
     std::env::var(MAX_CASES_ENV)
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(DEFAULT_MAX_CASES)
+}
+
+fn ingest_mode() -> IngestMode {
+    std::env::var(INGEST_MODE_ENV)
+        .ok()
+        .as_deref()
+        .unwrap_or("session")
+        .parse()
+        .unwrap_or_else(|err| panic!("{err}"))
 }
 
 fn perf_budget_ms() -> u128 {
