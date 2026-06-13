@@ -948,6 +948,7 @@ mod tests {
             subject: None,
             confidence: note::Confidence::High,
             kind: None,
+            entities: Vec::new(),
             classified: None,
             agent_id: "co<dex".to_owned(),
             host_id: "taylor".to_owned(),

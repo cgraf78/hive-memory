@@ -17,6 +17,42 @@ kind = "project-fact"
 body = "Before committing in Project alpha, run checkrun format and checkrun lint to validate local changes."
 
 [[record]]
+subject = "alpha-local-gate"
+entry_kind = "remember"
+scope = "project"
+project_id = "project-alpha"
+confidence = "high"
+kind = "project-fact"
+body = "Project alpha's local gate is `chkfmt` followed by `chklint`."
+
+[[record]]
+subject = "alpha-pr-ready"
+entry_kind = "remember"
+scope = "project"
+project_id = "project-alpha"
+confidence = "high"
+kind = "project-fact"
+body = "Project alpha requires `sley ready` before landing PRs."
+
+[[record]]
+subject = "beta-local-gate"
+entry_kind = "remember"
+scope = "project"
+project_id = "project-beta"
+confidence = "high"
+kind = "project-fact"
+body = "Project beta's local gate is `chkfmt` followed by `chklint`."
+
+[[record]]
+subject = "beta-pr-ready"
+entry_kind = "remember"
+scope = "project"
+project_id = "project-beta"
+confidence = "high"
+kind = "project-fact"
+body = "Project beta requires `sley ready` before release reviews."
+
+[[record]]
 subject = "beta-cargo-publish"
 entry_kind = "remember"
 scope = "project"
@@ -75,7 +111,7 @@ name = "semantic paraphrase finds validation command"
 feature = "semantic"
 query = "what validates changes before shipping"
 project_id = "project-alpha"
-expected = ["alpha-validation-command", "alpha-agent-rules-checkrun"]
+expected = ["alpha-validation-command", "alpha-agent-rules-checkrun", "alpha-local-gate", "new-checkrun-format-lint"]
 forbidden = ["beta-cargo-publish"]
 target_recall_at_5 = 1.0
 target_precision_at_5 = 1.0
@@ -91,6 +127,28 @@ forbidden = ["alpha-agent-rules-checkrun", "beta-cargo-publish"]
 target_recall_at_5 = 1.0
 target_precision_at_5 = 1.0
 note = "Entity work should improve scoping without injecting unrelated project facts."
+
+[[retrieval_case]]
+name = "entity aliases link checkrun shorthand"
+feature = "entity"
+query = "checkrun validation commands"
+project_id = "project-alpha"
+expected = ["alpha-agent-rules-checkrun", "alpha-validation-command", "alpha-local-gate", "new-checkrun-format-lint"]
+forbidden = ["beta-local-gate", "beta-cargo-publish"]
+target_recall_at_5 = 1.0
+target_precision_at_5 = 1.0
+note = "The useful entity delta is recalling chkfmt/chklint shorthand through the canonical checkrun entity."
+
+[[retrieval_case]]
+name = "entity aliases link pre landing verification"
+feature = "entity"
+query = "pre landing verification gate"
+project_id = "project-alpha"
+expected = ["alpha-pr-ready"]
+forbidden = ["beta-pr-ready"]
+target_recall_at_5 = 1.0
+target_precision_at_5 = 1.0
+note = "The useful entity delta is recalling the concrete sley ready gate from a conceptual pre-landing prompt."
 
 [[retrieval_case]]
 name = "project scoping blocks inactive repository"

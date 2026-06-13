@@ -58,12 +58,12 @@ include = ["active-agents-checkrun"]
 exclude = ["inactive-cargo-release", "raw-debug-note", "duplicate-active-agents-checkrun"]
 
 [[search_case]]
-name = "semantic gap baseline"
+name = "entity-linked paraphrase recall"
 query = "where are coding agent rules documented"
 project_id = "project-alpha"
-include = []
+include = ["active-agents-checkrun"]
 exclude = ["inactive-cargo-release"]
-note = "Current lexical search is not expected to match this paraphrase; semantic/entity phases need an eval delta before implementation."
+note = "Entity linking should connect natural agent-rule phrasing to the AGENTS.md project memory."
 
 [[context_case]]
 name = "active project startup context"
