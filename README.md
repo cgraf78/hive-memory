@@ -287,6 +287,9 @@ Useful write flags:
 --project <PATH>             derive project identity from a path
 --project-id <ID>            use an explicit project id
 --subject <SUBJECT>          short grouping label
+--valid-from <RFC3339>       when this memory starts being current
+--valid-to <RFC3339>         when this memory stops being current
+--supersedes <ID>            memory id superseded by this write; repeatable
 --tags <A,B>                 comma-separated tags
 --audience <AGENT,...>       permitted agents for agent-private writes
 --audience-writer-only       make the writer the only audience
@@ -298,6 +301,8 @@ Useful write flags:
 
 `hm remember` always writes a JSON event sidecar. `hm note` follows
 `defaults.event_sidecar`, unless `--event` or `--no-event` overrides it.
+Expired or not-yet-valid records are excluded from ordinary search, but
+historical queries such as "old" or "previous" can still retrieve them.
 
 ### Search and Context
 

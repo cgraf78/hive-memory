@@ -161,6 +161,15 @@ pub struct NoteFrontMatter {
     /// Optional RFC3339 expiration timestamp.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
+    /// Optional RFC3339 timestamp when this fact starts being valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<String>,
+    /// Optional RFC3339 timestamp when this fact stops being current.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_to: Option<String>,
+    /// Explicit records superseded by this note.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supersedes: Vec<String>,
     /// Optional explicit memory kind driving inject selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<MemoryKind>,
@@ -224,6 +233,12 @@ pub struct NoteWriteInput {
     pub related_event_id: Option<String>,
     /// Optional RFC3339 expiration timestamp.
     pub expires_at: Option<String>,
+    /// Optional RFC3339 timestamp when this fact starts being valid.
+    pub valid_from: Option<String>,
+    /// Optional RFC3339 timestamp when this fact stops being current.
+    pub valid_to: Option<String>,
+    /// Explicit records superseded by this note.
+    pub supersedes: Vec<String>,
     /// Optional explicit memory kind driving inject selection.
     pub kind: Option<MemoryKind>,
     /// Optional provenance for the persisted `kind` verdict.
@@ -321,6 +336,9 @@ impl NoteWriteInput {
             source_ref: self.source_ref.clone(),
             related_event_id: self.related_event_id.clone(),
             expires_at: self.expires_at.clone(),
+            valid_from: self.valid_from.clone(),
+            valid_to: self.valid_to.clone(),
+            supersedes: self.supersedes.clone(),
             kind: self.kind,
             classified: self.classified.clone(),
             audience: if self.scope == "agent-private" {
@@ -462,6 +480,12 @@ fn validate_front_matter(front_matter: &NoteFrontMatter) -> Result<(), NoteError
     if let Some(expires_at) = &front_matter.expires_at {
         validate_rfc3339("expires_at", expires_at)?;
     }
+    if let Some(valid_from) = &front_matter.valid_from {
+        validate_rfc3339("valid_from", valid_from)?;
+    }
+    if let Some(valid_to) = &front_matter.valid_to {
+        validate_rfc3339("valid_to", valid_to)?;
+    }
     if let Some(classified) = &front_matter.classified {
         validate_rfc3339("classified.at", &classified.at)?;
     }
@@ -539,6 +563,9 @@ mod tests {
             source_ref: None,
             related_event_id: None,
             expires_at: None,
+            valid_from: None,
+            valid_to: None,
+            supersedes: Vec::new(),
             kind: None,
             classified: None,
             audience: Vec::new(),
@@ -560,7 +587,11 @@ mod tests {
 
     #[test]
     fn note_round_trips_toml_front_matter() {
-        let front_matter = input()
+        let mut input = input();
+        input.valid_from = Some("2026-06-01T00:00:00Z".to_owned());
+        input.valid_to = Some("2026-07-01T00:00:00Z".to_owned());
+        input.supersedes = vec!["old-note-id".to_owned()];
+        let front_matter = input
             .front_matter("note-id".to_owned())
             .expect("front matter");
         let note = MarkdownNote {
@@ -572,6 +603,14 @@ mod tests {
         let parsed = parse_note(&rendered).expect("parse note");
 
         assert_eq!(parsed, note);
+        assert_eq!(
+            parsed.front_matter.valid_to.as_deref(),
+            Some("2026-07-01T00:00:00Z")
+        );
+        assert_eq!(
+            parsed.front_matter.supersedes,
+            vec!["old-note-id".to_owned()]
+        );
         assert!(rendered.starts_with("+++\nschema_version = 1\n"));
         assert!(!rendered.contains("audience ="));
     }

@@ -37,6 +37,15 @@ pub struct IndexEntry {
     pub subject: Option<String>,
     /// Writer confidence.
     pub confidence: note::Confidence,
+    /// Optional RFC3339 timestamp when this fact starts being valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<String>,
+    /// Optional RFC3339 timestamp when this fact stops being current.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_to: Option<String>,
+    /// Explicit records superseded by this entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supersedes: Vec<String>,
     /// Optional explicit memory kind, used by inject classification.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<note::MemoryKind>,
@@ -453,6 +462,19 @@ fn entry_from_note(
             tags: event.tags.clone(),
             subject: event.subject.clone(),
             confidence: event.confidence,
+            valid_from: event
+                .valid_from
+                .clone()
+                .or_else(|| front_matter.valid_from.clone()),
+            valid_to: event
+                .valid_to
+                .clone()
+                .or_else(|| front_matter.valid_to.clone()),
+            supersedes: if event.supersedes.is_empty() {
+                front_matter.supersedes.clone()
+            } else {
+                event.supersedes.clone()
+            },
             // Prefer the event's kind, falling back to the note's so a note that
             // carries kind without an event copy is still classified correctly.
             kind: event.kind.or(front_matter.kind),
@@ -490,6 +512,9 @@ fn entry_from_note(
         tags: front_matter.tags.clone(),
         subject: front_matter.subject.clone(),
         confidence: front_matter.confidence,
+        valid_from: front_matter.valid_from.clone(),
+        valid_to: front_matter.valid_to.clone(),
+        supersedes: front_matter.supersedes.clone(),
         kind: front_matter.kind,
         entities,
         classified: front_matter.classified.clone(),
@@ -704,6 +729,9 @@ mod tests {
             project_id: Some("github-com-cgraf78-hive-memory-018f5f57".to_owned()),
             subject: Some("workflow.preference".to_owned()),
             kind: None,
+            valid_from: None,
+            valid_to: None,
+            supersedes: Vec::new(),
             tags: vec!["preference".to_owned(), "config".to_owned()],
             audience: Vec::new(),
             source_kind: Some("session".to_owned()),

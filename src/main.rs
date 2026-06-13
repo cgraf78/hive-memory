@@ -477,6 +477,15 @@ struct WriteMemoryArgs {
     /// Optional explicit memory kind driving session-start inject selection.
     #[arg(long, value_parser = parse_memory_kind)]
     kind: Option<note::MemoryKind>,
+    /// RFC3339 timestamp when this memory starts being current.
+    #[arg(long)]
+    valid_from: Option<String>,
+    /// RFC3339 timestamp when this memory stops being current.
+    #[arg(long)]
+    valid_to: Option<String>,
+    /// Memory id superseded by this write. Repeat for multiple ids.
+    #[arg(long)]
+    supersedes: Vec<String>,
     /// Store without automatic kind inference when `--kind` is omitted.
     #[arg(long, conflicts_with = "kind")]
     no_infer_kind: bool,
@@ -1907,6 +1916,8 @@ fn run_write_memory(
     let created_at = OffsetDateTime::now_utc();
     let host_id = resolve_host_id(&config);
     let audience = resolve_audience(&args, &scope, &writer_agent_id)?;
+    validate_optional_rfc3339("--valid-from", args.valid_from.as_deref())?;
+    validate_optional_rfc3339("--valid-to", args.valid_to.as_deref())?;
     let should_write_event = match entry_kind {
         note::EntryKind::Remember => true,
         note::EntryKind::Note => {
@@ -1931,6 +1942,9 @@ fn run_write_memory(
         project_id: project_id.clone(),
         subject: args.subject,
         kind: kind_decision.kind,
+        valid_from: args.valid_from,
+        valid_to: args.valid_to,
+        supersedes: args.supersedes,
         tags: args.tags,
         audience: audience.clone(),
         source_kind: args.source_kind,
@@ -2033,6 +2047,9 @@ struct MemoryWriteFields {
     project_id: Option<String>,
     subject: Option<String>,
     kind: Option<note::MemoryKind>,
+    valid_from: Option<String>,
+    valid_to: Option<String>,
+    supersedes: Vec<String>,
     tags: Vec<String>,
     audience: Vec<String>,
     source_kind: Option<String>,
@@ -2069,6 +2086,9 @@ fn write_canonical_memory(
         project_id: input.project_id,
         subject: input.subject,
         kind: input.kind,
+        valid_from: input.valid_from,
+        valid_to: input.valid_to,
+        supersedes: input.supersedes,
         tags: input.tags,
         audience: input.audience,
         source_kind: input.source_kind,
@@ -2135,6 +2155,9 @@ fn enqueue_outbox_memory(
         source_ref: input.source_ref.clone(),
         related_event_id: write_event.then(|| id.clone()),
         expires_at: None,
+        valid_from: input.valid_from.clone(),
+        valid_to: input.valid_to.clone(),
+        supersedes: input.supersedes.clone(),
         kind: input.kind,
         classified: None,
         audience: input.audience.clone(),
@@ -2159,6 +2182,9 @@ fn enqueue_outbox_memory(
                 subject: input.subject,
                 tags: input.tags,
                 confidence: input.confidence,
+                valid_from: input.valid_from,
+                valid_to: input.valid_to,
+                supersedes: input.supersedes,
                 kind: input.kind,
                 classified: None,
                 audience: input.audience,
@@ -5186,6 +5212,15 @@ fn validate_secret_write(
     }
 
     Ok(())
+}
+
+fn validate_optional_rfc3339(label: &str, value: Option<&str>) -> Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+        .map(|_| ())
+        .map_err(|err| anyhow::anyhow!("{label} must be RFC3339: {err}"))
 }
 
 fn resolve_audience(
