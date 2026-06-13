@@ -4356,6 +4356,7 @@ fn prompt_recall_query(prompt: &str, path_hint: Option<&str>) -> Option<String> 
         }
     }
     if code_terms.is_empty()
+        && plain_terms.is_empty()
         && let Some(path_hint) = path_hint
         && let Some(file_name) = Path::new(path_hint)
             .file_name()
@@ -4380,6 +4381,7 @@ fn normalize_prompt_token(token: &str) -> String {
         .trim_matches(|ch: char| {
             !(ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '/' | '<' | '>'))
         })
+        .trim_end_matches('.')
         .to_ascii_lowercase()
 }
 

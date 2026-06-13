@@ -47,19 +47,36 @@ fn timestamp_rank(value: &str) -> i128 {
 }
 
 fn has_stale_marker(body: &str) -> bool {
-    body.contains("used to")
-        || body.contains("previously")
-        || body.contains("formerly")
-        || body.contains("old ")
-        || body.contains("no longer")
+    contains_phrase(body, &["used", "to"])
+        || contains_word(body, "previously")
+        || contains_word(body, "formerly")
+        || contains_word(body, "old")
+        || contains_phrase(body, &["no", "longer"])
 }
 
 fn has_replacement_marker(body: &str) -> bool {
-    body.contains("now ")
-        || body.contains("instead")
-        || body.contains("replaces")
-        || body.contains("replaced")
-        || body.contains("current")
+    contains_word(body, "now")
+        || contains_word(body, "instead")
+        || contains_word(body, "replaces")
+        || contains_word(body, "replaced")
+        || contains_word(body, "current")
+}
+
+fn contains_word(body: &str, word: &str) -> bool {
+    body_tokens(body).any(|token| token == word)
+}
+
+fn contains_phrase(body: &str, words: &[&str]) -> bool {
+    if words.is_empty() {
+        return false;
+    }
+    let tokens = body_tokens(body).collect::<Vec<_>>();
+    tokens.windows(words.len()).any(|window| window == words)
+}
+
+fn body_tokens(body: &str) -> impl Iterator<Item = &str> {
+    body.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
+        .filter(|token| !token.is_empty())
 }
 
 fn explicitly_searches_old_fact(old_body: &str, new_body: &str, query: Option<&str>) -> bool {
@@ -99,7 +116,15 @@ fn query_tokens(input: &str) -> BTreeSet<String> {
 fn is_marker_word(term: &str) -> bool {
     matches!(
         term,
-        "used" | "previously" | "formerly" | "longer" | "instead" | "replaces" | "replaced"
+        "current"
+            | "instead"
+            | "longer"
+            | "now"
+            | "old"
+            | "previously"
+            | "replaced"
+            | "replaces"
+            | "used"
     )
 }
 
@@ -191,5 +216,25 @@ mod tests {
         );
 
         assert!(!should_suppress_older(&old, &new, Some("cargo fmt")));
+    }
+
+    #[test]
+    fn ignores_marker_substrings_inside_unrelated_words() {
+        let old = entry(
+            "old",
+            "Project alpha told maintainers to run cargo fmt before committing.",
+            "2026-06-01T00:00:00Z",
+        );
+        let new = entry(
+            "new",
+            "Project alpha currently asks maintainers to run checkrun format before committing.",
+            "2026-06-02T00:00:00Z",
+        );
+
+        assert!(!should_suppress_older(
+            &old,
+            &new,
+            Some("before committing")
+        ));
     }
 }

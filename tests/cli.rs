@@ -5056,6 +5056,46 @@ fn hook_prompt_submit_recalls_relevant_search_only_project_memory_once() {
         .assert()
         .success();
 
+    let mut release_remember = cargo_bin_cmd!("hm");
+    release_remember
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "remember",
+            "--project",
+            repo.to_str().expect("utf8 repo"),
+            "--scope",
+            "project",
+            "--kind",
+            "reference",
+            "--text",
+            "Cargo.toml release tags use signed archives for distribution.",
+        ])
+        .assert()
+        .success();
+
+    let mut tests_remember = cargo_bin_cmd!("hm");
+    tests_remember
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "remember",
+            "--project",
+            repo.to_str().expect("utf8 repo"),
+            "--scope",
+            "project",
+            "--kind",
+            "reference",
+            "--text",
+            "Project maintainers inspect tests before release.",
+        ])
+        .assert()
+        .success();
+
     let mut raw = cargo_bin_cmd!("hm");
     raw.args([
         "--config",
@@ -5158,6 +5198,91 @@ fn hook_prompt_submit_recalls_relevant_search_only_project_memory_once() {
     let repeated_stdout = String::from_utf8(repeated_output).expect("utf8 stdout");
     assert!(repeated_stdout.contains("\"reason\": \"unchanged\""));
     assert!(!repeated_stdout.contains("\"kind\": \"inject_context\""));
+
+    let mut release_prompt = cargo_bin_cmd!("hm");
+    let release_output = release_prompt
+        .env("HIVE_MEMORY_SESSION_ID", "session-prompt-recall")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "prompt-submit",
+            "--project",
+            repo.join("src/main.rs").to_str().expect("utf8 project"),
+            "--text",
+            "Cargo.toml release tags",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let release_stdout = String::from_utf8(release_output).expect("utf8 stdout");
+    assert!(
+        release_stdout.contains("Cargo.toml release tags use signed archives"),
+        "release stdout:\n{release_stdout}"
+    );
+
+    let mut recalled_again = cargo_bin_cmd!("hm");
+    let recalled_again_output = recalled_again
+        .env("HIVE_MEMORY_SESSION_ID", "session-prompt-recall")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "prompt-submit",
+            "--project",
+            repo.join("src/main.rs").to_str().expect("utf8 project"),
+            "--text",
+            "Where are AGENTS.md checkrun rules documented?",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let recalled_again_stdout = String::from_utf8(recalled_again_output).expect("utf8 stdout");
+    assert!(
+        !recalled_again_stdout.contains("AGENTS.md documents the checkrun rules"),
+        "recalled again stdout:\n{recalled_again_stdout}"
+    );
+    assert!(
+        !recalled_again_stdout.contains("\"kind\": \"inject_context\""),
+        "recalled again stdout:\n{recalled_again_stdout}"
+    );
+
+    let mut tests_prompt = cargo_bin_cmd!("hm");
+    let tests_output = tests_prompt
+        .env("HIVE_MEMORY_SESSION_ID", "session-prompt-recall")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "prompt-submit",
+            "--project",
+            repo.join("src/main.rs").to_str().expect("utf8 project"),
+            "--text",
+            "Please inspect the tests.",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let tests_stdout = String::from_utf8(tests_output).expect("utf8 stdout");
+    assert!(
+        tests_stdout.contains("Project maintainers inspect tests"),
+        "tests stdout:\n{tests_stdout}"
+    );
 }
 
 #[test]
