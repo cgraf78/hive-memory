@@ -6523,6 +6523,26 @@ fn write_fake_backend(path: &std::path::Path, output: &str) {
     fs::set_permissions(path, perms).expect("chmod fake backend");
 }
 
+/// Write a backend that answers both capture and reconcile prompts: the
+/// extraction prompt (which asks for a "JSON array") gets `facts`; every
+/// reconcile decision prompt gets `op`. Lets one `hm capture --promote` run
+/// drive extraction and per-fact reconciliation through a single fake backend.
+fn write_promote_backend(path: &std::path::Path, facts: &str, op: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let facts = facts.replace('\'', r"'\''");
+    let op = op.replace('\'', r"'\''");
+    fs::write(
+        path,
+        format!(
+            "#!/usr/bin/env bash\nprompt=\"$(cat)\"\nif printf '%s' \"$prompt\" | grep -q 'JSON array'; then\n  printf '%s' '{facts}'\nelse\n  printf '%s' '{op}'\nfi\n"
+        ),
+    )
+    .expect("write promote backend");
+    let mut perms = fs::metadata(path).expect("meta").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).expect("chmod promote backend");
+}
+
 fn write_capture_config(
     config: &std::path::Path,
     dir: &std::path::Path,
@@ -6677,6 +6697,114 @@ fn capture_handles_apostrophe_in_extracted_fact() {
         .stdout(predicate::str::contains(
             "the user's preferred editor is neovim",
         ));
+}
+
+#[test]
+fn capture_promote_writes_durable_memory() {
+    let dir = temp_dir("capture-promote-add");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let backend = dir.join("fake-backend");
+    // Extraction yields two facts; with an empty store every fact reconciles to ADD.
+    write_promote_backend(
+        &backend,
+        r#"["user prefers fd over find", "project uses the rust 2024 edition"]"#,
+        r#"{"op":"ADD"}"#,
+    );
+    write_capture_config(&config, &dir, &personal, &backend);
+    init_store(&personal, "personal");
+
+    let mut capture = cargo_bin_cmd!("hm");
+    capture
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "capture",
+            "--promote",
+            "--text",
+            "user: I like fd. assistant: noted. user: we use rust 2024.",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("promoted 2 captured fact(s)"))
+        .stdout(predicate::str::contains("add"));
+
+    // Promoted facts are durable (remembered) memory, so a default search (no
+    // inbox) finds them — unlike plain capture, which only stages inbox notes.
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "fd find",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("user prefers fd over find"));
+}
+
+#[test]
+fn capture_promote_update_supersedes_existing_record() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir("capture-promote-update");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let backend = dir.join("fake-backend");
+    // Extraction returns one refining fact; the decision prompt targets the first
+    // existing memory id parsed from the prompt, so UPDATE supersedes the real record.
+    fs::write(
+        &backend,
+        "#!/usr/bin/env bash\nprompt=\"$(cat)\"\nif printf '%s' \"$prompt\" | grep -q 'JSON array'; then\n  printf '%s' '[\"the user now prefers neovim as their editor\"]'\nelse\n  id=\"$(printf '%s' \"$prompt\" | grep -oE 'id=[^:]+' | head -1 | cut -d= -f2)\"\n  printf '{\"op\":\"UPDATE\",\"id\":\"%s\"}' \"$id\"\nfi\n",
+    )
+    .expect("write backend");
+    let mut perms = fs::metadata(&backend).expect("meta").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&backend, perms).expect("chmod");
+    write_capture_config(&config, &dir, &personal, &backend);
+    init_store(&personal, "personal");
+
+    // Seed an existing durable memory to be superseded.
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "the user prefers vim as their editor",
+        ])
+        .assert()
+        .success();
+
+    let mut capture = cargo_bin_cmd!("hm");
+    capture
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "capture",
+            "--promote",
+            "--text",
+            "user: actually I switched to neovim now.",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("promoted 1 captured fact(s)"))
+        .stdout(predicate::str::contains("update"));
+
+    // The superseding record is recalled; the superseded one is suppressed.
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "user prefers editor",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("neovim"))
+        .stdout(predicate::str::contains("hits: 1"));
 }
 
 #[test]

@@ -645,6 +645,14 @@ struct CaptureArgs {
     /// Optional provenance reference recorded on each staged note.
     #[arg(long)]
     source_ref: Option<String>,
+    /// Reconcile each extracted fact into durable memory (mem0-style
+    /// add/update/delete) instead of staging low-confidence inbox notes.
+    #[arg(long, conflicts_with = "dry_run")]
+    promote: bool,
+    /// Number of most-similar existing memories to weigh per fact when
+    /// `--promote` is set (default 5).
+    #[arg(long, default_value_t = 5)]
+    limit: usize,
     /// Emit machine-readable output.
     #[arg(long)]
     json: bool,
@@ -3500,8 +3508,8 @@ fn run_capture(args: CaptureArgs, context: CliContext) -> Result<()> {
         )
     })?;
 
-    let conversation = match args.text {
-        Some(text) => text,
+    let conversation = match &args.text {
+        Some(text) => text.clone(),
         None => {
             let mut buffer = String::new();
             std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer)?;
@@ -3529,6 +3537,19 @@ fn run_capture(args: CaptureArgs, context: CliContext) -> Result<()> {
             }
         }
         return Ok(());
+    }
+
+    if args.promote {
+        return promote_captured_facts(PromoteCaptureInput {
+            config: &config,
+            context: &context,
+            agent_id: agent_id.as_deref(),
+            writer_agent_id: &writer_agent_id,
+            backend: &backend,
+            timeout,
+            args: &args,
+            facts: &facts,
+        });
     }
 
     // Stage each fact as a raw inbox note. Inbox notes are excluded from context
@@ -3592,6 +3613,207 @@ fn run_capture(args: CaptureArgs, context: CliContext) -> Result<()> {
     Ok(())
 }
 
+/// Inputs for promoting a batch of captured facts into durable memory.
+struct PromoteCaptureInput<'a> {
+    config: &'a Config,
+    context: &'a CliContext,
+    agent_id: Option<&'a str>,
+    writer_agent_id: &'a str,
+    backend: &'a llm::Backend,
+    timeout: std::time::Duration,
+    args: &'a CaptureArgs,
+    facts: &'a [String],
+}
+
+/// Reconcile each captured fact into durable memory (mem0-style
+/// add/update/delete) using one shared index snapshot. Secret-looking facts are
+/// skipped, never written. Reports per-fact operations.
+fn promote_captured_facts(input: PromoteCaptureInput<'_>) -> Result<()> {
+    let resolved_store = resolve_store(
+        input.config,
+        input.context.store.as_deref(),
+        None,
+        input.agent_id,
+        StoreAccess::Write,
+    )?;
+    let store_config = &input.config.stores[resolved_store.name.as_str()];
+    let manifest = read_store_manifest(input.config, &resolved_store.name, store_config)?;
+    // Rebuild once so every candidate reconciles against the same snapshot; new
+    // writes within the batch are not visible to later candidates, which keeps
+    // the decision input deterministic for a single capture call.
+    let report = rebuild_store_index(input.config, &resolved_store.name)?;
+
+    let ctx = PromoteCtx {
+        config: input.config,
+        store_root: &store_config.root,
+        manifest: &manifest,
+        entries: &report.entries,
+        backend: input.backend,
+        agent_id: input.agent_id,
+        writer_agent_id: input.writer_agent_id,
+        limit: input.args.limit,
+        timeout: input.timeout,
+    };
+
+    let mut outcomes: Vec<(String, &'static str, Option<String>)> = Vec::new();
+    for fact in input.facts {
+        // Defense-in-depth: capture's extraction already drops secret-looking
+        // facts, but re-check here so a credential can never reach durable
+        // memory through promotion. The body is redacted in the report so it is
+        // not echoed to stdout (which a pipeline might log).
+        if !secret::detect(fact).is_empty() {
+            outcomes.push(("<redacted secret>".to_owned(), "skipped-secret", None));
+            continue;
+        }
+        let operation = decide_candidate(&ctx, fact)?;
+        let action = operation_action(&operation);
+        let id = apply_decision(&ctx, fact, &operation, input.args.source_ref.as_deref())?;
+        outcomes.push((fact.clone(), action, id));
+    }
+
+    let skipped = outcomes
+        .iter()
+        .filter(|(_, action, _)| *action == "skipped-secret")
+        .count();
+    let promoted = outcomes.len() - skipped;
+
+    if input.args.json {
+        let rows: Vec<_> = outcomes
+            .iter()
+            .map(|(fact, action, id)| {
+                serde_json::json!({ "fact": fact, "operation": action, "id": id })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else {
+        if skipped > 0 {
+            println!(
+                "promoted {promoted} captured fact(s) into store {} ({skipped} skipped as secret):",
+                resolved_store.name
+            );
+        } else {
+            println!(
+                "promoted {promoted} captured fact(s) into store {}:",
+                resolved_store.name
+            );
+        }
+        for (fact, action, id) in &outcomes {
+            match id {
+                Some(id) => println!("- {action} {id}: {fact}"),
+                None => println!("- {action}: {fact}"),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Shared inputs for reconciling candidate facts against a store's durable
+/// memory, resolved once so a batch (`hm capture --promote`) reuses one index
+/// snapshot and backend across all candidates.
+struct PromoteCtx<'a> {
+    config: &'a Config,
+    store_root: &'a Path,
+    manifest: &'a store::StoreManifest,
+    entries: &'a [index::IndexEntry],
+    backend: &'a llm::Backend,
+    agent_id: Option<&'a str>,
+    writer_agent_id: &'a str,
+    limit: usize,
+    timeout: std::time::Duration,
+}
+
+/// Decide the mem0-style operation for one candidate against the store's nearest
+/// durable memories.
+fn decide_candidate(ctx: &PromoteCtx<'_>, candidate: &str) -> Result<reconcile::Operation> {
+    let hits = search::search(search::SearchInput {
+        store_root: ctx.store_root,
+        entries: ctx.entries,
+        query: candidate,
+        scopes: &ctx.config.defaults.search_scopes,
+        sources: &["remembered".to_owned()],
+        include_inbox: false,
+        agent_id: ctx.agent_id,
+        project_id: None,
+        limit: ctx.limit,
+    })?;
+    let existing: Vec<reconcile::ExistingMemory> = hits
+        .iter()
+        .map(|hit| reconcile::ExistingMemory {
+            id: hit.entry.id.clone(),
+            text: hit.entry.body.clone(),
+        })
+        .collect();
+    reconcile::reconcile(ctx.backend, candidate, &existing, ctx.timeout)
+        .map_err(|err| anyhow::anyhow!("reconcile decision failed: {err}"))
+}
+
+/// The stable action label for a reconcile operation.
+fn operation_action(operation: &reconcile::Operation) -> &'static str {
+    match operation {
+        reconcile::Operation::Add => "add",
+        reconcile::Operation::Update { .. } => "update",
+        reconcile::Operation::Delete { .. } => "delete",
+        reconcile::Operation::Noop => "noop",
+    }
+}
+
+/// The existing record ids a decision supersedes. UPDATE/DELETE supersede their
+/// target; ADD/NOOP supersede nothing. Single-sourced so the dry-run display and
+/// the write path in [`apply_decision`] never drift.
+fn supersede_targets(operation: &reconcile::Operation) -> Vec<String> {
+    match operation {
+        reconcile::Operation::Update { target } | reconcile::Operation::Delete { target } => {
+            vec![target.clone()]
+        }
+        reconcile::Operation::Add | reconcile::Operation::Noop => Vec::new(),
+    }
+}
+
+/// Apply a reconcile decision by writing the candidate as durable memory.
+/// UPDATE/DELETE additionally supersede the target (retained for audit, never
+/// hard-deleted). NOOP writes nothing. Returns the written record id, if any.
+fn apply_decision(
+    ctx: &PromoteCtx<'_>,
+    candidate: &str,
+    operation: &reconcile::Operation,
+    source_ref: Option<&str>,
+) -> Result<Option<String>> {
+    if matches!(operation, reconcile::Operation::Noop) {
+        return Ok(None);
+    }
+    let supersedes = supersede_targets(operation);
+    let options = write::AtomicWriteOptions {
+        fsync: ctx.config.storage.fsync.into(),
+        ..write::AtomicWriteOptions::default()
+    };
+    let result = memory::write_record(memory::WriteRecordInput {
+        root: ctx.store_root,
+        manifest: ctx.manifest,
+        entry_kind: note::EntryKind::Remember,
+        created_at: OffsetDateTime::now_utc(),
+        agent_id: ctx.writer_agent_id.to_owned(),
+        host_id: resolve_host_id(ctx.config),
+        user_id: ctx.config.user_id.clone(),
+        session_id: std::env::var("HIVE_MEMORY_SESSION_ID").ok(),
+        scope: ctx.config.defaults.write_scope.clone(),
+        confidence: note::Confidence::Medium,
+        body: candidate.to_owned(),
+        project_id: None,
+        subject: None,
+        kind: None,
+        valid_from: None,
+        valid_to: None,
+        supersedes,
+        tags: vec!["reconciled".to_owned()],
+        audience: Vec::new(),
+        source_kind: Some("reconcile".to_owned()),
+        source_ref: source_ref.map(str::to_owned),
+        write_event: true,
+        options,
+    })?;
+    Ok(Some(result.id))
+}
+
 fn run_reconcile(args: ReconcileArgs, context: CliContext) -> Result<()> {
     let config = load_config(context.config_path.as_deref())?;
     let agent_id = resolve_agent_id(context.as_agent.clone());
@@ -3637,40 +3859,22 @@ fn run_reconcile(args: ReconcileArgs, context: CliContext) -> Result<()> {
     let manifest = read_store_manifest(&config, &resolved_store.name, store_config)?;
     let report = rebuild_store_index(&config, &resolved_store.name)?;
 
-    // Find the most similar existing durable (remembered) memories so the model
-    // reconciles against real neighbors, not the whole store.
-    let hits = search::search(search::SearchInput {
-        store_root: &store_config.root,
-        entries: &report.entries,
-        query: &candidate,
-        scopes: &config.defaults.search_scopes,
-        sources: &["remembered".to_owned()],
-        include_inbox: false,
-        agent_id: agent_id.as_deref(),
-        project_id: None,
-        limit: args.limit,
-    })?;
-    let existing: Vec<reconcile::ExistingMemory> = hits
-        .iter()
-        .map(|hit| reconcile::ExistingMemory {
-            id: hit.entry.id.clone(),
-            text: hit.entry.body.clone(),
-        })
-        .collect();
-
     let timeout = std::time::Duration::from_secs(config.classifier.timeout_seconds);
-    let operation = reconcile::reconcile(&backend, &candidate, &existing, timeout)
-        .map_err(|err| anyhow::anyhow!("reconcile decision failed: {err}"))?;
-
-    // Map the decision onto the existing write path. Every mutating op writes the
-    // candidate as durable memory; UPDATE/DELETE additionally supersede the
-    // target so the older record is retained for audit but no longer recalled.
-    let (action, supersedes): (&str, Vec<String>) = match &operation {
-        reconcile::Operation::Add => ("add", Vec::new()),
-        reconcile::Operation::Update { target } => ("update", vec![target.clone()]),
-        reconcile::Operation::Delete { target } => ("delete", vec![target.clone()]),
-        reconcile::Operation::Noop => ("noop", Vec::new()),
+    let ctx = PromoteCtx {
+        config: &config,
+        store_root: &store_config.root,
+        manifest: &manifest,
+        entries: &report.entries,
+        backend: &backend,
+        agent_id: agent_id.as_deref(),
+        writer_agent_id: &writer_agent_id,
+        limit: args.limit,
+        timeout,
     };
+
+    let operation = decide_candidate(&ctx, &candidate)?;
+    let action = operation_action(&operation);
+    let supersedes = supersede_targets(&operation);
 
     if args.dry_run || matches!(operation, reconcile::Operation::Noop) {
         if args.json {
@@ -3686,46 +3890,16 @@ fn run_reconcile(args: ReconcileArgs, context: CliContext) -> Result<()> {
         return Ok(());
     }
 
-    let options = write::AtomicWriteOptions {
-        fsync: config.storage.fsync.into(),
-        ..write::AtomicWriteOptions::default()
-    };
-    let result = memory::write_record(memory::WriteRecordInput {
-        root: &store_config.root,
-        manifest: &manifest,
-        entry_kind: note::EntryKind::Remember,
-        created_at: OffsetDateTime::now_utc(),
-        agent_id: writer_agent_id,
-        host_id: resolve_host_id(&config),
-        user_id: config.user_id.clone(),
-        session_id: std::env::var("HIVE_MEMORY_SESSION_ID").ok(),
-        scope: config.defaults.write_scope.clone(),
-        confidence: note::Confidence::Medium,
-        body: candidate,
-        project_id: None,
-        subject: None,
-        kind: None,
-        valid_from: None,
-        valid_to: None,
-        supersedes,
-        tags: vec!["reconciled".to_owned()],
-        audience: Vec::new(),
-        source_kind: Some("reconcile".to_owned()),
-        source_ref: args.source_ref.clone(),
-        write_event: true,
-        options,
-    })?;
+    let id = apply_decision(&ctx, &candidate, &operation, args.source_ref.as_deref())?
+        .expect("non-noop decision always writes a record");
 
     if args.json {
         println!(
             "{}",
-            serde_json::json!({ "operation": action, "id": result.id, "applied": true })
+            serde_json::json!({ "operation": action, "id": id, "applied": true })
         );
     } else {
-        println!(
-            "{action}: wrote {} in store {}",
-            result.id, resolved_store.name
-        );
+        println!("{action}: wrote {id} in store {}", resolved_store.name);
     }
     Ok(())
 }
