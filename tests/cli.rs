@@ -5459,6 +5459,80 @@ fn hook_prompt_submit_skips_recall_when_index_is_not_fresh() {
 }
 
 #[test]
+fn hook_prompt_submit_recalls_from_cache_when_store_root_is_unavailable() {
+    let dir = temp_dir("hook-prompt-cache-store-unavailable");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let offline = dir.join("personal-offline");
+    let state = dir.join("state");
+    let cache = dir.join("cache");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            state_dir = "{}"
+            cache_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+            "#,
+            state.display(),
+            cache.display(),
+            personal.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "remember",
+            "--text",
+            "Prompt-submit cache-only recall should prefer zirconium adapters.",
+        ])
+        .assert()
+        .success();
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    fs::rename(&personal, &offline).expect("move store root offline");
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", "session-cache-store-unavailable")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "prompt-submit",
+            "--text",
+            "Should prompt-submit use zirconium adapters?",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"event\": \"prompt-submit\""))
+        .stdout(predicate::str::contains("\"reason\": \"selected\""))
+        .stdout(predicate::str::contains(
+            "Prompt-submit cache-only recall should prefer zirconium adapters.",
+        ));
+}
+
+#[test]
 fn hook_tool_complete_without_project_does_not_clear_context_selection() {
     let dir = temp_dir("hook-tool-complete-projectless");
     let config = dir.join("config.toml");

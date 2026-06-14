@@ -3610,7 +3610,7 @@ fn rebuild_store_index(config: &Config, store_name: &str) -> Result<index::LoadI
     Ok(report)
 }
 
-fn load_fresh_store_index(
+fn load_cached_store_index(
     config: &Config,
     store_name: &str,
 ) -> Result<Option<index::LoadIndexReport>> {
@@ -3619,7 +3619,7 @@ fn load_fresh_store_index(
         fsync: config.storage.fsync.into(),
         ..write::AtomicWriteOptions::default()
     };
-    Ok(index::load_fresh_index(&index::LoadIndexInput {
+    Ok(index::load_cached_index(&index::LoadIndexInput {
         store_name,
         store_root: &store_config.root,
         cache_dir: &config.cache_dir,
@@ -4400,7 +4400,7 @@ fn hook_prompt_recall_action(
     )?;
     let store_name = resolved_store.name.clone();
     let store_config = &config.stores[store_name.as_str()];
-    let report = match load_fresh_store_index(config, &store_name) {
+    let report = match load_cached_store_index(config, &store_name) {
         Ok(Some(report)) => report,
         Ok(None) => {
             let mut recall = HookRecallReport::skipped("index-not-fresh");

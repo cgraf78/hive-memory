@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 
+const INDEX_FINGERPRINT_SCHEMA_VERSION: u32 = 8;
+
 /// One line in `cache/indexes/<store-alias>.jsonl`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexEntry {
@@ -258,6 +260,38 @@ pub fn load_fresh_index(input: &LoadIndexInput<'_>) -> Result<Option<LoadIndexRe
     }
 
     Ok(None)
+}
+
+/// Read a locally cached index without touching the canonical store root.
+///
+/// This is intentionally weaker than [`load_fresh_index`]. Prompt-submit hooks
+/// run inside short agent timeouts, and the canonical store may live on a
+/// cloud-backed FUSE mount that takes seconds to wake after idle. For that
+/// boundary, stale-but-local recall is more useful than blocking the prompt.
+/// Refresh and normal read commands still own freshness validation.
+pub fn load_cached_index(
+    input: &LoadIndexInput<'_>,
+) -> Result<Option<LoadIndexReport>, IndexError> {
+    let path = scoped_index_path(input.cache_dir, input.store_name, input.store_root);
+    let fingerprint_path =
+        index_fingerprint_path(input.cache_dir, input.store_name, input.store_root);
+    let cached = match read_fingerprint(&fingerprint_path) {
+        Ok(cached) => cached,
+        Err(_) => return Ok(None),
+    };
+    if cached.schema_version != INDEX_FINGERPRINT_SCHEMA_VERSION
+        || cached.store_root != input.store_root.display().to_string()
+        || !path.is_file()
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(LoadIndexReport {
+        path: path.clone(),
+        entries: read_index(&path)?,
+        warnings: Vec::new(),
+        rebuilt: false,
+    }))
 }
 
 /// Rebuild one store's JSONL triage index from canonical inbox files.
@@ -614,7 +648,7 @@ fn canonical_fingerprint(store_root: &Path) -> Result<IndexFingerprint, IndexErr
     Ok(IndexFingerprint {
         // v8: entity extraction includes deterministic quoted/proper-name
         // phrase links in addition to built-in aliases and the store registry.
-        schema_version: 8,
+        schema_version: INDEX_FINGERPRINT_SCHEMA_VERSION,
         store_root: store_root.display().to_string(),
         canonical_dirs: dirs.len(),
         latest_directory_modified_nanos,
