@@ -215,6 +215,28 @@ pub fn invoke_with_env(
     timeout: Duration,
     env: &[(&str, &str)],
 ) -> Result<Verdict, LlmError> {
+    let stdout = run_backend_raw(backend, prompt, timeout, env)?;
+    parse_verdict(&stdout).ok_or(LlmError::InvalidOutput)
+}
+
+/// Run a backend and return its raw stdout, for callers that need free-form
+/// output rather than a parsed classification verdict (e.g. the QA-accuracy
+/// grader that answers and judges questions). Backend failures carry a stderr
+/// excerpt so quota/auth errors stay actionable.
+pub fn invoke_raw(backend: &Backend, prompt: &str, timeout: Duration) -> Result<String, LlmError> {
+    run_backend_raw(backend, prompt, timeout, &[])
+}
+
+/// Spawn the backend with the prompt on stdin and return its stdout on success.
+/// Shared by the classification (`invoke_with_env`) and free-form (`invoke_raw`)
+/// paths so process-group handling, timeout, and stderr diagnostics stay in one
+/// place.
+fn run_backend_raw(
+    backend: &Backend,
+    prompt: &str,
+    timeout: Duration,
+    env: &[(&str, &str)],
+) -> Result<String, LlmError> {
     if backend.argv.is_empty() {
         return Err(LlmError::Backend("empty backend argv".to_owned()));
     }
@@ -253,7 +275,7 @@ pub fn invoke_with_env(
             format!("exit status {:?}: {stderr}", output.status.code())
         }));
     }
-    parse_verdict(&String::from_utf8_lossy(&output.stdout)).ok_or(LlmError::InvalidOutput)
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Collapse backend stderr into a short single-line diagnostic excerpt.

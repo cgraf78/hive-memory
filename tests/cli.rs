@@ -6504,3 +6504,314 @@ fn projects_bind_validates_active_agent_read_and_write_affinity() {
         "agent codex may not write store work",
     ));
 }
+
+/// Write an executable fake model backend that echoes `output` on stdout,
+/// regardless of the prompt, for capture/classify CLI tests.
+fn write_fake_backend(path: &std::path::Path, output: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    // Escape single quotes for the single-quoted shell literal below, so an
+    // `output` containing an apostrophe (e.g. "user's preference") does not
+    // produce a broken script.
+    let escaped = output.replace('\'', r"'\''");
+    fs::write(
+        path,
+        format!("#!/usr/bin/env bash\ncat >/dev/null\nprintf '%s' '{escaped}'\n"),
+    )
+    .expect("write fake backend");
+    let mut perms = fs::metadata(path).expect("meta").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).expect("chmod fake backend");
+}
+
+fn write_capture_config(
+    config: &std::path::Path,
+    dir: &std::path::Path,
+    personal: &std::path::Path,
+    backend: &std::path::Path,
+) {
+    fs::write(
+        config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+            state_dir = "{}"
+            cache_dir = "{}"
+
+            [classifier]
+            backend = "command"
+            command = ["{}"]
+
+            [stores.personal]
+            root = "{}"
+            description = "Personal memory"
+            "#,
+            dir.join("data").display(),
+            dir.join("state").display(),
+            dir.join("cache").display(),
+            backend.display(),
+            personal.display(),
+        ),
+    )
+    .expect("write capture config");
+}
+
+#[test]
+fn capture_stages_extracted_facts_as_inbox_notes() {
+    let dir = temp_dir("capture-stage");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let backend = dir.join("fake-backend");
+    write_fake_backend(
+        &backend,
+        r#"["user prefers fd over find", "project uses the rust 2024 edition"]"#,
+    );
+    write_capture_config(&config, &dir, &personal, &backend);
+    init_store(&personal, "personal");
+
+    let mut capture = cargo_bin_cmd!("hm");
+    capture
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "capture",
+            "--text",
+            "user: I like fd. assistant: noted. user: we use rust 2024.",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("staged 2 captured fact(s)"));
+
+    // Staged facts land in the inbox (raw notes), not curated/remembered memory,
+    // so they only appear when inbox is explicitly searched.
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "fd find",
+            "--include-inbox",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("user prefers fd over find"));
+}
+
+#[test]
+fn capture_dry_run_writes_nothing() {
+    let dir = temp_dir("capture-dry");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let backend = dir.join("fake-backend");
+    write_fake_backend(&backend, r#"["some durable fact"]"#);
+    write_capture_config(&config, &dir, &personal, &backend);
+    init_store(&personal, "personal");
+
+    let mut capture = cargo_bin_cmd!("hm");
+    capture
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "capture",
+            "--text",
+            "user: a durable fact about me.",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dry run, nothing written"))
+        .stdout(predicate::str::contains("some durable fact"));
+
+    // Nothing was written, so an inbox search finds no captured note.
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "durable fact",
+            "--include-inbox",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hits: 0"));
+}
+
+#[test]
+fn capture_handles_apostrophe_in_extracted_fact() {
+    let dir = temp_dir("capture-apostrophe");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let backend = dir.join("fake-backend");
+    // The extracted fact contains an apostrophe; the fake-backend writer must
+    // escape it so the generated shell script stays valid.
+    write_fake_backend(&backend, r#"["the user's preferred editor is neovim"]"#);
+    write_capture_config(&config, &dir, &personal, &backend);
+    init_store(&personal, "personal");
+
+    let mut capture = cargo_bin_cmd!("hm");
+    capture
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "capture",
+            "--text",
+            "user: I use neovim.",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("staged 1 captured fact(s)"));
+
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "neovim editor",
+            "--include-inbox",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "the user's preferred editor is neovim",
+        ));
+}
+
+#[test]
+fn reconcile_add_writes_durable_memory() {
+    let dir = temp_dir("reconcile-add");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let backend = dir.join("fake-backend");
+    write_fake_backend(&backend, r#"{"op":"ADD"}"#);
+    write_capture_config(&config, &dir, &personal, &backend);
+    init_store(&personal, "personal");
+
+    let mut reconcile = cargo_bin_cmd!("hm");
+    reconcile
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "reconcile",
+            "--text",
+            "the user prefers ripgrep for searching",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("add: wrote"));
+
+    // ADD writes durable (remembered) memory, so a default search (no inbox) finds it.
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "ripgrep searching",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "the user prefers ripgrep for searching",
+        ));
+}
+
+#[test]
+fn reconcile_dry_run_writes_nothing() {
+    let dir = temp_dir("reconcile-dry");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let backend = dir.join("fake-backend");
+    write_fake_backend(&backend, r#"{"op":"ADD"}"#);
+    write_capture_config(&config, &dir, &personal, &backend);
+    init_store(&personal, "personal");
+
+    let mut reconcile = cargo_bin_cmd!("hm");
+    reconcile
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "reconcile",
+            "--text",
+            "a candidate that should not be written",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("add (dry run)"));
+
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "candidate written",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hits: 0"));
+}
+
+#[test]
+fn reconcile_update_supersedes_existing_record() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir("reconcile-update");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let backend = dir.join("fake-backend");
+    // A backend that targets the first existing memory id parsed from the prompt,
+    // so UPDATE points at the real (dynamically generated) record id.
+    fs::write(
+        &backend,
+        "#!/usr/bin/env bash\nprompt=\"$(cat)\"\nid=\"$(printf '%s' \"$prompt\" | grep -oE 'id=[^:]+' | head -1 | cut -d= -f2)\"\nprintf '{\"op\":\"UPDATE\",\"id\":\"%s\"}' \"$id\"\n",
+    )
+    .expect("write backend");
+    let mut perms = fs::metadata(&backend).expect("meta").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&backend, perms).expect("chmod");
+    write_capture_config(&config, &dir, &personal, &backend);
+    init_store(&personal, "personal");
+
+    // Seed an existing durable memory to be superseded.
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "the user prefers vim as their editor",
+        ])
+        .assert()
+        .success();
+
+    let mut reconcile = cargo_bin_cmd!("hm");
+    reconcile
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "reconcile",
+            "--text",
+            "the user now prefers neovim as their editor",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("update: wrote"));
+
+    // The superseding record is recalled; the superseded one is suppressed.
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "user prefers editor",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("neovim"))
+        .stdout(predicate::str::contains("hits: 1"));
+}
