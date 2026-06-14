@@ -22,7 +22,17 @@ fs2 = "0.4.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
-tantivy = "0.26"
+# Disable default features to drop `columnar-zstd-compression`, which pulls the
+# C `zstd-sys` crate. That C dependency breaks the static musl release builds
+# (no musl C toolchain on the runner) and would require a C compiler for
+# `cargo install`. The pure-Rust LZ4 store compressor is kept; this keeps the
+# whole dependency tree pure Rust.
+tantivy = { version = "0.26", default-features = false, features = [
+  "mmap",
+  "stopwords",
+  "lz4-compression",
+  "stemmer",
+] }
 time = { version = "0.3.44", default-features = false, features = ["formatting", "parsing", "std"] }
 toml = "0.9.8"
 unicode-normalization = "0.1.25"
