@@ -6652,7 +6652,9 @@ fn reconcile_add_writes_durable_memory() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("the user prefers ripgrep for searching"));
+        .stdout(predicate::str::contains(
+            "the user prefers ripgrep for searching",
+        ));
 }
 
 #[test]
