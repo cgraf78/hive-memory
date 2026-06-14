@@ -6613,5 +6613,7 @@ fn capture_handles_apostrophe_in_extracted_fact() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("the user's preferred editor is neovim"));
+        .stdout(predicate::str::contains(
+            "the user's preferred editor is neovim",
+        ));
 }
