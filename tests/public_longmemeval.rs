@@ -25,10 +25,46 @@ use time::OffsetDateTime;
 const DATASET_ENV: &str = "HIVE_MEMORY_LONGMEMEVAL_S_JSON";
 const MAX_CASES_ENV: &str = "HIVE_MEMORY_LONGMEMEVAL_MAX_CASES";
 const INGEST_MODE_ENV: &str = "HIVE_MEMORY_LONGMEMEVAL_INGEST";
+const RETRIEVER_ENV: &str = "HIVE_MEMORY_LONGMEMEVAL_RETRIEVER";
 const DEFAULT_MAX_CASES: usize = 100;
 const RETRIEVAL_LIMIT: usize = 5;
 const ITEM_RETRIEVAL_LIMIT: usize = RETRIEVAL_LIMIT * 5;
 const P95_BUDGET_MS: u128 = 500;
+
+/// Candidate-generation backend under test.
+///
+/// `lexical` is the shipped deterministic `search()` path. `bm25` is a
+/// dependency-free Okapi BM25 ranker used to measure whether statistical
+/// ranking beats the lexical coverage heuristic on the same corpus *before*
+/// taking on a real full-text engine (Tantivy) as a product dependency.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum Retriever {
+    Lexical,
+    Bm25,
+}
+
+impl Retriever {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Lexical => "lexical",
+            Self::Bm25 => "bm25",
+        }
+    }
+}
+
+impl FromStr for Retriever {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "lexical" => Ok(Self::Lexical),
+            "bm25" => Ok(Self::Bm25),
+            _ => Err(format!(
+                "unsupported {RETRIEVER_ENV}={value:?}; expected lexical or bm25"
+            )),
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct LongMemEvalCase {
@@ -55,6 +91,10 @@ struct Materialized {
     ingest_mode: IngestMode,
     entries_by_session_id: BTreeMap<String, Vec<IndexEntry>>,
     session_id_by_item_id: BTreeMap<String, String>,
+    /// Indexed memory text keyed by item id, used by the BM25 retriever. The
+    /// lexical path reads bodies through the store index; BM25 ranks this same
+    /// rendered text so the two backends see identical content.
+    text_by_item_id: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +242,42 @@ fn parses_longmemeval_fixture_dates_as_utc() {
 }
 
 #[test]
+fn tokenize_splits_on_non_alphanumeric_and_lowercases() {
+    assert_eq!(
+        tokenize("Dark-Roast COFFEE, please!"),
+        vec!["dark", "roast", "coffee", "please"]
+    );
+    assert!(tokenize("   ").is_empty());
+}
+
+#[test]
+fn bm25_ranks_document_with_rarer_query_terms_first() {
+    // "espresso" appears in one doc; "coffee" in both. A query for both terms
+    // must rank the doc carrying the rarer, more discriminating term first.
+    let candidates = [
+        ("a", "coffee is a common morning drink enjoyed worldwide"),
+        ("b", "coffee espresso is a strong concentrated brew"),
+    ];
+    let ranked = bm25_rank(&candidates, "espresso coffee", 5);
+    assert_eq!(ranked, vec!["b".to_owned(), "a".to_owned()]);
+}
+
+#[test]
+fn bm25_omits_documents_with_no_query_term_overlap() {
+    let candidates = [
+        ("a", "the user prefers dark roast coffee"),
+        ("b", "the user is learning to play the cello"),
+    ];
+    let ranked = bm25_rank(&candidates, "coffee roast", 5);
+    assert_eq!(ranked, vec!["a".to_owned()]);
+}
+
+#[test]
+fn bm25_handles_empty_candidates() {
+    assert!(bm25_rank(&[], "anything", 5).is_empty());
+}
+
+#[test]
 #[ignore = "requires HIVE_MEMORY_LONGMEMEVAL_S_JSON pointing at downloaded LongMemEval-S JSON"]
 fn longmemeval_s_retrieval_scoreboard() {
     let Some(dataset_path) = std::env::var_os(DATASET_ENV).map(PathBuf::from) else {
@@ -232,6 +308,7 @@ fn longmemeval_s_retrieval_scoreboard() {
     );
 
     let materialized = materialize(&cases);
+    let retriever = retriever();
     let mut overall = Score::default();
     let mut by_type = BTreeMap::<String, Score>::new();
 
@@ -258,20 +335,46 @@ fn longmemeval_s_retrieval_scoreboard() {
             .cloned()
             .collect::<BTreeSet<_>>();
         let start = Instant::now();
-        let hits = search(SearchInput {
-            store_root: &materialized.root,
-            entries: &haystack_entries,
-            query: &case.question,
-            scopes: &["global".to_owned()],
-            sources: &["remembered".to_owned()],
-            include_inbox: false,
-            agent_id: Some("codex"),
-            project_id: None,
-            limit: ITEM_RETRIEVAL_LIMIT,
-        })
-        .unwrap_or_else(|err| panic!("case {} search failed: {err}", case.question_id));
+        let actual = match retriever {
+            Retriever::Lexical => {
+                let hits = search(SearchInput {
+                    store_root: &materialized.root,
+                    entries: &haystack_entries,
+                    query: &case.question,
+                    scopes: &["global".to_owned()],
+                    sources: &["remembered".to_owned()],
+                    include_inbox: false,
+                    agent_id: Some("codex"),
+                    project_id: None,
+                    limit: ITEM_RETRIEVAL_LIMIT,
+                })
+                .unwrap_or_else(|err| panic!("case {} search failed: {err}", case.question_id));
+                unique_session_hits(&hits, &materialized.session_id_by_item_id)
+            }
+            Retriever::Bm25 => {
+                // Restrict candidates to this case's haystack, mirroring the
+                // lexical path which only sees per-case haystack entries.
+                let haystack: BTreeSet<&str> = case
+                    .haystack_session_ids
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
+                let candidates = materialized
+                    .text_by_item_id
+                    .iter()
+                    .filter(|(item_id, _)| {
+                        materialized
+                            .session_id_by_item_id
+                            .get(item_id.as_str())
+                            .is_some_and(|session_id| haystack.contains(session_id.as_str()))
+                    })
+                    .map(|(item_id, text)| (item_id.as_str(), text.as_str()))
+                    .collect::<Vec<_>>();
+                let ranked = bm25_rank(&candidates, &case.question, ITEM_RETRIEVAL_LIMIT);
+                unique_sessions_from_item_ids(&ranked, &materialized.session_id_by_item_id)
+            }
+        };
         let elapsed = start.elapsed();
-        let actual = unique_session_hits(&hits, &materialized.session_id_by_item_id);
 
         overall.add(&expected, &actual, elapsed);
         by_type
@@ -281,7 +384,8 @@ fn longmemeval_s_retrieval_scoreboard() {
     }
 
     eprintln!(
-        "LongMemEval-S mode={} overall cases={} recall@5={:.3} precision@5={:.3} mrr={:.3} non_answer_hits={} p95_ms={}",
+        "LongMemEval-S retriever={} mode={} overall cases={} recall@5={:.3} precision@5={:.3} mrr={:.3} non_answer_hits={} p95_ms={}",
+        retriever.as_str(),
         materialized.ingest_mode,
         overall.cases,
         overall.recall_at_5(),
@@ -292,7 +396,8 @@ fn longmemeval_s_retrieval_scoreboard() {
     );
     for (question_type, score) in by_type {
         eprintln!(
-            "LongMemEval-S mode={} {question_type} cases={} recall@5={:.3} precision@5={:.3} mrr={:.3} non_answer_hits={} p95_ms={}",
+            "LongMemEval-S retriever={} mode={} {question_type} cases={} recall@5={:.3} precision@5={:.3} mrr={:.3} non_answer_hits={} p95_ms={}",
+            retriever.as_str(),
             materialized.ingest_mode,
             score.cases,
             score.recall_at_5(),
@@ -431,6 +536,10 @@ fn materialize(cases: &[LongMemEvalCase]) -> Materialized {
         .iter()
         .map(|item| (item.id.clone(), item.answer_session_id.clone()))
         .collect::<BTreeMap<_, _>>();
+    let text_by_item_id = items
+        .iter()
+        .map(|item| (item.id.clone(), render_item(item)))
+        .collect::<BTreeMap<_, _>>();
     let mut entries_by_session_id = BTreeMap::<String, Vec<IndexEntry>>::new();
     for entry in report.entries {
         let Some(subject) = entry.subject.clone() else {
@@ -465,6 +574,7 @@ fn materialize(cases: &[LongMemEvalCase]) -> Materialized {
         ingest_mode,
         entries_by_session_id,
         session_id_by_item_id,
+        text_by_item_id,
     }
 }
 
@@ -604,6 +714,102 @@ fn unique_session_hits(
     session_ids
 }
 
+/// Map ranked item ids to their first-seen unique answer sessions, capped at the
+/// retrieval limit. Mirrors `unique_session_hits` for the BM25 path so both
+/// backends are scored on session-level recall identically.
+fn unique_sessions_from_item_ids(
+    item_ids: &[String],
+    session_id_by_item_id: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut seen = BTreeSet::<String>::new();
+    let mut session_ids = Vec::<String>::new();
+    for item_id in item_ids {
+        let Some(session_id) = session_id_by_item_id.get(item_id) else {
+            continue;
+        };
+        if seen.insert(session_id.clone()) {
+            session_ids.push(session_id.clone());
+        }
+        if session_ids.len() == RETRIEVAL_LIMIT {
+            break;
+        }
+    }
+    session_ids
+}
+
+/// Rank candidates with Okapi BM25 (k1=1.2, b=0.75) and return up to `limit`
+/// item ids, highest score first. Ties break on item id so the scoreboard is
+/// reproducible. This is a deliberately dependency-free reference ranker: it
+/// measures whether statistical term weighting beats the lexical coverage
+/// heuristic before committing to a real full-text engine.
+fn bm25_rank(candidates: &[(&str, &str)], query: &str, limit: usize) -> Vec<String> {
+    const K1: f64 = 1.2;
+    const B: f64 = 0.75;
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let docs: Vec<(&str, Vec<String>)> = candidates
+        .iter()
+        .map(|(id, text)| (*id, tokenize(text)))
+        .collect();
+    let doc_count = docs.len() as f64;
+    let total_len: usize = docs.iter().map(|(_, terms)| terms.len()).sum();
+    // Guard the empty-corpus-text case so the length normalizer stays finite.
+    let avg_len = if total_len == 0 {
+        1.0
+    } else {
+        total_len as f64 / doc_count
+    };
+
+    let mut doc_freq: BTreeMap<&str, usize> = BTreeMap::new();
+    for (_, terms) in &docs {
+        for term in terms.iter().map(String::as_str).collect::<BTreeSet<_>>() {
+            *doc_freq.entry(term).or_insert(0) += 1;
+        }
+    }
+
+    let query_terms: BTreeSet<String> = tokenize(query).into_iter().collect();
+    let mut scored: Vec<(f64, &str)> = docs
+        .iter()
+        .map(|(id, terms)| {
+            let doc_len = terms.len() as f64;
+            let mut term_freq: BTreeMap<&str, usize> = BTreeMap::new();
+            for term in terms {
+                *term_freq.entry(term.as_str()).or_insert(0) += 1;
+            }
+            let score = query_terms
+                .iter()
+                .filter_map(|term| {
+                    let freq = *term_freq.get(term.as_str())? as f64;
+                    let containing = *doc_freq.get(term.as_str()).unwrap_or(&0) as f64;
+                    let idf = (((doc_count - containing + 0.5) / (containing + 0.5)) + 1.0).ln();
+                    let norm = freq + K1 * (1.0 - B + B * doc_len / avg_len);
+                    Some(idf * (freq * (K1 + 1.0)) / norm)
+                })
+                .sum::<f64>();
+            (score, *id)
+        })
+        .collect();
+
+    scored.sort_by(|left, right| right.0.total_cmp(&left.0).then_with(|| left.1.cmp(right.1)));
+    scored
+        .into_iter()
+        .filter(|(score, _)| *score > 0.0)
+        .take(limit)
+        .map(|(_, id)| id.to_owned())
+        .collect()
+}
+
+/// Lowercase Unicode-alphanumeric tokenizer shared by the BM25 index and query
+/// so document and query terms normalize identically.
+fn tokenize(text: &str) -> Vec<String> {
+    text.split(|ch: char| !ch.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
 fn cleanup_materialized(materialized: &Materialized) {
     for path in [&materialized.temp_root, &materialized.cache_root] {
         if let Err(err) = fs::remove_dir_all(path) {
@@ -624,6 +830,15 @@ fn ingest_mode() -> IngestMode {
         .ok()
         .as_deref()
         .unwrap_or("session")
+        .parse()
+        .unwrap_or_else(|err| panic!("{err}"))
+}
+
+fn retriever() -> Retriever {
+    std::env::var(RETRIEVER_ENV)
+        .ok()
+        .as_deref()
+        .unwrap_or("lexical")
         .parse()
         .unwrap_or_else(|err| panic!("{err}"))
 }
