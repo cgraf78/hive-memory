@@ -46,9 +46,10 @@ pub struct ContextInput<'a> {
     pub path_hint: Option<&'a str>,
     /// Token-ish budget using the v1 byte/4 approximation.
     pub max_tokens: usize,
-    /// Session-start selection strategy. `Recency` (default) keeps legacy
-    /// include-all behavior; `Relevance` withholds search-only candidates via
-    /// the inject classifier.
+    /// Session-start selection strategy. `Adaptive` (default) withholds only
+    /// records explicitly tagged as non-startup and never drops untagged
+    /// content; `Recency` includes everything in scope; `Relevance` applies the
+    /// full inject classifier (may withhold untagged ambiguous globals).
     pub inject_strategy: inject::Strategy,
     /// Capture candidate-level include/skip decisions for debugging selection.
     pub explain: bool,
@@ -297,11 +298,14 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
         } else {
             entry.body.clone()
         };
-        // Under Relevance, withhold candidates the classifier marks search-only
-        // (operational logs, raw notes) so startup context stays focused. The
-        // body must be resolved first because the operational signal is content.
-        if input.inject_strategy == inject::Strategy::Relevance {
-            let class = inject::classify(
+        // Withhold candidates the active strategy marks search-only so startup
+        // context stays focused. Recency keeps everything; Relevance applies the
+        // full content classifier; Adaptive (default) only withholds explicitly
+        // non-startup kinds and never guesses against untagged content. The body
+        // must be resolved first because Relevance's signal is content.
+        if input.inject_strategy != inject::Strategy::Recency {
+            let class = inject::select(
+                input.inject_strategy,
                 ClassifyInput {
                     scope: &entry.scope,
                     project_id: entry.project_id.as_deref(),
