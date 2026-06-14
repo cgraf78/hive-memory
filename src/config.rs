@@ -43,6 +43,7 @@ const DEFAULTS_KEYS: &[&str] = &[
     "hook_context_max_tokens",
     "context_cache_max_age",
     "context_strategy",
+    "search_backend",
 ];
 const AGENT_KEYS: &[&str] = &[
     "default_store",
@@ -211,6 +212,11 @@ pub struct DefaultsConfig {
     /// unrecognized value degrades to legacy behavior instead of failing the
     /// hook path; resolved via `inject::Strategy::from_config`.
     pub context_strategy: String,
+    /// Candidate-generation backend for `hm search`: `lexical` (default
+    /// deterministic scan) or `tantivy` (local BM25 full-text index, higher
+    /// recall). Stored as a string so an unrecognized value degrades to the
+    /// lexical default instead of failing.
+    pub search_backend: String,
 }
 
 /// Background LLM classification policy.
@@ -902,6 +908,7 @@ impl DefaultsConfig {
             hook_context_max_tokens: raw.hook_context_max_tokens.unwrap_or(4000),
             context_cache_max_age: raw.context_cache_max_age.unwrap_or_else(|| "7d".to_owned()),
             context_strategy: raw.context_strategy.unwrap_or_else(|| "recency".to_owned()),
+            search_backend: raw.search_backend.unwrap_or_else(|| "lexical".to_owned()),
         }
     }
 }
@@ -1096,6 +1103,7 @@ struct RawDefaultsConfig {
     hook_context_max_tokens: Option<u32>,
     context_cache_max_age: Option<String>,
     context_strategy: Option<String>,
+    search_backend: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

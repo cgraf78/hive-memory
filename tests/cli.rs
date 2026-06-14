@@ -2733,6 +2733,67 @@ fn search_finds_remembered_note() {
 }
 
 #[test]
+fn search_tantivy_backend_returns_results_end_to_end() {
+    let dir = temp_dir("search-tantivy");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    // Config opts into the Tantivy backend via [defaults].search_backend.
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+            state_dir = "{}"
+            cache_dir = "{}"
+
+            [defaults]
+            search_backend = "tantivy"
+
+            [stores.personal]
+            root = "{}"
+            description = "Personal memory"
+            "#,
+            dir.join("data").display(),
+            dir.join("state").display(),
+            dir.join("cache").display(),
+            personal.display(),
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Chris prefers dark roast coffee in the mornings.",
+        ])
+        .assert()
+        .success();
+
+    // A keyword query the BM25 index ranks; proves the backend builds, persists,
+    // and serves results through the CLI path with policy filtering intact.
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "coffee",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hits: 1"))
+        .stdout(predicate::str::contains(
+            "snippet: Chris prefers dark roast coffee in the mornings.",
+        ));
+}
+
+#[test]
 fn search_finds_curated_memory_from_default_sources() {
     let dir = temp_dir("search-curated-default");
     let config = dir.join("config.toml");

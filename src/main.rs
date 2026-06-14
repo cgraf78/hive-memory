@@ -10,7 +10,7 @@ use hive_memory::config::{Config, ConfigPaths, EventSidecarPolicy, Sensitivity, 
 use hive_memory::{
     classify, config, context as memory_context, curation, doctor, eval as memory_eval, event,
     hook as memory_hook, id, index, inject, memory, note, outbox, path as memory_path, project,
-    search, secret, store, write, write_classify,
+    retrieval, search, secret, store, write, write_classify,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -2309,7 +2309,7 @@ fn run_search(args: SearchArgs, context: CliContext) -> Result<()> {
             .iter()
             .any(|source| source == "inbox" || source == "all");
 
-    let hits = search::search(search::SearchInput {
+    let search_input = search::SearchInput {
         store_root: &store_config.root,
         entries: &report.entries,
         query: &args.query,
@@ -2319,7 +2319,13 @@ fn run_search(args: SearchArgs, context: CliContext) -> Result<()> {
         agent_id: agent_id.as_deref(),
         project_id: project_id.as_deref(),
         limit: args.limit,
-    })?;
+    };
+    let hits = run_search_backend(
+        &config,
+        &resolved_store.name,
+        &store_config.root,
+        search_input,
+    )?;
 
     if args.json {
         let output = hits
@@ -2342,6 +2348,55 @@ fn run_search(args: SearchArgs, context: CliContext) -> Result<()> {
         println!("snippet: {}", hit.snippet);
     }
     Ok(())
+}
+
+/// Run `hm search` through the configured backend. The Tantivy backend raises
+/// recall on paraphrased queries; on any retrieval failure it falls back to the
+/// lexical scan with a warning so a degraded index never strips results.
+fn run_search_backend(
+    config: &Config,
+    store_name: &str,
+    store_root: &Path,
+    input: search::SearchInput<'_>,
+) -> Result<Vec<search::SearchHit>> {
+    if config
+        .defaults
+        .search_backend
+        .trim()
+        .eq_ignore_ascii_case("tantivy")
+    {
+        match tantivy_search(config, store_name, store_root, input.clone()) {
+            Ok(hits) => return Ok(hits),
+            Err(err) => {
+                eprintln!(
+                    "warning: full-text search backend unavailable ({err}); using lexical search"
+                );
+            }
+        }
+    }
+    Ok(search::search(input)?)
+}
+
+/// Open (or create) the store's persistent Tantivy index, refresh it from the
+/// current entries when their fingerprint changed, and run a policy-filtered
+/// BM25 search. The index lives under the disposable cache dir, keyed by store.
+fn tantivy_search(
+    config: &Config,
+    store_name: &str,
+    store_root: &Path,
+    input: search::SearchInput<'_>,
+) -> std::result::Result<Vec<search::SearchHit>, search::SearchError> {
+    let dir = config.cache_dir.join("search").join(store_name);
+    let index = retrieval::SearchIndex::open_or_create_in_dir(&dir)
+        .map_err(|err| search::SearchError::Retrieval(err.to_string()))?;
+    let fingerprint = search::entries_fingerprint(input.entries);
+    if !index.is_fresh(&fingerprint) {
+        let documents = search::search_documents(store_root, input.entries)?;
+        index
+            .rebuild_tagged(&documents, Some(&fingerprint))
+            .map_err(|err| search::SearchError::Retrieval(err.to_string()))?;
+    }
+    search::search_indexed(input, &index)
 }
 
 #[derive(Debug, Serialize)]

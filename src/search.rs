@@ -7,9 +7,11 @@
 
 use crate::curated::CuratedFile;
 use crate::index::IndexEntry;
+use crate::retrieval::{SearchDocument, SearchIndex};
 use crate::{entity, note, project, supersession, validity, visibility};
+use sha2::{Digest, Sha256};
 use std::borrow::Cow;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt::{self, Display};
 use std::fs;
@@ -127,6 +129,9 @@ pub enum SearchError {
     },
     /// Entity registry could not be loaded.
     EntityRegistry(String),
+    /// The full-text retrieval backend failed. Callers should fall back to the
+    /// lexical path so a degraded index never strips search results entirely.
+    Retrieval(String),
 }
 
 impl Display for SearchError {
@@ -154,6 +159,7 @@ impl Display for SearchError {
                 )
             }
             Self::EntityRegistry(message) => write!(f, "{message}"),
+            Self::Retrieval(message) => write!(f, "full-text retrieval failed: {message}"),
         }
     }
 }
@@ -968,6 +974,115 @@ fn confidence_rank(confidence: note::Confidence) -> u8 {
     }
 }
 
+/// Search over a prebuilt Tantivy index instead of the lexical scan.
+///
+/// Candidate generation is BM25 (high recall on paraphrased/multi-session
+/// queries); `hm` policy is then applied as a mandatory post-filter exactly as
+/// in the lexical path — the index is a recall optimization, never a security
+/// boundary. The caller is responsible for building/refreshing `index` from the
+/// same `entries`; `search_documents` and `entries_fingerprint` support that.
+///
+/// On any retrieval-engine failure this returns [`SearchError::Retrieval`] so
+/// the caller can fall back to [`search`] rather than show no results.
+pub fn search_indexed(
+    input: SearchInput<'_>,
+    index: &SearchIndex,
+) -> Result<Vec<SearchHit>, SearchError> {
+    let project_ids = project_filter_ids(input.store_root, input.project_id)?;
+    let by_id: HashMap<&str, &IndexEntry> = input
+        .entries
+        .iter()
+        .map(|entry| (entry.id.as_str(), entry))
+        .collect();
+
+    // Over-fetch so policy post-filtering cannot empty the result below the
+    // requested limit when high-ranked candidates are filtered out.
+    let over_fetch = input.limit.saturating_mul(5).max(20);
+    let ranked = index
+        .query(input.query, over_fetch)
+        .map_err(|err| SearchError::Retrieval(err.to_string()))?;
+
+    let mut hits = Vec::new();
+    for ranked_hit in ranked {
+        let Some(entry) = by_id.get(ranked_hit.id.as_str()) else {
+            continue;
+        };
+        if !source_allowed(entry, input.sources, input.include_inbox)
+            || !scope_allowed(entry, input.scopes)
+            || !project_allowed(entry, project_ids.as_ref())
+            || !visibility::audience_allows(entry, input.agent_id)
+            || !validity::allows_search(entry, false)
+        {
+            continue;
+        }
+        let body = indexed_body(input.store_root, entry)?;
+        // BM25 scores are small floats; scale to the integer score contract while
+        // preserving rank order.
+        let score = (f64::from(ranked_hit.score) * 1000.0) as usize;
+        hits.push(SearchHit {
+            entry: (*entry).clone(),
+            score,
+            trace: SearchScoreTrace::default(),
+            snippet: retrieval_snippet(&body),
+        });
+    }
+    collapse_duplicate_hits(&mut hits);
+    hits.truncate(input.limit);
+    Ok(hits)
+}
+
+/// Map index entries to search documents for indexing. Resolves the canonical
+/// body for older cache entries that did not store it inline.
+pub fn search_documents(
+    store_root: &Path,
+    entries: &[IndexEntry],
+) -> Result<Vec<SearchDocument>, SearchError> {
+    entries
+        .iter()
+        .map(|entry| {
+            let body = indexed_body(store_root, entry)?;
+            Ok(SearchDocument {
+                id: entry.id.clone(),
+                subject: entry.subject.clone(),
+                tags: entry.tags.clone(),
+                body: body.into_owned(),
+            })
+        })
+        .collect()
+}
+
+/// Content fingerprint of an entry set, used to decide whether a cached Tantivy
+/// index is still fresh. Stable across entry ordering: ids are sorted before
+/// hashing, and body plus searchable metadata are included so any content edit
+/// invalidates the cache.
+pub fn entries_fingerprint(entries: &[IndexEntry]) -> String {
+    let mut keyed: Vec<&IndexEntry> = entries.iter().collect();
+    keyed.sort_by(|left, right| left.id.cmp(&right.id));
+    let mut hasher = Sha256::new();
+    for entry in keyed {
+        hasher.update(entry.id.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(entry.subject.as_deref().unwrap_or_default().as_bytes());
+        hasher.update([0u8]);
+        hasher.update(entry.tags.join(",").as_bytes());
+        hasher.update([0u8]);
+        hasher.update(entry.body.as_bytes());
+        hasher.update([0u8]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// First non-empty trimmed line of a body, bounded for display.
+fn retrieval_snippet(body: &str) -> String {
+    body.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .chars()
+        .take(160)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1164,6 +1279,175 @@ mod tests {
 
     fn hit_bodies(hits: &[SearchHit]) -> Vec<String> {
         hits.iter().map(|hit| hit.entry.body.clone()).collect()
+    }
+
+    fn build_index(root: &Path, entries: &[IndexEntry]) -> SearchIndex {
+        let index = SearchIndex::in_memory().expect("create index");
+        let documents = search_documents(root, entries).expect("documents");
+        index.rebuild(&documents).expect("rebuild");
+        index
+    }
+
+    fn indexed_input<'a>(
+        root: &'a Path,
+        entries: &'a [IndexEntry],
+        query: &'a str,
+        scopes: &'a [String],
+        agent_id: Option<&'a str>,
+        project_id: Option<&'a str>,
+    ) -> SearchInput<'a> {
+        SearchInput {
+            store_root: root,
+            entries,
+            query,
+            scopes,
+            sources: &[],
+            include_inbox: false,
+            agent_id,
+            project_id,
+            limit: 20,
+        }
+    }
+
+    #[test]
+    fn indexed_search_returns_body_matches() {
+        let dir = temp_dir("indexed-body-match");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "Chris prefers dark roast coffee for mornings.",
+            timestamp(1_778_946_153),
+            Vec::new(),
+        );
+        let entries = entries(&root, &cache);
+        let index = build_index(&root, &entries);
+
+        let hits = search_indexed(
+            indexed_input(&root, &entries, "coffee preference", &[], None, None),
+            &index,
+        )
+        .expect("indexed search");
+
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].snippet.contains("coffee"));
+    }
+
+    #[test]
+    fn indexed_search_enforces_project_scope() {
+        let dir = temp_dir("indexed-project");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_project_record(&root, "Project alpha deploys on tag push.", "proj-alpha");
+        let entries = entries(&root, &cache);
+        let index = build_index(&root, &entries);
+
+        // A project-scoped record must not surface without the matching project,
+        // even though BM25 ranked it as a candidate.
+        let leaked = search_indexed(
+            indexed_input(&root, &entries, "deploy tag push", &[], None, None),
+            &index,
+        )
+        .expect("search");
+        assert!(leaked.is_empty(), "project record leaked without a project");
+
+        let matched = search_indexed(
+            indexed_input(
+                &root,
+                &entries,
+                "deploy tag push",
+                &[],
+                None,
+                Some("proj-alpha"),
+            ),
+            &index,
+        )
+        .expect("search");
+        assert_eq!(matched.len(), 1);
+    }
+
+    #[test]
+    fn indexed_search_enforces_audience() {
+        let dir = temp_dir("indexed-audience");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "agent-private",
+            "Agent-private note about the deploy key rotation.",
+            timestamp(1_778_946_153),
+            vec!["codex".to_owned()],
+        );
+        let entries = entries(&root, &cache);
+        let index = build_index(&root, &entries);
+
+        let wrong = search_indexed(
+            indexed_input(&root, &entries, "deploy key", &[], Some("other"), None),
+            &index,
+        )
+        .expect("search");
+        assert!(
+            wrong.is_empty(),
+            "agent-private record leaked to wrong agent"
+        );
+
+        let right = search_indexed(
+            indexed_input(&root, &entries, "deploy key", &[], Some("codex"), None),
+            &index,
+        )
+        .expect("search");
+        assert_eq!(right.len(), 1);
+    }
+
+    #[test]
+    fn entries_fingerprint_is_order_independent_and_content_sensitive() {
+        let dir = temp_dir("fingerprint");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "first record",
+            timestamp(1_778_946_153),
+            Vec::new(),
+        );
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "second record",
+            timestamp(1_778_946_154),
+            Vec::new(),
+        );
+        let baseline_entries = entries(&root, &cache);
+        let baseline = entries_fingerprint(&baseline_entries);
+
+        let mut reordered = baseline_entries.clone();
+        reordered.reverse();
+        assert_eq!(
+            baseline,
+            entries_fingerprint(&reordered),
+            "fingerprint must not depend on entry order"
+        );
+
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "third record changes the corpus",
+            timestamp(1_778_946_155),
+            Vec::new(),
+        );
+        let grown = entries(&root, &cache);
+        assert_ne!(
+            baseline,
+            entries_fingerprint(&grown),
+            "a content change must change the fingerprint"
+        );
     }
 
     #[test]

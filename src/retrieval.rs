@@ -83,6 +83,11 @@ pub struct SearchManifest {
     pub search_schema_version: u32,
     /// Number of documents in the last successful rebuild.
     pub document_count: usize,
+    /// Opaque content fingerprint of the corpus the index was built from. The
+    /// caller supplies it (typically derived from the source records); when it is
+    /// unchanged the index is fresh and a rebuild can be skipped.
+    #[serde(default)]
+    pub fingerprint: Option<String>,
 }
 
 /// A retrieval failure. Tantivy errors are flattened to a message because the
@@ -208,8 +213,14 @@ impl SearchIndex {
     /// set, and commits. Incremental, receipt-driven updates are a later phase;
     /// the full-rebuild contract is the simple, correct starting point. On a
     /// directory-backed index a manifest is written after the commit succeeds.
-    /// Returns the number of documents indexed.
-    pub fn rebuild(&self, documents: &[SearchDocument]) -> Result<usize, RetrievalError> {
+    /// Returns the number of documents indexed. `fingerprint` is recorded in the
+    /// manifest so a later open can skip the rebuild when the corpus is unchanged
+    /// (see [`SearchIndex::is_fresh`]).
+    pub fn rebuild_tagged(
+        &self,
+        documents: &[SearchDocument],
+        fingerprint: Option<&str>,
+    ) -> Result<usize, RetrievalError> {
         let mut writer: IndexWriter = self
             .index
             .writer(WRITER_HEAP_BYTES)
@@ -244,10 +255,27 @@ impl SearchIndex {
                     schema_version: 1,
                     search_schema_version: SEARCH_SCHEMA_VERSION,
                     document_count: documents.len(),
+                    fingerprint: fingerprint.map(str::to_owned),
                 },
             )?;
         }
         Ok(documents.len())
+    }
+
+    /// Full rebuild without a content fingerprint. Convenience for callers that
+    /// manage freshness themselves or use an ephemeral in-memory index.
+    pub fn rebuild(&self, documents: &[SearchDocument]) -> Result<usize, RetrievalError> {
+        self.rebuild_tagged(documents, None)
+    }
+
+    /// True when a directory-backed index's manifest fingerprint matches
+    /// `fingerprint`, meaning the cache already reflects the current corpus and a
+    /// rebuild can be skipped. Always false for an in-memory index or an index
+    /// built without a fingerprint.
+    pub fn is_fresh(&self, fingerprint: &str) -> bool {
+        self.manifest()
+            .and_then(|manifest| manifest.fingerprint)
+            .is_some_and(|stored| stored == fingerprint)
     }
 
     /// Retrieve up to `limit` records ranked by BM25 relevance to `query`.
@@ -493,6 +521,32 @@ mod tests {
         let hits = index.query("coffee", 5).expect("query");
         let ids: Vec<&str> = hits.iter().map(|hit| hit.id.as_str()).collect();
         assert_eq!(ids, vec!["new"], "old contents must not survive a rebuild");
+    }
+
+    #[test]
+    fn is_fresh_tracks_the_corpus_fingerprint() {
+        let dir = std::env::temp_dir().join(format!(
+            "hm-retrieval-fresh-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let index = SearchIndex::open_or_create_in_dir(&dir).expect("create");
+        index
+            .rebuild_tagged(&[doc("a", "x")], Some("fp1"))
+            .expect("rebuild");
+        assert!(index.is_fresh("fp1"));
+        assert!(!index.is_fresh("fp2"), "a changed fingerprint is not fresh");
+
+        // The fingerprint persists, so a reopen can skip rebuilding.
+        let reopened = SearchIndex::open_or_create_in_dir(&dir).expect("reopen");
+        assert!(reopened.is_fresh("fp1"));
+
+        // An in-memory or untagged index is never considered fresh.
+        assert!(!SearchIndex::in_memory().expect("ram").is_fresh("fp1"));
+
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]
