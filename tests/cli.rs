@@ -6448,9 +6448,13 @@ fn projects_bind_validates_active_agent_read_and_write_affinity() {
 /// regardless of the prompt, for capture/classify CLI tests.
 fn write_fake_backend(path: &std::path::Path, output: &str) {
     use std::os::unix::fs::PermissionsExt;
+    // Escape single quotes for the single-quoted shell literal below, so an
+    // `output` containing an apostrophe (e.g. "user's preference") does not
+    // produce a broken script.
+    let escaped = output.replace('\'', r"'\''");
     fs::write(
         path,
-        format!("#!/usr/bin/env bash\ncat >/dev/null\nprintf '%s' '{output}'\n"),
+        format!("#!/usr/bin/env bash\ncat >/dev/null\nprintf '%s' '{escaped}'\n"),
     )
     .expect("write fake backend");
     let mut perms = fs::metadata(path).expect("meta").permissions();
@@ -6571,4 +6575,43 @@ fn capture_dry_run_writes_nothing() {
         .assert()
         .success()
         .stdout(predicate::str::contains("hits: 0"));
+}
+
+#[test]
+fn capture_handles_apostrophe_in_extracted_fact() {
+    let dir = temp_dir("capture-apostrophe");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let backend = dir.join("fake-backend");
+    // The extracted fact contains an apostrophe; the fake-backend writer must
+    // escape it so the generated shell script stays valid.
+    write_fake_backend(&backend, r#"["the user's preferred editor is neovim"]"#);
+    write_capture_config(&config, &dir, &personal, &backend);
+    init_store(&personal, "personal");
+
+    let mut capture = cargo_bin_cmd!("hm");
+    capture
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "capture",
+            "--text",
+            "user: I use neovim.",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("staged 1 captured fact(s)"));
+
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "neovim editor",
+            "--include-inbox",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("the user's preferred editor is neovim"));
 }
