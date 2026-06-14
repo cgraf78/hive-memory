@@ -6617,3 +6617,138 @@ fn capture_handles_apostrophe_in_extracted_fact() {
             "the user's preferred editor is neovim",
         ));
 }
+
+#[test]
+fn reconcile_add_writes_durable_memory() {
+    let dir = temp_dir("reconcile-add");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let backend = dir.join("fake-backend");
+    write_fake_backend(&backend, r#"{"op":"ADD"}"#);
+    write_capture_config(&config, &dir, &personal, &backend);
+    init_store(&personal, "personal");
+
+    let mut reconcile = cargo_bin_cmd!("hm");
+    reconcile
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "reconcile",
+            "--text",
+            "the user prefers ripgrep for searching",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("add: wrote"));
+
+    // ADD writes durable (remembered) memory, so a default search (no inbox) finds it.
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "ripgrep searching",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("the user prefers ripgrep for searching"));
+}
+
+#[test]
+fn reconcile_dry_run_writes_nothing() {
+    let dir = temp_dir("reconcile-dry");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let backend = dir.join("fake-backend");
+    write_fake_backend(&backend, r#"{"op":"ADD"}"#);
+    write_capture_config(&config, &dir, &personal, &backend);
+    init_store(&personal, "personal");
+
+    let mut reconcile = cargo_bin_cmd!("hm");
+    reconcile
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "reconcile",
+            "--text",
+            "a candidate that should not be written",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("add (dry run)"));
+
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "candidate written",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hits: 0"));
+}
+
+#[test]
+fn reconcile_update_supersedes_existing_record() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir("reconcile-update");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let backend = dir.join("fake-backend");
+    // A backend that targets the first existing memory id parsed from the prompt,
+    // so UPDATE points at the real (dynamically generated) record id.
+    fs::write(
+        &backend,
+        "#!/usr/bin/env bash\nprompt=\"$(cat)\"\nid=\"$(printf '%s' \"$prompt\" | grep -oE 'id=[^:]+' | head -1 | cut -d= -f2)\"\nprintf '{\"op\":\"UPDATE\",\"id\":\"%s\"}' \"$id\"\n",
+    )
+    .expect("write backend");
+    let mut perms = fs::metadata(&backend).expect("meta").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&backend, perms).expect("chmod");
+    write_capture_config(&config, &dir, &personal, &backend);
+    init_store(&personal, "personal");
+
+    // Seed an existing durable memory to be superseded.
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "the user prefers vim as their editor",
+        ])
+        .assert()
+        .success();
+
+    let mut reconcile = cargo_bin_cmd!("hm");
+    reconcile
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "reconcile",
+            "--text",
+            "the user now prefers neovim as their editor",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("update: wrote"));
+
+    // The superseding record is recalled; the superseded one is suppressed.
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "user prefers editor",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("neovim"))
+        .stdout(predicate::str::contains("hits: 1"));
+}

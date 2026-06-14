@@ -26,6 +26,7 @@ pub mod note;
 pub mod outbox;
 pub mod path;
 pub mod project;
+pub mod reconcile;
 pub mod search;
 pub mod secret;
 pub mod signals;
