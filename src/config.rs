@@ -206,10 +206,12 @@ pub struct DefaultsConfig {
     pub hook_context_max_tokens: u32,
     /// Max age string for hook context cache fallback.
     pub context_cache_max_age: String,
-    /// Session-start selection strategy: `recency` (legacy include-all) or
-    /// `relevance` (apply the inject classifier). Stored as a string so an
-    /// unrecognized value degrades to legacy behavior instead of failing the
-    /// hook path; resolved via `inject::Strategy::from_config`.
+    /// Session-start selection strategy: `adaptive` (default; recall-safe —
+    /// withholds only explicitly non-startup kinds, never untagged content),
+    /// `recency` (include everything in scope), or `relevance` (full inject
+    /// classifier, may withhold untagged ambiguous globals). Stored as a string
+    /// so an unrecognized value degrades to the safe default instead of failing
+    /// the hook path; resolved via `inject::Strategy::from_config`.
     pub context_strategy: String,
 }
 
