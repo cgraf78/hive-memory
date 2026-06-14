@@ -38,7 +38,7 @@ const BACKEND_ENV: &str = "HIVE_MEMORY_QA_BACKEND";
 const MAX_CASES_ENV: &str = "HIVE_MEMORY_QA_MAX_CASES";
 const DEFAULT_MAX_CASES: usize = 15;
 const RETRIEVAL_LIMIT: usize = 5;
-const CONTEXT_CHAR_BUDGET: usize = 8000;
+const CONTEXT_CHAR_BUDGET: usize = 24000;
 
 #[derive(Debug, Deserialize)]
 struct LongMemEvalCase {
@@ -175,17 +175,27 @@ fn qa_accuracy_correlates_with_retrieval() {
                     continue;
                 }
             };
-        let judged = match llm::invoke_raw(
+        let judge_raw = match llm::invoke_raw(
             &backend,
             &judge_prompt(&answer_text(&case.answer), &answer),
             timeout,
         ) {
-            Ok(text) => judged_correct(&text),
+            Ok(text) => text,
             Err(err) => {
                 eprintln!("judge backend failed: {err}; skipping case");
                 continue;
             }
         };
+        let judged = judged_correct(&judge_raw);
+        if std::env::var("HIVE_MEMORY_QA_DEBUG").is_ok() {
+            eprintln!(
+                "DEBUG ctx_len={} recall_hit={recall_hit}\n  gold={:?}\n  answer={:?}\n  judge={:?}",
+                context.len(),
+                answer_text(&case.answer),
+                answer.trim(),
+                judge_raw.trim(),
+            );
+        }
 
         tally.cases += 1;
         tally.correct += usize::from(judged);
@@ -328,12 +338,17 @@ fn build_context(case: &LongMemEvalCase, retrieved: &[String]) -> String {
 
     let mut context = String::new();
     for session_id in retrieved {
+        if context.len() >= CONTEXT_CHAR_BUDGET {
+            break;
+        }
         if let Some(turns) = by_id.get(session_id.as_str()) {
             let block = render_session(turns);
-            if context.len() + block.len() > CONTEXT_CHAR_BUDGET {
-                break;
-            }
-            context.push_str(&block);
+            // Truncate the block to the remaining budget rather than dropping it
+            // wholesale; otherwise a single long session larger than the budget
+            // would leave the context empty and force a spurious UNKNOWN.
+            let remaining = CONTEXT_CHAR_BUDGET - context.len();
+            let slice: String = block.chars().take(remaining).collect();
+            context.push_str(&slice);
             context.push_str("\n\n");
         }
     }
