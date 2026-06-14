@@ -8,9 +8,9 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use hive_memory::config::{Config, ConfigPaths, EventSidecarPolicy, Sensitivity, StoreConfig};
 use hive_memory::{
-    classify, config, context as memory_context, curation, doctor, eval as memory_eval, event,
-    hook as memory_hook, id, index, inject, memory, note, outbox, path as memory_path, project,
-    search, secret, store, write, write_classify,
+    capture, classify, config, context as memory_context, curation, doctor, eval as memory_eval,
+    event, hook as memory_hook, id, index, inject, llm, memory, note, outbox, path as memory_path,
+    project, reconcile, retrieval, search, secret, store, write, write_classify,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -72,6 +72,12 @@ enum Command {
     Retag(RetagArgs),
     /// Run the background LLM classification pass now.
     Classify(ClassifyArgs),
+    /// Extract durable facts from a conversation and stage them as raw inbox
+    /// notes for later review/promotion. Never writes canonical memory.
+    Capture(CaptureArgs),
+    /// Reconcile a candidate fact against existing memory (mem0-style
+    /// ADD/UPDATE/DELETE/NOOP) and apply it via remember + supersedes.
+    Reconcile(ReconcileArgs),
     /// Refresh local outbox and indexes.
     Refresh(RefreshArgs),
     /// Flush local outbox writes to reachable stores.
@@ -627,6 +633,43 @@ struct ClassifyArgs {
     json: bool,
 }
 
+/// Arguments for `hm capture`.
+#[derive(Debug, Args)]
+struct CaptureArgs {
+    /// Conversation text to extract facts from. Reads stdin when omitted.
+    #[arg(long)]
+    text: Option<String>,
+    /// Show the extracted candidate facts without writing anything.
+    #[arg(long)]
+    dry_run: bool,
+    /// Optional provenance reference recorded on each staged note.
+    #[arg(long)]
+    source_ref: Option<String>,
+    /// Emit machine-readable output.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Arguments for `hm reconcile`.
+#[derive(Debug, Args)]
+struct ReconcileArgs {
+    /// Candidate fact to reconcile. Reads stdin when omitted.
+    #[arg(long)]
+    text: Option<String>,
+    /// Decide and print the operation without writing anything.
+    #[arg(long)]
+    dry_run: bool,
+    /// Number of most-similar existing memories to weigh (default 5).
+    #[arg(long, default_value_t = 5)]
+    limit: usize,
+    /// Optional provenance reference recorded on a written record.
+    #[arg(long)]
+    source_ref: Option<String>,
+    /// Emit machine-readable output.
+    #[arg(long)]
+    json: bool,
+}
+
 /// Arguments for `hm refresh`.
 #[derive(Debug, Args)]
 struct RefreshArgs {
@@ -741,6 +784,8 @@ fn run(cli: Cli) -> Result<()> {
         Some(Command::SyncStatus(args)) => run_sync_status(args, context),
         Some(Command::Retag(args)) => run_retag(args, context),
         Some(Command::Classify(args)) => run_classify(args, context),
+        Some(Command::Capture(args)) => run_capture(args, context),
+        Some(Command::Reconcile(args)) => run_reconcile(args, context),
         Some(Command::Refresh(args)) => run_refresh(args, context),
         Some(Command::Flush(args)) => run_flush(args, context),
         Some(Command::Outbox(OutboxCommand::Flush(args))) => run_flush(args, context),
@@ -2309,7 +2354,7 @@ fn run_search(args: SearchArgs, context: CliContext) -> Result<()> {
             .iter()
             .any(|source| source == "inbox" || source == "all");
 
-    let hits = search::search(search::SearchInput {
+    let search_input = search::SearchInput {
         store_root: &store_config.root,
         entries: &report.entries,
         query: &args.query,
@@ -2319,7 +2364,13 @@ fn run_search(args: SearchArgs, context: CliContext) -> Result<()> {
         agent_id: agent_id.as_deref(),
         project_id: project_id.as_deref(),
         limit: args.limit,
-    })?;
+    };
+    let hits = run_search_backend(
+        &config,
+        &resolved_store.name,
+        &store_config.root,
+        search_input,
+    )?;
 
     if args.json {
         let output = hits
@@ -2342,6 +2393,123 @@ fn run_search(args: SearchArgs, context: CliContext) -> Result<()> {
         println!("snippet: {}", hit.snippet);
     }
     Ok(())
+}
+
+/// Run `hm search` through the configured backend. The Tantivy backend raises
+/// recall on paraphrased queries; on any retrieval failure it falls back to the
+/// lexical scan with a warning so a degraded index never strips results.
+fn run_search_backend(
+    config: &Config,
+    store_name: &str,
+    store_root: &Path,
+    input: search::SearchInput<'_>,
+) -> Result<Vec<search::SearchHit>> {
+    if config
+        .defaults
+        .search_backend
+        .trim()
+        .eq_ignore_ascii_case("tantivy")
+    {
+        match tantivy_search(config, store_name, store_root, input.clone()) {
+            Ok(hits) => return Ok(hits),
+            Err(err) => {
+                eprintln!(
+                    "warning: full-text search backend unavailable ({err}); using lexical search"
+                );
+            }
+        }
+    }
+    Ok(search::search(input)?)
+}
+
+/// Open (or create) the store's persistent Tantivy index, refresh it from the
+/// current entries when their fingerprint changed, and run a policy-filtered
+/// BM25 search. The index lives under the disposable cache dir, keyed by store.
+fn tantivy_search(
+    config: &Config,
+    store_name: &str,
+    store_root: &Path,
+    input: search::SearchInput<'_>,
+) -> std::result::Result<Vec<search::SearchHit>, search::SearchError> {
+    let dir = config.cache_dir.join("search").join(store_name);
+    let index = retrieval::SearchIndex::open_or_create_in_dir(&dir)
+        .map_err(|err| search::SearchError::Retrieval(err.to_string()))?;
+    let fingerprint = search::entries_fingerprint(input.entries);
+    if !index.is_fresh(&fingerprint) {
+        let documents = search::search_documents(store_root, input.entries)?;
+        index
+            .rebuild_tagged(&documents, Some(&fingerprint))
+            .map_err(|err| search::SearchError::Retrieval(err.to_string()))?;
+    }
+    search::search_indexed(input, &index)
+}
+
+/// Hook-safe BM25 search: query the persistent index ONLY when it is already
+/// fresh for `input.entries`. Never rebuilds — the prompt-submit hook must not
+/// pay for a full index rebuild on its latency budget. Returns `None` (so the
+/// caller falls back to lexical) when the backend is off, the index is
+/// stale/absent, or the engine errors. The index is kept fresh out of band by
+/// `hm refresh` (tool-complete) and interactive `hm search`.
+fn tantivy_search_if_fresh(
+    config: &Config,
+    store_name: &str,
+    input: search::SearchInput<'_>,
+) -> Option<Vec<search::SearchHit>> {
+    if !config
+        .defaults
+        .search_backend
+        .trim()
+        .eq_ignore_ascii_case("tantivy")
+    {
+        return None;
+    }
+    let dir = config.cache_dir.join("search").join(store_name);
+    // Read-only open: never create or rebuild on the hook's hot path. A missing
+    // or stale index yields None so the caller uses lexical; refresh rebuilds it.
+    let index = retrieval::SearchIndex::open_existing_in_dir(&dir)
+        .ok()
+        .flatten()?;
+    if !index.is_fresh(&search::entries_fingerprint(input.entries)) {
+        return None;
+    }
+    search::search_indexed(input, &index).ok()
+}
+
+/// Rebuild the store's persistent Tantivy index from `entries` when the backend
+/// is enabled and the index is stale. Called off the hot path (refresh /
+/// tool-complete) so the prompt hook can query a fresh index cheaply.
+fn refresh_tantivy_index(
+    config: &Config,
+    store_name: &str,
+    store_root: &Path,
+    entries: &[index::IndexEntry],
+) {
+    if !config
+        .defaults
+        .search_backend
+        .trim()
+        .eq_ignore_ascii_case("tantivy")
+    {
+        return;
+    }
+    let dir = config.cache_dir.join("search").join(store_name);
+    let result = retrieval::SearchIndex::open_or_create_in_dir(&dir).and_then(|index| {
+        let fingerprint = search::entries_fingerprint(entries);
+        if index.is_fresh(&fingerprint) {
+            return Ok(());
+        }
+        let documents = search::search_documents(store_root, entries)
+            .map_err(|err| retrieval::RetrievalError::Engine(err.to_string()))?;
+        index
+            .rebuild_tagged(&documents, Some(&fingerprint))
+            .map(|_| ())
+    });
+    if let Err(err) = result {
+        // Best-effort: a failed cache refresh must never break the write/refresh
+        // flow. The next interactive search rebuilds, and recall falls back to
+        // lexical meanwhile.
+        eprintln!("warning: full-text index refresh skipped: {err}");
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -3313,6 +3481,255 @@ fn run_retag(args: RetagArgs, context: CliContext) -> Result<()> {
     Ok(())
 }
 
+fn run_capture(args: CaptureArgs, context: CliContext) -> Result<()> {
+    let config = load_config(context.config_path.as_deref())?;
+    let agent_id = resolve_agent_id(context.as_agent.clone());
+    let writer_agent_id = agent_id.clone().unwrap_or_else(|| "human".to_owned());
+
+    // Resolve a model backend the same way the classifier does, so capture honors
+    // the same [classifier] config and PATH preference order.
+    let backend = llm::detect(
+        config.classifier.backend.as_deref(),
+        &config.classifier.command,
+        config.classifier.model.as_deref(),
+        None,
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "no usable model backend; configure [classifier] or install codex/claude/gemini"
+        )
+    })?;
+
+    let conversation = match args.text {
+        Some(text) => text,
+        None => {
+            let mut buffer = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer)?;
+            buffer
+        }
+    };
+    if conversation.trim().is_empty() {
+        anyhow::bail!("no conversation text provided");
+    }
+
+    let timeout = std::time::Duration::from_secs(config.classifier.timeout_seconds);
+    let facts = capture::extract(&backend, &conversation, timeout)
+        .map_err(|err| anyhow::anyhow!("capture extraction failed: {err}"))?;
+
+    if args.dry_run {
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&facts)?);
+        } else {
+            println!(
+                "captured {} candidate fact(s) (dry run, nothing written):",
+                facts.len()
+            );
+            for fact in &facts {
+                println!("- {fact}");
+            }
+        }
+        return Ok(());
+    }
+
+    // Stage each fact as a raw inbox note. Inbox notes are excluded from context
+    // by default, so capture can never silently change agent behavior; promoting
+    // a staged note into durable memory is a separate, reviewed step.
+    let resolved_store = resolve_store(
+        &config,
+        context.store.as_deref(),
+        None,
+        agent_id.as_deref(),
+        StoreAccess::Write,
+    )?;
+    let store_config = &config.stores[resolved_store.name.as_str()];
+    let manifest = read_store_manifest(&config, &resolved_store.name, store_config)?;
+    let host_id = resolve_host_id(&config);
+    let session_id = std::env::var("HIVE_MEMORY_SESSION_ID").ok();
+    let options = write::AtomicWriteOptions {
+        fsync: config.storage.fsync.into(),
+        ..write::AtomicWriteOptions::default()
+    };
+
+    let mut written = Vec::new();
+    for fact in &facts {
+        let result = memory::write_record(memory::WriteRecordInput {
+            root: &store_config.root,
+            manifest: &manifest,
+            entry_kind: note::EntryKind::Note,
+            created_at: OffsetDateTime::now_utc(),
+            agent_id: writer_agent_id.clone(),
+            host_id: host_id.clone(),
+            user_id: config.user_id.clone(),
+            session_id: session_id.clone(),
+            scope: config.defaults.write_scope.clone(),
+            confidence: note::Confidence::Low,
+            body: fact.clone(),
+            project_id: None,
+            subject: None,
+            kind: None,
+            valid_from: None,
+            valid_to: None,
+            supersedes: Vec::new(),
+            tags: vec!["capture".to_owned()],
+            audience: Vec::new(),
+            source_kind: Some("capture".to_owned()),
+            source_ref: args.source_ref.clone(),
+            write_event: true,
+            options: options.clone(),
+        })?;
+        written.push(result.id);
+    }
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&written)?);
+    } else {
+        println!(
+            "staged {} captured fact(s) as inbox notes in store {}",
+            written.len(),
+            resolved_store.name
+        );
+    }
+    Ok(())
+}
+
+fn run_reconcile(args: ReconcileArgs, context: CliContext) -> Result<()> {
+    let config = load_config(context.config_path.as_deref())?;
+    let agent_id = resolve_agent_id(context.as_agent.clone());
+    let writer_agent_id = agent_id.clone().unwrap_or_else(|| "human".to_owned());
+
+    let backend = llm::detect(
+        config.classifier.backend.as_deref(),
+        &config.classifier.command,
+        config.classifier.model.as_deref(),
+        None,
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "no usable model backend; configure [classifier] or install codex/claude/gemini"
+        )
+    })?;
+
+    let candidate = match args.text {
+        Some(text) => text,
+        None => {
+            let mut buffer = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer)?;
+            buffer
+        }
+    };
+    let candidate = candidate.trim().to_owned();
+    if candidate.is_empty() {
+        anyhow::bail!("no candidate fact provided");
+    }
+    // Never let a credential reach durable memory through reconciliation.
+    if !secret::detect(&candidate).is_empty() {
+        anyhow::bail!("refusing to reconcile a candidate that looks like a secret");
+    }
+
+    let resolved_store = resolve_store(
+        &config,
+        context.store.as_deref(),
+        None,
+        agent_id.as_deref(),
+        StoreAccess::Write,
+    )?;
+    let store_config = &config.stores[resolved_store.name.as_str()];
+    let manifest = read_store_manifest(&config, &resolved_store.name, store_config)?;
+    let report = rebuild_store_index(&config, &resolved_store.name)?;
+
+    // Find the most similar existing durable (remembered) memories so the model
+    // reconciles against real neighbors, not the whole store.
+    let hits = search::search(search::SearchInput {
+        store_root: &store_config.root,
+        entries: &report.entries,
+        query: &candidate,
+        scopes: &config.defaults.search_scopes,
+        sources: &["remembered".to_owned()],
+        include_inbox: false,
+        agent_id: agent_id.as_deref(),
+        project_id: None,
+        limit: args.limit,
+    })?;
+    let existing: Vec<reconcile::ExistingMemory> = hits
+        .iter()
+        .map(|hit| reconcile::ExistingMemory {
+            id: hit.entry.id.clone(),
+            text: hit.entry.body.clone(),
+        })
+        .collect();
+
+    let timeout = std::time::Duration::from_secs(config.classifier.timeout_seconds);
+    let operation = reconcile::reconcile(&backend, &candidate, &existing, timeout)
+        .map_err(|err| anyhow::anyhow!("reconcile decision failed: {err}"))?;
+
+    // Map the decision onto the existing write path. Every mutating op writes the
+    // candidate as durable memory; UPDATE/DELETE additionally supersede the
+    // target so the older record is retained for audit but no longer recalled.
+    let (action, supersedes): (&str, Vec<String>) = match &operation {
+        reconcile::Operation::Add => ("add", Vec::new()),
+        reconcile::Operation::Update { target } => ("update", vec![target.clone()]),
+        reconcile::Operation::Delete { target } => ("delete", vec![target.clone()]),
+        reconcile::Operation::Noop => ("noop", Vec::new()),
+    };
+
+    if args.dry_run || matches!(operation, reconcile::Operation::Noop) {
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({ "operation": action, "supersedes": supersedes, "applied": false })
+            );
+        } else if matches!(operation, reconcile::Operation::Noop) {
+            println!("noop: candidate already represented; nothing written");
+        } else {
+            println!("{action} (dry run): would write candidate, supersedes={supersedes:?}");
+        }
+        return Ok(());
+    }
+
+    let options = write::AtomicWriteOptions {
+        fsync: config.storage.fsync.into(),
+        ..write::AtomicWriteOptions::default()
+    };
+    let result = memory::write_record(memory::WriteRecordInput {
+        root: &store_config.root,
+        manifest: &manifest,
+        entry_kind: note::EntryKind::Remember,
+        created_at: OffsetDateTime::now_utc(),
+        agent_id: writer_agent_id,
+        host_id: resolve_host_id(&config),
+        user_id: config.user_id.clone(),
+        session_id: std::env::var("HIVE_MEMORY_SESSION_ID").ok(),
+        scope: config.defaults.write_scope.clone(),
+        confidence: note::Confidence::Medium,
+        body: candidate,
+        project_id: None,
+        subject: None,
+        kind: None,
+        valid_from: None,
+        valid_to: None,
+        supersedes,
+        tags: vec!["reconciled".to_owned()],
+        audience: Vec::new(),
+        source_kind: Some("reconcile".to_owned()),
+        source_ref: args.source_ref.clone(),
+        write_event: true,
+        options,
+    })?;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({ "operation": action, "id": result.id, "applied": true })
+        );
+    } else {
+        println!(
+            "{action}: wrote {} in store {}",
+            result.id, resolved_store.name
+        );
+    }
+    Ok(())
+}
+
 fn run_classify(args: ClassifyArgs, context: CliContext) -> Result<()> {
     let config = load_config(context.config_path.as_deref())?;
     let agent_id = resolve_agent_id(context.as_agent.clone());
@@ -3796,8 +4213,15 @@ fn perform_refresh(config: &Config, forced: bool) -> Result<HookRefreshReport> {
     }
 
     let mut indexes = 0usize;
-    for store_name in config.stores.keys() {
-        rebuild_store_index(config, store_name)?;
+    for (store_name, store_config) in &config.stores {
+        let report = rebuild_store_index(config, store_name)?;
+        // Keep the full-text index fresh off the hot path so the prompt-submit
+        // hook can query BM25 cheaply (it never rebuilds). No-op unless the
+        // tantivy backend is enabled.
+        // TODO(perf): this re-reads canonical notes that rebuild_store_index just
+        // read to extract search documents; a later phase should share one
+        // document-extraction pass between the JSONL and Tantivy indexes.
+        refresh_tantivy_index(config, store_name, &store_config.root, &report.entries);
         indexes += 1;
     }
 
@@ -4414,7 +4838,7 @@ fn hook_prompt_recall_action(
             return Ok((None, recall));
         }
     };
-    let hits = match search::search(search::SearchInput {
+    let search_input = search::SearchInput {
         store_root: &store_config.root,
         entries: &report.entries,
         query: &query,
@@ -4424,17 +4848,25 @@ fn hook_prompt_recall_action(
         agent_id: agent_id.as_deref(),
         project_id: project_id.as_deref(),
         limit: 10,
-    }) {
-        Ok(hits) => hits,
-        Err(search::SearchError::EmptyQuery) => {
-            return Ok((None, HookRecallReport::skipped("budget-empty")));
-        }
-        Err(err) => {
-            let mut recall = HookRecallReport::skipped("index-unavailable");
-            recall.retrieval_ms = started.elapsed().as_millis();
-            eprintln!("warning: prompt recall skipped: {err}");
-            return Ok((None, recall));
-        }
+    };
+    // Prefer BM25 recall when the persistent index is already fresh; this is
+    // where the prompt hook gains paraphrase/multi-session recall. Fall back to
+    // the lexical scan when the index is stale/absent so the hook never pays for
+    // a rebuild on its latency budget (refresh/tool-complete keeps it fresh).
+    let hits = match tantivy_search_if_fresh(config, &store_name, search_input.clone()) {
+        Some(hits) => hits,
+        None => match search::search(search_input) {
+            Ok(hits) => hits,
+            Err(search::SearchError::EmptyQuery) => {
+                return Ok((None, HookRecallReport::skipped("budget-empty")));
+            }
+            Err(err) => {
+                let mut recall = HookRecallReport::skipped("index-unavailable");
+                recall.retrieval_ms = started.elapsed().as_millis();
+                eprintln!("warning: prompt recall skipped: {err}");
+                return Ok((None, recall));
+            }
+        },
     };
 
     let state = memory_hook::load_state(&config.state_dir, session_id)?;

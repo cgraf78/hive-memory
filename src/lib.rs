@@ -6,6 +6,7 @@
 
 #![deny(missing_docs)]
 
+pub mod capture;
 pub mod classify;
 pub mod config;
 pub mod context;
@@ -25,6 +26,8 @@ pub mod note;
 pub mod outbox;
 pub mod path;
 pub mod project;
+pub mod reconcile;
+pub mod retrieval;
 pub mod search;
 pub mod secret;
 pub mod signals;

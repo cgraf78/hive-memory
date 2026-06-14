@@ -2733,6 +2733,67 @@ fn search_finds_remembered_note() {
 }
 
 #[test]
+fn search_tantivy_backend_returns_results_end_to_end() {
+    let dir = temp_dir("search-tantivy");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    // Config opts into the Tantivy backend via [defaults].search_backend.
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+            state_dir = "{}"
+            cache_dir = "{}"
+
+            [defaults]
+            search_backend = "tantivy"
+
+            [stores.personal]
+            root = "{}"
+            description = "Personal memory"
+            "#,
+            dir.join("data").display(),
+            dir.join("state").display(),
+            dir.join("cache").display(),
+            personal.display(),
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Chris prefers dark roast coffee in the mornings.",
+        ])
+        .assert()
+        .success();
+
+    // A keyword query the BM25 index ranks; proves the backend builds, persists,
+    // and serves results through the CLI path with policy filtering intact.
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "coffee",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hits: 1"))
+        .stdout(predicate::str::contains(
+            "snippet: Chris prefers dark roast coffee in the mornings.",
+        ));
+}
+
+#[test]
 fn search_finds_curated_memory_from_default_sources() {
     let dir = temp_dir("search-curated-default");
     let config = dir.join("config.toml");
@@ -6442,4 +6503,507 @@ fn projects_bind_validates_active_agent_read_and_write_affinity() {
     .stderr(predicate::str::contains(
         "agent codex may not write store work",
     ));
+}
+
+/// Write an executable fake model backend that echoes `output` on stdout,
+/// regardless of the prompt, for capture/classify CLI tests.
+fn write_fake_backend(path: &std::path::Path, output: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    // Escape single quotes for the single-quoted shell literal below, so an
+    // `output` containing an apostrophe (e.g. "user's preference") does not
+    // produce a broken script.
+    let escaped = output.replace('\'', r"'\''");
+    fs::write(
+        path,
+        format!("#!/usr/bin/env bash\ncat >/dev/null\nprintf '%s' '{escaped}'\n"),
+    )
+    .expect("write fake backend");
+    let mut perms = fs::metadata(path).expect("meta").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).expect("chmod fake backend");
+}
+
+fn write_capture_config(
+    config: &std::path::Path,
+    dir: &std::path::Path,
+    personal: &std::path::Path,
+    backend: &std::path::Path,
+) {
+    fs::write(
+        config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+            state_dir = "{}"
+            cache_dir = "{}"
+
+            [classifier]
+            backend = "command"
+            command = ["{}"]
+
+            [stores.personal]
+            root = "{}"
+            description = "Personal memory"
+            "#,
+            dir.join("data").display(),
+            dir.join("state").display(),
+            dir.join("cache").display(),
+            backend.display(),
+            personal.display(),
+        ),
+    )
+    .expect("write capture config");
+}
+
+#[test]
+fn capture_stages_extracted_facts_as_inbox_notes() {
+    let dir = temp_dir("capture-stage");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let backend = dir.join("fake-backend");
+    write_fake_backend(
+        &backend,
+        r#"["user prefers fd over find", "project uses the rust 2024 edition"]"#,
+    );
+    write_capture_config(&config, &dir, &personal, &backend);
+    init_store(&personal, "personal");
+
+    let mut capture = cargo_bin_cmd!("hm");
+    capture
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "capture",
+            "--text",
+            "user: I like fd. assistant: noted. user: we use rust 2024.",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("staged 2 captured fact(s)"));
+
+    // Staged facts land in the inbox (raw notes), not curated/remembered memory,
+    // so they only appear when inbox is explicitly searched.
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "fd find",
+            "--include-inbox",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("user prefers fd over find"));
+}
+
+#[test]
+fn capture_dry_run_writes_nothing() {
+    let dir = temp_dir("capture-dry");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let backend = dir.join("fake-backend");
+    write_fake_backend(&backend, r#"["some durable fact"]"#);
+    write_capture_config(&config, &dir, &personal, &backend);
+    init_store(&personal, "personal");
+
+    let mut capture = cargo_bin_cmd!("hm");
+    capture
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "capture",
+            "--text",
+            "user: a durable fact about me.",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dry run, nothing written"))
+        .stdout(predicate::str::contains("some durable fact"));
+
+    // Nothing was written, so an inbox search finds no captured note.
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "durable fact",
+            "--include-inbox",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hits: 0"));
+}
+
+#[test]
+fn capture_handles_apostrophe_in_extracted_fact() {
+    let dir = temp_dir("capture-apostrophe");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let backend = dir.join("fake-backend");
+    // The extracted fact contains an apostrophe; the fake-backend writer must
+    // escape it so the generated shell script stays valid.
+    write_fake_backend(&backend, r#"["the user's preferred editor is neovim"]"#);
+    write_capture_config(&config, &dir, &personal, &backend);
+    init_store(&personal, "personal");
+
+    let mut capture = cargo_bin_cmd!("hm");
+    capture
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "capture",
+            "--text",
+            "user: I use neovim.",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("staged 1 captured fact(s)"));
+
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "neovim editor",
+            "--include-inbox",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "the user's preferred editor is neovim",
+        ));
+}
+
+#[test]
+fn reconcile_add_writes_durable_memory() {
+    let dir = temp_dir("reconcile-add");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let backend = dir.join("fake-backend");
+    write_fake_backend(&backend, r#"{"op":"ADD"}"#);
+    write_capture_config(&config, &dir, &personal, &backend);
+    init_store(&personal, "personal");
+
+    let mut reconcile = cargo_bin_cmd!("hm");
+    reconcile
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "reconcile",
+            "--text",
+            "the user prefers ripgrep for searching",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("add: wrote"));
+
+    // ADD writes durable (remembered) memory, so a default search (no inbox) finds it.
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "ripgrep searching",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "the user prefers ripgrep for searching",
+        ));
+}
+
+#[test]
+fn reconcile_dry_run_writes_nothing() {
+    let dir = temp_dir("reconcile-dry");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let backend = dir.join("fake-backend");
+    write_fake_backend(&backend, r#"{"op":"ADD"}"#);
+    write_capture_config(&config, &dir, &personal, &backend);
+    init_store(&personal, "personal");
+
+    let mut reconcile = cargo_bin_cmd!("hm");
+    reconcile
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "reconcile",
+            "--text",
+            "a candidate that should not be written",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("add (dry run)"));
+
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "candidate written",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hits: 0"));
+}
+
+#[test]
+fn reconcile_update_supersedes_existing_record() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir("reconcile-update");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let backend = dir.join("fake-backend");
+    // A backend that targets the first existing memory id parsed from the prompt,
+    // so UPDATE points at the real (dynamically generated) record id.
+    fs::write(
+        &backend,
+        "#!/usr/bin/env bash\nprompt=\"$(cat)\"\nid=\"$(printf '%s' \"$prompt\" | grep -oE 'id=[^:]+' | head -1 | cut -d= -f2)\"\nprintf '{\"op\":\"UPDATE\",\"id\":\"%s\"}' \"$id\"\n",
+    )
+    .expect("write backend");
+    let mut perms = fs::metadata(&backend).expect("meta").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&backend, perms).expect("chmod");
+    write_capture_config(&config, &dir, &personal, &backend);
+    init_store(&personal, "personal");
+
+    // Seed an existing durable memory to be superseded.
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "the user prefers vim as their editor",
+        ])
+        .assert()
+        .success();
+
+    let mut reconcile = cargo_bin_cmd!("hm");
+    reconcile
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "reconcile",
+            "--text",
+            "the user now prefers neovim as their editor",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("update: wrote"));
+
+    // The superseding record is recalled; the superseded one is suppressed.
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "user prefers editor",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("neovim"))
+        .stdout(predicate::str::contains("hits: 1"));
+}
+
+fn write_backend_strategy_config(
+    config: &std::path::Path,
+    dir: &std::path::Path,
+    personal: &std::path::Path,
+    search_backend: &str,
+    context_strategy: &str,
+) {
+    fs::write(
+        config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+            state_dir = "{}"
+            cache_dir = "{}"
+
+            [defaults]
+            search_backend = "{search_backend}"
+            context_strategy = "{context_strategy}"
+
+            [stores.personal]
+            root = "{}"
+            description = "Personal memory"
+            "#,
+            dir.join("data").display(),
+            dir.join("state").display(),
+            dir.join("cache").display(),
+            personal.display(),
+        ),
+    )
+    .expect("write backend/strategy config");
+}
+
+/// End-to-end proof that the prompt-submit hook recalls via the BM25 backend:
+/// the memory is search-only at session start (relevance strategy), and the
+/// prompt has only partial term overlap so the lexical coverage threshold
+/// rejects it while BM25 still ranks it. With the tantivy backend the hook
+/// recalls and injects the memory; with the lexical backend it does not.
+fn run_prompt_submit_hook(config: &std::path::Path, query: &str) -> String {
+    // Prime the session-start cache so prompt-submit takes the recall path
+    // instead of re-emitting changed startup context.
+    let mut session_start = cargo_bin_cmd!("hm");
+    session_start
+        .env("HIVE_MEMORY_SESSION_ID", "e2e-session")
+        .env("HIVE_MEMORY_AGENT_ID", "claude")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "hook",
+            "session-start",
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    let output = cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", "e2e-session")
+        .env("HIVE_MEMORY_AGENT_ID", "claude")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "hook",
+            "prompt-submit",
+            "--json",
+            "--text",
+            query,
+        ])
+        .output()
+        .expect("run prompt-submit");
+    assert!(output.status.success(), "prompt-submit failed");
+    String::from_utf8(output.stdout).expect("utf8 stdout")
+}
+
+#[test]
+fn prompt_submit_hook_recalls_via_bm25_backend() {
+    let dir = temp_dir("hook-bm25");
+    let personal = dir.join("personal");
+    init_store(&personal, "personal");
+    // A search-only-at-startup global fact (relevance withholds it). The prompt
+    // recall query trims to two terms ("alpha", "pipeline"); only "alpha" is in
+    // the memory. Lexical search requires both terms (1/2 -> miss); BM25 ranks
+    // the record on the one matching term (-> recall).
+    let memory = "The alpha service uses a manual verification checklist.";
+    let query = "alpha pipeline";
+
+    for backend in ["tantivy", "lexical"] {
+        let config = dir.join(format!("config-{backend}.toml"));
+        write_backend_strategy_config(&config, &dir, &personal, backend, "relevance");
+
+        let mut remember = cargo_bin_cmd!("hm");
+        // only needed once, but writing twice is idempotent on identical text
+        remember
+            .env("HIVE_MEMORY_AGENT_ID", "claude")
+            .args([
+                "--config",
+                config.to_str().expect("utf8 config"),
+                "remember",
+                "--text",
+                memory,
+            ])
+            .assert()
+            .success();
+
+        // Build the indexes (JSONL + tantivy) off the hot path, like tool-complete.
+        let mut refresh = cargo_bin_cmd!("hm");
+        refresh
+            .env("HIVE_MEMORY_AGENT_ID", "claude")
+            .args([
+                "--config",
+                config.to_str().expect("utf8 config"),
+                "refresh",
+                "--force",
+            ])
+            .assert()
+            .success();
+
+        let out = run_prompt_submit_hook(&config, query);
+        if backend == "tantivy" {
+            assert!(
+                out.contains("alpha service uses a manual verification"),
+                "tantivy backend should recall the partial-overlap memory; got: {out}"
+            );
+        } else {
+            assert!(
+                !out.contains("alpha service uses a manual verification"),
+                "lexical backend should reject the sub-threshold query; got: {out}"
+            );
+        }
+    }
+}
+
+#[test]
+fn prompt_submit_hook_falls_back_when_tantivy_index_absent() {
+    // search_backend=tantivy but the BM25 index was never built (e.g. the user
+    // enabled it before the first tantivy-aware refresh). The prompt-submit hook
+    // must succeed via lexical fallback and must NOT create the index on its hot
+    // path. We build only the JSONL index (refresh under the lexical backend) so
+    // recall reaches the tantivy-fresh check rather than skipping on a stale JSONL.
+    let dir = temp_dir("hook-bm25-absent");
+    let personal = dir.join("personal");
+    init_store(&personal, "personal");
+    let memory = "The bravo service writes its audit log to the central bucket.";
+
+    let lexical_cfg = dir.join("config-lexical.toml");
+    write_backend_strategy_config(&lexical_cfg, &dir, &personal, "lexical", "relevance");
+    let tantivy_cfg = dir.join("config-tantivy.toml");
+    write_backend_strategy_config(&tantivy_cfg, &dir, &personal, "tantivy", "relevance");
+
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .env("HIVE_MEMORY_AGENT_ID", "claude")
+        .args([
+            "--config",
+            lexical_cfg.to_str().expect("utf8"),
+            "remember",
+            "--text",
+            memory,
+        ])
+        .assert()
+        .success();
+    // Refresh under lexical: builds the JSONL index, never the tantivy index.
+    let mut refresh = cargo_bin_cmd!("hm");
+    refresh
+        .env("HIVE_MEMORY_AGENT_ID", "claude")
+        .args([
+            "--config",
+            lexical_cfg.to_str().expect("utf8"),
+            "refresh",
+            "--force",
+        ])
+        .assert()
+        .success();
+
+    let search_index_dir = dir.join("cache").join("search");
+    assert!(
+        !search_index_dir.exists(),
+        "lexical refresh must not build the tantivy index"
+    );
+
+    // Prompt-submit under the tantivy backend: index absent -> lexical fallback.
+    let out = run_prompt_submit_hook(&tantivy_cfg, "bravo audit bucket");
+    assert!(
+        out.contains("bravo service writes its audit log"),
+        "lexical fallback should still recall a full-term match; got: {out}"
+    );
+    // The hot path must not have created the tantivy index.
+    assert!(
+        !search_index_dir.exists(),
+        "prompt-submit hook must not create the tantivy index on the hot path"
+    );
 }

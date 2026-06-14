@@ -43,6 +43,7 @@ const DEFAULTS_KEYS: &[&str] = &[
     "hook_context_max_tokens",
     "context_cache_max_age",
     "context_strategy",
+    "search_backend",
 ];
 const AGENT_KEYS: &[&str] = &[
     "default_store",
@@ -206,11 +207,18 @@ pub struct DefaultsConfig {
     pub hook_context_max_tokens: u32,
     /// Max age string for hook context cache fallback.
     pub context_cache_max_age: String,
-    /// Session-start selection strategy: `recency` (legacy include-all) or
-    /// `relevance` (apply the inject classifier). Stored as a string so an
-    /// unrecognized value degrades to legacy behavior instead of failing the
-    /// hook path; resolved via `inject::Strategy::from_config`.
+    /// Session-start selection strategy: `adaptive` (default; recall-safe —
+    /// withholds only explicitly non-startup kinds, never untagged content),
+    /// `recency` (include everything in scope), or `relevance` (full inject
+    /// classifier, may withhold untagged ambiguous globals). Stored as a string
+    /// so an unrecognized value degrades to the safe default instead of failing
+    /// the hook path; resolved via `inject::Strategy::from_config`.
     pub context_strategy: String,
+    /// Candidate-generation backend for `hm search`: `lexical` (default
+    /// deterministic scan) or `tantivy` (local BM25 full-text index, higher
+    /// recall). Stored as a string so an unrecognized value degrades to the
+    /// lexical default instead of failing.
+    pub search_backend: String,
 }
 
 /// Background LLM classification policy.
@@ -901,7 +909,10 @@ impl DefaultsConfig {
             event_sidecar: raw.event_sidecar.unwrap_or_default(),
             hook_context_max_tokens: raw.hook_context_max_tokens.unwrap_or(4000),
             context_cache_max_age: raw.context_cache_max_age.unwrap_or_else(|| "7d".to_owned()),
-            context_strategy: raw.context_strategy.unwrap_or_else(|| "recency".to_owned()),
+            context_strategy: raw
+                .context_strategy
+                .unwrap_or_else(|| "adaptive".to_owned()),
+            search_backend: raw.search_backend.unwrap_or_else(|| "lexical".to_owned()),
         }
     }
 }
@@ -1096,6 +1107,7 @@ struct RawDefaultsConfig {
     hook_context_max_tokens: Option<u32>,
     context_cache_max_age: Option<String>,
     context_strategy: Option<String>,
+    search_backend: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1407,9 +1419,10 @@ mod tests {
             loaded.config.defaults.event_sidecar,
             EventSidecarPolicy::Always
         );
-        // Unset strategy defaults to legacy behavior, so existing stores are
-        // unaffected until they opt in.
-        assert_eq!(loaded.config.defaults.context_strategy, "recency");
+        // Unset strategy defaults to the recall-safe Adaptive selector: it only
+        // withholds explicitly non-startup kinds and never drops untagged
+        // content, so the default can raise precision without regressing recall.
+        assert_eq!(loaded.config.defaults.context_strategy, "adaptive");
         assert_eq!(
             loaded.config.offline,
             OfflineConfig {
