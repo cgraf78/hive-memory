@@ -328,10 +328,17 @@ impl SearchIndex {
                 path: path.clone(),
                 message: err.to_string(),
             })?;
-        std::fs::write(&path, text).map_err(|err| RetrievalError::Manifest {
-            path,
+        // Write atomically (temp file in the same dir, then rename) so a crash or
+        // failed write never leaves a populated index dir with a missing/partial
+        // manifest — which `manifest_is_incompatible` would otherwise treat as
+        // unknown and wipe, discarding a perfectly good committed index.
+        let temp = dir.join(format!("{MANIFEST_FILE}.tmp"));
+        let manifest_error = |err: std::io::Error| RetrievalError::Manifest {
+            path: path.clone(),
             message: err.to_string(),
-        })
+        };
+        std::fs::write(&temp, text).map_err(manifest_error)?;
+        std::fs::rename(&temp, &path).map_err(manifest_error)
     }
 
     /// True when a directory already holds an index whose manifest is missing or
@@ -350,18 +357,12 @@ impl SearchIndex {
     }
 
     fn clear_dir(dir: &Path) -> Result<(), RetrievalError> {
-        for entry in
-            std::fs::read_dir(dir).map_err(|err| RetrievalError::Engine(err.to_string()))?
-        {
-            let entry = entry.map_err(|err| RetrievalError::Engine(err.to_string()))?;
-            let path = entry.path();
-            let result = if path.is_dir() {
-                std::fs::remove_dir_all(&path)
-            } else {
-                std::fs::remove_file(&path)
-            };
-            result.map_err(|err| RetrievalError::Engine(err.to_string()))?;
-        }
+        // Remove and recreate the whole directory in one shot rather than
+        // deleting entries piecemeal: a mid-loop failure would otherwise leave a
+        // half-cleared index dir. The index is a rebuildable cache, so dropping
+        // the entire tree is always safe.
+        std::fs::remove_dir_all(dir).map_err(|err| RetrievalError::Engine(err.to_string()))?;
+        std::fs::create_dir_all(dir).map_err(|err| RetrievalError::Engine(err.to_string()))?;
         Ok(())
     }
 }
