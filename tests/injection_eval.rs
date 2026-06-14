@@ -290,8 +290,10 @@ fn is_high_value(subject: &str) -> bool {
 fn score_context(injected: &BTreeMap<String, usize>, ctx: &LabeledContext) -> Score {
     let include: BTreeSet<&str> = ctx.include.iter().map(String::as_str).collect();
     let exclude: BTreeSet<&str> = ctx.exclude.iter().map(String::as_str).collect();
-    let mut score = Score::default();
-    score.injected_tokens = injected.values().sum();
+    let mut score = Score {
+        injected_tokens: injected.values().sum(),
+        ..Score::default()
+    };
     for subject in &include {
         if injected.contains_key(*subject) {
             score.tp += 1;

@@ -119,7 +119,7 @@ pub struct ClassifyInput<'a> {
 /// 3. An explicit `kind` is authoritative for search-only kinds and for
 ///    project-scoped facts. Legacy preference tags attached to a specific
 ///    project still need to read like behavior guidance; older inference was
-///    broader and mis-tagged some repo facts as always-on preferences.
+///    broader and wrongly tagged some repo facts as always-on preferences.
 /// 4. Otherwise fall back: project-scoped records defer to the project filter,
 ///    global records that clearly read as behavior guidance stay always-on, and
 ///    all other ambiguous global records remain available through search.
