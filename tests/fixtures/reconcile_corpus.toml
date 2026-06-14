@@ -1,0 +1,120 @@
+# Labeled corpus for the reconcile (mem0-style ADD/UPDATE/DELETE/NOOP) eval.
+#
+#  - [[decision]]: does reconcile() pick the right operation for a candidate
+#    against existing memories?
+#  - [[stream]]: ingesting an ordered fact stream with reconcile-promote should
+#    keep the *current* fact retrievable and suppress the *stale* one, where
+#    blind append leaves both. Stale markers are chosen so they do NOT appear as
+#    a substring of the current fact, so a "leak" means the genuinely stale
+#    record was retrieved (not the stale word reused in the current fact).
+#
+# Synthetic; the only external dependency is the model backend (test is ignored).
+
+# ---- decision accuracy ----------------------------------------------------
+
+[[decision]]
+candidate = "The user now prefers neovim as their primary editor."
+expected = "update"
+[[decision.existing]]
+id = "e1"
+text = "The user prefers vim as their primary editor."
+[[decision.existing]]
+id = "e2"
+text = "The user lives in Seattle."
+
+[[decision]]
+candidate = "The user enjoys trail running on weekends."
+expected = "add"
+[[decision.existing]]
+id = "e1"
+text = "The user prefers tabs over spaces."
+[[decision.existing]]
+id = "e2"
+text = "The user drives a blue sedan."
+
+[[decision]]
+candidate = "The user prefers vim as their primary editor."
+expected = "noop"
+[[decision.existing]]
+id = "e1"
+text = "The user prefers vim as their primary editor."
+
+[[decision]]
+candidate = "The user no longer uses Jenkins for continuous integration."
+expected = "delete"
+[[decision.existing]]
+id = "e1"
+text = "The user uses Jenkins for continuous integration."
+[[decision.existing]]
+id = "e2"
+text = "The user deploys on Fridays."
+
+[[decision]]
+candidate = "The user's favorite coffee is now a flat white."
+expected = "update"
+[[decision.existing]]
+id = "e1"
+text = "The user's favorite coffee is a cortado."
+
+[[decision]]
+candidate = "The user is allergic to peanuts."
+expected = "add"
+[[decision.existing]]
+id = "e1"
+text = "The user prefers window seats on flights."
+
+[[decision]]
+candidate = "The user has moved to Austin."
+expected = "update"
+[[decision.existing]]
+id = "e1"
+text = "The user lives in Portland."
+
+[[decision]]
+candidate = "The user's preferred shell is fish."
+expected = "noop"
+[[decision.existing]]
+id = "e1"
+text = "The user uses the fish shell as their preferred shell."
+
+# ---- end-to-end streams ---------------------------------------------------
+
+[[stream]]
+facts = [
+  "The user prefers vim as their primary editor.",
+  "The user now prefers neovim as their primary editor.",
+]
+[[stream.query]]
+ask = "editor preference"
+current = "neovim"
+stale = "prefers vim"
+
+[[stream]]
+facts = [
+  "The user's favorite coffee is a cortado.",
+  "The user's favorite coffee is now a flat white.",
+]
+[[stream.query]]
+ask = "favorite coffee"
+current = "flat white"
+stale = "cortado"
+
+[[stream]]
+facts = [
+  "The user runs continuous integration on Jenkins.",
+  "The user has migrated continuous integration entirely to GitHub Actions.",
+]
+[[stream.query]]
+ask = "continuous integration platform"
+current = "GitHub Actions"
+stale = "Jenkins"
+
+[[stream]]
+facts = [
+  "The user lives in Portland.",
+  "The user has moved and now lives in Austin.",
+]
+[[stream.query]]
+ask = "where the user lives"
+current = "Austin"
+stale = "Portland"
