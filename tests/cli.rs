@@ -7007,3 +7007,64 @@ fn prompt_submit_hook_falls_back_when_tantivy_index_absent() {
         "prompt-submit hook must not create the tantivy index on the hot path"
     );
 }
+
+#[test]
+fn doctor_reports_search_index_health() {
+    let dir = temp_dir("doctor-search-index");
+    let personal = dir.join("personal");
+    let config = dir.join("config.toml");
+    write_backend_strategy_config(&config, &dir, &personal, "tantivy", "relevance");
+    init_store(&personal, "personal");
+
+    // Before any refresh the full-text index does not exist yet.
+    let mut before = cargo_bin_cmd!("hm");
+    before
+        .args([
+            "--config",
+            config.to_str().expect("utf8"),
+            "doctor",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "search index for store personal not built yet",
+        ));
+
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .args([
+            "--config",
+            config.to_str().expect("utf8"),
+            "remember",
+            "--text",
+            "the alpha service deploys on tag push",
+        ])
+        .assert()
+        .success();
+    let mut refresh = cargo_bin_cmd!("hm");
+    refresh
+        .args([
+            "--config",
+            config.to_str().expect("utf8"),
+            "refresh",
+            "--force",
+        ])
+        .assert()
+        .success();
+
+    // After refresh the index is healthy.
+    let mut after = cargo_bin_cmd!("hm");
+    after
+        .args([
+            "--config",
+            config.to_str().expect("utf8"),
+            "doctor",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "search index for store personal is healthy",
+        ));
+}

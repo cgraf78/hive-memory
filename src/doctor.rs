@@ -5,7 +5,9 @@
 //! the configured stores and local project bindings be trusted before an agent
 //! relies on them?
 
-use crate::{classify, config, event, index, note, outbox, project, secret, store, write};
+use crate::{
+    classify, config, event, index, note, outbox, project, retrieval, secret, store, write,
+};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -189,6 +191,7 @@ pub fn run(input: DoctorInput<'_>) -> DoctorReport {
     check_agent_policies(input.config, &mut checks);
     check_outbox(input.config, &mut checks);
     check_classifier(input.config, &mut checks);
+    check_search_index(input.config, &mut checks);
     // Secret scanning is deliberately kept off the quick path. Hooks and
     // update-time health checks need cheap structural validation, while this
     // audit walks note content and is intended for explicit human review.
@@ -2060,6 +2063,79 @@ fn summarize_fixes(actions: Vec<DoctorFixAction>) -> DoctorFixReport {
     }
 }
 
+/// Health of one store's persistent full-text (Tantivy) index, derived from
+/// cheap filesystem/manifest signals only — no canonical re-scan, so this stays
+/// on the quick doctor path per the retrieval design.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchIndexHealth {
+    /// No index built yet (no manifest); `hm refresh` will create it.
+    NotBuilt,
+    /// Manifest present, schema compatible, index opens.
+    Healthy,
+    /// Manifest present but its schema version is incompatible with this build.
+    Incompatible,
+    /// Manifest present but the index could not be opened (corrupt/unreadable).
+    Unreadable,
+}
+
+/// Classify a store's search-index directory. Distinguishes "never built" from
+/// "stale schema" by checking the manifest file before asking the engine to
+/// open it: [`retrieval::SearchIndex::open_existing_in_dir`] collapses both into
+/// `Ok(None)`, but doctor wants to advise differently (refresh vs --force).
+fn search_index_health(dir: &Path) -> SearchIndexHealth {
+    if !dir.join("manifest.json").exists() {
+        return SearchIndexHealth::NotBuilt;
+    }
+    match retrieval::SearchIndex::open_existing_in_dir(dir) {
+        Ok(Some(_)) => SearchIndexHealth::Healthy,
+        Ok(None) => SearchIndexHealth::Incompatible,
+        Err(_) => SearchIndexHealth::Unreadable,
+    }
+}
+
+/// Report full-text index health per store. Only meaningful when the Tantivy
+/// search backend is enabled; lexical stores have no index to check. Repairs are
+/// not attempted here — `hm refresh --force` rebuilds the (disposable) cache, so
+/// the checks point there rather than mutating anything.
+fn check_search_index(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
+    if !config
+        .defaults
+        .search_backend
+        .trim()
+        .eq_ignore_ascii_case("tantivy")
+    {
+        return;
+    }
+    for name in config.stores.keys() {
+        let dir = config.cache_dir.join("search").join(name);
+        let id = format!("search-index.{name}");
+        match search_index_health(&dir) {
+            SearchIndexHealth::NotBuilt => checks.push(pass(
+                id,
+                format!("search index for store {name} not built yet; run hm refresh"),
+                Vec::new(),
+            )),
+            SearchIndexHealth::Healthy => checks.push(pass(
+                id,
+                format!("search index for store {name} is healthy"),
+                Vec::new(),
+            )),
+            SearchIndexHealth::Incompatible => checks.push(warn(
+                id,
+                format!(
+                    "search index for store {name} has an incompatible schema; run hm refresh --force"
+                ),
+                vec![dir.display().to_string()],
+            )),
+            SearchIndexHealth::Unreadable => checks.push(warn(
+                id,
+                format!("search index for store {name} is unreadable; run hm refresh --force"),
+                vec![dir.display().to_string()],
+            )),
+        }
+    }
+}
+
 fn pass(id: impl Into<String>, message: impl Into<String>, paths: Vec<String>) -> DoctorCheck {
     DoctorCheck {
         id: id.into(),
@@ -2142,6 +2218,59 @@ fn path_is_toml(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn doctor_temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "hm-doctor-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn search_index_health_reports_not_built_for_empty_dir() {
+        let dir = doctor_temp_dir("si-empty");
+        assert_eq!(search_index_health(&dir), SearchIndexHealth::NotBuilt);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn search_index_health_reports_healthy_after_build() {
+        let dir = doctor_temp_dir("si-healthy");
+        let index = retrieval::SearchIndex::open_or_create_in_dir(&dir).expect("create");
+        index
+            .rebuild_tagged(
+                &[retrieval::SearchDocument {
+                    id: "a".to_owned(),
+                    subject: None,
+                    tags: Vec::new(),
+                    body: "coffee".to_owned(),
+                }],
+                Some("fp"),
+            )
+            .expect("rebuild");
+        assert_eq!(search_index_health(&dir), SearchIndexHealth::Healthy);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn search_index_health_reports_incompatible_for_bad_schema() {
+        let dir = doctor_temp_dir("si-badschema");
+        // A manifest from a future/incompatible schema version: present but not
+        // readable by this build, so doctor advises a forced rebuild.
+        fs::write(
+            dir.join("manifest.json"),
+            r#"{"schema_version":1,"search_schema_version":999,"document_count":0,"fingerprint":null}"#,
+        )
+        .expect("write manifest");
+        assert_eq!(search_index_health(&dir), SearchIndexHealth::Incompatible);
+        fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn atomic_temp_name_matches_writer_temps() {
