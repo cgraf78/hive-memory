@@ -207,11 +207,13 @@ impl From<crate::curated::CuratedError> for ContextError {
 
 /// Assemble bounded Markdown context from canonical memory.
 ///
-/// Raw/remembered inbox filtering is driven by index metadata, but bodies are
-/// read from canonical Markdown files so the index remains a disposable cache.
-/// Curated files are read directly from `memories/`, `people/`, and `rules/`.
-/// Each included body is wrapped as data and escaped so memory content cannot
-/// forge or terminate the boundary block that tells agents how to treat it.
+/// Raw/remembered inbox filtering is driven by index metadata, and modern index
+/// entries carry the parsed body so hook paths do not need to reopen canonical
+/// notes. Body-less legacy index entries fall back to canonical Markdown reads
+/// and skip only that record if the note is unavailable. Curated files are read
+/// directly from `memories/`, `people/`, and `rules/`. Each included body is
+/// wrapped as data and escaped so memory content cannot forge or terminate the
+/// boundary block that tells agents how to treat it.
 pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, ContextError> {
     let header = render_header(&input);
     let mut markdown = header;

@@ -18,6 +18,7 @@ const CONTEXT_WARM_BUDGET_MS: u128 = 200;
 const SEARCH_WARM_BUDGET_MS: u128 = 300;
 const HOOK_PROMPT_BASELINE_WARM_BUDGET_MS: u128 = 300;
 const HOOK_PROMPT_RECALL_WARM_BUDGET_MS: u128 = 350;
+const HOOK_PROMPT_CACHED_OFFLINE_BUDGET_MS: u128 = 350;
 const HOOK_TOOL_COMPLETE_NO_RECEIPT_WARM_BUDGET_MS: u128 = 200;
 const SYNTHETIC_OUTBOX_ITEMS: usize = 100;
 const FLUSH_RUNS: usize = 10;
@@ -188,6 +189,42 @@ fn hook_prompt_submit_recall_stays_within_warm_budget() {
 }
 
 #[test]
+#[ignore = "CI runs this explicitly because it measures full hook recall latency"]
+fn hook_prompt_submit_cached_recall_stays_fast_when_store_root_is_unavailable() {
+    let fixture = SyntheticStore::new();
+    fixture.refresh_index();
+    let offline_root = fixture.root.with_extension("offline");
+    fs::rename(&fixture.root, &offline_root).expect("move synthetic store offline");
+
+    let prompt_p95 = p95_ms(repeat(RUNS, || {
+        hm_command(
+            &fixture.config,
+            [
+                "--as-agent",
+                "codex",
+                "hook",
+                "prompt-submit",
+                "--project",
+                "/tmp/hive-memory-perf-project/src/main.rs",
+                "--text",
+                "needle-4999",
+                "--json",
+            ],
+        )
+        .env("HIVE_MEMORY_SESSION_ID", "perf-prompt-cached-offline")
+        .assert()
+        .success();
+    }));
+    eprintln!("hm hook prompt-submit cached-offline p95: {prompt_p95}ms");
+
+    let prompt_budget = budget_ms(HOOK_PROMPT_CACHED_OFFLINE_BUDGET_MS);
+    assert!(
+        prompt_p95 <= prompt_budget,
+        "hm hook prompt-submit cached-offline p95 {prompt_p95}ms exceeded {prompt_budget}ms"
+    );
+}
+
+#[test]
 #[ignore = "CI runs this explicitly because it measures full hook CLI latency"]
 fn hook_tool_complete_without_receipts_stays_within_warm_budget() {
     let fixture = SyntheticStore::new();
@@ -249,6 +286,7 @@ fn budget_ms(base_ms: u128) -> u128 {
 
 struct SyntheticStore {
     config: PathBuf,
+    root: PathBuf,
 }
 
 impl SyntheticStore {
@@ -267,7 +305,7 @@ impl SyntheticStore {
         .expect("init synthetic store");
         write_config(&config, &root, &cache, &state);
         write_notes(&root);
-        Self { config }
+        Self { config, root }
     }
 
     fn refresh_index(&self) {
