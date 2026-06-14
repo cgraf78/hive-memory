@@ -8,9 +8,9 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use hive_memory::config::{Config, ConfigPaths, EventSidecarPolicy, Sensitivity, StoreConfig};
 use hive_memory::{
-    classify, config, context as memory_context, curation, doctor, eval as memory_eval, event,
-    hook as memory_hook, id, index, inject, memory, note, outbox, path as memory_path, project,
-    search, secret, store, write, write_classify,
+    capture, classify, config, context as memory_context, curation, doctor, eval as memory_eval,
+    event, hook as memory_hook, id, index, inject, llm, memory, note, outbox, path as memory_path,
+    project, search, secret, store, write, write_classify,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -72,6 +72,9 @@ enum Command {
     Retag(RetagArgs),
     /// Run the background LLM classification pass now.
     Classify(ClassifyArgs),
+    /// Extract durable facts from a conversation and stage them as raw inbox
+    /// notes for later review/promotion. Never writes canonical memory.
+    Capture(CaptureArgs),
     /// Refresh local outbox and indexes.
     Refresh(RefreshArgs),
     /// Flush local outbox writes to reachable stores.
@@ -627,6 +630,23 @@ struct ClassifyArgs {
     json: bool,
 }
 
+/// Arguments for `hm capture`.
+#[derive(Debug, Args)]
+struct CaptureArgs {
+    /// Conversation text to extract facts from. Reads stdin when omitted.
+    #[arg(long)]
+    text: Option<String>,
+    /// Show the extracted candidate facts without writing anything.
+    #[arg(long)]
+    dry_run: bool,
+    /// Optional provenance reference recorded on each staged note.
+    #[arg(long)]
+    source_ref: Option<String>,
+    /// Emit machine-readable output.
+    #[arg(long)]
+    json: bool,
+}
+
 /// Arguments for `hm refresh`.
 #[derive(Debug, Args)]
 struct RefreshArgs {
@@ -741,6 +761,7 @@ fn run(cli: Cli) -> Result<()> {
         Some(Command::SyncStatus(args)) => run_sync_status(args, context),
         Some(Command::Retag(args)) => run_retag(args, context),
         Some(Command::Classify(args)) => run_classify(args, context),
+        Some(Command::Capture(args)) => run_capture(args, context),
         Some(Command::Refresh(args)) => run_refresh(args, context),
         Some(Command::Flush(args)) => run_flush(args, context),
         Some(Command::Outbox(OutboxCommand::Flush(args))) => run_flush(args, context),
@@ -3309,6 +3330,117 @@ fn run_retag(args: RetagArgs, context: CliContext) -> Result<()> {
         if result.event_path.is_some() {
             println!("event: updated");
         }
+    }
+    Ok(())
+}
+
+fn run_capture(args: CaptureArgs, context: CliContext) -> Result<()> {
+    let config = load_config(context.config_path.as_deref())?;
+    let agent_id = resolve_agent_id(context.as_agent.clone());
+    let writer_agent_id = agent_id.clone().unwrap_or_else(|| "human".to_owned());
+
+    // Resolve a model backend the same way the classifier does, so capture honors
+    // the same [classifier] config and PATH preference order.
+    let backend = llm::detect(
+        config.classifier.backend.as_deref(),
+        &config.classifier.command,
+        config.classifier.model.as_deref(),
+        None,
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "no usable model backend; configure [classifier] or install codex/claude/gemini"
+        )
+    })?;
+
+    let conversation = match args.text {
+        Some(text) => text,
+        None => {
+            let mut buffer = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer)?;
+            buffer
+        }
+    };
+    if conversation.trim().is_empty() {
+        anyhow::bail!("no conversation text provided");
+    }
+
+    let timeout = std::time::Duration::from_secs(config.classifier.timeout_seconds);
+    let facts = capture::extract(&backend, &conversation, timeout)
+        .map_err(|err| anyhow::anyhow!("capture extraction failed: {err}"))?;
+
+    if args.dry_run {
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&facts)?);
+        } else {
+            println!(
+                "captured {} candidate fact(s) (dry run, nothing written):",
+                facts.len()
+            );
+            for fact in &facts {
+                println!("- {fact}");
+            }
+        }
+        return Ok(());
+    }
+
+    // Stage each fact as a raw inbox note. Inbox notes are excluded from context
+    // by default, so capture can never silently change agent behavior; promoting
+    // a staged note into durable memory is a separate, reviewed step.
+    let resolved_store = resolve_store(
+        &config,
+        context.store.as_deref(),
+        None,
+        agent_id.as_deref(),
+        StoreAccess::Write,
+    )?;
+    let store_config = &config.stores[resolved_store.name.as_str()];
+    let manifest = read_store_manifest(&config, &resolved_store.name, store_config)?;
+    let host_id = resolve_host_id(&config);
+    let session_id = std::env::var("HIVE_MEMORY_SESSION_ID").ok();
+    let options = write::AtomicWriteOptions {
+        fsync: config.storage.fsync.into(),
+        ..write::AtomicWriteOptions::default()
+    };
+
+    let mut written = Vec::new();
+    for fact in &facts {
+        let result = memory::write_record(memory::WriteRecordInput {
+            root: &store_config.root,
+            manifest: &manifest,
+            entry_kind: note::EntryKind::Note,
+            created_at: OffsetDateTime::now_utc(),
+            agent_id: writer_agent_id.clone(),
+            host_id: host_id.clone(),
+            user_id: config.user_id.clone(),
+            session_id: session_id.clone(),
+            scope: config.defaults.write_scope.clone(),
+            confidence: note::Confidence::Low,
+            body: fact.clone(),
+            project_id: None,
+            subject: None,
+            kind: None,
+            valid_from: None,
+            valid_to: None,
+            supersedes: Vec::new(),
+            tags: vec!["capture".to_owned()],
+            audience: Vec::new(),
+            source_kind: Some("capture".to_owned()),
+            source_ref: args.source_ref.clone(),
+            write_event: true,
+            options: options.clone(),
+        })?;
+        written.push(result.id);
+    }
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&written)?);
+    } else {
+        println!(
+            "staged {} captured fact(s) as inbox notes in store {}",
+            written.len(),
+            resolved_store.name
+        );
     }
     Ok(())
 }

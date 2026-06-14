@@ -6,6 +6,7 @@
 
 #![deny(missing_docs)]
 
+pub mod capture;
 pub mod classify;
 pub mod config;
 pub mod context;

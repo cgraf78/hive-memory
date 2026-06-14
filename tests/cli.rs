@@ -6443,3 +6443,132 @@ fn projects_bind_validates_active_agent_read_and_write_affinity() {
         "agent codex may not write store work",
     ));
 }
+
+/// Write an executable fake model backend that echoes `output` on stdout,
+/// regardless of the prompt, for capture/classify CLI tests.
+fn write_fake_backend(path: &std::path::Path, output: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::write(
+        path,
+        format!("#!/usr/bin/env bash\ncat >/dev/null\nprintf '%s' '{output}'\n"),
+    )
+    .expect("write fake backend");
+    let mut perms = fs::metadata(path).expect("meta").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).expect("chmod fake backend");
+}
+
+fn write_capture_config(
+    config: &std::path::Path,
+    dir: &std::path::Path,
+    personal: &std::path::Path,
+    backend: &std::path::Path,
+) {
+    fs::write(
+        config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+            state_dir = "{}"
+            cache_dir = "{}"
+
+            [classifier]
+            backend = "command"
+            command = ["{}"]
+
+            [stores.personal]
+            root = "{}"
+            description = "Personal memory"
+            "#,
+            dir.join("data").display(),
+            dir.join("state").display(),
+            dir.join("cache").display(),
+            backend.display(),
+            personal.display(),
+        ),
+    )
+    .expect("write capture config");
+}
+
+#[test]
+fn capture_stages_extracted_facts_as_inbox_notes() {
+    let dir = temp_dir("capture-stage");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let backend = dir.join("fake-backend");
+    write_fake_backend(
+        &backend,
+        r#"["user prefers fd over find", "project uses the rust 2024 edition"]"#,
+    );
+    write_capture_config(&config, &dir, &personal, &backend);
+    init_store(&personal, "personal");
+
+    let mut capture = cargo_bin_cmd!("hm");
+    capture
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "capture",
+            "--text",
+            "user: I like fd. assistant: noted. user: we use rust 2024.",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("staged 2 captured fact(s)"));
+
+    // Staged facts land in the inbox (raw notes), not curated/remembered memory,
+    // so they only appear when inbox is explicitly searched.
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "fd find",
+            "--include-inbox",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("user prefers fd over find"));
+}
+
+#[test]
+fn capture_dry_run_writes_nothing() {
+    let dir = temp_dir("capture-dry");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let backend = dir.join("fake-backend");
+    write_fake_backend(&backend, r#"["some durable fact"]"#);
+    write_capture_config(&config, &dir, &personal, &backend);
+    init_store(&personal, "personal");
+
+    let mut capture = cargo_bin_cmd!("hm");
+    capture
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "capture",
+            "--text",
+            "user: a durable fact about me.",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dry run, nothing written"))
+        .stdout(predicate::str::contains("some durable fact"));
+
+    // Nothing was written, so an inbox search finds no captured note.
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "durable fact",
+            "--include-inbox",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hits: 0"));
+}
