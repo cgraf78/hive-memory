@@ -239,8 +239,9 @@ pub fn load_or_rebuild_index(input: LoadIndexInput<'_>) -> Result<LoadIndexRepor
 
 /// Read a fresh cached index without rebuilding stale or missing cache files.
 ///
-/// Prompt hooks need this stricter contract: a cache miss should degrade recall,
-/// not turn a latency-sensitive agent boundary into a full store scan.
+/// Callers that need freshness but cannot safely rebuild can use this contract
+/// to degrade on a cache miss instead of turning a latency-sensitive boundary
+/// into a full store scan.
 pub fn load_fresh_index(input: &LoadIndexInput<'_>) -> Result<Option<LoadIndexReport>, IndexError> {
     let path = scoped_index_path(input.cache_dir, input.store_name, input.store_root);
     let fingerprint_path =
