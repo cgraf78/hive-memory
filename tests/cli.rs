@@ -6946,3 +6946,64 @@ fn prompt_submit_hook_recalls_via_bm25_backend() {
         }
     }
 }
+
+#[test]
+fn prompt_submit_hook_falls_back_when_tantivy_index_absent() {
+    // search_backend=tantivy but the BM25 index was never built (e.g. the user
+    // enabled it before the first tantivy-aware refresh). The prompt-submit hook
+    // must succeed via lexical fallback and must NOT create the index on its hot
+    // path. We build only the JSONL index (refresh under the lexical backend) so
+    // recall reaches the tantivy-fresh check rather than skipping on a stale JSONL.
+    let dir = temp_dir("hook-bm25-absent");
+    let personal = dir.join("personal");
+    init_store(&personal, "personal");
+    let memory = "The bravo service writes its audit log to the central bucket.";
+
+    let lexical_cfg = dir.join("config-lexical.toml");
+    write_backend_strategy_config(&lexical_cfg, &dir, &personal, "lexical", "relevance");
+    let tantivy_cfg = dir.join("config-tantivy.toml");
+    write_backend_strategy_config(&tantivy_cfg, &dir, &personal, "tantivy", "relevance");
+
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .env("HIVE_MEMORY_AGENT_ID", "claude")
+        .args([
+            "--config",
+            lexical_cfg.to_str().expect("utf8"),
+            "remember",
+            "--text",
+            memory,
+        ])
+        .assert()
+        .success();
+    // Refresh under lexical: builds the JSONL index, never the tantivy index.
+    let mut refresh = cargo_bin_cmd!("hm");
+    refresh
+        .env("HIVE_MEMORY_AGENT_ID", "claude")
+        .args([
+            "--config",
+            lexical_cfg.to_str().expect("utf8"),
+            "refresh",
+            "--force",
+        ])
+        .assert()
+        .success();
+
+    let search_index_dir = dir.join("cache").join("search");
+    assert!(
+        !search_index_dir.exists(),
+        "lexical refresh must not build the tantivy index"
+    );
+
+    // Prompt-submit under the tantivy backend: index absent -> lexical fallback.
+    let out = run_prompt_submit_hook(&tantivy_cfg, "bravo audit bucket");
+    assert!(
+        out.contains("bravo service writes its audit log"),
+        "lexical fallback should still recall a full-term match; got: {out}"
+    );
+    // The hot path must not have created the tantivy index.
+    assert!(
+        !search_index_dir.exists(),
+        "prompt-submit hook must not create the tantivy index on the hot path"
+    );
+}

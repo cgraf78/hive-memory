@@ -207,6 +207,31 @@ impl SearchIndex {
         })
     }
 
+    /// Open an existing directory-backed index read-only, without ever creating
+    /// or rebuilding it.
+    ///
+    /// Returns `Ok(None)` when no usable index is present — the directory is
+    /// missing, has no manifest (never built), or its manifest reports an
+    /// incompatible schema. This is the hot-path-safe opener: the prompt-submit
+    /// hook must never write to the filesystem or rebuild on its latency budget,
+    /// so it uses this instead of [`SearchIndex::open_or_create_in_dir`] and
+    /// falls back to lexical search when `None`.
+    pub fn open_existing_in_dir(dir: &Path) -> Result<Option<Self>, RetrievalError> {
+        if !Self::manifest_path(dir).exists() || Self::manifest_is_incompatible(dir) {
+            return Ok(None);
+        }
+        let (_schema, fields) = Self::build_schema();
+        let directory =
+            MmapDirectory::open(dir).map_err(|err| RetrievalError::Engine(err.to_string()))?;
+        let index =
+            Index::open(directory).map_err(|err| RetrievalError::Engine(err.to_string()))?;
+        Ok(Some(Self {
+            index,
+            fields,
+            dir: Some(dir.to_path_buf()),
+        }))
+    }
+
     /// Replace the entire index contents with `documents` in one atomic commit.
     ///
     /// This is a full rebuild: it deletes all existing documents, adds the new
@@ -441,6 +466,44 @@ mod tests {
             "how does hm context handle cloud sync"
         );
         assert_eq!(sanitize_query("  +  *  "), "");
+    }
+
+    #[test]
+    fn open_existing_returns_none_without_creating_when_absent() {
+        let dir = std::env::temp_dir().join(format!(
+            "hm-retrieval-absent-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // No index built yet: must report absent AND must not create the dir
+        // (the hook hot path must never write).
+        assert!(
+            SearchIndex::open_existing_in_dir(&dir)
+                .expect("open")
+                .is_none()
+        );
+        assert!(!dir.exists(), "open_existing must not create the index dir");
+
+        // After a real build it opens read-only and serves results.
+        let built = SearchIndex::open_or_create_in_dir(&dir).expect("create");
+        built
+            .rebuild_tagged(&[doc("a", "coffee notes")], Some("fp1"))
+            .expect("rebuild");
+        let reopened = SearchIndex::open_existing_in_dir(&dir)
+            .expect("open")
+            .expect("present after build");
+        assert!(reopened.is_fresh("fp1"));
+        assert_eq!(
+            reopened
+                .query("coffee", 5)
+                .expect("query")
+                .first()
+                .map(|hit| hit.id.as_str()),
+            Some("a")
+        );
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]

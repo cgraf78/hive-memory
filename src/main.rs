@@ -2464,7 +2464,11 @@ fn tantivy_search_if_fresh(
         return None;
     }
     let dir = config.cache_dir.join("search").join(store_name);
-    let index = retrieval::SearchIndex::open_or_create_in_dir(&dir).ok()?;
+    // Read-only open: never create or rebuild on the hook's hot path. A missing
+    // or stale index yields None so the caller uses lexical; refresh rebuilds it.
+    let index = retrieval::SearchIndex::open_existing_in_dir(&dir)
+        .ok()
+        .flatten()?;
     if !index.is_fresh(&search::entries_fingerprint(input.entries)) {
         return None;
     }
@@ -4214,6 +4218,9 @@ fn perform_refresh(config: &Config, forced: bool) -> Result<HookRefreshReport> {
         // Keep the full-text index fresh off the hot path so the prompt-submit
         // hook can query BM25 cheaply (it never rebuilds). No-op unless the
         // tantivy backend is enabled.
+        // TODO(perf): this re-reads canonical notes that rebuild_store_index just
+        // read to extract search documents; a later phase should share one
+        // document-extraction pass between the JSONL and Tantivy indexes.
         refresh_tantivy_index(config, store_name, &store_config.root, &report.entries);
         indexes += 1;
     }
