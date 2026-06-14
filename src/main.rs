@@ -2399,6 +2399,70 @@ fn tantivy_search(
     search::search_indexed(input, &index)
 }
 
+/// Hook-safe BM25 search: query the persistent index ONLY when it is already
+/// fresh for `input.entries`. Never rebuilds — the prompt-submit hook must not
+/// pay for a full index rebuild on its latency budget. Returns `None` (so the
+/// caller falls back to lexical) when the backend is off, the index is
+/// stale/absent, or the engine errors. The index is kept fresh out of band by
+/// `hm refresh` (tool-complete) and interactive `hm search`.
+fn tantivy_search_if_fresh(
+    config: &Config,
+    store_name: &str,
+    input: search::SearchInput<'_>,
+) -> Option<Vec<search::SearchHit>> {
+    if !config
+        .defaults
+        .search_backend
+        .trim()
+        .eq_ignore_ascii_case("tantivy")
+    {
+        return None;
+    }
+    let dir = config.cache_dir.join("search").join(store_name);
+    let index = retrieval::SearchIndex::open_or_create_in_dir(&dir).ok()?;
+    if !index.is_fresh(&search::entries_fingerprint(input.entries)) {
+        return None;
+    }
+    search::search_indexed(input, &index).ok()
+}
+
+/// Rebuild the store's persistent Tantivy index from `entries` when the backend
+/// is enabled and the index is stale. Called off the hot path (refresh /
+/// tool-complete) so the prompt hook can query a fresh index cheaply.
+fn refresh_tantivy_index(
+    config: &Config,
+    store_name: &str,
+    store_root: &Path,
+    entries: &[index::IndexEntry],
+) {
+    if !config
+        .defaults
+        .search_backend
+        .trim()
+        .eq_ignore_ascii_case("tantivy")
+    {
+        return;
+    }
+    let dir = config.cache_dir.join("search").join(store_name);
+    let result = retrieval::SearchIndex::open_or_create_in_dir(&dir).and_then(|index| {
+        let fingerprint = search::entries_fingerprint(entries);
+        if index.is_fresh(&fingerprint) {
+            return Ok(());
+        }
+        let documents = search::search_documents(store_root, entries)
+            .map_err(|err| retrieval::RetrievalError::Engine(err.to_string()))?;
+        index
+            .rebuild_tagged(&documents, Some(&fingerprint))
+            .map(|_| ())
+    });
+    if let Err(err) = result {
+        // Best-effort: a failed cache refresh must never break the write/refresh
+        // flow. The next interactive search rebuilds, and recall falls back to
+        // lexical meanwhile.
+        eprintln!("warning: full-text index refresh skipped: {err}");
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct SearchJsonHit {
     id: String,
@@ -3851,8 +3915,12 @@ fn perform_refresh(config: &Config, forced: bool) -> Result<HookRefreshReport> {
     }
 
     let mut indexes = 0usize;
-    for store_name in config.stores.keys() {
-        rebuild_store_index(config, store_name)?;
+    for (store_name, store_config) in &config.stores {
+        let report = rebuild_store_index(config, store_name)?;
+        // Keep the full-text index fresh off the hot path so the prompt-submit
+        // hook can query BM25 cheaply (it never rebuilds). No-op unless the
+        // tantivy backend is enabled.
+        refresh_tantivy_index(config, store_name, &store_config.root, &report.entries);
         indexes += 1;
     }
 
@@ -4469,7 +4537,7 @@ fn hook_prompt_recall_action(
             return Ok((None, recall));
         }
     };
-    let hits = match search::search(search::SearchInput {
+    let search_input = search::SearchInput {
         store_root: &store_config.root,
         entries: &report.entries,
         query: &query,
@@ -4479,17 +4547,25 @@ fn hook_prompt_recall_action(
         agent_id: agent_id.as_deref(),
         project_id: project_id.as_deref(),
         limit: 10,
-    }) {
-        Ok(hits) => hits,
-        Err(search::SearchError::EmptyQuery) => {
-            return Ok((None, HookRecallReport::skipped("budget-empty")));
-        }
-        Err(err) => {
-            let mut recall = HookRecallReport::skipped("index-unavailable");
-            recall.retrieval_ms = started.elapsed().as_millis();
-            eprintln!("warning: prompt recall skipped: {err}");
-            return Ok((None, recall));
-        }
+    };
+    // Prefer BM25 recall when the persistent index is already fresh; this is
+    // where the prompt hook gains paraphrase/multi-session recall. Fall back to
+    // the lexical scan when the index is stale/absent so the hook never pays for
+    // a rebuild on its latency budget (refresh/tool-complete keeps it fresh).
+    let hits = match tantivy_search_if_fresh(config, &store_name, search_input.clone()) {
+        Some(hits) => hits,
+        None => match search::search(search_input) {
+            Ok(hits) => hits,
+            Err(search::SearchError::EmptyQuery) => {
+                return Ok((None, HookRecallReport::skipped("budget-empty")));
+            }
+            Err(err) => {
+                let mut recall = HookRecallReport::skipped("index-unavailable");
+                recall.retrieval_ms = started.elapsed().as_millis();
+                eprintln!("warning: prompt recall skipped: {err}");
+                return Ok((None, recall));
+            }
+        },
     };
 
     let state = memory_hook::load_state(&config.state_dir, session_id)?;

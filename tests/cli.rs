@@ -6504,3 +6504,134 @@ fn projects_bind_validates_active_agent_read_and_write_affinity() {
         "agent codex may not write store work",
     ));
 }
+
+fn write_backend_strategy_config(
+    config: &std::path::Path,
+    dir: &std::path::Path,
+    personal: &std::path::Path,
+    search_backend: &str,
+    context_strategy: &str,
+) {
+    fs::write(
+        config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+            state_dir = "{}"
+            cache_dir = "{}"
+
+            [defaults]
+            search_backend = "{search_backend}"
+            context_strategy = "{context_strategy}"
+
+            [stores.personal]
+            root = "{}"
+            description = "Personal memory"
+            "#,
+            dir.join("data").display(),
+            dir.join("state").display(),
+            dir.join("cache").display(),
+            personal.display(),
+        ),
+    )
+    .expect("write backend/strategy config");
+}
+
+/// End-to-end proof that the prompt-submit hook recalls via the BM25 backend:
+/// the memory is search-only at session start (relevance strategy), and the
+/// prompt has only partial term overlap so the lexical coverage threshold
+/// rejects it while BM25 still ranks it. With the tantivy backend the hook
+/// recalls and injects the memory; with the lexical backend it does not.
+fn run_prompt_submit_hook(config: &std::path::Path, query: &str) -> String {
+    // Prime the session-start cache so prompt-submit takes the recall path
+    // instead of re-emitting changed startup context.
+    let mut session_start = cargo_bin_cmd!("hm");
+    session_start
+        .env("HIVE_MEMORY_SESSION_ID", "e2e-session")
+        .env("HIVE_MEMORY_AGENT_ID", "claude")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "hook",
+            "session-start",
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    let output = cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", "e2e-session")
+        .env("HIVE_MEMORY_AGENT_ID", "claude")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "hook",
+            "prompt-submit",
+            "--json",
+            "--text",
+            query,
+        ])
+        .output()
+        .expect("run prompt-submit");
+    assert!(output.status.success(), "prompt-submit failed");
+    String::from_utf8(output.stdout).expect("utf8 stdout")
+}
+
+#[test]
+fn prompt_submit_hook_recalls_via_bm25_backend() {
+    let dir = temp_dir("hook-bm25");
+    let personal = dir.join("personal");
+    init_store(&personal, "personal");
+    // A search-only-at-startup global fact (relevance withholds it). The prompt
+    // recall query trims to two terms ("alpha", "pipeline"); only "alpha" is in
+    // the memory. Lexical search requires both terms (1/2 -> miss); BM25 ranks
+    // the record on the one matching term (-> recall).
+    let memory = "The alpha service uses a manual verification checklist.";
+    let query = "alpha pipeline";
+
+    for backend in ["tantivy", "lexical"] {
+        let config = dir.join(format!("config-{backend}.toml"));
+        write_backend_strategy_config(&config, &dir, &personal, backend, "relevance");
+
+        let mut remember = cargo_bin_cmd!("hm");
+        // only needed once, but writing twice is idempotent on identical text
+        remember
+            .env("HIVE_MEMORY_AGENT_ID", "claude")
+            .args([
+                "--config",
+                config.to_str().expect("utf8 config"),
+                "remember",
+                "--text",
+                memory,
+            ])
+            .assert()
+            .success();
+
+        // Build the indexes (JSONL + tantivy) off the hot path, like tool-complete.
+        let mut refresh = cargo_bin_cmd!("hm");
+        refresh
+            .env("HIVE_MEMORY_AGENT_ID", "claude")
+            .args([
+                "--config",
+                config.to_str().expect("utf8 config"),
+                "refresh",
+                "--force",
+            ])
+            .assert()
+            .success();
+
+        let out = run_prompt_submit_hook(&config, query);
+        if backend == "tantivy" {
+            assert!(
+                out.contains("alpha service uses a manual verification"),
+                "tantivy backend should recall the partial-overlap memory; got: {out}"
+            );
+        } else {
+            assert!(
+                !out.contains("alpha service uses a manual verification"),
+                "lexical backend should reject the sub-threshold query; got: {out}"
+            );
+        }
+    }
+}
