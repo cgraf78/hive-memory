@@ -23,24 +23,35 @@ use crate::signals;
 /// Session-start selection strategy, chosen by `context_strategy` config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Strategy {
-    /// Legacy behavior: include everything in scope, ordered by recency. No
-    /// inject classification. This is the default so nothing changes until a
-    /// store opts in.
-    #[default]
+    /// Include everything in scope, ordered by recency. No inject
+    /// classification.
     Recency,
-    /// Apply the inject classifier: search-only candidates are withheld so
-    /// session-start context favors durable, project-relevant memory.
+    /// Apply the full inject classifier: search-only candidates are withheld so
+    /// session-start context favors durable, project-relevant memory. This is
+    /// the most aggressive strategy and can withhold *untagged* ambiguous global
+    /// facts based on content heuristics.
     Relevance,
+    /// Recall-safe middle ground and the default. Withholds a remembered record
+    /// only when the writer gave it an explicit `kind` that says "not
+    /// startup context" (`Incident`, `Reference`, or a `ProjectFact` outside its
+    /// own project). Untagged content is always kept, exactly as `Recency` would
+    /// — so enabling it can only raise precision, never drop a memory the writer
+    /// did not explicitly mark. As records accumulate explicit kinds (via
+    /// write-time inference and the background classifier) precision improves
+    /// without ever guessing against untagged memory.
+    #[default]
+    Adaptive,
 }
 
 impl Strategy {
-    /// Resolve the strategy from its config string, defaulting to `Recency` on
+    /// Resolve the strategy from its config string, defaulting to `Adaptive` on
     /// anything unrecognized. Unknown values must not fail the latency-sensitive
-    /// hook path, so an unexpected string degrades to today's behavior.
+    /// hook path, so an unexpected string degrades to the safe default.
     pub fn from_config(value: &str) -> Self {
         match value.trim().to_lowercase().as_str() {
+            "recency" => Self::Recency,
             "relevance" => Self::Relevance,
-            _ => Self::Recency,
+            _ => Self::Adaptive,
         }
     }
 }
@@ -143,6 +154,43 @@ pub fn classify(input: ClassifyInput<'_>, markers: &IncidentMarkers) -> InjectCl
         return InjectClass::AlwaysOn;
     }
     InjectClass::SearchOnly
+}
+
+/// Classify a candidate under the recall-safe [`Strategy::Adaptive`] rule.
+///
+/// The single invariant: an *untagged* remembered record (no explicit `kind`)
+/// is never withheld — it is treated exactly as `Recency` would treat it. Only
+/// records the writer explicitly marked as non-startup are held back, so turning
+/// this on can raise precision but can never silently drop a memory the writer
+/// did not classify. This deliberately does NOT run the content heuristics
+/// (operational/transient detection) that [`classify`] applies to untagged text,
+/// because those are guesses against unlabeled content.
+pub fn classify_adaptive(input: ClassifyInput<'_>) -> InjectClass {
+    if input.entry_kind == EntryKind::Note {
+        return InjectClass::SearchOnly;
+    }
+    match input.kind {
+        Some(MemoryKind::Preference) => InjectClass::AlwaysOn,
+        Some(MemoryKind::ProjectFact) if input.scope == "project" => InjectClass::ProjectScoped,
+        Some(MemoryKind::ProjectFact) => InjectClass::SearchOnly,
+        Some(MemoryKind::Incident | MemoryKind::Reference) => InjectClass::SearchOnly,
+        None if input.scope == "project" => InjectClass::ProjectScoped,
+        None => InjectClass::AlwaysOn,
+    }
+}
+
+/// Dispatch to the classifier for `strategy`. `Recency` never withholds, so it
+/// short-circuits to `AlwaysOn`; the project/scope filter still applies upstream.
+pub fn select(
+    strategy: Strategy,
+    input: ClassifyInput<'_>,
+    markers: &IncidentMarkers,
+) -> InjectClass {
+    match strategy {
+        Strategy::Recency => InjectClass::AlwaysOn,
+        Strategy::Relevance => classify(input, markers),
+        Strategy::Adaptive => classify_adaptive(input),
+    }
 }
 
 /// True when the body reads as an operational log; see `signals` for the
@@ -347,9 +395,101 @@ mod tests {
         assert_eq!(Strategy::from_config("relevance"), Strategy::Relevance);
         assert_eq!(Strategy::from_config("  Relevance "), Strategy::Relevance);
         assert_eq!(Strategy::from_config("recency"), Strategy::Recency);
-        // Unknown values degrade to legacy behavior rather than erroring.
-        assert_eq!(Strategy::from_config("bogus"), Strategy::Recency);
-        assert_eq!(Strategy::from_config(""), Strategy::Recency);
+        assert_eq!(Strategy::from_config("adaptive"), Strategy::Adaptive);
+        // Unknown values degrade to the safe default rather than erroring.
+        assert_eq!(Strategy::from_config("bogus"), Strategy::Adaptive);
+        assert_eq!(Strategy::from_config(""), Strategy::Adaptive);
+    }
+
+    #[test]
+    fn adaptive_never_withholds_untagged_remembered_content() {
+        // The core safety property: an untagged remembered record must never be
+        // dropped by Adaptive, even text that Relevance would withhold as an
+        // operational log. Adaptive only trusts explicit kinds.
+        let operational = "2026-06-06 root cause: a cron job leaked session bus daemons.";
+        assert_eq!(
+            classify_adaptive(global(operational)),
+            InjectClass::AlwaysOn
+        );
+        assert_eq!(
+            classify_adaptive(global("a plain durable fact about the user")),
+            InjectClass::AlwaysOn
+        );
+        // Contrast: Relevance withholds the same untagged operational log.
+        assert_eq!(
+            classify(global(operational), &IncidentMarkers::default()),
+            InjectClass::SearchOnly
+        );
+    }
+
+    #[test]
+    fn adaptive_withholds_explicit_non_startup_kinds() {
+        for kind in [MemoryKind::Incident, MemoryKind::Reference] {
+            let tagged = ClassifyInput {
+                scope: "global",
+                project_id: None,
+                entry_kind: EntryKind::Remember,
+                kind: Some(kind),
+                body: "explicitly tagged record",
+            };
+            assert_eq!(classify_adaptive(tagged), InjectClass::SearchOnly);
+        }
+    }
+
+    #[test]
+    fn adaptive_keeps_preferences_and_scopes_project_facts() {
+        let pref = ClassifyInput {
+            scope: "global",
+            project_id: None,
+            entry_kind: EntryKind::Remember,
+            kind: Some(MemoryKind::Preference),
+            body: "prefer fd over find",
+        };
+        assert_eq!(classify_adaptive(pref), InjectClass::AlwaysOn);
+
+        let project_fact = ClassifyInput {
+            scope: "project",
+            project_id: Some("repo-alpha"),
+            entry_kind: EntryKind::Remember,
+            kind: Some(MemoryKind::ProjectFact),
+            body: "repo alpha deploys on tag push",
+        };
+        assert_eq!(classify_adaptive(project_fact), InjectClass::ProjectScoped);
+    }
+
+    #[test]
+    fn adaptive_treats_raw_notes_as_search_only() {
+        let note = ClassifyInput {
+            entry_kind: EntryKind::Note,
+            ..global("a stray idea")
+        };
+        assert_eq!(classify_adaptive(note), InjectClass::SearchOnly);
+    }
+
+    #[test]
+    fn select_recency_includes_everything() {
+        let markers = IncidentMarkers::default();
+        // Even a tagged incident is included under Recency; only the upstream
+        // scope/project filter narrows it.
+        let incident = ClassifyInput {
+            scope: "global",
+            project_id: None,
+            entry_kind: EntryKind::Remember,
+            kind: Some(MemoryKind::Incident),
+            body: "tagged incident",
+        };
+        assert_eq!(
+            select(Strategy::Recency, incident, &markers),
+            InjectClass::AlwaysOn
+        );
+        assert_eq!(
+            select(Strategy::Adaptive, incident, &markers),
+            InjectClass::SearchOnly
+        );
+        assert_eq!(
+            select(Strategy::Relevance, incident, &markers),
+            InjectClass::SearchOnly
+        );
     }
 
     #[test]

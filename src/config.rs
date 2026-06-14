@@ -901,7 +901,9 @@ impl DefaultsConfig {
             event_sidecar: raw.event_sidecar.unwrap_or_default(),
             hook_context_max_tokens: raw.hook_context_max_tokens.unwrap_or(4000),
             context_cache_max_age: raw.context_cache_max_age.unwrap_or_else(|| "7d".to_owned()),
-            context_strategy: raw.context_strategy.unwrap_or_else(|| "recency".to_owned()),
+            context_strategy: raw
+                .context_strategy
+                .unwrap_or_else(|| "adaptive".to_owned()),
         }
     }
 }
@@ -1407,9 +1409,10 @@ mod tests {
             loaded.config.defaults.event_sidecar,
             EventSidecarPolicy::Always
         );
-        // Unset strategy defaults to legacy behavior, so existing stores are
-        // unaffected until they opt in.
-        assert_eq!(loaded.config.defaults.context_strategy, "recency");
+        // Unset strategy defaults to the recall-safe Adaptive selector: it only
+        // withholds explicitly non-startup kinds and never drops untagged
+        // content, so the default can raise precision without regressing recall.
+        assert_eq!(loaded.config.defaults.context_strategy, "adaptive");
         assert_eq!(
             loaded.config.offline,
             OfflineConfig {

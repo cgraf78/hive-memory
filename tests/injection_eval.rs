@@ -212,17 +212,20 @@ fn materialize(corpus: &Corpus, root: &Path) -> Vec<IndexEntry> {
 // Strategies
 // ---------------------------------------------------------------------------
 
-/// Run a strategy for one session and return the subjects it would inject.
+/// Run a strategy for one session and return the injected subjects mapped to the
+/// tokens each consumed.
 ///
 /// This drives the real production path: the strategy is handed to
 /// `assemble_context` exactly as the live hook does, so the eval scores the
-/// shipped selector rather than a parallel reimplementation.
+/// shipped selector rather than a parallel reimplementation. Returning the
+/// per-section token cost lets the eval express the precision win in tokens (the
+/// guardrail that keeps a recall change from quietly stuffing context).
 fn inject(
     strategy: InjectStrategy,
     root: &Path,
     entries: &[IndexEntry],
     project_id: Option<&str>,
-) -> BTreeSet<String> {
+) -> BTreeMap<String, usize> {
     let by_id: BTreeMap<&str, &str> = entries
         .iter()
         .filter_map(|e| e.subject.as_deref().map(|s| (e.id.as_str(), s)))
@@ -249,7 +252,11 @@ fn inject(
     output
         .sections
         .iter()
-        .filter_map(|s| by_id.get(s.id.as_str()).map(|s| (*s).to_owned()))
+        .filter_map(|section| {
+            by_id
+                .get(section.id.as_str())
+                .map(|subject| ((*subject).to_owned(), section.estimated_tokens))
+        })
         .collect()
 }
 
@@ -266,6 +273,11 @@ struct Score {
     fn_: usize,
     /// Dropped preferences — the failure we refuse to trade precision for.
     high_value_fn: usize,
+    /// Tokens across all injected sections (true and false positives).
+    injected_tokens: usize,
+    /// Tokens spent on false positives — context noise the agent pays for every
+    /// turn. The standing guardrail: a recall change must not inflate this.
+    wasted_tokens: usize,
 }
 
 /// A preference subject is high-value: dropping it changes how the agent works,
@@ -275,12 +287,13 @@ fn is_high_value(subject: &str) -> bool {
     subject.starts_with("pref-")
 }
 
-fn score_context(injected: &BTreeSet<String>, ctx: &LabeledContext) -> Score {
+fn score_context(injected: &BTreeMap<String, usize>, ctx: &LabeledContext) -> Score {
     let include: BTreeSet<&str> = ctx.include.iter().map(String::as_str).collect();
     let exclude: BTreeSet<&str> = ctx.exclude.iter().map(String::as_str).collect();
     let mut score = Score::default();
+    score.injected_tokens = injected.values().sum();
     for subject in &include {
-        if injected.contains(*subject) {
+        if injected.contains_key(*subject) {
             score.tp += 1;
         } else {
             score.fn_ += 1;
@@ -290,8 +303,9 @@ fn score_context(injected: &BTreeSet<String>, ctx: &LabeledContext) -> Score {
         }
     }
     for subject in &exclude {
-        if injected.contains(*subject) {
+        if let Some(tokens) = injected.get(*subject) {
             score.fp += 1;
+            score.wasted_tokens += tokens;
         }
     }
     score
@@ -329,7 +343,7 @@ fn evaluate(strategy: InjectStrategy) -> (Vec<(String, Score)>, Score) {
         let injected = inject(strategy, &root, &entries, project);
         let score = score_context(&injected, ctx);
         println!(
-            "  {:<20} precision={:.3} recall={:.3}  tp={} fp={} fn={} hi-fn={}",
+            "  {:<20} precision={:.3} recall={:.3}  tp={} fp={} fn={} hi-fn={} tokens={} wasted={}",
             ctx.name,
             precision(score.tp, score.fp),
             recall(score.tp, score.fn_),
@@ -337,15 +351,19 @@ fn evaluate(strategy: InjectStrategy) -> (Vec<(String, Score)>, Score) {
             score.fp,
             score.fn_,
             score.high_value_fn,
+            score.injected_tokens,
+            score.wasted_tokens,
         );
         total.tp += score.tp;
         total.fp += score.fp;
         total.fn_ += score.fn_;
         total.high_value_fn += score.high_value_fn;
+        total.injected_tokens += score.injected_tokens;
+        total.wasted_tokens += score.wasted_tokens;
         per_context.push((ctx.name.clone(), score));
     }
     println!(
-        "  {:<20} precision={:.3} recall={:.3}  tp={} fp={} fn={} hi-fn={}",
+        "  {:<20} precision={:.3} recall={:.3}  tp={} fp={} fn={} hi-fn={} tokens={} wasted={}",
         "AGGREGATE",
         precision(total.tp, total.fp),
         recall(total.tp, total.fn_),
@@ -353,6 +371,8 @@ fn evaluate(strategy: InjectStrategy) -> (Vec<(String, Score)>, Score) {
         total.fp,
         total.fn_,
         total.high_value_fn,
+        total.injected_tokens,
+        total.wasted_tokens,
     );
 
     let _ = fs::remove_dir_all(&root);
@@ -469,5 +489,67 @@ fn relevance_reaches_full_precision_with_kind() {
     assert!(
         (precision(total.tp, total.fp) - 1.0).abs() < f64::EPSILON,
         "explicit kind closes the residual to full precision"
+    );
+}
+
+/// Adaptive (the new default) is a strict, recall-safe precision win over
+/// Recency: it withholds only records carrying an explicit non-startup `kind`
+/// (the tagged incident and the two tagged references in the corpus) and never
+/// drops a wanted memory or an untagged record. The untagged incidents and the
+/// untagged legacy global fact are deliberately still injected — Adaptive does
+/// not guess against unlabeled content; that is the property that makes it safe
+/// to enable by default.
+#[test]
+fn adaptive_is_a_recall_safe_precision_win() {
+    let (per_context, total) = evaluate(InjectStrategy::Adaptive);
+
+    // Recall-safety floor: nothing wanted dropped, no preference dropped.
+    for (name, score) in &per_context {
+        assert_eq!(score.fn_, 0, "{name}: adaptive dropped a wanted memory");
+    }
+    assert_eq!(total.fn_, 0, "adaptive must drop nothing wanted");
+    assert_eq!(
+        total.high_value_fn, 0,
+        "adaptive must never drop a preference"
+    );
+    assert_eq!(total.tp, 19, "adaptive must keep every true positive");
+
+    let recency = evaluate(InjectStrategy::Recency).1;
+    // Strictly fewer false positives and fewer wasted tokens than Recency,
+    // because the tagged incident/reference records are withheld.
+    assert!(
+        total.fp < recency.fp,
+        "adaptive must withhold the explicitly-tagged non-startup records"
+    );
+    assert!(total.wasted_tokens < recency.wasted_tokens);
+    assert!(total.injected_tokens < recency.injected_tokens);
+    assert!(precision(total.tp, total.fp) > precision(recency.tp, recency.fp));
+    // But it is not as aggressive as Relevance: it keeps the untagged excludes,
+    // so some false positives remain. This is the safety/precision trade.
+    assert!(
+        total.fp > 0,
+        "adaptive must not guess against untagged content"
+    );
+}
+
+/// The injected-token guardrail made explicit: both precision strategies spend
+/// fewer tokens on false-positive context than Recency, with Relevance driving
+/// wasted tokens to zero on the fully-tagged corpus. This is the standing
+/// regression guard so a future recall change cannot quietly stuff context.
+#[test]
+fn precision_strategies_cut_wasted_tokens_versus_recency() {
+    let recency = evaluate(InjectStrategy::Recency).1;
+    let adaptive = evaluate(InjectStrategy::Adaptive).1;
+    let relevance = evaluate(InjectStrategy::Relevance).1;
+
+    assert!(
+        recency.wasted_tokens > 0,
+        "recency over-injects by construction"
+    );
+    assert!(adaptive.wasted_tokens < recency.wasted_tokens);
+    assert!(relevance.wasted_tokens <= adaptive.wasted_tokens);
+    assert_eq!(
+        relevance.wasted_tokens, 0,
+        "relevance reaches full precision, so it wastes no tokens"
     );
 }

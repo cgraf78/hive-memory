@@ -297,11 +297,14 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
         } else {
             entry.body.clone()
         };
-        // Under Relevance, withhold candidates the classifier marks search-only
-        // (operational logs, raw notes) so startup context stays focused. The
-        // body must be resolved first because the operational signal is content.
-        if input.inject_strategy == inject::Strategy::Relevance {
-            let class = inject::classify(
+        // Withhold candidates the active strategy marks search-only so startup
+        // context stays focused. Recency keeps everything; Relevance applies the
+        // full content classifier; Adaptive (default) only withholds explicitly
+        // non-startup kinds and never guesses against untagged content. The body
+        // must be resolved first because Relevance's signal is content.
+        if input.inject_strategy != inject::Strategy::Recency {
+            let class = inject::select(
+                input.inject_strategy,
                 ClassifyInput {
                     scope: &entry.scope,
                     project_id: entry.project_id.as_deref(),
