@@ -267,19 +267,18 @@ pub fn search(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
             })
             .then_with(|| left.entry.note_path.cmp(&right.entry.note_path))
     });
-    suppress_superseded_hits(&mut hits, &query, input.limit);
+    suppress_superseded_hits(&mut hits, &query.phrase, input.limit);
     collapse_duplicate_hits(&mut hits);
     hits.truncate(input.limit);
     Ok(hits)
 }
 
-fn suppress_superseded_hits(hits: &mut Vec<SearchHit>, query: &SearchQuery, limit: usize) {
+fn suppress_superseded_hits(hits: &mut Vec<SearchHit>, phrase: &str, limit: usize) {
     let scan_len = hits.len().min(limit.saturating_mul(4).clamp(16, 128));
     let mut suppressed = BTreeSet::new();
     for older in hits.iter().take(scan_len) {
         for newer in hits.iter().take(scan_len) {
-            if supersession::should_suppress_older(&older.entry, &newer.entry, Some(&query.phrase))
-            {
+            if supersession::should_suppress_older(&older.entry, &newer.entry, Some(phrase)) {
                 suppressed.insert(older.entry.id.clone());
                 break;
             }
@@ -995,6 +994,12 @@ pub fn search_indexed(
         .map(|entry| (entry.id.as_str(), entry))
         .collect();
 
+    // Match the lexical path's temporal handling: an "oldest/first/original"
+    // query intends historical data, so expired records must remain eligible.
+    // Hardcoding include_expired=false would silently hide them under the
+    // Tantivy backend only.
+    let include_expired = contains_temporal_indicator(input.query, OLDEST_TERMS);
+
     // Over-fetch so policy post-filtering cannot empty the result below the
     // requested limit when high-ranked candidates are filtered out.
     let over_fetch = input.limit.saturating_mul(5).max(20);
@@ -1011,14 +1016,19 @@ pub fn search_indexed(
             || !scope_allowed(entry, input.scopes)
             || !project_allowed(entry, project_ids.as_ref())
             || !visibility::audience_allows(entry, input.agent_id)
-            || !validity::allows_search(entry, false)
+            || !validity::allows_search(entry, include_expired)
         {
             continue;
         }
         let body = indexed_body(input.store_root, entry)?;
-        // BM25 scores are small floats; scale to the integer score contract while
-        // preserving rank order.
-        let score = (f64::from(ranked_hit.score) * 1000.0) as usize;
+        // BM25 scores are small non-negative floats; scale to the integer score
+        // contract while preserving rank order. Guard against a non-finite score
+        // (NaN/inf) so a pathological corpus cannot mint a `usize::MAX` rank.
+        let score = if ranked_hit.score.is_finite() && ranked_hit.score >= 0.0 {
+            (f64::from(ranked_hit.score) * 1000.0) as usize
+        } else {
+            0
+        };
         hits.push(SearchHit {
             entry: (*entry).clone(),
             score,
@@ -1026,6 +1036,10 @@ pub fn search_indexed(
             snippet: retrieval_snippet(&body),
         });
     }
+    // Apply the same supersession suppression as the lexical path so a record
+    // explicitly replaced by a newer one does not resurface. The query phrase is
+    // lowercased to match how the lexical path builds it.
+    suppress_superseded_hits(&mut hits, &input.query.to_ascii_lowercase(), input.limit);
     collapse_duplicate_hits(&mut hits);
     hits.truncate(input.limit);
     Ok(hits)
@@ -1053,21 +1067,26 @@ pub fn search_documents(
 
 /// Content fingerprint of an entry set, used to decide whether a cached Tantivy
 /// index is still fresh. Stable across entry ordering: ids are sorted before
-/// hashing, and body plus searchable metadata are included so any content edit
-/// invalidates the cache.
+/// hashing. Includes the indexed text (subject/tags/body) AND the fields that
+/// drive post-filtering (scope/project_id/audience), so a metadata-only edit
+/// that changes which records a query may return still invalidates the cache.
 pub fn entries_fingerprint(entries: &[IndexEntry]) -> String {
     let mut keyed: Vec<&IndexEntry> = entries.iter().collect();
     keyed.sort_by(|left, right| left.id.cmp(&right.id));
     let mut hasher = Sha256::new();
     for entry in keyed {
-        hasher.update(entry.id.as_bytes());
-        hasher.update([0u8]);
-        hasher.update(entry.subject.as_deref().unwrap_or_default().as_bytes());
-        hasher.update([0u8]);
-        hasher.update(entry.tags.join(",").as_bytes());
-        hasher.update([0u8]);
-        hasher.update(entry.body.as_bytes());
-        hasher.update([0u8]);
+        for field in [
+            entry.id.as_str(),
+            entry.subject.as_deref().unwrap_or_default(),
+            &entry.tags.join(","),
+            entry.scope.as_str(),
+            entry.project_id.as_deref().unwrap_or_default(),
+            &entry.audience.join(","),
+            entry.body.as_str(),
+        ] {
+            hasher.update(field.as_bytes());
+            hasher.update([0u8]);
+        }
     }
     format!("{:x}", hasher.finalize())
 }
@@ -1447,6 +1466,83 @@ mod tests {
             baseline,
             entries_fingerprint(&grown),
             "a content change must change the fingerprint"
+        );
+    }
+
+    #[test]
+    fn entries_fingerprint_reacts_to_metadata_only_edits() {
+        let dir = temp_dir("fingerprint-metadata");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "deploy key rotation policy",
+            timestamp(1_778_946_153),
+            Vec::new(),
+        );
+        let base = entries(&root, &cache);
+        let baseline = entries_fingerprint(&base);
+
+        // A metadata-only change that alters which queries may return the record
+        // (scope/audience/project) must invalidate the cache even though the
+        // indexed text is byte-identical.
+        let mut scoped = base.clone();
+        scoped[0].scope = "agent-private".to_owned();
+        assert_ne!(baseline, entries_fingerprint(&scoped), "scope change");
+
+        let mut audienced = base.clone();
+        audienced[0].audience = vec!["codex".to_owned()];
+        assert_ne!(baseline, entries_fingerprint(&audienced), "audience change");
+    }
+
+    #[test]
+    fn indexed_search_suppresses_superseded_records() {
+        let dir = temp_dir("indexed-supersede");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        let old_id = write_project_record_with_validity(
+            &root,
+            "Project alpha deploys with the manual checklist.",
+            "proj-alpha",
+            None,
+            None,
+            Vec::new(),
+        );
+        write_project_record_with_validity(
+            &root,
+            "Project alpha deploys with the checkrun gate.",
+            "proj-alpha",
+            None,
+            None,
+            vec![old_id.clone()],
+        );
+        let entries = entries(&root, &cache);
+        let index = build_index(&root, &entries);
+
+        // Both records match "deploys"; the superseded older one must be hidden,
+        // matching the lexical path's supersession behavior.
+        let hits = search_indexed(
+            indexed_input(
+                &root,
+                &entries,
+                "alpha deploys",
+                &["project".to_owned()],
+                None,
+                Some("proj-alpha"),
+            ),
+            &index,
+        )
+        .expect("search");
+        assert!(
+            hits.iter().all(|hit| hit.entry.id != old_id),
+            "superseded record must not surface; hits={hits:?}"
+        );
+        assert!(
+            hits.iter()
+                .any(|hit| hit.entry.body.contains("checkrun gate")),
+            "the superseding record should still be returned"
         );
     }
 
