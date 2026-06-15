@@ -493,6 +493,72 @@ mod tests {
     }
 
     #[test]
+    fn select_diverges_on_untagged_operational_global_fact() {
+        let markers = IncidentMarkers::default();
+        // An UNTAGGED operational global fact (dated root-cause log, no `kind`).
+        // This is the case where Adaptive and Relevance MUST diverge: Adaptive
+        // never withholds untagged content, but Relevance runs the content
+        // heuristic and withholds it. A refactor that swapped the two arms of
+        // `select` would flip these and fail here — unlike the existing
+        // `select_recency_includes_everything` case (a tagged incident) where
+        // both arms agree on SearchOnly.
+        let untagged_operational =
+            global("2026-06-06 root cause: a cron job leaked session bus daemons.");
+
+        assert_eq!(
+            select(Strategy::Recency, untagged_operational, &markers),
+            InjectClass::AlwaysOn,
+            "Recency never withholds"
+        );
+        assert_eq!(
+            select(Strategy::Adaptive, untagged_operational, &markers),
+            InjectClass::AlwaysOn,
+            "Adaptive keeps untagged content"
+        );
+        assert_eq!(
+            select(Strategy::Relevance, untagged_operational, &markers),
+            InjectClass::SearchOnly,
+            "Relevance can withhold untagged operational content"
+        );
+        // Anti-tautology guard: prove the two arms actually disagree here, so the
+        // test would catch a swap that made `select` route Adaptive through the
+        // Relevance classifier.
+        assert_ne!(
+            select(Strategy::Adaptive, untagged_operational, &markers),
+            select(Strategy::Relevance, untagged_operational, &markers)
+        );
+    }
+
+    #[test]
+    fn select_scopes_untagged_project_input_for_adaptive_and_relevance() {
+        let markers = IncidentMarkers::default();
+        // An UNTAGGED project-scoped record (no `kind`). Both Adaptive and
+        // Relevance defer to the project filter (ProjectScoped); Recency includes
+        // it unconditionally (AlwaysOn). This pins the project-scope behavior of
+        // each arm independently of the operational-content path above.
+        let untagged_project = ClassifyInput {
+            scope: "project",
+            project_id: Some("repo-alpha"),
+            entry_kind: EntryKind::Remember,
+            kind: None,
+            body: "repo alpha deploys on tag push",
+        };
+
+        assert_eq!(
+            select(Strategy::Adaptive, untagged_project, &markers),
+            InjectClass::ProjectScoped
+        );
+        assert_eq!(
+            select(Strategy::Relevance, untagged_project, &markers),
+            InjectClass::ProjectScoped
+        );
+        assert_eq!(
+            select(Strategy::Recency, untagged_project, &markers),
+            InjectClass::AlwaysOn
+        );
+    }
+
+    #[test]
     fn default_markers_match_shared_vocabulary() {
         // Anti-drift lock: read-time selection must judge untagged text with
         // exactly the vocabulary write-time inference uses, or a record can be
