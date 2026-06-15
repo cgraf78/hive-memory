@@ -9,11 +9,13 @@ use crate::{id, write};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self, Display};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 
 /// Input for resolving one project identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,12 +170,19 @@ pub struct ProjectAliases {
 pub fn resolve_project(input: ResolveProjectInput) -> Result<ProjectResolution, ProjectError> {
     let project_hint = absolutize_hint(&input.hint)?;
     let start_dir = starting_dir(&project_hint);
-    let marker = find_marker(&start_dir)?;
-    let git_root = find_git_root(&start_dir);
-    let project_root = marker
-        .as_ref()
-        .map(|marker| marker.root.clone())
-        .or_else(|| git_root.clone())
+
+    // Cache the expensive part of resolution (filesystem walk + VCS config
+    // parse) per starting directory. Explicit/env IDs short-circuit it, so the
+    // cache key is the start dir alone; the cached value records what the
+    // filesystem revealed (root + remote-derived or path-derived identity) and
+    // each caller's IDs are layered on top below. Repeated resolves in one
+    // command (e.g. recall walking several hints under the same repo) then cost
+    // a map lookup instead of re-walking the tree.
+    let discovered = discover_cached(&start_dir)?;
+
+    let marker_root = discovered.marker.as_ref().map(|marker| marker.root.clone());
+    let project_root = marker_root
+        .or_else(|| discovered.vcs_root.clone())
         .unwrap_or_else(|| start_dir.clone());
 
     if let Some(project_id) = input.explicit_project_id.filter(|value| !value.is_empty()) {
@@ -192,21 +201,19 @@ pub fn resolve_project(input: ResolveProjectInput) -> Result<ProjectResolution, 
             source: ProjectIdSource::Env,
         });
     }
-    if let Some(marker) = marker {
+    if let Some(marker) = &discovered.marker {
         return Ok(ProjectResolution {
-            project_id: marker.project_id,
+            project_id: marker.project_id.clone(),
             project_root,
             project_hint,
             source: ProjectIdSource::Marker,
         });
     }
-    if let Some(root) = git_root
-        && let Some(remote) = git_origin_url(&root)
-    {
-        let normalized = normalize_remote_url(&remote);
+    if let (Some(root), Some(remote)) = (&discovered.vcs_root, &discovered.remote_url) {
+        let normalized = normalize_remote_url(remote);
         return Ok(ProjectResolution {
             project_id: derived_id(&normalized),
-            project_root: root,
+            project_root: root.clone(),
             project_hint,
             source: ProjectIdSource::GitRemote,
         });
@@ -219,6 +226,65 @@ pub fn resolve_project(input: ResolveProjectInput) -> Result<ProjectResolution, 
         project_hint,
         source: ProjectIdSource::Path,
     })
+}
+
+/// Everything resolution learns from the filesystem for one starting dir.
+///
+/// Separated from `ProjectResolution` because it is identity-source agnostic and
+/// memoizable: it does not depend on a caller's explicit/env IDs, only on the
+/// directory tree. `marker` is stored so the (cheap) marker walk is shared too.
+#[derive(Clone)]
+struct Discovered {
+    marker: Option<Marker>,
+    vcs_root: Option<PathBuf>,
+    /// Raw remote URL parsed from the VCS config, if any. Normalization is
+    /// deliberately deferred to callers so the cached value stays a faithful
+    /// copy of what is on disk.
+    remote_url: Option<String>,
+}
+
+/// Process-wide memo of filesystem discovery keyed by absolutized start dir.
+///
+/// A `Mutex<HashMap>` is enough: contention is nil (resolution is short and
+/// infrequent within a single CLI invocation) and the win is eliminating
+/// repeated tree walks, not lock-free concurrency.
+static DISCOVERY_CACHE: Mutex<Option<HashMap<PathBuf, Discovered>>> = Mutex::new(None);
+
+fn discover_cached(start_dir: &Path) -> Result<Discovered, ProjectError> {
+    if let Ok(guard) = DISCOVERY_CACHE.lock()
+        && let Some(cache) = guard.as_ref()
+        && let Some(hit) = cache.get(start_dir)
+    {
+        return Ok(hit.clone());
+    }
+
+    let discovered = discover(start_dir)?;
+
+    if let Ok(mut guard) = DISCOVERY_CACHE.lock() {
+        guard
+            .get_or_insert_with(HashMap::new)
+            .insert(start_dir.to_path_buf(), discovered.clone());
+    }
+    Ok(discovered)
+}
+
+fn discover(start_dir: &Path) -> Result<Discovered, ProjectError> {
+    let marker = find_marker(start_dir)?;
+    let vcs_root = find_vcs_root(start_dir);
+    let remote_url = vcs_root.as_deref().and_then(vcs_remote_url);
+    Ok(Discovered {
+        marker,
+        vcs_root,
+        remote_url,
+    })
+}
+
+/// Clear the process-wide discovery cache. Test-only.
+#[cfg(test)]
+fn clear_discovery_cache() {
+    if let Ok(mut guard) = DISCOVERY_CACHE.lock() {
+        *guard = None;
+    }
 }
 
 /// Normalize a git origin URL so protocol/auth changes preserve project id.
@@ -565,6 +631,7 @@ fn project_directories(store_root: &Path) -> Result<Vec<String>, ProjectError> {
     Ok(ids)
 }
 
+#[derive(Clone)]
 struct Marker {
     root: PathBuf,
     project_id: String,
@@ -601,20 +668,180 @@ fn find_marker(start: &Path) -> Result<Option<Marker>, ProjectError> {
     Ok(None)
 }
 
-fn find_git_root(start: &Path) -> Option<PathBuf> {
-    let output = Command::new("git")
-        .args(["-C", start.to_str()?, "rev-parse", "--show-toplevel"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+/// VCS marker directory/file names recognized for shell-free root discovery,
+/// ordered by precedence. `.git` is checked first because it is by far the most
+/// common and, for colocated `jj`, is the backend that actually holds the
+/// remote config. Each is a repo-root sentinel: the first ancestor containing
+/// any of them is the root.
+const VCS_MARKERS: [&str; 4] = [".git", ".hg", ".jj", ".svn"];
+
+/// Find the enclosing VCS repository root without spawning a subprocess.
+///
+/// Walks from `start` up through its ancestors looking for a VCS marker. `.git`
+/// may be a directory (normal clone) OR a file (worktrees/submodules store a
+/// `gitdir:` redirect there), so directory-vs-file is not used to filter; mere
+/// existence of any marker name marks the root. This replaces
+/// `git rev-parse --show-toplevel`, which on machines with a slow `git` shim
+/// dominated recall latency.
+fn find_vcs_root(start: &Path) -> Option<PathBuf> {
+    for dir in start.ancestors() {
+        if VCS_MARKERS.iter().any(|marker| dir.join(marker).exists()) {
+            return Some(dir.to_path_buf());
+        }
     }
-    let root = String::from_utf8(output.stdout).ok()?;
-    let root = root.trim();
-    (!root.is_empty()).then(|| PathBuf::from(root))
+    None
 }
 
-fn git_origin_url(root: &Path) -> Option<String> {
+/// Derive the upstream remote URL for a repo root by reading the VCS config file
+/// directly, falling back to a subprocess only when parsing yields nothing.
+///
+/// Parsing the config file (rather than `git remote get-url origin`) keeps the
+/// common path shell-free and therefore independent of how slow the `git` binary
+/// is. The subprocess fallback exists only for exotic layouts the parser does
+/// not cover, and never runs when the config already answers the question.
+fn vcs_remote_url(root: &Path) -> Option<String> {
+    if let Some(url) = parse_remote_url(root) {
+        return Some(url);
+    }
+    git_origin_url_subprocess(root)
+}
+
+/// Parse a remote/upstream URL from the on-disk VCS config for `root`.
+fn parse_remote_url(root: &Path) -> Option<String> {
+    if let Some(git_dir) = resolve_git_dir(root) {
+        if let Some(url) = parse_git_config_origin(&git_dir.join("config")) {
+            return Some(url);
+        }
+    }
+    // Mercurial / Sapling colocated checkout.
+    if let Some(url) = parse_hg_default(&root.join(".hg/hgrc")) {
+        return Some(url);
+    }
+    // Non-colocated jj keeps its git backend under `.jj/repo/store/git`.
+    parse_git_config_origin(&root.join(".jj/repo/store/git/config"))
+}
+
+/// Resolve the real git directory for a repo root, following the `gitdir:`
+/// redirect used by worktrees and submodules when `.git` is a file.
+fn resolve_git_dir(root: &Path) -> Option<PathBuf> {
+    let dot_git = root.join(".git");
+    let metadata = fs::metadata(&dot_git).ok()?;
+    if metadata.is_dir() {
+        return Some(dot_git);
+    }
+    if metadata.is_file() {
+        let contents = fs::read_to_string(&dot_git).ok()?;
+        let target = contents.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix("gitdir:")
+                .map(|value| value.trim().to_owned())
+        })?;
+        let target = PathBuf::from(target);
+        let resolved = if target.is_absolute() {
+            target
+        } else {
+            root.join(target)
+        };
+        // Worktree gitdirs point at `.git/worktrees/<name>`; the remote config
+        // lives in the shared `commondir`, not the per-worktree gitdir.
+        if let Some(common) = read_commondir(&resolved) {
+            return Some(common);
+        }
+        return Some(resolved);
+    }
+    None
+}
+
+/// Follow a worktree gitdir's `commondir` pointer to the shared git directory.
+fn read_commondir(git_dir: &Path) -> Option<PathBuf> {
+    let contents = fs::read_to_string(git_dir.join("commondir")).ok()?;
+    let relative = contents.trim();
+    if relative.is_empty() {
+        return None;
+    }
+    let common = PathBuf::from(relative);
+    Some(if common.is_absolute() {
+        common
+    } else {
+        git_dir.join(common)
+    })
+}
+
+/// Extract the `[remote "origin"] url` from a git config file.
+///
+/// Hand-rolled rather than pulling in a git library: the format is a tiny INI
+/// dialect and we only need one key. Section headers and `key = value` lines are
+/// matched leniently (whitespace, inline comments) but conservatively enough to
+/// pick `origin` over other remotes regardless of declaration order.
+fn parse_git_config_origin(path: &Path) -> Option<String> {
+    let contents = fs::read_to_string(path).ok()?;
+    let mut in_origin = false;
+    for raw in contents.lines() {
+        let line = raw.trim();
+        if let Some(section) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            in_origin = is_origin_section(section);
+            continue;
+        }
+        if !in_origin {
+            continue;
+        }
+        if let Some(value) = config_value(line, "url") {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// True for a `remote "origin"` section header body (the text inside `[...]`).
+fn is_origin_section(section: &str) -> bool {
+    let mut parts = section.split_whitespace();
+    if parts.next() != Some("remote") {
+        return false;
+    }
+    // Subsection name is quoted: `remote "origin"`.
+    parts.next().map(|name| name.trim_matches('"')) == Some("origin")
+}
+
+/// Parse the Mercurial/Sapling `[paths] default = ...` upstream URL.
+fn parse_hg_default(path: &Path) -> Option<String> {
+    let contents = fs::read_to_string(path).ok()?;
+    let mut in_paths = false;
+    for raw in contents.lines() {
+        let line = raw.trim();
+        if let Some(section) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            in_paths = section.trim() == "paths";
+            continue;
+        }
+        if in_paths && let Some(value) = config_value(line, "default") {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// Parse `key = value` from one INI line, returning the value for `key`.
+///
+/// Stops at `#`/`;` inline comments and ignores blank/comment lines so a stray
+/// comment after the URL never leaks into the project id.
+fn config_value(line: &str, key: &str) -> Option<String> {
+    if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+        return None;
+    }
+    let (name, value) = line.split_once('=')?;
+    if name.trim() != key {
+        return None;
+    }
+    let value = value.trim();
+    let value = value
+        .split_once(" #")
+        .or_else(|| value.split_once(" ;"))
+        .map_or(value, |(head, _)| head);
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+/// Last-resort remote lookup via `git`, used only when config parsing fails.
+fn git_origin_url_subprocess(root: &Path) -> Option<String> {
     let output = Command::new("git")
         .args(["-C", root.to_str()?, "remote", "get-url", "origin"])
         .output()
@@ -820,5 +1047,216 @@ mod tests {
         assert_eq!(resolved.project_id, "cli-id");
         assert_eq!(resolved.project_root, root);
         assert_eq!(resolved.source, ProjectIdSource::Explicit);
+    }
+
+    /// Write a minimal git config with one `origin` remote under `root/.git`.
+    fn write_git_config(root: &Path, url: &str) {
+        let git_dir = root.join(".git");
+        fs::create_dir_all(&git_dir).expect("git dir");
+        fs::write(
+            git_dir.join("config"),
+            format!("[core]\n\trepositoryformatversion = 0\n[remote \"origin\"]\n\turl = {url}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n"),
+        )
+        .expect("git config");
+    }
+
+    #[test]
+    fn marker_walk_finds_git_dir_root() {
+        let root = temp_dir("vcs-git-dir");
+        fs::create_dir_all(root.join(".git")).expect("git dir");
+        let nested = root.join("a/b/c");
+        fs::create_dir_all(&nested).expect("nested");
+
+        let found = find_vcs_root(&nested).expect("root found");
+
+        assert_eq!(found, root);
+    }
+
+    #[test]
+    fn marker_walk_finds_git_file_root() {
+        let root = temp_dir("vcs-git-file");
+        // Worktrees and submodules store `.git` as a file, not a directory.
+        fs::write(root.join(".git"), "gitdir: /elsewhere/.git/worktrees/wt\n").expect("git file");
+
+        let found = find_vcs_root(&root).expect("root found");
+
+        assert_eq!(found, root);
+    }
+
+    #[test]
+    fn marker_walk_finds_hg_root() {
+        let root = temp_dir("vcs-hg");
+        fs::create_dir_all(root.join(".hg")).expect("hg dir");
+        let nested = root.join("deep/leaf");
+        fs::create_dir_all(&nested).expect("nested");
+
+        let found = find_vcs_root(&nested).expect("root found");
+
+        assert_eq!(found, root);
+    }
+
+    #[test]
+    fn marker_walk_returns_none_without_vcs() {
+        let root = temp_dir("vcs-none");
+        let nested = root.join("x/y");
+        fs::create_dir_all(&nested).expect("nested");
+
+        assert_eq!(find_vcs_root(&nested), None);
+    }
+
+    #[test]
+    fn parses_ssh_and_https_git_origin() {
+        let ssh_root = temp_dir("git-ssh");
+        write_git_config(&ssh_root, "git@github.com:cgraf78/hive-memory.git");
+        let https_root = temp_dir("git-https");
+        write_git_config(&https_root, "https://github.com/cgraf78/hive-memory.git");
+
+        let ssh_url = vcs_remote_url(&ssh_root).expect("ssh url");
+        let https_url = vcs_remote_url(&https_root).expect("https url");
+
+        // Equivalent URL spellings must normalize to one identity, matching the
+        // ids the old `git remote get-url` path produced.
+        assert_eq!(
+            derived_id(&normalize_remote_url(&ssh_url)),
+            derived_id(&normalize_remote_url(&https_url))
+        );
+        assert_eq!(
+            derived_id(&normalize_remote_url(&ssh_url)),
+            "github-com-cgraf78-hive-memory-f8a6daf797a6"
+        );
+    }
+
+    #[test]
+    fn parses_origin_without_trailing_dot_git() {
+        let root = temp_dir("git-no-suffix");
+        write_git_config(&root, "https://github.com/cgraf78/hive-memory");
+
+        let url = vcs_remote_url(&root).expect("url");
+
+        assert_eq!(
+            derived_id(&normalize_remote_url(&url)),
+            "github-com-cgraf78-hive-memory-f8a6daf797a6"
+        );
+    }
+
+    #[test]
+    fn picks_origin_among_multiple_remotes_regardless_of_order() {
+        let root = temp_dir("git-multi-remote");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(&git_dir).expect("git dir");
+        // `upstream` declared before `origin` to prove section selection, not
+        // first-url-wins, drives the choice.
+        fs::write(
+            git_dir.join("config"),
+            "[remote \"upstream\"]\n\turl = git@github.com:other/fork.git\n[remote \"origin\"]\n\turl = git@github.com:cgraf78/hive-memory.git\n",
+        )
+        .expect("git config");
+
+        let url = vcs_remote_url(&root).expect("url");
+
+        assert_eq!(url, "git@github.com:cgraf78/hive-memory.git");
+    }
+
+    #[test]
+    fn resolves_git_file_redirect_to_real_config() {
+        // Simulate a worktree: `.git` is a file pointing at a worktree gitdir
+        // whose `commondir` redirects to the shared git dir holding the remote.
+        let main = temp_dir("git-worktree-main");
+        let common = main.join(".git");
+        fs::create_dir_all(&common).expect("common dir");
+        fs::write(
+            common.join("config"),
+            "[remote \"origin\"]\n\turl = git@github.com:cgraf78/hive-memory.git\n",
+        )
+        .expect("config");
+        let worktree_gitdir = common.join("worktrees/wt");
+        fs::create_dir_all(&worktree_gitdir).expect("worktree gitdir");
+        fs::write(worktree_gitdir.join("commondir"), "../..\n").expect("commondir");
+
+        let checkout = temp_dir("git-worktree-checkout");
+        fs::write(
+            checkout.join(".git"),
+            format!("gitdir: {}\n", worktree_gitdir.display()),
+        )
+        .expect("git file");
+
+        let url = vcs_remote_url(&checkout).expect("url");
+
+        assert_eq!(url, "git@github.com:cgraf78/hive-memory.git");
+    }
+
+    #[test]
+    fn parses_hg_default_path() {
+        let root = temp_dir("hg-default");
+        let hg_dir = root.join(".hg");
+        fs::create_dir_all(&hg_dir).expect("hg dir");
+        fs::write(
+            hg_dir.join("hgrc"),
+            "[paths]\ndefault = https://github.com/cgraf78/hive-memory\n",
+        )
+        .expect("hgrc");
+
+        let url = vcs_remote_url(&root).expect("url");
+
+        assert_eq!(
+            derived_id(&normalize_remote_url(&url)),
+            "github-com-cgraf78-hive-memory-f8a6daf797a6"
+        );
+    }
+
+    #[test]
+    fn remote_url_is_none_when_config_has_no_origin() {
+        let root = temp_dir("git-no-origin");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(&git_dir).expect("git dir");
+        // No origin and no real git binary will succeed here, so the fallback
+        // also yields nothing.
+        fs::write(
+            git_dir.join("config"),
+            "[remote \"upstream\"]\n\turl = git@github.com:other/fork.git\n",
+        )
+        .expect("config");
+
+        assert_eq!(parse_remote_url(&root), None);
+    }
+
+    #[test]
+    fn resolve_uses_parsed_git_origin_for_id() {
+        clear_discovery_cache();
+        let root = temp_dir("resolve-git-id");
+        write_git_config(&root, "git@github.com:cgraf78/hive-memory.git");
+
+        let resolved = resolve_project(ResolveProjectInput {
+            hint: root.clone(),
+            explicit_project_id: None,
+            env_project_id: None,
+        })
+        .expect("resolve project");
+
+        assert_eq!(resolved.source, ProjectIdSource::GitRemote);
+        assert_eq!(
+            resolved.project_id,
+            "github-com-cgraf78-hive-memory-f8a6daf797a6"
+        );
+    }
+
+    #[test]
+    fn discovery_cache_returns_same_result_without_rewalking() {
+        clear_discovery_cache();
+        let root = temp_dir("resolve-cache");
+        write_git_config(&root, "git@github.com:cgraf78/hive-memory.git");
+        let start = starting_dir(&absolutize_hint(&root).expect("absolutize"));
+
+        let first = discover_cached(&start).expect("first discover");
+        // Mutating the config after the first walk proves the second read is
+        // served from cache, not re-parsed from disk.
+        fs::write(root.join(".git/config"), "[core]\n").expect("clobber config");
+        let second = discover_cached(&start).expect("second discover");
+
+        assert_eq!(first.remote_url, second.remote_url);
+        assert_eq!(
+            first.remote_url.as_deref(),
+            Some("git@github.com:cgraf78/hive-memory.git")
+        );
     }
 }
