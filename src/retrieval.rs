@@ -503,7 +503,11 @@ mod tests {
                 .map(|hit| hit.id.as_str()),
             Some("a")
         );
-        std::fs::remove_dir_all(&dir).expect("cleanup");
+        // Best-effort cleanup: the assertions above are what matter, and on
+        // macOS a still-mmapped Tantivy index dir can intermittently refuse
+        // removal. The temp dir is unique per process+line, so leaving it on a
+        // rare failure is harmless.
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
