@@ -6,7 +6,8 @@
 //! relies on them?
 
 use crate::{
-    classify, config, event, index, note, outbox, project, retrieval, secret, store, write,
+    classify, config, event, index, note, outbox, project, retrieval, secret, store, supersession,
+    write,
 };
 use serde::Serialize;
 use std::fs;
@@ -199,6 +200,7 @@ pub fn run(input: DoctorInput<'_>) -> DoctorReport {
         check_outbox_archives(input.config, &mut checks);
         check_event_pairing(input.config, &mut checks);
         check_agent_private_audience(input.config, &mut checks);
+        check_dangling_supersedes(input.config, &mut checks);
         check_note_secrets(input.config, &mut checks);
         check_note_prompt_risks(input.config, &mut checks);
     }
@@ -1336,6 +1338,125 @@ fn check_agent_private_audience(config: &config::Config, checks: &mut Vec<Doctor
     }
 }
 
+/// Surface explicit `supersedes` links whose target is NOT actually retired in a
+/// full-store resolution. Two informational cases are flagged:
+///
+///   - **Dangling target** — a `supersedes` id that names no present record, so
+///     the link can never retire anything. Usually a typo or a target that was
+///     deleted/never synced to this machine.
+///   - **Audience-shadowed survivor** — a target that the full (all-audience)
+///     resolution would retire, but the audience-visible-only resolution would
+///     not. This means the only corrector is an `agent-private` record, so the
+///     stale target still surfaces in broad recall for every viewer outside that
+///     audience. Privacy correctly wins over supersession (see the context
+///     resolver), but a writer who expected the correction to be universal
+///     should know it is scoped to one agent.
+///
+/// This is informational (a warning, never an error): a dangling or shadowed
+/// link is a recoverable authoring/sync condition, not store corruption. It
+/// reads only the rebuilt index, so it does not re-walk canonical notes.
+fn check_dangling_supersedes(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
+    for (store_name, store_config) in &config.stores {
+        let id = format!("store.{store_name}.supersedes");
+        let index_path =
+            index::scoped_index_path(&config.cache_dir, store_name, &store_config.root);
+        let entries = match index::read_index(&index_path) {
+            Ok(entries) => entries,
+            Err(_) => {
+                // A missing/unbuilt index is not an authoring problem; the
+                // search-index and classifier checks already advise rebuilding.
+                checks.push(pass(
+                    id,
+                    format!(
+                        "store {store_name} supersedes links not checked; index not built (run hm refresh)"
+                    ),
+                    vec![index_path.display().to_string()],
+                ));
+                continue;
+            }
+        };
+
+        let SupersedesResolution { dangling, shadowed } = resolve_supersedes_health(&entries);
+
+        if dangling.is_empty() && shadowed.is_empty() {
+            checks.push(pass(
+                id,
+                format!("store {store_name} explicit supersedes targets all resolve"),
+                vec![index_path.display().to_string()],
+            ));
+            continue;
+        }
+
+        if !dangling.is_empty() {
+            checks.push(warn(
+                format!("{id}.dangling"),
+                format!(
+                    "store {store_name} has {} explicit supersedes link(s) naming an absent target",
+                    dangling.len()
+                ),
+                dangling,
+            ));
+        }
+        if !shadowed.is_empty() {
+            checks.push(warn(
+                format!("{id}.audience-shadowed"),
+                format!(
+                    "store {store_name} has {} superseded target(s) kept visible because the only corrector is agent-private",
+                    shadowed.len()
+                ),
+                shadowed,
+            ));
+        }
+    }
+}
+
+/// Resolution-consistency findings for explicit `supersedes` links in a store.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SupersedesResolution {
+    /// `"<source-id> -> <missing-target-id>"` for each link naming an absent id.
+    dangling: Vec<String>,
+    /// Target ids retired only by an audience-restricted corrector, so they
+    /// still surface for viewers outside that audience.
+    shadowed: Vec<String>,
+}
+
+/// Compute dangling and audience-shadowed `supersedes` targets over a full store.
+///
+/// Pure over the index entries so it can be unit-tested without a `Config` or a
+/// built cache. Shadowing is detected by comparing the full-set resolution
+/// against the resolution that excludes audience-gated (`agent-private`) records:
+/// a target retired by the full set but kept by the visible-only set survives
+/// only because its corrector is private. `agent-private` is the sole
+/// audience-gated scope, so dropping it yields the universally-visible suppressor
+/// set used by every non-member viewer.
+fn resolve_supersedes_health(entries: &[index::IndexEntry]) -> SupersedesResolution {
+    let present: std::collections::BTreeSet<&str> =
+        entries.iter().map(|entry| entry.id.as_str()).collect();
+    let mut dangling = Vec::new();
+    for entry in entries {
+        for target in &entry.supersedes {
+            if !present.contains(target.as_str()) {
+                dangling.push(format!("{} -> {target}", entry.id));
+            }
+        }
+    }
+
+    let all_refs: Vec<&index::IndexEntry> = entries.iter().collect();
+    let visible_refs: Vec<&index::IndexEntry> = entries
+        .iter()
+        .filter(|entry| entry.scope != "agent-private")
+        .collect();
+    let retired_full = supersession::suppressed_ids(&all_refs, None);
+    let retired_visible = supersession::suppressed_ids(&visible_refs, None);
+    let shadowed: Vec<String> = retired_full
+        .iter()
+        .filter(|target| !retired_visible.contains(*target))
+        .cloned()
+        .collect();
+
+    SupersedesResolution { dangling, shadowed }
+}
+
 fn check_project_bindings(config: &config::Config, checks: &mut Vec<DoctorCheck>) {
     let dir = config.data_dir.join("projects");
     let entries = match fs::read_dir(&dir) {
@@ -2230,6 +2351,95 @@ mod tests {
         ));
         fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    fn supersedes_entry(id: &str, scope: &str, supersedes: Vec<String>) -> index::IndexEntry {
+        index::IndexEntry {
+            id: id.to_owned(),
+            store_id: "store".to_owned(),
+            entry_kind: note::EntryKind::Remember,
+            scope: scope.to_owned(),
+            project_id: None,
+            audience: Vec::new(),
+            tags: Vec::new(),
+            subject: None,
+            confidence: note::Confidence::High,
+            valid_from: None,
+            valid_to: None,
+            supersedes,
+            kind: None,
+            entities: Vec::new(),
+            classified: None,
+            agent_id: "codex".to_owned(),
+            host_id: "taylor".to_owned(),
+            created_at: "2026-06-01T00:00:00Z".to_owned(),
+            body: format!("Body of {id}."),
+            note_path: format!("inbox/notes/{id}.md"),
+            event_path: None,
+        }
+    }
+
+    #[test]
+    fn supersedes_health_is_clean_for_resolved_links() {
+        // A present, audience-unrestricted corrector retires its target with no
+        // dangling or shadowed findings.
+        let entries = vec![
+            supersedes_entry("old", "global", Vec::new()),
+            supersedes_entry("new", "global", vec!["old".to_owned()]),
+        ];
+
+        assert_eq!(
+            resolve_supersedes_health(&entries),
+            SupersedesResolution::default()
+        );
+    }
+
+    #[test]
+    fn supersedes_health_flags_dangling_target() {
+        // A `supersedes` id that names no present record can never retire
+        // anything; it is reported as dangling.
+        let entries = vec![supersedes_entry(
+            "new",
+            "global",
+            vec!["missing-id".to_owned()],
+        )];
+
+        let resolution = resolve_supersedes_health(&entries);
+
+        assert_eq!(resolution.dangling, vec!["new -> missing-id".to_owned()]);
+        assert!(resolution.shadowed.is_empty());
+    }
+
+    #[test]
+    fn supersedes_health_flags_audience_shadowed_target() {
+        // The only corrector is agent-private, so the global target is retired in
+        // the full resolution but survives for every viewer outside that
+        // audience. Privacy wins over supersession; doctor surfaces the gap.
+        let entries = vec![
+            supersedes_entry("old", "global", Vec::new()),
+            supersedes_entry("private-new", "agent-private", vec!["old".to_owned()]),
+        ];
+
+        let resolution = resolve_supersedes_health(&entries);
+
+        assert!(resolution.dangling.is_empty());
+        assert_eq!(resolution.shadowed, vec!["old".to_owned()]);
+    }
+
+    #[test]
+    fn supersedes_health_not_shadowed_when_visible_corrector_exists() {
+        // A target retired by BOTH a private and a visible corrector is not
+        // shadowed: the visible link already retires it for every viewer.
+        let entries = vec![
+            supersedes_entry("old", "global", Vec::new()),
+            supersedes_entry("private-new", "agent-private", vec!["old".to_owned()]),
+            supersedes_entry("visible-new", "global", vec!["old".to_owned()]),
+        ];
+
+        let resolution = resolve_supersedes_health(&entries);
+
+        assert!(resolution.dangling.is_empty());
+        assert!(resolution.shadowed.is_empty());
     }
 
     #[test]

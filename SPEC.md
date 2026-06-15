@@ -238,6 +238,14 @@ schema reported by `hm --version` is the store/record `schema_version`, not the
 cache's internal versions, which are an implementation detail of the local
 triage index and never appear in the stability contract.
 
+The `schema <n>` in `hm --version`'s `hm X.Y.Z (git <short-sha>, schema <n>)`
+line is specifically the manifest/store `schema_version` — the single number the
+stability contract freezes. The per-artifact schema versions (config, Markdown
+front matter, JSON event, outbox metadata), which all share the value `1` in v1
+but could diverge under a future migration, are reported per store by
+`hm doctor` and `hm stores show`, not collapsed into the one-line `--version`
+banner.
+
 ### Markdown Note Schema
 
 Canonical notes live under:
@@ -1097,12 +1105,30 @@ never rewrites or deletes canonical memory; it only filters what broad recall
 shows. Both `hm search` and `hm context` apply the SAME resolution through one
 shared resolver so the two surfaces can never disagree about what is current.
 
-Both surfaces resolve supersession over the set of records the caller would
-otherwise see — for `hm context` that is the viewer-visible set after scope,
-project, and audience filtering; for `hm search` it is the query-matched hits
-after the same filtering. A record the caller cannot see can never suppress one
-it can: context filters first, then resolves supersession over the survivors, so
-visibility always takes precedence over supersession.
+Each surface resolves supersession with two distinct sets in mind: the set of
+records eligible to ACT as a suppressor, and the set of records actually
+RENDERED. A suppressor must be **audience-permitted and valid**: a record the
+caller cannot see (another agent's `agent-private`) can never suppress one it
+can, and a record outside its validity window (expired or not yet valid) — which
+is itself dropped from rendering — can never suppress a live older fact, or the
+caller would lose both the corrector and the target. Visibility and validity
+therefore take precedence over supersession.
+
+Suppressors are NOT scope/project filtered, because an explicit `supersedes`
+link is authoritative ACROSS scope (see below): a global or other-project
+correction must still retire its target even for a viewer who narrowed `--scope`
+and would never render the corrector. The natural-language heuristic stays
+conservative regardless, because it independently requires the corrector and
+target to share the same scope and project, so widening the suppressor input can
+never make the heuristic fire across scope. The RENDERED set still applies every
+filter (source, scope, project, audience, validity); supersession then removes
+any rendered record that an audience-permitted, valid record supersedes.
+
+For `hm search` the suppressor and rendered sets coincide in the query-matched,
+audience/scope/project/validity-filtered hits: search inherently considers only
+records that match the query, which is its legitimate scope. The cross-scope
+behavior above is specific to `hm context`, whose suppressor set is every
+audience-permitted, valid record regardless of the viewer's selected scope.
 
 There are two clearly separated confidence layers:
 
@@ -1112,10 +1138,13 @@ There are two clearly separated confidence layers:
    or entry kind. A correction written as a `note`, or one that moves the fact
    from project scope to global scope, still hides the fact it explicitly
    replaces. This is the durable contract a writer opts into. Explicit links are
-   resolved across the FULL set the surface considers (an O(n) id lookup): in
-   `hm context` that is every viewer-visible record, and in `hm search` it is
-   every query-matched hit, regardless of rank. An explicit correction is never
-   missed because its target ranked low.
+   resolved across the FULL suppressor set the surface considers (an O(n) id
+   lookup): in `hm context` that is every audience-permitted, valid record — NOT
+   scope/project filtered, so a cross-scope correction retires its target even
+   when the viewer narrowed `--scope` — and in `hm search` it is every
+   query-matched hit, regardless of rank. An explicit correction is never missed
+   because its target ranked low or because the corrector sits outside the
+   viewer's selected scope.
 2. **Natural-language heuristic (lower confidence, windowed).** When there is no
    explicit link, a deliberately narrow heuristic may still suppress an older
    record. It fires only when both records are `remember` entries in the SAME
@@ -1136,6 +1165,11 @@ Invariants:
   corrected. This guarantee is *unconditional* for explicit `supersedes` links
   (resolved across the full set) and *among the top candidates* for the
   windowed natural-language heuristic.
+- **Suppressors are audience-permitted and valid.** Only a record the caller may
+  see and that is currently within its validity window can suppress another. An
+  `agent-private` corrector the viewer cannot see, or an expired/not-yet-valid
+  corrector that is itself dropped from rendering, never hides a live older fact —
+  otherwise the caller would be left with neither the corrector nor the target.
 - **Historical recall exception (search only).** A query that explicitly names a
   token living only in the older fact (for example searching `cargo fmt` after a
   `checkrun format` correction) keeps the older record visible, so historical

@@ -2476,16 +2476,31 @@ fn tantivy_search(
         // cache-key lock. `Ok(Some(lock))` lets us rebuild while holding it;
         // `Ok(None)` means another rebuild already holds it, and a lock I/O error
         // means we cannot coordinate — in both of those cases skip our rebuild and
-        // search the current (stale) index read-only instead of blocking this
+        // search the current index read-only instead of blocking this
         // latency-sensitive read. The lock guard must outlive the rebuild, so it
         // is bound for the whole branch.
-        if let Ok(Some(_rebuild_lock)) =
-            index::try_rebuild_lock(&config.cache_dir, store_name, store_root)
-        {
-            let documents = search::search_documents(store_root, input.entries)?;
-            index
-                .rebuild_tagged(&documents, Some(&fingerprint))
-                .map_err(|err| search::SearchError::Retrieval(err.to_string()))?;
+        match index::try_rebuild_lock(&config.cache_dir, store_name, store_root) {
+            Ok(Some(_rebuild_lock)) => {
+                let documents = search::search_documents(store_root, input.entries)?;
+                index
+                    .rebuild_tagged(&documents, Some(&fingerprint))
+                    .map_err(|err| search::SearchError::Retrieval(err.to_string()))?;
+            }
+            // Rebuild skipped (another holder has the lock, or we cannot coordinate).
+            // `open_or_create_in_dir` will have just created an EMPTY index when none
+            // existed, so serving it now would silently return zero hits and strip
+            // results on the primary recall path. A populated-but-stale index is fine
+            // to serve (the other holder's rebuild lands for the next query), but a
+            // never-built/empty index must NOT short-circuit the lexical fallback.
+            // The manifest is written only after a successful rebuild commit, so its
+            // absence distinguishes "never built / empty" from "stale but populated".
+            _ if index.manifest().is_none() => {
+                return Err(search::SearchError::Retrieval(
+                    "full-text index not yet populated and a concurrent rebuild holds the cache lock"
+                        .to_owned(),
+                ));
+            }
+            _ => {}
         }
     }
     search::search_indexed(input, &index)

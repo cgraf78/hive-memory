@@ -373,9 +373,15 @@ fn is_newer(candidate: &IndexEntry, older: &IndexEntry) -> bool {
 }
 
 fn timestamp_rank(value: &str) -> i128 {
+    // An unparseable `created_at` must rank BELOW every genuinely-dated record,
+    // not at the epoch. Using `unwrap_or_default()` (0 = 1970-01-01) conflated
+    // "junk timestamp" with "written at the epoch", so a cycle/heuristic winner
+    // could be chosen as a record with a malformed date over a real one. A
+    // distinct minimum sentinel keeps "newest wins" honest: junk always loses,
+    // and the deterministic id tie-break still resolves all-junk cycles.
     OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
         .map(|timestamp| timestamp.unix_timestamp_nanos())
-        .unwrap_or_default()
+        .unwrap_or(i128::MIN)
 }
 
 fn has_stale_marker(body: &str) -> bool {
@@ -695,6 +701,141 @@ mod tests {
     }
 
     #[test]
+    fn self_loop_node_survives() {
+        // A self-loop (A supersedes A) is a degenerate cycle. It must keep its
+        // single member, never erase it: a record cannot retire itself.
+        let mut a = entry("a", "Fact A.", "2026-06-01T00:00:00Z");
+        a.supersedes = vec!["a".to_owned()];
+        let entries = [&a];
+
+        let suppressed = suppressed_ids(&entries, None);
+
+        assert!(suppressed.is_empty());
+    }
+
+    #[test]
+    fn two_disjoint_cycles_each_keep_their_own_winner() {
+        // Independent cycles must be resolved independently; one cycle's winner
+        // must not influence the other. Cycle 1: a<->b (b newer wins). Cycle 2:
+        // c<->d (d newer wins).
+        let mut a = entry("a", "Fact A.", "2026-06-01T00:00:00Z");
+        let mut b = entry("b", "Fact B.", "2026-06-02T00:00:00Z");
+        let mut c = entry("c", "Fact C.", "2026-06-01T00:00:00Z");
+        let mut d = entry("d", "Fact D.", "2026-06-02T00:00:00Z");
+        a.supersedes = vec!["b".to_owned()];
+        b.supersedes = vec!["a".to_owned()];
+        c.supersedes = vec!["d".to_owned()];
+        d.supersedes = vec!["c".to_owned()];
+        let entries = [&a, &b, &c, &d];
+
+        let suppressed = suppressed_ids(&entries, None);
+
+        // Each cycle drops exactly its older loser; both winners survive.
+        assert_eq!(suppressed.len(), 2);
+        assert!(suppressed.contains("a"));
+        assert!(suppressed.contains("c"));
+        assert!(!suppressed.contains("b"));
+        assert!(!suppressed.contains("d"));
+    }
+
+    #[test]
+    fn cycle_with_acyclic_in_edge_suppresses_whole_cycle() {
+        // D is an acyclic live head pointing into a 3-cycle A->B->C->A. D is not
+        // a cycle member, so D survives and retires A; the cycle's own resolution
+        // would keep one of {A,B,C}, but D's explicit acyclic link suppresses A
+        // outright, and B,C remain suppressed by the cycle. Net: only D survives.
+        let mut a = entry("a", "Fact A.", "2026-06-01T00:00:00Z");
+        let mut b = entry("b", "Fact B.", "2026-06-02T00:00:00Z");
+        let mut c = entry("c", "Fact C.", "2026-06-03T00:00:00Z");
+        let mut d = entry("d", "Fact D.", "2026-06-04T00:00:00Z");
+        a.supersedes = vec!["b".to_owned()];
+        b.supersedes = vec!["c".to_owned()];
+        c.supersedes = vec!["a".to_owned()];
+        d.supersedes = vec!["a".to_owned()];
+        let entries = [&a, &b, &c, &d];
+
+        let suppressed = suppressed_ids(&entries, None);
+
+        // A is suppressed (acyclic link from D, and it is not the cycle winner C).
+        // B and C: the cycle keeps winner C, suppresses A and B. But A is also
+        // hit by D's acyclic edge. D has no inbound link, so it survives.
+        assert!(suppressed.contains("a"));
+        assert!(suppressed.contains("b"));
+        assert!(!suppressed.contains("d"));
+        // Exactly one of the cycle survives (its winner C); D also survives.
+        assert!(!suppressed.contains("c"));
+        assert_eq!(suppressed.len(), 2);
+    }
+
+    #[test]
+    fn four_node_cycle_keeps_exactly_one() {
+        // A 4-node explicit cycle A->B->C->D->A keeps exactly one member: the
+        // newest by (created_at, id) over the whole SCC.
+        let mut a = entry("a", "Fact A.", "2026-06-01T00:00:00Z");
+        let mut b = entry("b", "Fact B.", "2026-06-02T00:00:00Z");
+        let mut c = entry("c", "Fact C.", "2026-06-03T00:00:00Z");
+        let mut d = entry("d", "Fact D.", "2026-06-04T00:00:00Z");
+        a.supersedes = vec!["b".to_owned()];
+        b.supersedes = vec!["c".to_owned()];
+        c.supersedes = vec!["d".to_owned()];
+        d.supersedes = vec!["a".to_owned()];
+        let entries = [&a, &b, &c, &d];
+
+        let suppressed = suppressed_ids(&entries, None);
+
+        // "d" is newest, so it wins; the other three are suppressed.
+        assert_eq!(suppressed.len(), 3);
+        assert!(!suppressed.contains("d"));
+        assert!(suppressed.contains("a"));
+        assert!(suppressed.contains("b"));
+        assert!(suppressed.contains("c"));
+    }
+
+    #[test]
+    fn three_cycle_all_equal_timestamps_keeps_largest_id() {
+        // With identical `created_at` across the whole 3-cycle, the winner is the
+        // lexicographically-largest id so the choice is deterministic. "c" > "b"
+        // > "a", so "c" survives.
+        let mut a = entry("a", "Fact A.", "2026-06-01T00:00:00Z");
+        let mut b = entry("b", "Fact B.", "2026-06-01T00:00:00Z");
+        let mut c = entry("c", "Fact C.", "2026-06-01T00:00:00Z");
+        a.supersedes = vec!["b".to_owned()];
+        b.supersedes = vec!["c".to_owned()];
+        c.supersedes = vec!["a".to_owned()];
+        let entries = [&a, &b, &c];
+
+        let suppressed = suppressed_ids(&entries, None);
+
+        assert_eq!(suppressed.len(), 2);
+        assert!(suppressed.contains("a"));
+        assert!(suppressed.contains("b"));
+        assert!(!suppressed.contains("c"));
+    }
+
+    #[test]
+    fn unparseable_timestamp_loses_to_dated_record_in_cycle() {
+        // Fix C: a junk `created_at` must rank below any real date, not at the
+        // epoch. In a 2-cycle where one member has a malformed timestamp, the
+        // genuinely-dated record must win regardless of id ordering. Here the
+        // junk-dated record "z" has the larger id, so if junk mapped to epoch the
+        // dated "a" (smaller id) could still win by date — this test instead
+        // proves the dated record wins even when junk has the larger id.
+        let mut a = entry("a", "Dated fact.", "2026-06-01T00:00:00Z");
+        let mut z = entry("z", "Junk-dated fact.", "not-a-timestamp");
+        a.supersedes = vec!["z".to_owned()];
+        z.supersedes = vec!["a".to_owned()];
+        let entries = [&a, &z];
+
+        let suppressed = suppressed_ids(&entries, None);
+
+        // "a" outranks "z" purely because "z"'s timestamp is unparseable, even
+        // though "z" has the larger id (id is only a tie-break on equal ranks).
+        assert_eq!(suppressed.len(), 1);
+        assert!(suppressed.contains("z"));
+        assert!(!suppressed.contains("a"));
+    }
+
+    #[test]
     fn explicit_link_suppresses_beyond_heuristic_window() {
         // Phase 1 (explicit links) is unbounded: an explicit correction whose
         // target sits past HEURISTIC_SCAN_WINDOW still suppresses it. Build a
@@ -722,38 +863,49 @@ mod tests {
     }
 
     #[test]
-    fn heuristic_is_bounded_to_scan_window() {
-        // Phase 2 (NL heuristic) is bounded. A clear stale/replacement pair whose
-        // older record sits just beyond the window is NOT suppressed; the same
-        // pair within the window IS. This proves the bound is real and that the
-        // explicit-link unbounded case above is genuinely Phase 1, not Phase 2.
+    fn heuristic_window_boundary_is_exact() {
+        // Phase 2 (NL heuristic) scans exactly `entries[..HEURISTIC_SCAN_WINDOW]`.
+        // Place the newer correction at index 0 and the stale older record at a
+        // chosen index, padding the gap with unrelated filler. The pair must be
+        // suppressed when the older sits at the LAST in-window slot
+        // (HEURISTIC_SCAN_WINDOW - 1) and must NOT be suppressed when it sits at
+        // the FIRST out-of-window slot (HEURISTIC_SCAN_WINDOW).
         let old_body = "Project alpha used to run cargo fmt before committing.";
         let new_body = "Project alpha now uses checkrun format before committing.";
 
-        // Out of window: place the older record past the window, the newer first.
-        let count = HEURISTIC_SCAN_WINDOW + 10;
-        let mut owned = Vec::with_capacity(count);
-        owned.push(entry("newer", new_body, "2026-06-02T00:00:00Z"));
-        for i in 1..(count - 1) {
-            owned.push(entry(
-                &format!("filler-{i}"),
-                "Unrelated filler body.",
-                "2026-06-01T00:00:00Z",
-            ));
-        }
-        owned.push(entry("older", old_body, "2026-06-01T00:00:00Z"));
-        let entries: Vec<&IndexEntry> = owned.iter().collect();
-        let suppressed = suppressed_ids(&entries, None);
+        // Build a list of `len` entries with `newer` at 0 and `older` at
+        // `older_index`, everything else inert filler.
+        let build = |older_index: usize, len: usize| -> Vec<IndexEntry> {
+            let mut owned = Vec::with_capacity(len);
+            owned.push(entry("newer", new_body, "2026-06-02T00:00:00Z"));
+            for i in 1..len {
+                if i == older_index {
+                    owned.push(entry("older", old_body, "2026-06-01T00:00:00Z"));
+                } else {
+                    owned.push(entry(
+                        &format!("filler-{i}"),
+                        "Unrelated filler body.",
+                        "2026-06-01T00:00:00Z",
+                    ));
+                }
+            }
+            owned
+        };
+
+        // Older at the last in-window index: suppressed.
+        let in_window = build(HEURISTIC_SCAN_WINDOW - 1, HEURISTIC_SCAN_WINDOW + 4);
+        let in_refs: Vec<&IndexEntry> = in_window.iter().collect();
         assert!(
-            !suppressed.contains("older"),
-            "heuristic must not reach beyond the scan window"
+            suppressed_ids(&in_refs, None).contains("older"),
+            "older at index HEURISTIC_SCAN_WINDOW-1 must be suppressed"
         );
 
-        // Within window: the same pair adjacent at the top IS suppressed.
-        let newer = entry("newer", new_body, "2026-06-02T00:00:00Z");
-        let older = entry("older", old_body, "2026-06-01T00:00:00Z");
-        let near = [&newer, &older];
-        let near_suppressed = suppressed_ids(&near, None);
-        assert!(near_suppressed.contains("older"));
+        // Older at the first out-of-window index: NOT suppressed.
+        let out_window = build(HEURISTIC_SCAN_WINDOW, HEURISTIC_SCAN_WINDOW + 4);
+        let out_refs: Vec<&IndexEntry> = out_window.iter().collect();
+        assert!(
+            !suppressed_ids(&out_refs, None).contains("older"),
+            "older at index HEURISTIC_SCAN_WINDOW must not be suppressed"
+        );
     }
 }
