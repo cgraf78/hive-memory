@@ -68,18 +68,19 @@ fn contains_github_token(text: &str) -> bool {
 
 fn contains_assignment_secret(text: &str) -> bool {
     text.lines().any(|line| {
-        let Some((_key, value)) = split_assignment(line) else {
+        let Some((key, value)) = split_assignment(line) else {
             return false;
         };
         // Assignment-style detection is intentionally key-driven. Broad
         // entropy checks would catch too much ordinary technical prose and make
         // memory writes frustrating, while obvious credential keys give useful
         // protection without pretending to be a full DLP scanner.
-        let key = line
-            .split(['=', ':'])
-            .next()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
+        //
+        // Derive both `key` and `value` from the same `split_assignment` so they
+        // stay consistent. Recomputing `key` with a different split (e.g. on the
+        // earliest of `:`/`=`) can pair a sensitive value with a non-sensitive
+        // key prefix and miss the secret entirely.
+        let key = key.to_ascii_lowercase();
         let sensitive_key = [
             "api_key",
             "api-key",
@@ -164,5 +165,76 @@ mod tests {
         );
         let aws_key = ["AKIA", "ABCDEFGHIJKLMNOP"].concat();
         assert_eq!(ids(&aws_key), vec!["aws-access-key-id"]);
+    }
+
+    #[test]
+    fn detects_secret_when_value_split_precedes_key_separator() {
+        // Regression: `value` is derived from the `=` split, but `key` used to be
+        // recomputed by splitting on the earliest of `:`/`=`. For this line the
+        // value (`supersecret...`) is sensitive yet the recomputed key was only
+        // `note`, so the finding was missed. Both must come from the same split.
+        assert_eq!(
+            ids("note: the password=supersecretvalue123"),
+            vec!["secret-assignment"]
+        );
+    }
+
+    #[test]
+    fn detects_all_github_token_prefixes() {
+        for prefix in ["gho_", "ghu_", "ghs_", "ghr_"] {
+            // 4-char prefix + 36 chars comfortably clears the >= 30 length floor.
+            let token = format!("token {prefix}abcdefghijklmnopqrstuvwxyz1234567890");
+            assert_eq!(ids(&token), vec!["github-token"], "prefix {prefix}");
+        }
+    }
+
+    #[test]
+    fn detects_asia_aws_prefix() {
+        // `ASIA` temporary credentials must be caught alongside `AKIA`.
+        let aws_key = ["ASIA", "ABCDEFGHIJKLMNOP"].concat();
+        assert_eq!(ids(&aws_key), vec!["aws-access-key-id"]);
+    }
+
+    #[test]
+    fn returns_sorted_findings_for_multiple_secrets() {
+        // BTreeSet ordering makes the detector-id set deterministic and sorted.
+        let text =
+            "-----BEGIN OPENSSH PRIVATE KEY-----\ntoken ghp_abcdefghijklmnopqrstuvwxyz1234567890";
+        assert_eq!(ids(text), vec!["github-token", "private-key"]);
+    }
+
+    #[test]
+    fn ignores_twenty_char_token_without_aws_prefix() {
+        // Exactly 20 chars but no `AKIA`/`ASIA` prefix must not match, so ordinary
+        // tokens in notes stay unblocked.
+        let token = "ZZZZABCDEFGHIJKLMNOP";
+        assert_eq!(token.len(), 20);
+        assert!(ids(token).is_empty());
+    }
+
+    #[test]
+    fn ignores_short_github_token() {
+        // `ghp_` prefix but below the >= 30 length floor.
+        assert!(ids("token ghp_short").is_empty());
+    }
+
+    #[test]
+    fn ignores_assignment_with_short_value() {
+        // Sensitive key but value under the 8-char realism floor.
+        assert!(ids("api_key = short").is_empty());
+    }
+
+    #[test]
+    fn ignores_assignment_with_redaction_markers() {
+        // Sensitive key paired with values that signal an intentional non-secret.
+        assert!(ids("api_key = thisisredacted").is_empty());
+        assert!(ids("api_key = <token>").is_empty());
+        assert!(ids("api_key = your_token_here").is_empty());
+    }
+
+    #[test]
+    fn ignores_private_key_marker_missing_closing_delimiter() {
+        // Needs both the opening `-----BEGIN ` and the `PRIVATE KEY-----` tail.
+        assert!(ids("-----BEGIN OPENSSH PRIVATE KEY").is_empty());
     }
 }
