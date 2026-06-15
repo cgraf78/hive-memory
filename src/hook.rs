@@ -91,6 +91,32 @@ impl Drop for RefreshLock {
     }
 }
 
+/// Held local lock serializing one session's hook-state read-modify-write.
+///
+/// `save_state` replaces the whole state file atomically, but the surrounding
+/// load -> mutate -> save sequence in each `mark_*` is not atomic. Distinct hook
+/// events for the same session (e.g. `prompt-submit` -> `mark_prompt_recall` and
+/// `tool-complete` -> `mark_receipts_refreshed`) fire close together at
+/// prompt/tool boundaries, each loads the same prior state, mutates a different
+/// field, and atomically rewrites the file, so the second writer's whole-file
+/// replace clobbers the first writer's field. This lock serializes that critical
+/// section so concurrent field updates compose instead of racing.
+///
+/// Like `RefreshLock` this is a local-process/file lock only; cross-machine
+/// synced copies still coordinate through their own host-local locks.
+#[derive(Debug)]
+pub struct StateLock {
+    file: File,
+    /// Lock file path, exposed for diagnostics and tests.
+    pub path: PathBuf,
+}
+
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
 /// Hook state load/save failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookStateError {
@@ -196,6 +222,81 @@ pub fn try_refresh_lock(
     }
 }
 
+/// Return the hook-state lock path for one session.
+///
+/// The lock is keyed by `session_id` alone because that is exactly the scope of
+/// the state file (`state_path` ignores agent id): every writer of one session's
+/// `hook-state.json` must converge on the same lock to serialize correctly, even
+/// if separate agents share the session namespace. It lives under a dedicated
+/// `locks/hook-state` subtree so it never contends with the refresh lock
+/// (`locks/refresh`), which keeps the two locks deadlock-free by construction.
+pub fn state_lock_path(state_dir: &Path, session_id: &str) -> PathBuf {
+    state_dir
+        .join("locks")
+        .join("hook-state")
+        .join(format!("{}.lock", id::sanitize_component(session_id)))
+}
+
+/// Try to acquire the non-blocking per-session hook-state lock.
+///
+/// Returning `Ok(None)` means another hook is mid read-modify-write for this
+/// session; callers degrade to a best-effort unlocked update rather than failing,
+/// because hooks must never hard-fail on lock contention. Only genuine I/O
+/// errors (which mean local coordination state cannot be trusted) are surfaced.
+pub fn try_state_lock(
+    state_dir: &Path,
+    session_id: &str,
+) -> Result<Option<StateLock>, HookStateError> {
+    let path = state_lock_path(state_dir, session_id);
+    let Some(parent) = path.parent() else {
+        return Err(HookStateError::Io {
+            action: "create state lock parent",
+            path,
+            message: "lock path has no parent".to_owned(),
+        });
+    };
+    fs::create_dir_all(parent).map_err(|err| io_error("create state lock parent", parent, err))?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|err| io_error("open state lock", &path, err))?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(StateLock { file, path })),
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(err) => Err(io_error("lock state", &path, err)),
+    }
+}
+
+/// Run a load -> mutate -> save cycle under the per-session state lock.
+///
+/// This is the single serialized critical section every `mark_*` routes through.
+/// Lock acquisition is best-effort: on contention (`Ok(None)`) the closure still
+/// runs unlocked so the hook never hard-fails, accepting the original racy
+/// behavior only in the rare window where two hooks for one session overlap. The
+/// lock is held for the whole load+mutate+save and released by `StateLock`'s
+/// `Drop` when this function returns. It is never nested with `RefreshLock`, so
+/// no lock-ordering deadlock is possible.
+fn with_state_lock<F>(
+    state_dir: &Path,
+    session_id: &str,
+    mutate: F,
+    options: &write::AtomicWriteOptions,
+) -> Result<HookState, HookStateError>
+where
+    F: FnOnce(&mut HookState),
+{
+    // Best-effort: contention degrades to an unlocked update, a hard I/O error
+    // (corrupt local coordination state) still propagates.
+    let _lock = try_state_lock(state_dir, session_id)?;
+    let mut state = load_state(state_dir, session_id)?;
+    mutate(&mut state);
+    save_state(state_dir, session_id, &state, options)?;
+    Ok(state)
+}
+
 /// Load hook state, returning an empty state when the session has no file yet.
 pub fn load_state(state_dir: &Path, session_id: &str) -> Result<HookState, HookStateError> {
     let path = state_path(state_dir, session_id);
@@ -237,12 +338,17 @@ pub fn mark_memory_pending(
     reason: impl Into<String>,
     options: &write::AtomicWriteOptions,
 ) -> Result<HookState, HookStateError> {
-    let mut state = load_state(state_dir, session_id)?;
-    state.memory_pending = true;
-    state.pending_reason = Some(reason.into());
-    state.updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
-    save_state(state_dir, session_id, &state, options)?;
-    Ok(state)
+    let reason = reason.into();
+    with_state_lock(
+        state_dir,
+        session_id,
+        |state| {
+            state.memory_pending = true;
+            state.pending_reason = Some(reason);
+            state.updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
+        },
+        options,
+    )
 }
 
 /// Record that refresh/tool-complete consumed receipts through `receipt_count`.
@@ -253,15 +359,19 @@ pub fn mark_receipts_refreshed(
     clear_memory_pending: bool,
     options: &write::AtomicWriteOptions,
 ) -> Result<HookState, HookStateError> {
-    let mut state = load_state(state_dir, session_id)?;
-    state.refreshed_receipts = receipt_count;
-    if clear_memory_pending {
-        state.memory_pending = false;
-        state.pending_reason = None;
-    }
-    state.updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
-    save_state(state_dir, session_id, &state, options)?;
-    Ok(state)
+    with_state_lock(
+        state_dir,
+        session_id,
+        |state| {
+            state.refreshed_receipts = receipt_count;
+            if clear_memory_pending {
+                state.memory_pending = false;
+                state.pending_reason = None;
+            }
+            state.updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
+        },
+        options,
+    )
 }
 
 /// Record the context selection emitted to a session.
@@ -271,11 +381,16 @@ pub fn mark_context_key(
     context_key: impl Into<String>,
     options: &write::AtomicWriteOptions,
 ) -> Result<HookState, HookStateError> {
-    let mut state = load_state(state_dir, session_id)?;
-    state.context_key = Some(context_key.into());
-    state.updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
-    save_state(state_dir, session_id, &state, options)?;
-    Ok(state)
+    let context_key = context_key.into();
+    with_state_lock(
+        state_dir,
+        session_id,
+        |state| {
+            state.context_key = Some(context_key);
+            state.updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
+        },
+        options,
+    )
 }
 
 /// Record startup/project-selection context emitted to a session.
@@ -286,12 +401,17 @@ pub fn mark_startup_context(
     memory_ids: Vec<String>,
     options: &write::AtomicWriteOptions,
 ) -> Result<HookState, HookStateError> {
-    let mut state = load_state(state_dir, session_id)?;
-    state.context_key = Some(context_key.into());
-    state.startup_memory_ids = memory_ids;
-    state.updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
-    save_state(state_dir, session_id, &state, options)?;
-    Ok(state)
+    let context_key = context_key.into();
+    with_state_lock(
+        state_dir,
+        session_id,
+        |state| {
+            state.context_key = Some(context_key);
+            state.startup_memory_ids = memory_ids;
+            state.updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
+        },
+        options,
+    )
 }
 
 /// Record prompt-specific recall emitted to a session.
@@ -302,15 +422,20 @@ pub fn mark_prompt_recall(
     memory_ids: Vec<String>,
     options: &write::AtomicWriteOptions,
 ) -> Result<HookState, HookStateError> {
-    let mut state = load_state(state_dir, session_id)?;
-    state.prompt_recall_key = Some(recall_key.into());
-    state.prompt_recall_memory_ids.extend(memory_ids);
-    state.prompt_recall_memory_ids.sort();
-    state.prompt_recall_memory_ids.dedup();
-    state.prompt_recall_updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
-    state.updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
-    save_state(state_dir, session_id, &state, options)?;
-    Ok(state)
+    let recall_key = recall_key.into();
+    with_state_lock(
+        state_dir,
+        session_id,
+        |state| {
+            state.prompt_recall_key = Some(recall_key);
+            state.prompt_recall_memory_ids.extend(memory_ids);
+            state.prompt_recall_memory_ids.sort();
+            state.prompt_recall_memory_ids.dedup();
+            state.prompt_recall_updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
+            state.updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
+        },
+        options,
+    )
 }
 
 /// Return memory ids already sent to the session.
@@ -487,6 +612,130 @@ mod tests {
 
         assert!(first.path.is_file());
         assert!(second.is_none());
+    }
+
+    #[test]
+    fn state_lock_path_sanitizes_session() {
+        let path = state_lock_path(Path::new("/tmp/hm"), "codex/session:1");
+
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/hm/locks/hook-state/codex-session-1.lock")
+        );
+    }
+
+    #[test]
+    fn state_lock_lives_outside_refresh_lock_subtree() {
+        // The two locks must not share a path, otherwise a held refresh lock
+        // would block hook-state updates and vice versa, risking deadlock.
+        let state = state_lock_path(Path::new("/tmp/hm"), "session-1");
+        let refresh = refresh_lock_path(Path::new("/tmp/hm"), "codex", "session-1");
+
+        assert_ne!(state, refresh);
+        assert!(state.starts_with("/tmp/hm/locks/hook-state"));
+        assert!(refresh.starts_with("/tmp/hm/locks/refresh"));
+    }
+
+    #[test]
+    fn state_lock_reports_existing_holder_without_blocking() {
+        // Contention must degrade gracefully: a second try_lock while the first
+        // is held returns Ok(None) rather than panicking or hard-erroring.
+        let dir = temp_dir("state-lock");
+        let first = try_state_lock(&dir, "session-1")
+            .expect("first lock")
+            .expect("first acquired");
+        let second = try_state_lock(&dir, "session-1").expect("second lock");
+
+        assert!(first.path.is_file());
+        assert!(second.is_none());
+
+        // Releasing the first holder lets a later acquirer succeed again.
+        drop(first);
+        let third = try_state_lock(&dir, "session-1").expect("third lock");
+        assert!(third.is_some());
+    }
+
+    /// Acquire the per-session state lock, spinning until the holder releases.
+    ///
+    /// `try_state_lock` is non-blocking by design (hooks must not stall), so the
+    /// concurrency test drives a blocking acquire itself to exercise true
+    /// serialization rather than the best-effort fall-through path.
+    fn block_state_lock(dir: &Path, session: &str) -> StateLock {
+        loop {
+            if let Some(lock) = try_state_lock(dir, session).expect("state lock") {
+                return lock;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn serialized_concurrent_marks_preserve_both_field_updates() {
+        // Two distinct hook events mutate different fields of the same session's
+        // state at nearly the same time. Before serialization the second
+        // whole-file replace could clobber the first writer's field; holding the
+        // per-session lock across each load -> mutate -> save makes the updates
+        // compose. Each thread takes the lock (mirroring how the production hook
+        // serializes the critical section) and runs a `mark_*` under it.
+        let dir = temp_dir("concurrent-marks");
+        let session = "session-1";
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let pending_dir = dir.clone();
+        let pending_barrier = std::sync::Arc::clone(&barrier);
+        let pending = std::thread::spawn(move || {
+            pending_barrier.wait();
+            for _ in 0..50 {
+                let _lock = block_state_lock(&pending_dir, session);
+                mark_memory_pending(&pending_dir, session, "intent", &options())
+                    .expect("mark pending");
+            }
+        });
+
+        let startup_dir = dir.clone();
+        let startup_barrier = std::sync::Arc::clone(&barrier);
+        let startup = std::thread::spawn(move || {
+            startup_barrier.wait();
+            for _ in 0..50 {
+                let _lock = block_state_lock(&startup_dir, session);
+                mark_startup_context(
+                    &startup_dir,
+                    session,
+                    "agent=codex|store=personal",
+                    vec!["mem-a".to_owned(), "mem-b".to_owned()],
+                    &options(),
+                )
+                .expect("mark startup");
+            }
+        });
+
+        pending.join().expect("pending thread");
+        startup.join().expect("startup thread");
+
+        let loaded = load_state(&dir, session).expect("load state");
+
+        // Both mutations survive: the pending flag from one writer and the
+        // startup context/memory ids from the other.
+        assert!(
+            loaded.memory_pending,
+            "memory_pending must survive concurrent startup-context writes"
+        );
+        assert_eq!(
+            loaded.pending_reason.as_deref(),
+            Some("intent"),
+            "pending reason must survive"
+        );
+        assert_eq!(
+            loaded.context_key.as_deref(),
+            Some("agent=codex|store=personal"),
+            "startup context key must survive concurrent pending writes"
+        );
+        assert_eq!(
+            loaded.startup_memory_ids,
+            vec!["mem-a".to_owned(), "mem-b".to_owned()],
+            "startup memory ids must survive"
+        );
     }
 
     #[test]
