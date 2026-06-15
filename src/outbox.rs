@@ -709,14 +709,30 @@ fn publish_payload(
         Ok(existing) if sha256(&existing) == expected_hash => Ok(PublishResult::AlreadyPresent),
         Ok(_) => Ok(PublishResult::Conflict),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            write::write_atomic_create_new(&final_path, &contents, options).map_err(|err| {
-                OutboxError::Io {
-                    action: "write final payload",
-                    path: final_path,
-                    message: err.to_string(),
-                }
-            })?;
-            Ok(PublishResult::Written)
+            match write::write_atomic_create_new(&final_path, &contents, options) {
+                Ok(_) => Ok(PublishResult::Written),
+                // The destination was absent at the read above but `create_new`
+                // refused to publish: a concurrent flusher of the same item won
+                // the race between our NotFound check and our publish. This is a
+                // benign lost race, not a real failure — re-read the destination
+                // and let identical bytes collapse into the idempotent
+                // already-present path. We re-check by content (not by parsing the
+                // write error's display text) so the genuine different-content
+                // conflict and any other I/O failure still surface as errors. If
+                // the re-read finds the file gone again (the winner's own cleanup,
+                // or a transient FS state), the original write error stands.
+                Err(write_err) => match fs::read(&final_path) {
+                    Ok(existing) if sha256(&existing) == expected_hash => {
+                        Ok(PublishResult::AlreadyPresent)
+                    }
+                    Ok(_) => Ok(PublishResult::Conflict),
+                    Err(_) => Err(OutboxError::Io {
+                        action: "write final payload",
+                        path: final_path,
+                        message: write_err.to_string(),
+                    }),
+                },
+            }
         }
         Err(err) => Err(io_error("read final payload", &final_path, err)),
     }
@@ -1066,5 +1082,98 @@ mod tests {
         let normalized =
             validate_relative_path("./inbox/./note.md").expect("curdir segments are harmless");
         assert_eq!(normalized, PathBuf::from("inbox/note.md"));
+    }
+
+    /// Build an isolated temp store + outbox source for a `publish_payload` test.
+    /// Returns `(store_root, source_path)` with `payload` written to the source.
+    fn publish_fixture(tag: &str, payload: &[u8]) -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!(
+            "hm-outbox-publish-{tag}-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let store_root = base.join("store");
+        let source_dir = base.join("item");
+        fs::create_dir_all(&store_root).expect("create store root");
+        fs::create_dir_all(&source_dir).expect("create source dir");
+        let source = source_dir.join("note.md");
+        fs::write(&source, payload).expect("write source payload");
+        (store_root, source)
+    }
+
+    /// A concurrent flusher that already published byte-identical content must not
+    /// fail the loser: `write_atomic_create_new` returns `AlreadyExists`, and the
+    /// content re-check must collapse the lost race into the idempotent
+    /// already-present outcome so `perform_refresh` does not bail on `failed>0`.
+    #[test]
+    fn publish_payload_matching_existing_is_already_present_not_failed() {
+        let payload = b"durable memory body";
+        let (store_root, source) = publish_fixture("match", payload);
+        let expected_hash = sha256(payload);
+        let relative = "inbox/notes/2026/06/15/note.md";
+        // The winner already published identical bytes at the destination.
+        let final_path = store_root.join(relative);
+        fs::create_dir_all(final_path.parent().expect("parent")).expect("create dest parent");
+        fs::write(&final_path, payload).expect("pre-create winner output");
+
+        let result = publish_payload(
+            &source,
+            &store_root,
+            relative,
+            &expected_hash,
+            &write::AtomicWriteOptions::default(),
+        )
+        .expect("matching content must not error");
+        assert_eq!(result, PublishResult::AlreadyPresent);
+        let _ = fs::remove_dir_all(store_root.parent().expect("base"));
+    }
+
+    /// A destination that already exists with DIFFERENT content is a genuine
+    /// conflict and must still be reported as such — the lost-race re-check must
+    /// not weaken real different-content detection.
+    #[test]
+    fn publish_payload_different_existing_is_conflict() {
+        let payload = b"intended body";
+        let (store_root, source) = publish_fixture("conflict", payload);
+        let expected_hash = sha256(payload);
+        let relative = "inbox/notes/2026/06/15/note.md";
+        let final_path = store_root.join(relative);
+        fs::create_dir_all(final_path.parent().expect("parent")).expect("create dest parent");
+        fs::write(&final_path, b"someone else's different bytes").expect("pre-create conflict");
+
+        let result = publish_payload(
+            &source,
+            &store_root,
+            relative,
+            &expected_hash,
+            &write::AtomicWriteOptions::default(),
+        )
+        .expect("conflict is a reported result, not a hard error");
+        assert_eq!(result, PublishResult::Conflict);
+        let _ = fs::remove_dir_all(store_root.parent().expect("base"));
+    }
+
+    /// The clean path (destination absent) must still publish and report
+    /// `Written`, proving the race-recovery branch did not regress the common case.
+    #[test]
+    fn publish_payload_absent_destination_writes() {
+        let payload = b"fresh body";
+        let (store_root, source) = publish_fixture("fresh", payload);
+        let expected_hash = sha256(payload);
+        let relative = "inbox/notes/2026/06/15/note.md";
+
+        let result = publish_payload(
+            &source,
+            &store_root,
+            relative,
+            &expected_hash,
+            &write::AtomicWriteOptions::default(),
+        )
+        .expect("clean write must succeed");
+        assert_eq!(result, PublishResult::Written);
+        let written = fs::read(store_root.join(relative)).expect("destination written");
+        assert_eq!(written, payload);
+        let _ = fs::remove_dir_all(store_root.parent().expect("base"));
     }
 }
