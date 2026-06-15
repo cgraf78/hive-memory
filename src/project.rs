@@ -708,10 +708,10 @@ fn vcs_remote_url(root: &Path) -> Option<String> {
 
 /// Parse a remote/upstream URL from the on-disk VCS config for `root`.
 fn parse_remote_url(root: &Path) -> Option<String> {
-    if let Some(git_dir) = resolve_git_dir(root) {
-        if let Some(url) = parse_git_config_origin(&git_dir.join("config")) {
-            return Some(url);
-        }
+    if let Some(git_dir) = resolve_git_dir(root)
+        && let Some(url) = parse_git_config_origin(&git_dir.join("config"))
+    {
+        return Some(url);
     }
     // Mercurial / Sapling colocated checkout.
     if let Some(url) = parse_hg_default(&root.join(".hg/hgrc")) {
