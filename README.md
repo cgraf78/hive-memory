@@ -467,7 +467,7 @@ milliseconds or less, so wiring Hive Memory into an agent's lifecycle does not
 slow the turn down.
 
 **Honest caveats.** These numbers are approximate and machine-dependent —
-measured on a typical Linux devserver, so treat them as order-of-magnitude, not
+measured on a typical Linux machine, so treat them as order-of-magnitude, not
 guarantees. Real-world conditions shift them:
 
 - A **cloud-synced store** (Google Drive, Dropbox) adds filesystem latency on
