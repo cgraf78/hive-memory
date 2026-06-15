@@ -272,6 +272,7 @@ tags = ["preference", "workflow"]
 source_kind = "session"
 source_ref = "abc123"
 related_event_id = "20260516T154233.184921Z_taylor_12345_codex_a8f31c"
+supersedes = ["20260515T101112.000000Z_taylor_12000_codex_b1c2d3"] # record ids this entry replaces
 expires_at = ""              # RFC3339 or empty
 kind = "preference"          # preference|project-fact|incident|reference
 audience = ["codex"]         # see "Audience and agent-private" below
@@ -304,6 +305,11 @@ Rules:
   bridge into curated memory files.
 - Notes are immutable by convention once written. Corrections should be new
   notes referencing the old ID, unless a human intentionally edits the file.
+- `supersedes` is the explicit, authoritative correction link: it lists the
+  record ids this entry replaces. Broad recall (`hm search` and `hm context`)
+  hides a record that a newer one explicitly supersedes, across scope and entry
+  kind. See the Supersession section for the full resolution algorithm,
+  invariants, and the lower-confidence natural-language fallback.
 
 Why front matter: the human text remains clean Markdown, while metadata stays
 machine-readable enough for filtering and auditing.
@@ -375,6 +381,14 @@ Aliases:
 
 - `memories/projects/<id>/aliases.toml` lists prior IDs (e.g., after a repo
   rename). Search/context follow the alias chain so memory survives moves.
+- Project ids derived from on-disk alias metadata are untrusted input: a synced
+  or tampered store could list ids like `../../../../etc` or an absolute path,
+  which would otherwise be joined onto `memories/projects/` and inject arbitrary
+  `.md` at the highest (`curated`) trust level. Every alias/project id is
+  validated at the resolution boundary and must be a single normal path
+  component (no `..`, absolute, rooted, prefix, or separator components);
+  unsafe ids are dropped rather than followed, with defense-in-depth re-checks
+  at the curated filesystem join.
 - `hm projects alias <old-id> <new-id>` updates this file under the same
   single-user constraint as other curated writes.
 - `hm doctor` warns when unclaimed `project_id` values exist that no alias
@@ -672,10 +686,30 @@ dotfiles hooks should not orchestrate them directly.
 
 ### Store Affinity and Resolution
 
-Store selection is a privacy boundary, not just a convenience default.
+Store selection is a privacy boundary, not just a convenience default. Agent
+identity is **self-asserted** via `--as-agent`/`HIVE_MEMORY_AGENT_ID`: any
+process can claim any agent id, so per-agent store affinity is defense in depth,
+not a cryptographic boundary. The rules below are written so that *dropping*
+identity does not silently widen access.
 
-- Human commands without `HIVE_MEMORY_AGENT_ID` may use any configured store,
-  subject to sensitivity rules and explicit `--include-secret` refusals.
+- Memory read/write commands (`remember`, `note`, `search`, `context`,
+  `promote`, `inbox`, `classify`, `reconcile`, `projects alias`, hooks) without
+  any asserted agent identity fail closed to the **global default store's**
+  conservative policy: `read_stores = [default_store]`,
+  `write_stores = [default_store]`, `allow_all_stores = false`. A plain human
+  shell running `hm remember`/`hm search` with no `--as-agent` therefore keeps
+  working against the default store, but a no-identity request for a NON-default
+  store via `--store`/`HIVE_MEMORY_STORE` is exit `4` (`privacy_refusal`). This
+  closes the bypass where a restricted agent reaches an out-of-allowlist store
+  by simply not passing `--as-agent`. Because identity is self-asserted, this is
+  a guardrail against accidental/lazy widening, not a hard security boundary.
+- Local-affinity commands that only manage machine-private binding metadata
+  (`projects bind`, `projects resolve`, `projects show`) keep human any-store
+  access: a human may bind/inspect any configured store regardless of the global
+  default, since the binding is local data under `data_dir` and agent affinity
+  is still re-checked when memory is actually read or written. An asserted agent
+  identity is enforced under these commands too, so a binding can never bless a
+  store outside the agent's allowlist.
 - Agent/hook commands with `HIVE_MEMORY_AGENT_ID` are constrained by
   `[agents.<id>]`. If no matching section exists, v1 creates a conservative
   effective policy with `default_store = <global default_store>`,
@@ -1030,6 +1064,54 @@ Output:
 - With `--if-changed`, no output when unchanged; exit code remains `0`.
 - `--json` returns sections with source paths, audience, trust level, and
   estimated tokens, plus `emitted`.
+
+### Supersession
+
+When a newer record corrects an older one, broad recall must reflect current
+truth instead of injecting both the stale and the corrected fact. Supersession
+is the resolution layer that decides, at read time, which records to hide. It
+never rewrites or deletes canonical memory; it only filters what broad recall
+shows. Both `hm search` and `hm context` apply the SAME resolution through one
+shared resolver so the two surfaces can never disagree about what is current.
+
+There are two clearly separated confidence layers:
+
+1. **Explicit `supersedes` links (authoritative).** A record may carry a
+   `supersedes` list naming the record ids it replaces (see Markdown Note
+   Schema). An explicit link suppresses its target regardless of scope, project,
+   or entry kind. A correction written as a `note`, or one that moves the fact
+   from project scope to global scope, still hides the fact it explicitly
+   replaces. This is the durable contract a writer opts into.
+2. **Natural-language heuristic (lower confidence).** When there is no explicit
+   link, a deliberately narrow heuristic may still suppress an older record. It
+   fires only when both records are `remember` entries in the SAME scope and
+   project, the older body carries a stale marker (for example "used to",
+   "previously", "formerly", "no longer"), the newer body carries a replacement
+   marker (for example "now", "instead", "replaces", "current"), and the two
+   bodies share at least two topic words. The heuristic MUST NOT relax the
+   explicit-link rules; it only adds suppression the explicit layer did not
+   already provide.
+
+Invariants:
+
+- **Broad recall reflects current truth.** Both `hm search` (without a
+  historical query) and `hm context` always suppress superseded records, so the
+  most-trusted agent read path never injects a fact that a newer record has
+  corrected.
+- **Historical recall exception (search only).** A query that explicitly names a
+  token living only in the older fact (for example searching `cargo fmt` after a
+  `checkrun format` correction) keeps the older record visible, so historical
+  questions can still find what the fact used to be. `hm context` has no query,
+  so this exception never applies there and superseded records are always
+  hidden.
+- **Cycle resolution.** A reciprocal explicit link (A supersedes B and B
+  supersedes A, as can arise from a hand-edit or import) must not erase both
+  records. The explicit layer keeps a single deterministic winner — the newer
+  record by `created_at`, tie-broken by the lexicographically larger id — and
+  suppresses only the loser, so a cycle never makes a fact vanish entirely.
+- **No canonical mutation.** Suppression is a read-time view. The superseded
+  Markdown note and JSON event remain on disk and remain discoverable through
+  the historical-recall exception.
 
 ### `hm flush`
 
@@ -1667,6 +1749,13 @@ Frozen at 1.0:
 - `--json` output shape per command (`hm remember`, `hm note`, `hm search`,
   `hm context --json`, `hm flush`, `hm stores list/show`, `hm doctor --json`).
 - The data-boundary block syntax used by `hm context`.
+- The supersession contract (see Supersession): an explicit `supersedes` link is
+  authoritative across scope and entry kind; broad recall in both `hm search`
+  and `hm context` reflects current truth; the historical-recall exception
+  applies only to a search query that names the old fact; a reciprocal explicit
+  cycle resolves to a single deterministic winner. The natural-language
+  suppression heuristic is NOT frozen and may evolve under "Search ranking" and
+  "Context section ordering and selection heuristics" below.
 
 Free to evolve in 1.x:
 

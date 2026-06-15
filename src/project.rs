@@ -472,6 +472,35 @@ fn starting_dir(path: &Path) -> PathBuf {
     }
 }
 
+/// Return whether a project id is a safe single path component.
+///
+/// Project ids become directory names under `memories/projects/<id>/`. A
+/// hostile or buggy synced store can put arbitrary strings in `aliases.toml`
+/// (`project_id`/`aliases`) or even craft odd directory names, and curated
+/// discovery joins those ids straight onto the store root at the highest
+/// (`curated`/`human`) trust level. Anything other than a single, normal path
+/// component (`..`, an absolute or rooted path, a Windows prefix, a path with
+/// separators, `.`, or empty) could escape the store and inject attacker-chosen
+/// `.md` files into agent context/search, so it is rejected here at the identity
+/// boundary that all consumers share.
+///
+/// Legitimate ids are flat slugs such as
+/// `github-com-cgraf78-hive-memory-018f5f57`, which pass unchanged.
+pub fn is_safe_project_id(project_id: &str) -> bool {
+    if project_id.is_empty() {
+        return false;
+    }
+    let path = Path::new(project_id);
+    let mut components = path.components();
+    // Exactly one component, and it must be a plain file/dir name. `Normal`
+    // rejects `..` (`ParentDir`), `.` (`CurDir`), `/` roots (`RootDir`),
+    // and Windows drive/UNC prefixes (`Prefix`).
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(value)), None) => value.to_str() == Some(project_id),
+        _ => false,
+    }
+}
+
 /// Return the store-relative alias file path for one canonical project id.
 pub fn aliases_relative_path(project_id: &str) -> PathBuf {
     Path::new("memories/projects")
@@ -578,7 +607,18 @@ pub fn related_project_ids(
     store_root: &Path,
     project_id: &str,
 ) -> Result<BTreeSet<String>, ProjectError> {
-    let mut ids = BTreeSet::from([project_id.to_owned()]);
+    // Sanitize at this identity boundary so every consumer (curated discovery,
+    // doctor, search/context) is covered, not just the curated join. Ids that
+    // would escape `memories/projects/` are dropped rather than turned into a
+    // hard error: a single poisoned alias entry must not blind a project to the
+    // rest of its legitimate memory. See `is_safe_project_id`.
+    let mut ids = BTreeSet::new();
+    let insert_safe = |ids: &mut BTreeSet<String>, candidate: String| {
+        if is_safe_project_id(&candidate) {
+            ids.insert(candidate);
+        }
+    };
+    insert_safe(&mut ids, project_id.to_owned());
     for directory_id in project_directories(store_root)? {
         let Some(aliases) = load_aliases(store_root, &directory_id)? else {
             continue;
@@ -587,9 +627,11 @@ pub fn related_project_ids(
             || directory_id == project_id
             || aliases.aliases.iter().any(|alias| alias == project_id)
         {
-            ids.insert(directory_id);
-            ids.insert(aliases.project_id);
-            ids.extend(aliases.aliases);
+            insert_safe(&mut ids, directory_id);
+            insert_safe(&mut ids, aliases.project_id);
+            for alias in aliases.aliases {
+                insert_safe(&mut ids, alias);
+            }
         }
     }
     Ok(ids)
@@ -1044,6 +1086,53 @@ mod tests {
         assert_eq!(from_current, from_old);
         assert!(from_current.contains("current-project"));
         assert!(from_current.contains("old-project"));
+    }
+
+    #[test]
+    fn is_safe_project_id_accepts_normal_slugs() {
+        assert!(is_safe_project_id(
+            "github-com-cgraf78-hive-memory-018f5f57"
+        ));
+        assert!(is_safe_project_id("current-project"));
+        assert!(is_safe_project_id("a"));
+        assert!(is_safe_project_id("under_score.dot"));
+    }
+
+    #[test]
+    fn is_safe_project_id_rejects_escapes() {
+        assert!(!is_safe_project_id(""));
+        assert!(!is_safe_project_id("."));
+        assert!(!is_safe_project_id(".."));
+        assert!(!is_safe_project_id("../etc"));
+        assert!(!is_safe_project_id("../../../../tmp/evil"));
+        assert!(!is_safe_project_id("a/b"));
+        assert!(!is_safe_project_id("/etc/passwd"));
+        assert!(!is_safe_project_id("/tmp/evil"));
+        // Trailing separator collapses to one component but is not a flat slug.
+        assert!(!is_safe_project_id("evil/"));
+    }
+
+    #[test]
+    fn related_project_ids_drops_path_escaping_aliases() {
+        let dir = temp_dir("related-poisoned");
+        let projects = dir.join("memories/projects/current-project");
+        fs::create_dir_all(&projects).expect("project dir");
+        // A hostile or buggy synced store can list arbitrary strings here. The
+        // canonical id stays usable, but the escaping aliases must be dropped
+        // so curated discovery never joins them onto the store root.
+        fs::write(
+            projects.join("aliases.toml"),
+            "schema_version = 1\nproject_id = \"current-project\"\naliases = [\"../../../../tmp/evil\", \"/etc\", \"old-project\"]\n",
+        )
+        .expect("write aliases");
+
+        let ids = related_project_ids(&dir, "current-project").expect("related ids");
+
+        assert!(ids.contains("current-project"));
+        assert!(ids.contains("old-project"));
+        assert!(!ids.contains("../../../../tmp/evil"));
+        assert!(!ids.contains("/etc"));
+        assert!(ids.iter().all(|id| is_safe_project_id(id)));
     }
 
     #[test]

@@ -274,16 +274,16 @@ pub fn search(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
 }
 
 fn suppress_superseded_hits(hits: &mut Vec<SearchHit>, phrase: &str, limit: usize) {
+    // Bound the O(n^2) scan to the top-ranked window so a large hit list stays
+    // cheap; suppression only matters among the records a user would actually
+    // see. The shared resolver in `supersession` owns the actual rules.
     let scan_len = hits.len().min(limit.saturating_mul(4).clamp(16, 128));
-    let mut suppressed = BTreeSet::new();
-    for older in hits.iter().take(scan_len) {
-        for newer in hits.iter().take(scan_len) {
-            if supersession::should_suppress_older(&older.entry, &newer.entry, Some(phrase)) {
-                suppressed.insert(older.entry.id.clone());
-                break;
-            }
-        }
-    }
+    let window = hits
+        .iter()
+        .take(scan_len)
+        .map(|hit| &hit.entry)
+        .collect::<Vec<_>>();
+    let suppressed = supersession::suppressed_ids(&window, Some(phrase));
     hits.retain(|hit| !suppressed.contains(&hit.entry.id));
 }
 

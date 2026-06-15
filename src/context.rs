@@ -7,7 +7,7 @@
 use crate::curated::CuratedFile;
 use crate::index::IndexEntry;
 use crate::inject::{self, ClassifyInput, IncidentMarkers, InjectClass};
-use crate::{note, project, validity, visibility};
+use crate::{note, project, supersession, validity, visibility};
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{self, Display};
@@ -254,7 +254,18 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
 
     // Built once and reused; the Relevance strategy consults it per candidate.
     let markers = IncidentMarkers::default();
-    for entry in sorted_candidates(input.entries) {
+    let candidates = sorted_candidates(input.entries);
+    // Context is the most-trusted agent read path, so it must reflect current
+    // truth: a record explicitly (or heuristically) superseded by a newer one
+    // is hidden here exactly as `hm search` hides it. Context has no query, so
+    // the historical-recall exception never fires and superseded records are
+    // always suppressed. This uses the same shared resolver as search.
+    let superseded = supersession::suppressed_ids(&candidates, None);
+    for entry in candidates {
+        if superseded.contains(&entry.id) {
+            push_decision(&mut decisions, &input, entry, "skipped", "superseded");
+            continue;
+        }
         if !source_allowed(entry, input.sources, input.include_inbox) {
             push_decision(&mut decisions, &input, entry, "skipped", "source");
             continue;
@@ -329,11 +340,13 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
         let block = render_memory_block(input.store_name, entry, trust, &record_body);
         let block_tokens = estimate_tokens(&block);
         if estimated_tokens + block_tokens > input.max_tokens {
+            // Budget policy is first-fit-then-stop and MUST be identical whether
+            // or not `explain` is set: the debug flag records diagnostics, it
+            // never changes which memories are injected. Record the skip, then
+            // stop packing so a later smaller candidate cannot jump ahead of the
+            // overflowing higher-priority one it follows in sorted order.
             push_decision(&mut decisions, &input, entry, "skipped", "budget");
-            if !input.explain {
-                break;
-            }
-            continue;
+            break;
         }
 
         markdown.push_str(&block);
@@ -667,6 +680,12 @@ mod tests {
     }
 
     fn write_record(record: TestRecord<'_>) {
+        write_record_full(record, Vec::new());
+    }
+
+    /// Write a record with an explicit `supersedes` list, returning the created
+    /// id so supersession tests can wire links between records.
+    fn write_record_full(record: TestRecord<'_>, supersedes: Vec<String>) -> String {
         memory::write_record(memory::WriteRecordInput {
             root: record.root,
             manifest: &manifest(),
@@ -684,7 +703,7 @@ mod tests {
             kind: None,
             valid_from: None,
             valid_to: None,
-            supersedes: Vec::new(),
+            supersedes,
             tags: Vec::new(),
             audience: record.audience,
             source_kind: None,
@@ -692,7 +711,8 @@ mod tests {
             write_event: true,
             options: options(),
         })
-        .expect("write memory");
+        .expect("write memory")
+        .id
     }
 
     fn entries(root: &Path, cache: &Path) -> Vec<IndexEntry> {
@@ -1239,5 +1259,216 @@ mod tests {
                 .iter()
                 .any(|decision| decision.action == "skipped" && decision.reason == "unreadable")
         );
+    }
+
+    #[test]
+    fn context_suppresses_explicitly_superseded_record() {
+        // The critical regression: context is the primary agent read path, so an
+        // explicitly superseded record must not be injected as live remembered
+        // memory while search hides it. Broad context shows only current truth.
+        let dir = temp_dir("supersede-explicit");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        let old_id = write_record_full(
+            TestRecord {
+                root: &root,
+                entry_kind: note::EntryKind::Remember,
+                scope: "global",
+                body: "Deployment gate is launchctl.",
+                created_at: timestamp(1_778_946_153),
+                project_id: None,
+                audience: Vec::new(),
+            },
+            Vec::new(),
+        );
+        write_record_full(
+            TestRecord {
+                root: &root,
+                entry_kind: note::EntryKind::Remember,
+                scope: "global",
+                body: "Deployment gate is deployctl.",
+                created_at: timestamp(1_778_946_154),
+                project_id: None,
+                audience: Vec::new(),
+            },
+            vec![old_id.clone()],
+        );
+        let entries = entries(&root, &cache);
+        let sources = ["remembered".to_owned()];
+        let mut request = input(&root, &entries, &[], &sources);
+        request.explain = true;
+
+        let output = assemble_context(request).expect("context");
+
+        assert_eq!(output.sections.len(), 1);
+        assert!(output.markdown.contains("Deployment gate is deployctl."));
+        assert!(!output.markdown.contains("Deployment gate is launchctl."));
+        assert!(output.decisions.iter().any(|decision| {
+            decision.id == old_id && decision.action == "skipped" && decision.reason == "superseded"
+        }));
+    }
+
+    #[test]
+    fn context_suppresses_explicit_link_across_scope_and_kind() {
+        // An explicit link is authoritative even when the records differ in
+        // scope and entry kind, where the conservative NL heuristic would refuse.
+        let dir = temp_dir("supersede-cross");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        // Older lives in project scope; written as remember.
+        let old_id = write_record_full(
+            TestRecord {
+                root: &root,
+                entry_kind: note::EntryKind::Remember,
+                scope: "project",
+                body: "Release uses cargo-dist for project repo-a.",
+                created_at: timestamp(1_778_946_153),
+                project_id: Some("repo-a"),
+                audience: Vec::new(),
+            },
+            Vec::new(),
+        );
+        // Newer is a global remembered correction explicitly superseding it.
+        write_record_full(
+            TestRecord {
+                root: &root,
+                entry_kind: note::EntryKind::Remember,
+                scope: "global",
+                body: "Release uses cargo-release everywhere now.",
+                created_at: timestamp(1_778_946_154),
+                project_id: None,
+                audience: Vec::new(),
+            },
+            vec![old_id.clone()],
+        );
+        let entries = entries(&root, &cache);
+        let sources = ["remembered".to_owned()];
+        // Project scope must be eligible for the older record so the only thing
+        // that hides it is supersession, not the project filter.
+        let scopes = ["global".to_owned(), "project".to_owned()];
+        let mut request = input(&root, &entries, &scopes, &sources);
+        request.project_id = Some("repo-a");
+
+        let output = assemble_context(request).expect("context");
+
+        assert!(output.markdown.contains("Release uses cargo-release"));
+        assert!(!output.markdown.contains("cargo-dist"));
+    }
+
+    #[test]
+    fn context_supersession_cycle_keeps_one_record() {
+        // Reciprocal explicit links must not erase both records. Exactly one
+        // survives (the deterministic winner: newer by timestamp).
+        let dir = temp_dir("supersede-cycle");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        let first_id = write_record_full(
+            TestRecord {
+                root: &root,
+                entry_kind: note::EntryKind::Remember,
+                scope: "global",
+                body: "Cycle fact older.",
+                created_at: timestamp(1_778_946_153),
+                project_id: None,
+                audience: Vec::new(),
+            },
+            Vec::new(),
+        );
+        let second_id = write_record_full(
+            TestRecord {
+                root: &root,
+                entry_kind: note::EntryKind::Remember,
+                scope: "global",
+                body: "Cycle fact newer.",
+                created_at: timestamp(1_778_946_154),
+                project_id: None,
+                audience: Vec::new(),
+            },
+            vec![first_id.clone()],
+        );
+        // Build entries, then inject the reciprocal link on the older record to
+        // simulate a hand-edit/import that created an A↔B cycle.
+        let mut entries = entries(&root, &cache);
+        for entry in &mut entries {
+            if entry.id == first_id {
+                entry.supersedes = vec![second_id.clone()];
+            }
+        }
+        let sources = ["remembered".to_owned()];
+        let output = assemble_context(input(&root, &entries, &[], &sources)).expect("context");
+
+        // Exactly one record survives, and it is the newer winner.
+        assert_eq!(output.sections.len(), 1);
+        assert!(output.markdown.contains("Cycle fact newer."));
+        assert!(!output.markdown.contains("Cycle fact older."));
+    }
+
+    #[test]
+    fn explain_does_not_change_emitted_context() {
+        // A high-priority candidate overflows the budget and a later one would
+        // fit. The budget/packing policy must be identical regardless of the
+        // `explain` flag, so the injected Markdown and sections are byte-equal.
+        let dir = temp_dir("explain-parity");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        // High confidence + newest sorts first; it is large enough to overflow.
+        write_record(TestRecord {
+            root: &root,
+            entry_kind: note::EntryKind::Remember,
+            scope: "global",
+            body: "This first high-priority memory is intentionally long enough to overflow the tiny budget once the header is counted.",
+            created_at: timestamp(1_778_946_200),
+            project_id: None,
+            audience: Vec::new(),
+        });
+        // A later, smaller candidate that would fit on its own.
+        write_record(TestRecord {
+            root: &root,
+            entry_kind: note::EntryKind::Remember,
+            scope: "global",
+            body: "Short later memory.",
+            created_at: timestamp(1_778_946_100),
+            project_id: None,
+            audience: Vec::new(),
+        });
+        let entries = entries(&root, &cache);
+        let sources = ["remembered".to_owned()];
+        let mut base = input(&root, &entries, &[], &sources);
+
+        // Size the budget so the small later block WOULD fit on its own after the
+        // header, but the large first-sorted block does not. This is exactly the
+        // input that exposes the old explain-divergent packing: skip-and-continue
+        // would slip the small block in only when explain is true.
+        let header_tokens = estimate_tokens(&render_header(&base));
+        let small_entry = base
+            .entries
+            .iter()
+            .find(|entry| entry.body == "Short later memory.")
+            .expect("small entry");
+        let small_block = render_memory_block(
+            base.store_name,
+            small_entry,
+            TrustLevel::Remembered,
+            &small_entry.body,
+        );
+        base.max_tokens = header_tokens + estimate_tokens(&small_block);
+
+        let mut with_explain = base.clone();
+        with_explain.explain = true;
+        let mut without_explain = base.clone();
+        without_explain.explain = false;
+
+        let explained = assemble_context(with_explain).expect("context");
+        let plain = assemble_context(without_explain).expect("context");
+
+        // First-fit-then-stop: the overflowing first block stops packing, so the
+        // later smaller block is NOT injected under either flag value, and the
+        // emitted Markdown/sections are byte-identical regardless of explain.
+        assert_eq!(explained.markdown, plain.markdown);
+        assert_eq!(explained.sections, plain.sections);
+        assert!(!plain.markdown.contains("Short later memory."));
+        // Diagnostics still differ: only the explain run records decisions.
+        assert!(!explained.decisions.is_empty());
+        assert!(plain.decisions.is_empty());
     }
 }

@@ -2,30 +2,176 @@
 //!
 //! This module does not rewrite canonical memory. It only answers whether a
 //! newer indexed record is strong enough evidence to hide an older record from
-//! broad recall results. The rules are intentionally narrow so historical
-//! searches can still find the old fact when the query names it directly.
+//! broad recall results. There are two clearly separated layers:
+//!
+//! 1. **Explicit `supersedes` links** are authoritative. When one record's
+//!    `supersedes` list names another record, the named target is suppressed
+//!    regardless of scope or entry kind. This is the durable contract a writer
+//!    opts into; a correction written as a `note`, or one that moves scope or
+//!    project, still hides the fact it explicitly replaces.
+//! 2. **The natural-language heuristic** is a strictly lower-confidence
+//!    fallback used only when there is no explicit link. It stays narrow
+//!    (same scope AND both records `Remember`, plus stale/replacement markers
+//!    and topic-word overlap) so it never silently rewrites memory on a guess.
+//!    The heuristic MUST NOT relax the explicit-link rules; it only adds
+//!    suppression the explicit layer did not already provide.
+//!
+//! Both layers keep one shared exception: when a query explicitly names a token
+//! that lives only in the older fact, historical recall wins and the older
+//! record stays visible. Context has no query, so that exception is always
+//! inactive there and current truth is always what gets injected.
 
 use crate::{index::IndexEntry, note};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use time::OffsetDateTime;
 
+/// Upper bound on how many candidates the natural-language heuristic compares
+/// pairwise. Explicit `supersedes` links are always resolved across the full set
+/// (an O(n) id lookup); only the inherently O(n²) heuristic is windowed, mirroring
+/// how `hm search` already caps its scan. Without this bound, `hm context` over a
+/// large store ran the full O(n²) heuristic over every candidate (≈9.6s at 5000
+/// notes). The window is generous enough to cover search's own ≤128 pre-window.
+const HEURISTIC_SCAN_WINDOW: usize = 256;
+
+/// Compute the set of record ids that should be hidden from broad recall.
+///
+/// This is the single source of truth shared by `hm search` and `hm context`.
+/// Search passes the lowercased query phrase so the historical-recall exception
+/// can keep an explicitly named old fact visible; context passes `None` because
+/// broad context must always reflect current truth.
+///
+/// The returned ids are a subset of the input entries' ids. Callers filter
+/// their own result lists against this set, so the function never reorders or
+/// clones the caller's records.
+#[must_use]
+pub fn suppressed_ids(entries: &[&IndexEntry], query: Option<&str>) -> BTreeSet<String> {
+    let mut suppressed = BTreeSet::new();
+
+    // Phase 1 — explicit `supersedes` links: authoritative and resolved across
+    // the FULL set via direct id lookup, so a superseded record is hidden no
+    // matter how large the store is or where the records rank. O(n + links).
+    let by_id: HashMap<&str, &IndexEntry> = entries
+        .iter()
+        .map(|entry| (entry.id.as_str(), *entry))
+        .collect();
+    for newer in entries {
+        for target_id in &newer.supersedes {
+            if let Some(older) = by_id.get(target_id.as_str())
+                && should_suppress_older(older, newer, query)
+            {
+                suppressed.insert(older.id.clone());
+            }
+        }
+    }
+
+    // Phase 2 — natural-language heuristic: inherently pairwise, so it is bounded
+    // to the top window of candidates (already priority/recency ordered by the
+    // caller). This is a best-effort lower-confidence layer; the authoritative
+    // explicit links above are unaffected by the bound. Pairs already joined by
+    // an explicit link are skipped here since Phase 1 owns them.
+    let window = &entries[..entries.len().min(HEURISTIC_SCAN_WINDOW)];
+    for older in window {
+        if suppressed.contains(&older.id) {
+            continue;
+        }
+        for newer in window {
+            if newer.supersedes.iter().any(|id| id == &older.id) {
+                continue;
+            }
+            if should_suppress_older(older, newer, query) {
+                suppressed.insert(older.id.clone());
+                break;
+            }
+        }
+    }
+
+    suppressed
+}
+
 /// Return whether `older` should be suppressed when `newer` is also present.
+///
+/// Resolution order:
+///
+/// 1. An explicit `supersedes` link is authoritative across scope and entry
+///    kind, subject only to the historical-query exception and to cycle
+///    resolution (a reciprocal A↔B link suppresses only the deterministic
+///    loser, never both members).
+/// 2. Otherwise the conservative natural-language heuristic applies, gated on
+///    same scope, both records being `Remember`, stale/replacement markers, and
+///    topic-word overlap.
+#[must_use]
 pub fn should_suppress_older(older: &IndexEntry, newer: &IndexEntry, query: Option<&str>) -> bool {
-    if older.id == newer.id
-        || older.entry_kind != note::EntryKind::Remember
-        || newer.entry_kind != note::EntryKind::Remember
-        || !same_scope(older, newer)
-    {
+    if older.id == newer.id {
         return false;
     }
+
     if newer.supersedes.iter().any(|id| id == &older.id) {
-        return !explicitly_searches_old_fact(
-            &older.body.to_ascii_lowercase(),
-            &newer.body.to_ascii_lowercase(),
-            query,
-        );
+        return suppress_for_explicit_link(older, newer, query);
     }
-    if !is_newer(newer, older) {
+
+    suppress_for_heuristic(older, newer, query)
+}
+
+/// Decide suppression for an explicit `supersedes` link.
+///
+/// Authoritative across scope and entry kind. Two guards apply:
+///
+/// - the historical-query exception keeps the older record when the query names
+///   a token unique to it; and
+/// - cycle resolution: when the link is reciprocal (`older` also supersedes
+///   `newer`), suppress only the deterministic loser so a hand-edited or
+///   imported A↔B cycle can never erase both records.
+fn suppress_for_explicit_link(older: &IndexEntry, newer: &IndexEntry, query: Option<&str>) -> bool {
+    if explicitly_searches_old_fact(
+        &older.body.to_ascii_lowercase(),
+        &newer.body.to_ascii_lowercase(),
+        query,
+    ) {
+        return false;
+    }
+
+    let reciprocal = older.supersedes.iter().any(|id| id == &newer.id);
+    if reciprocal {
+        // A cycle would otherwise make this true in both directions and drop
+        // every member. Keep exactly one deterministic winner: the newer record
+        // by timestamp, tie-broken by larger id. Suppress only the loser.
+        return &older.id != cycle_winner_id(older, newer);
+    }
+
+    true
+}
+
+/// Pick the surviving record id for a reciprocal explicit cycle.
+///
+/// Newer-by-timestamp wins; ties break toward the lexicographically larger id
+/// so the choice is deterministic regardless of input ordering.
+fn cycle_winner_id<'a>(left: &'a IndexEntry, right: &'a IndexEntry) -> &'a String {
+    let left_rank = timestamp_rank(&left.created_at);
+    let right_rank = timestamp_rank(&right.created_at);
+    match left_rank.cmp(&right_rank) {
+        std::cmp::Ordering::Greater => &left.id,
+        std::cmp::Ordering::Less => &right.id,
+        std::cmp::Ordering::Equal => {
+            if left.id >= right.id {
+                &left.id
+            } else {
+                &right.id
+            }
+        }
+    }
+}
+
+/// Decide suppression for the lower-confidence natural-language heuristic.
+///
+/// This path never fires when an explicit link exists; it only adds suppression
+/// the explicit layer could not. It stays deliberately conservative so a guess
+/// from prose markers cannot hide a fact across scope or entry-kind boundaries.
+fn suppress_for_heuristic(older: &IndexEntry, newer: &IndexEntry, query: Option<&str>) -> bool {
+    if older.entry_kind != note::EntryKind::Remember
+        || newer.entry_kind != note::EntryKind::Remember
+        || !same_scope(older, newer)
+        || !is_newer(newer, older)
+    {
         return false;
     }
 
@@ -249,5 +395,84 @@ mod tests {
             &new,
             Some("before committing")
         ));
+    }
+
+    #[test]
+    fn explicit_link_suppresses_across_scope() {
+        // The older record lives in a different scope/project than the newer
+        // one. The natural-language heuristic would refuse (different scope),
+        // but an explicit link is authoritative and must still suppress.
+        let mut old = entry(
+            "old",
+            "Deploys use the manual checklist.",
+            "2026-06-01T00:00:00Z",
+        );
+        old.scope = "global".to_owned();
+        old.project_id = None;
+        let mut new = entry(
+            "new",
+            "Deploys use the checkrun gate.",
+            "2026-06-02T00:00:00Z",
+        );
+        new.supersedes = vec!["old".to_owned()];
+
+        assert!(should_suppress_older(&old, &new, Some("deploys")));
+    }
+
+    #[test]
+    fn explicit_link_suppresses_across_entry_kind() {
+        // A correction written as a `note` (not `remember`) must still suppress
+        // its explicit target. The heuristic would refuse on entry kind alone.
+        let mut old = entry("old", "Release uses cargo-dist.", "2026-06-01T00:00:00Z");
+        old.entry_kind = note::EntryKind::Remember;
+        let mut new = entry("new", "Release uses cargo-release.", "2026-06-02T00:00:00Z");
+        new.entry_kind = note::EntryKind::Note;
+        new.supersedes = vec!["old".to_owned()];
+
+        assert!(should_suppress_older(&old, &new, Some("release")));
+    }
+
+    #[test]
+    fn explicit_cycle_keeps_deterministic_winner() {
+        // Reciprocal A↔B links from a hand-edit/import. Exactly one record must
+        // survive: the newer by timestamp.
+        let mut older = entry("a", "Fact A.", "2026-06-01T00:00:00Z");
+        let mut newer = entry("b", "Fact B.", "2026-06-02T00:00:00Z");
+        older.supersedes = vec!["b".to_owned()];
+        newer.supersedes = vec!["a".to_owned()];
+
+        // The older loses to the newer winner.
+        assert!(should_suppress_older(&older, &newer, None));
+        // The newer winner is never suppressed by the older loser.
+        assert!(!should_suppress_older(&newer, &older, None));
+    }
+
+    #[test]
+    fn explicit_cycle_tie_breaks_on_id() {
+        // Identical timestamps: the larger id wins deterministically so the
+        // cycle still drops exactly one record.
+        let mut a = entry("a", "Fact A.", "2026-06-01T00:00:00Z");
+        let mut b = entry("b", "Fact B.", "2026-06-01T00:00:00Z");
+        a.supersedes = vec!["b".to_owned()];
+        b.supersedes = vec!["a".to_owned()];
+
+        // "b" > "a", so "b" wins and "a" is suppressed.
+        assert!(should_suppress_older(&a, &b, None));
+        assert!(!should_suppress_older(&b, &a, None));
+    }
+
+    #[test]
+    fn suppressed_ids_drops_only_cycle_loser() {
+        let mut a = entry("a", "Fact A.", "2026-06-01T00:00:00Z");
+        let mut b = entry("b", "Fact B.", "2026-06-02T00:00:00Z");
+        a.supersedes = vec!["b".to_owned()];
+        b.supersedes = vec!["a".to_owned()];
+        let entries = [&a, &b];
+
+        let suppressed = suppressed_ids(&entries, None);
+
+        assert_eq!(suppressed.len(), 1);
+        assert!(suppressed.contains("a"));
+        assert!(!suppressed.contains("b"));
     }
 }
