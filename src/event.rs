@@ -316,8 +316,12 @@ pub fn render_event(event: &MemoryEvent) -> Result<String, EventError> {
 
 /// Parse and validate a JSON event.
 pub fn parse_event(input: &str) -> Result<MemoryEvent, EventError> {
-    let event: MemoryEvent =
+    let mut event: MemoryEvent =
         serde_json::from_str(input).map_err(|err| EventError::InvalidJson(err.to_string()))?;
+    // Mirror note parsing: a blank validity timestamp means absent, not an
+    // RFC3339 value to validate.
+    crate::note::normalize_blank_timestamp(&mut event.valid_from);
+    crate::note::normalize_blank_timestamp(&mut event.valid_to);
     validate_event(&event)?;
     Ok(event)
 }
@@ -546,6 +550,23 @@ mod tests {
         assert_eq!(parsed.supersedes, vec!["old-event-id".to_owned()]);
         assert!(rendered.contains("\"type\": \"memory.observation\""));
         assert!(rendered.ends_with('\n'));
+    }
+
+    #[test]
+    fn blank_validity_window_parses_as_absent() {
+        let event = MemoryEvent::observation(input()).expect("event");
+        let rendered = render_event(&event).expect("render event");
+        // Inject blank validity timestamps, mirroring the note "blank means
+        // absent" convention; these would otherwise fail RFC3339 validation.
+        let with_blanks = rendered.replace(
+            "\"body\":",
+            "\"valid_from\": \"\",\n  \"valid_to\": \"   \",\n  \"body\":",
+        );
+
+        let parsed = parse_event(&with_blanks).expect("parse event with blank validity window");
+
+        assert_eq!(parsed.valid_from, None);
+        assert_eq!(parsed.valid_to, None);
     }
 
     #[test]

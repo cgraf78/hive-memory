@@ -1210,13 +1210,19 @@ pub fn parse_duration_time(input: &str) -> Option<time::Duration> {
     if number < 0 {
         return None;
     }
-    match unit {
-        'd' => Some(time::Duration::days(number)),
-        'h' => Some(time::Duration::hours(number)),
-        'm' => Some(time::Duration::minutes(number)),
-        's' => Some(time::Duration::seconds(number)),
+    // `time::Duration::{days,hours,minutes}` do a checked multiply internally and
+    // PANIC on overflow, so a large in-range magnitude like `9223372036854775807d`
+    // would crash config load (and thus every command and hook). Build the
+    // duration from a `checked_mul` of seconds and fall back to `None` so the
+    // caller's `ConfigError::InvalidValue` path fires cleanly instead.
+    let seconds = match unit {
+        'd' => number.checked_mul(86_400),
+        'h' => number.checked_mul(3_600),
+        'm' => number.checked_mul(60),
+        's' => Some(number),
         _ => None,
-    }
+    }?;
+    Some(time::Duration::seconds(seconds))
 }
 
 /// Parse compact config durations into std durations for filesystem stamps.
@@ -1772,6 +1778,42 @@ mod tests {
         assert!(matches!(
             err,
             ConfigError::InvalidValue { key, .. } if key == "classifier.command"
+        ));
+    }
+
+    #[test]
+    fn parse_duration_returns_none_on_overflow_instead_of_panicking() {
+        // Regression: the magnitude parses as an in-range `i64`, but multiplying
+        // it up to days/hours/minutes overflows. The old code called
+        // `time::Duration::days`, whose internal checked multiply panicked and
+        // crashed config load. Both parsers must return `None` cleanly.
+        assert_eq!(parse_duration_time("9223372036854775807d"), None);
+        assert_eq!(parse_duration_time("9223372036854775807h"), None);
+        assert_eq!(parse_duration_time("9223372036854775807m"), None);
+        assert_eq!(parse_duration_std("9223372036854775807d"), None);
+        // A bare-seconds magnitude at the i64 ceiling still parses (no multiply).
+        assert!(parse_duration_time("9223372036854775807s").is_some());
+    }
+
+    #[test]
+    fn classifier_min_interval_overflow_errors_without_panic() {
+        let err = LoadedConfig::from_str_with_env(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "/tmp/personal"
+
+            [classifier]
+            min_interval = "9223372036854775807d"
+            "#,
+            env,
+        )
+        .expect_err("config fails");
+
+        assert!(matches!(
+            err,
+            ConfigError::InvalidValue { key, .. } if key == "classifier.min_interval"
         ));
     }
 
