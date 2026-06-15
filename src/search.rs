@@ -267,24 +267,25 @@ pub fn search(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
             })
             .then_with(|| left.entry.note_path.cmp(&right.entry.note_path))
     });
-    suppress_superseded_hits(&mut hits, &query.phrase, input.limit);
+    let suppressed = suppress_superseded_hits(&hits, &query.phrase);
+    hits.retain(|hit| !suppressed.contains(&hit.entry.id));
     collapse_duplicate_hits(&mut hits);
     hits.truncate(input.limit);
     Ok(hits)
 }
 
-fn suppress_superseded_hits(hits: &mut Vec<SearchHit>, phrase: &str, limit: usize) {
-    // Bound the O(n^2) scan to the top-ranked window so a large hit list stays
-    // cheap; suppression only matters among the records a user would actually
-    // see. The shared resolver in `supersession` owns the actual rules.
-    let scan_len = hits.len().min(limit.saturating_mul(4).clamp(16, 128));
-    let window = hits
-        .iter()
-        .take(scan_len)
-        .map(|hit| &hit.entry)
-        .collect::<Vec<_>>();
-    let suppressed = supersession::suppressed_ids(&window, Some(phrase));
-    hits.retain(|hit| !suppressed.contains(&hit.entry.id));
+fn suppress_superseded_hits(hits: &[SearchHit], phrase: &str) -> BTreeSet<String> {
+    // Feed the FULL (already audience/scope/project-filtered) hit set to the
+    // shared resolver. Pre-windowing by rank would let an explicit `supersedes`
+    // correction ranked beyond the window miss its target, violating the frozen
+    // contract that explicit links are authoritative in both surfaces. The
+    // resolver keeps explicit-link resolution O(n) over the full set and bounds
+    // only the inherently O(n^2) NL heuristic internally, so feeding everything
+    // is cheap. Search inherently sees only query-matched hits — that is the
+    // legitimate search scope; the fix is about not dropping explicit links
+    // among the matches by rank.
+    let entries = hits.iter().map(|hit| &hit.entry).collect::<Vec<_>>();
+    supersession::suppressed_ids(&entries, Some(phrase))
 }
 
 fn collapse_duplicate_hits(hits: &mut Vec<SearchHit>) {
@@ -1039,7 +1040,8 @@ pub fn search_indexed(
     // Apply the same supersession suppression as the lexical path so a record
     // explicitly replaced by a newer one does not resurface. The query phrase is
     // lowercased to match how the lexical path builds it.
-    suppress_superseded_hits(&mut hits, &input.query.to_ascii_lowercase(), input.limit);
+    let suppressed = suppress_superseded_hits(&hits, &input.query.to_ascii_lowercase());
+    hits.retain(|hit| !suppressed.contains(&hit.entry.id));
     collapse_duplicate_hits(&mut hits);
     hits.truncate(input.limit);
     Ok(hits)
@@ -1495,6 +1497,93 @@ mod tests {
         let mut audienced = base.clone();
         audienced[0].audience = vec!["codex".to_owned()];
         assert_ne!(baseline, entries_fingerprint(&audienced), "audience change");
+    }
+
+    /// Build an in-memory `IndexEntry` with a body, id, and created_at so a test
+    /// can construct a large ranked hit list without touching the filesystem.
+    fn search_entry(id: &str, body: &str, created_at: &str, supersedes: Vec<String>) -> IndexEntry {
+        IndexEntry {
+            id: id.to_owned(),
+            store_id: "store".to_owned(),
+            entry_kind: note::EntryKind::Remember,
+            scope: "global".to_owned(),
+            project_id: None,
+            audience: Vec::new(),
+            tags: Vec::new(),
+            subject: None,
+            confidence: note::Confidence::High,
+            valid_from: None,
+            valid_to: None,
+            supersedes,
+            kind: None,
+            entities: Vec::new(),
+            classified: None,
+            agent_id: "codex".to_owned(),
+            host_id: "taylor".to_owned(),
+            created_at: created_at.to_owned(),
+            body: body.to_owned(),
+            note_path: format!("inbox/notes/{id}.md"),
+            event_path: None,
+        }
+    }
+
+    #[test]
+    fn explicit_link_suppresses_target_ranked_beyond_window() {
+        // Bug 2: the resolver must see the FULL filtered hit set, not a top-128
+        // pre-window. Build > 128 matching hits where the explicit correction and
+        // its target both rank at the very bottom (oldest), so the old rank-based
+        // pre-window would have dropped them before suppression ran.
+        let dir = temp_dir("supersede-beyond-window");
+        let root = dir.join("store");
+
+        let mut owned = Vec::new();
+        // 130 higher-ranked filler hits (newer => sort above the pair). They all
+        // match the query token "deploys" so they become real hits.
+        for i in 0..130 {
+            owned.push(search_entry(
+                &format!("filler-{i:03}"),
+                "Team deploys the service.",
+                "2026-06-10T00:00:00Z",
+                Vec::new(),
+            ));
+        }
+        // The superseded target and its explicit correction, both OLDEST so they
+        // rank at the bottom of the hit list (position > 128).
+        let target = search_entry(
+            "old-target",
+            "Team deploys with the legacy gate.",
+            "2026-06-01T00:00:00Z",
+            Vec::new(),
+        );
+        owned.push(target);
+        owned.push(search_entry(
+            "new-correction",
+            "Team deploys with the modern gate.",
+            "2026-06-02T00:00:00Z",
+            vec!["old-target".to_owned()],
+        ));
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &owned,
+            query: "deploys",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 200,
+        })
+        .expect("search");
+
+        assert!(
+            hits.iter().all(|hit| hit.entry.id != "old-target"),
+            "explicit-supersedes target must be hidden even when ranked beyond the old window"
+        );
+        assert!(
+            hits.iter().any(|hit| hit.entry.id == "new-correction"),
+            "the superseding correction should still be returned"
+        );
     }
 
     #[test]

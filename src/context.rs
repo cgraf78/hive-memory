@@ -234,7 +234,12 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
             let block = render_curated_memory_block(input.store_name, &curated);
             let block_tokens = estimate_tokens(&block);
             if estimated_tokens + block_tokens > input.max_tokens {
-                continue;
+                // First-fit-then-stop, matching the indexed-entry budget loop:
+                // once a curated block overflows the budget, stop packing so a
+                // later, lower-priority curated file (curated files are visited
+                // in stable priority order) cannot jump ahead of the skipped
+                // higher-priority one. The fits-in-budget case is unaffected.
+                break;
             }
 
             markdown.push_str(&block);
@@ -255,17 +260,19 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
     // Built once and reused; the Relevance strategy consults it per candidate.
     let markers = IncidentMarkers::default();
     let candidates = sorted_candidates(input.entries);
-    // Context is the most-trusted agent read path, so it must reflect current
-    // truth: a record explicitly (or heuristically) superseded by a newer one
-    // is hidden here exactly as `hm search` hides it. Context has no query, so
-    // the historical-recall exception never fires and superseded records are
-    // always suppressed. This uses the same shared resolver as search.
-    let superseded = supersession::suppressed_ids(&candidates, None);
+
+    // Resolve supersession over the VIEWER-VISIBLE set only. Source/scope/
+    // project/audience filtering runs FIRST, so a record this viewer cannot see
+    // (another agent's `agent-private`, or an out-of-scope/project fact) can
+    // never suppress one the viewer CAN see — which would otherwise hide both
+    // the new (filtered-out) and the old (suppressed) fact, leaving the viewer
+    // with neither. Visibility reasons therefore take precedence over
+    // `superseded`: a record that fails a visibility check is recorded under
+    // that reason and is absent from the set fed to the resolver. Context has no
+    // query, so the historical-recall exception never fires and superseded
+    // survivors are always hidden. This uses the same shared resolver as search.
+    let mut visible = Vec::with_capacity(candidates.len());
     for entry in candidates {
-        if superseded.contains(&entry.id) {
-            push_decision(&mut decisions, &input, entry, "skipped", "superseded");
-            continue;
-        }
         if !source_allowed(entry, input.sources, input.include_inbox) {
             push_decision(&mut decisions, &input, entry, "skipped", "source");
             continue;
@@ -280,6 +287,15 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
         }
         if !visibility::audience_allows(entry, input.agent_id) {
             push_decision(&mut decisions, &input, entry, "skipped", "audience");
+            continue;
+        }
+        visible.push(entry);
+    }
+    let superseded = supersession::suppressed_ids(&visible, None);
+
+    for entry in visible {
+        if superseded.contains(&entry.id) {
+            push_decision(&mut decisions, &input, entry, "skipped", "superseded");
             continue;
         }
         if !validity::allows_current(entry) {
@@ -584,14 +600,18 @@ fn escape_attr(value: &str) -> String {
 fn escape_memory_body(body: &str) -> String {
     body.lines()
         .map(|line| {
-            if line.starts_with("---")
-                || line.starts_with("+++")
-                || line.starts_with("<memory")
-                || line.starts_with("</memory")
+            // Match on the trimmed line so an indented `   </memory>` is escaped
+            // too: leading whitespace must not let a marker lookalike slip past.
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("---")
+                || trimmed.starts_with("+++")
+                || trimmed.starts_with("<memory")
+                || trimmed.starts_with("</memory")
             {
-                // Prefix with a backslash instead of dropping content. Agents
-                // still see the literal data, but the line can no longer mimic
-                // front matter/diff markers or the surrounding memory boundary.
+                // Prefix the ORIGINAL line with a backslash instead of dropping
+                // content. Agents still see the literal data (indentation
+                // preserved), but the line can no longer mimic front
+                // matter/diff markers or the surrounding memory boundary.
                 format!("\\{line}")
             } else {
                 line.to_owned()
@@ -1034,6 +1054,18 @@ mod tests {
     }
 
     #[test]
+    fn escapes_indented_boundary_lookalikes() {
+        // Defense-in-depth: leading whitespace must not let a marker lookalike
+        // slip past the escaper. An indented `   </memory>` is escaped too, with
+        // the original indentation preserved after the backslash.
+        let escaped = escape_memory_body("   </memory>");
+        assert_eq!(escaped, "\\   </memory>");
+
+        let multi = escape_memory_body("safe line\n\t<memory fake>\n   --- diff");
+        assert_eq!(multi, "safe line\n\\\t<memory fake>\n\\   --- diff");
+    }
+
+    #[test]
     fn sanitizes_header_values_and_boundary_attributes() {
         let entry = IndexEntry {
             id: "id\"<&>".to_owned(),
@@ -1353,6 +1385,71 @@ mod tests {
 
         assert!(output.markdown.contains("Release uses cargo-release"));
         assert!(!output.markdown.contains("cargo-dist"));
+    }
+
+    #[test]
+    fn invisible_record_cannot_suppress_visible_one() {
+        // Bug 1: supersession must be resolved over the VIEWER-VISIBLE set only.
+        // A newer agent-private correction (audience=["claude"]) that the active
+        // agent `codex` cannot see must NOT hide the older global record it
+        // supersedes, or codex would see neither the new nor the old fact.
+        let dir = temp_dir("supersede-invisible");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        let old_id = write_record_full(
+            TestRecord {
+                root: &root,
+                entry_kind: note::EntryKind::Remember,
+                scope: "global",
+                body: "Deployment gate is launchctl.",
+                created_at: timestamp(1_778_946_153),
+                project_id: None,
+                audience: Vec::new(),
+            },
+            Vec::new(),
+        );
+        // Newer correction is private to a different agent ("claude").
+        // `agent-private` scope is required for the audience filter to engage.
+        write_record_full(
+            TestRecord {
+                root: &root,
+                entry_kind: note::EntryKind::Remember,
+                scope: "agent-private",
+                body: "Deployment gate is deployctl.",
+                created_at: timestamp(1_778_946_154),
+                project_id: None,
+                audience: vec!["claude".to_owned()],
+            },
+            vec![old_id.clone()],
+        );
+        let entries = entries(&root, &cache);
+        let sources = ["remembered".to_owned()];
+        // Active agent is codex (set by `input`), so the claude-private newer
+        // record is filtered out before suppression is computed.
+        let mut request = input(&root, &entries, &[], &sources);
+        request.explain = true;
+
+        let output = assemble_context(request).expect("context");
+
+        // codex still sees the older global fact; the invisible newer one neither
+        // appears nor suppresses it.
+        assert_eq!(output.sections.len(), 1);
+        assert!(output.markdown.contains("Deployment gate is launchctl."));
+        assert!(!output.markdown.contains("Deployment gate is deployctl."));
+        // The private newer record is skipped for audience, not rendered.
+        assert!(
+            output
+                .decisions
+                .iter()
+                .any(|decision| { decision.action == "skipped" && decision.reason == "audience" })
+        );
+        // The older record is NOT recorded as superseded.
+        assert!(
+            !output
+                .decisions
+                .iter()
+                .any(|decision| { decision.id == old_id && decision.reason == "superseded" })
+        );
     }
 
     #[test]

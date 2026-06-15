@@ -54,12 +54,30 @@ pub fn suppressed_ids(entries: &[&IndexEntry], query: Option<&str>) -> BTreeSet<
         .iter()
         .map(|entry| (entry.id.as_str(), *entry))
         .collect();
+    // Map every node that participates in an explicit-supersedes cycle (an SCC of
+    // size >= 2, or a self-loop) to that cycle's single deterministic winner.
+    // Cycles of any length must keep exactly one member, never erase all of them.
+    let cycle_winners = cycle_winners(entries, &by_id);
     for newer in entries {
         for target_id in &newer.supersedes {
-            if let Some(older) = by_id.get(target_id.as_str())
-                && should_suppress_older(older, newer, query)
-            {
-                suppressed.insert(older.id.clone());
+            if let Some(older) = by_id.get(target_id.as_str()) {
+                if explicitly_searches_old_fact(
+                    &older.body.to_ascii_lowercase(),
+                    &newer.body.to_ascii_lowercase(),
+                    query,
+                ) {
+                    continue;
+                }
+                // A node in a cycle is suppressed iff it is not its cycle's
+                // winner; this generalizes the reciprocal A<->B special case to
+                // cycles of any length. Acyclic links suppress their target.
+                if let Some(winner) = cycle_winners.get(older.id.as_str()) {
+                    if older.id.as_str() != *winner {
+                        suppressed.insert(older.id.clone());
+                    }
+                } else {
+                    suppressed.insert(older.id.clone());
+                }
             }
         }
     }
@@ -139,6 +157,165 @@ fn suppress_for_explicit_link(older: &IndexEntry, newer: &IndexEntry, query: Opt
     }
 
     true
+}
+
+/// Map each entry that participates in an explicit-supersedes cycle to that
+/// cycle's single surviving id.
+///
+/// The cycle is taken over the explicit `supersedes` graph restricted to the
+/// present entries: an edge `newer -> older` exists when `newer.supersedes`
+/// names a present `older`. A node is "in a cycle" when it belongs to a strongly
+/// connected component of size >= 2, or it supersedes itself (a self-loop). The
+/// winner is the maximum member by `(created_at, id)` — newest wins, ties broken
+/// by the lexicographically larger id — so the choice is deterministic
+/// regardless of input ordering. Acyclic nodes are absent from the map.
+///
+/// This generalizes the reciprocal A<->B guard to cycles of any length so a
+/// hand-edited or imported cycle (A->B->C->A) can never erase all its members.
+/// The graph is sparse, so this is cheap even at large entry counts.
+fn cycle_winners(
+    entries: &[&IndexEntry],
+    by_id: &HashMap<&str, &IndexEntry>,
+) -> HashMap<String, String> {
+    let sccs = strongly_connected_components(entries, by_id);
+    let mut winners = HashMap::new();
+    for scc in sccs {
+        // A trivial SCC (single node) is only a cycle when it has a self-loop.
+        let is_cycle = scc.len() >= 2 || {
+            let id = scc[0];
+            by_id
+                .get(id)
+                .is_some_and(|entry| entry.supersedes.iter().any(|target| target == id))
+        };
+        if !is_cycle {
+            continue;
+        }
+        let winner = scc
+            .iter()
+            .filter_map(|id| by_id.get(*id).copied())
+            .max_by(|left, right| {
+                timestamp_rank(&left.created_at)
+                    .cmp(&timestamp_rank(&right.created_at))
+                    .then_with(|| left.id.cmp(&right.id))
+            })
+            .map(|entry| entry.id.clone());
+        if let Some(winner) = winner {
+            for id in scc {
+                winners.insert(id.to_owned(), winner.clone());
+            }
+        }
+    }
+    winners
+}
+
+/// Compute strongly connected components of the present-entry explicit-supersedes
+/// graph using an iterative Tarjan to avoid recursion blowups on deep chains.
+///
+/// Returns one `Vec` of node ids per component. Only edges into present entries
+/// are followed, so the graph is exactly the subgraph the resolver can act on.
+fn strongly_connected_components<'a>(
+    entries: &[&'a IndexEntry],
+    by_id: &HashMap<&str, &'a IndexEntry>,
+) -> Vec<Vec<&'a str>> {
+    #[derive(Clone, Copy)]
+    struct NodeState {
+        index: usize,
+        lowlink: usize,
+        on_stack: bool,
+    }
+
+    // Stable node ordering keeps SCC output deterministic across runs.
+    let nodes: Vec<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
+    let mut state: HashMap<&str, NodeState> = HashMap::with_capacity(nodes.len());
+    let mut stack: Vec<&str> = Vec::new();
+    let mut next_index = 0usize;
+    let mut components: Vec<Vec<&str>> = Vec::new();
+
+    // Successors of `node`: the present records it explicitly supersedes.
+    let successors = |node: &str| -> Vec<&'a str> {
+        by_id
+            .get(node)
+            .map(|entry| {
+                entry
+                    .supersedes
+                    .iter()
+                    .filter_map(|target| by_id.get(target.as_str()).map(|found| found.id.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    // Explicit DFS frame stack: `(node, next successor index)`.
+    for &root in &nodes {
+        if state.contains_key(root) {
+            continue;
+        }
+        let mut frames: Vec<(&str, usize, Vec<&str>)> = vec![(root, 0, successors(root))];
+        state.insert(
+            root,
+            NodeState {
+                index: next_index,
+                lowlink: next_index,
+                on_stack: true,
+            },
+        );
+        next_index += 1;
+        stack.push(root);
+
+        while let Some((node, child_idx, succs)) = frames.last_mut() {
+            if *child_idx < succs.len() {
+                let child = succs[*child_idx];
+                *child_idx += 1;
+                if let Some(child_state) = state.get(child).copied() {
+                    if child_state.on_stack {
+                        let node_index = state[*node].index;
+                        let candidate = child_state.index.min(node_index);
+                        let entry = state.get_mut(node).expect("node state present");
+                        entry.lowlink = entry.lowlink.min(candidate);
+                    }
+                } else {
+                    state.insert(
+                        child,
+                        NodeState {
+                            index: next_index,
+                            lowlink: next_index,
+                            on_stack: true,
+                        },
+                    );
+                    next_index += 1;
+                    stack.push(child);
+                    let child_succs = successors(child);
+                    frames.push((child, 0, child_succs));
+                }
+            } else {
+                let node = *node;
+                let node_state = state[node];
+                if node_state.lowlink == node_state.index {
+                    let mut component = Vec::new();
+                    while let Some(top) = stack.pop() {
+                        if let Some(entry) = state.get_mut(top) {
+                            entry.on_stack = false;
+                        }
+                        component.push(top);
+                        if top == node {
+                            break;
+                        }
+                    }
+                    components.push(component);
+                }
+                frames.pop();
+                // Propagate this node's lowlink up to its parent frame.
+                if let Some((parent, _, _)) = frames.last() {
+                    let parent = *parent;
+                    let node_lowlink = state[node].lowlink;
+                    let parent_entry = state.get_mut(parent).expect("parent state present");
+                    parent_entry.lowlink = parent_entry.lowlink.min(node_lowlink);
+                }
+            }
+        }
+    }
+
+    components
 }
 
 /// Pick the surviving record id for a reciprocal explicit cycle.
@@ -474,5 +651,109 @@ mod tests {
         assert_eq!(suppressed.len(), 1);
         assert!(suppressed.contains("a"));
         assert!(!suppressed.contains("b"));
+    }
+
+    #[test]
+    fn three_cycle_keeps_exactly_one_deterministic_winner() {
+        // A 3-node explicit cycle A->B->C->A must not erase every member; the
+        // pairwise reciprocal guard only caught 2-cycles. Exactly one survives:
+        // the newest by (created_at, id) over the whole cycle.
+        let mut a = entry("a", "Fact A.", "2026-06-01T00:00:00Z");
+        let mut b = entry("b", "Fact B.", "2026-06-02T00:00:00Z");
+        let mut c = entry("c", "Fact C.", "2026-06-03T00:00:00Z");
+        a.supersedes = vec!["b".to_owned()];
+        b.supersedes = vec!["c".to_owned()];
+        c.supersedes = vec!["a".to_owned()];
+        let entries = [&a, &b, &c];
+
+        let suppressed = suppressed_ids(&entries, None);
+
+        // "c" is newest, so it wins; "a" and "b" are suppressed.
+        assert_eq!(suppressed.len(), 2);
+        assert!(suppressed.contains("a"));
+        assert!(suppressed.contains("b"));
+        assert!(!suppressed.contains("c"));
+    }
+
+    #[test]
+    fn three_chain_suppresses_all_but_head() {
+        // An acyclic chain A->B->C (A supersedes B, B supersedes C) is NOT a
+        // cycle: A is the live head and both B and C are superseded.
+        let mut a = entry("a", "Fact A.", "2026-06-03T00:00:00Z");
+        let mut b = entry("b", "Fact B.", "2026-06-02T00:00:00Z");
+        let c = entry("c", "Fact C.", "2026-06-01T00:00:00Z");
+        a.supersedes = vec!["b".to_owned()];
+        b.supersedes = vec!["c".to_owned()];
+        let entries = [&a, &b, &c];
+
+        let suppressed = suppressed_ids(&entries, None);
+
+        assert_eq!(suppressed.len(), 2);
+        assert!(suppressed.contains("b"));
+        assert!(suppressed.contains("c"));
+        assert!(!suppressed.contains("a"));
+    }
+
+    #[test]
+    fn explicit_link_suppresses_beyond_heuristic_window() {
+        // Phase 1 (explicit links) is unbounded: an explicit correction whose
+        // target sits past HEURISTIC_SCAN_WINDOW still suppresses it. Build a
+        // list where the superseded target is the very last entry, well beyond
+        // the window, and the newer record naming it is first.
+        let count = HEURISTIC_SCAN_WINDOW + 50;
+        let mut owned = Vec::with_capacity(count);
+        // index 0 is the newer correction; the last index is its explicit target.
+        let target_id = format!("filler-{}", count - 1);
+        let mut newer = entry("newer", "Replacement fact.", "2026-06-02T00:00:00Z");
+        newer.supersedes = vec![target_id.clone()];
+        owned.push(newer);
+        for i in 1..count {
+            owned.push(entry(
+                &format!("filler-{i}"),
+                "Unrelated filler body.",
+                "2026-06-01T00:00:00Z",
+            ));
+        }
+        let entries: Vec<&IndexEntry> = owned.iter().collect();
+
+        let suppressed = suppressed_ids(&entries, None);
+
+        assert!(suppressed.contains(target_id.as_str()));
+    }
+
+    #[test]
+    fn heuristic_is_bounded_to_scan_window() {
+        // Phase 2 (NL heuristic) is bounded. A clear stale/replacement pair whose
+        // older record sits just beyond the window is NOT suppressed; the same
+        // pair within the window IS. This proves the bound is real and that the
+        // explicit-link unbounded case above is genuinely Phase 1, not Phase 2.
+        let old_body = "Project alpha used to run cargo fmt before committing.";
+        let new_body = "Project alpha now uses checkrun format before committing.";
+
+        // Out of window: place the older record past the window, the newer first.
+        let count = HEURISTIC_SCAN_WINDOW + 10;
+        let mut owned = Vec::with_capacity(count);
+        owned.push(entry("newer", new_body, "2026-06-02T00:00:00Z"));
+        for i in 1..(count - 1) {
+            owned.push(entry(
+                &format!("filler-{i}"),
+                "Unrelated filler body.",
+                "2026-06-01T00:00:00Z",
+            ));
+        }
+        owned.push(entry("older", old_body, "2026-06-01T00:00:00Z"));
+        let entries: Vec<&IndexEntry> = owned.iter().collect();
+        let suppressed = suppressed_ids(&entries, None);
+        assert!(
+            !suppressed.contains("older"),
+            "heuristic must not reach beyond the scan window"
+        );
+
+        // Within window: the same pair adjacent at the top IS suppressed.
+        let newer = entry("newer", new_body, "2026-06-02T00:00:00Z");
+        let older = entry("older", old_body, "2026-06-01T00:00:00Z");
+        let near = [&newer, &older];
+        let near_suppressed = suppressed_ids(&near, None);
+        assert!(near_suppressed.contains("older"));
     }
 }

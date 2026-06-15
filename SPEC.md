@@ -1074,6 +1074,13 @@ never rewrites or deletes canonical memory; it only filters what broad recall
 shows. Both `hm search` and `hm context` apply the SAME resolution through one
 shared resolver so the two surfaces can never disagree about what is current.
 
+Both surfaces resolve supersession over the set of records the caller would
+otherwise see — for `hm context` that is the viewer-visible set after scope,
+project, and audience filtering; for `hm search` it is the query-matched hits
+after the same filtering. A record the caller cannot see can never suppress one
+it can: context filters first, then resolves supersession over the survivors, so
+visibility always takes precedence over supersession.
+
 There are two clearly separated confidence layers:
 
 1. **Explicit `supersedes` links (authoritative).** A record may carry a
@@ -1081,34 +1088,55 @@ There are two clearly separated confidence layers:
    Schema). An explicit link suppresses its target regardless of scope, project,
    or entry kind. A correction written as a `note`, or one that moves the fact
    from project scope to global scope, still hides the fact it explicitly
-   replaces. This is the durable contract a writer opts into.
-2. **Natural-language heuristic (lower confidence).** When there is no explicit
-   link, a deliberately narrow heuristic may still suppress an older record. It
-   fires only when both records are `remember` entries in the SAME scope and
-   project, the older body carries a stale marker (for example "used to",
-   "previously", "formerly", "no longer"), the newer body carries a replacement
-   marker (for example "now", "instead", "replaces", "current"), and the two
-   bodies share at least two topic words. The heuristic MUST NOT relax the
-   explicit-link rules; it only adds suppression the explicit layer did not
-   already provide.
+   replaces. This is the durable contract a writer opts into. Explicit links are
+   resolved across the FULL set the surface considers (an O(n) id lookup): in
+   `hm context` that is every viewer-visible record, and in `hm search` it is
+   every query-matched hit, regardless of rank. An explicit correction is never
+   missed because its target ranked low.
+2. **Natural-language heuristic (lower confidence, windowed).** When there is no
+   explicit link, a deliberately narrow heuristic may still suppress an older
+   record. It fires only when both records are `remember` entries in the SAME
+   scope and project, the older body carries a stale marker (for example "used
+   to", "previously", "formerly", "no longer"), the newer body carries a
+   replacement marker (for example "now", "instead", "replaces", "current"), and
+   the two bodies share at least two topic words. Because it is inherently
+   pairwise (O(n²)), it is bounded to the top window of candidates (the top 256,
+   priority/recency ordered) and is therefore best-effort: it suppresses only
+   among the top candidates. The heuristic MUST NOT relax the explicit-link
+   rules; it only adds suppression the explicit layer did not already provide.
 
 Invariants:
 
 - **Broad recall reflects current truth.** Both `hm search` (without a
-  historical query) and `hm context` always suppress superseded records, so the
+  historical query) and `hm context` suppress superseded records, so the
   most-trusted agent read path never injects a fact that a newer record has
-  corrected.
+  corrected. This guarantee is *unconditional* for explicit `supersedes` links
+  (resolved across the full set) and *among the top candidates* for the
+  windowed natural-language heuristic.
 - **Historical recall exception (search only).** A query that explicitly names a
   token living only in the older fact (for example searching `cargo fmt` after a
   `checkrun format` correction) keeps the older record visible, so historical
   questions can still find what the fact used to be. `hm context` has no query,
   so this exception never applies there and superseded records are always
   hidden.
-- **Cycle resolution.** A reciprocal explicit link (A supersedes B and B
-  supersedes A, as can arise from a hand-edit or import) must not erase both
-  records. The explicit layer keeps a single deterministic winner — the newer
-  record by `created_at`, tie-broken by the lexicographically larger id — and
-  suppresses only the loser, so a cycle never makes a fact vanish entirely.
+- **Cycle resolution.** Explicit `supersedes` links can form a cycle of any
+  length (A↔B, or A→B→C→A) through a hand-edit or import. Such a cycle must not
+  erase all its members. The explicit layer detects cycle membership over the
+  present-entry `supersedes` graph (a strongly connected component of size ≥ 2,
+  or a self-loop) and keeps a single deterministic winner — the newest member by
+  `created_at`, tie-broken by the lexicographically larger id — suppressing only
+  the others. A cycle therefore never makes every fact in it vanish, no matter
+  how many records it spans. An acyclic chain (A→B→C, A supersedes B, B
+  supersedes C) is not a cycle: the head A stays live and B and C are suppressed.
+- **Clock-skew immunity (explicit links only).** Explicit `supersedes`
+  resolution is id-based and therefore clock-skew-immune: it does not depend on
+  comparing `created_at` across records (the cycle tie-break uses `created_at`
+  only to pick a winner among already-linked members). The natural-language
+  heuristic and recency ordering, by contrast, compare wall-clock `created_at`,
+  so on records written by hosts with skewed clocks the heuristic's
+  newer/older decision is best-effort. Writers who need a reliable cross-host
+  correction should use an explicit `supersedes` link rather than relying on the
+  heuristic.
 - **No canonical mutation.** Suppression is a read-time view. The superseded
   Markdown note and JSON event remain on disk and remain discoverable through
   the historical-recall exception.
@@ -1750,12 +1778,18 @@ Frozen at 1.0:
   `hm context --json`, `hm flush`, `hm stores list/show`, `hm doctor --json`).
 - The data-boundary block syntax used by `hm context`.
 - The supersession contract (see Supersession): an explicit `supersedes` link is
-  authoritative across scope and entry kind; broad recall in both `hm search`
-  and `hm context` reflects current truth; the historical-recall exception
-  applies only to a search query that names the old fact; a reciprocal explicit
-  cycle resolves to a single deterministic winner. The natural-language
-  suppression heuristic is NOT frozen and may evolve under "Search ranking" and
-  "Context section ordering and selection heuristics" below.
+  authoritative across scope and entry kind and is resolved across the full set
+  each surface considers (viewer-visible records in `hm context`, query-matched
+  hits in `hm search`), so an explicit correction is never missed by rank;
+  supersession is resolved only over records the caller can already see, so
+  visibility takes precedence over supersession; broad recall in both `hm
+  search` and `hm context` reflects current truth (unconditionally for explicit
+  links); the historical-recall exception applies only to a search query that
+  names the old fact; an explicit `supersedes` cycle of any length resolves to a
+  single deterministic winner so it never erases all its members. The
+  natural-language suppression heuristic is NOT frozen (it is windowed and
+  best-effort) and may evolve under "Search ranking" and "Context section
+  ordering and selection heuristics" below.
 
 Free to evolve in 1.x:
 
