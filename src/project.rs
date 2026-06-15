@@ -219,7 +219,7 @@ pub fn resolve_project(input: ResolveProjectInput) -> Result<ProjectResolution, 
         });
     }
 
-    let path_key = project_root.to_string_lossy();
+    let path_key = stable_path_key(&project_root);
     Ok(ProjectResolution {
         project_id: path_id(&project_root, &path_key),
         project_root,
@@ -859,6 +859,50 @@ fn derived_id(key: &str) -> String {
     format!("{slug}-{}", short_hash(key))
 }
 
+/// Machine-stable hash key for the path-fallback project id.
+///
+/// The path fallback is the last identity rung (no explicit/env id, no marker,
+/// no VCS remote), so the only signal is the directory location. Hashing the
+/// absolute path makes the id host-variant — `/home/cgraf/git/foo` and
+/// `/Users/chris/git/foo` are the same logical project but differ by OS home
+/// dir, so project-scoped memory written on one machine is invisible on the
+/// other. To keep the id stable across hosts, key off the `$HOME`-relative path
+/// (namespaced with `~/`) when the root lives under `$HOME`; two machines with
+/// the same layout under their respective homes then derive the same id.
+///
+/// Residual: paths outside `$HOME` (or when `$HOME` is unknown) fall back to the
+/// absolute path and stay host-local — declare a `.hive-memory-project` marker
+/// or use a VCS remote for cross-host stability there.
+fn stable_path_key(root: &Path) -> String {
+    path_key_relative_to(root, home_dir().as_deref())
+}
+
+/// Pure core of [`stable_path_key`], parameterized on `home` so it is testable
+/// without mutating the process `$HOME`. Returns `~`/`~/<rel>` when `root` is
+/// under `home`, else the absolute path.
+fn path_key_relative_to(root: &Path, home: Option<&Path>) -> String {
+    if let Some(home) = home
+        && let Ok(rel) = root.strip_prefix(home)
+    {
+        let rel = rel.to_string_lossy();
+        return if rel.is_empty() {
+            "~".to_owned()
+        } else {
+            format!("~/{rel}")
+        };
+    }
+    root.to_string_lossy().into_owned()
+}
+
+/// Canonicalized `$HOME`, if known. Canonicalized so it matches the
+/// already-canonicalized project root (symlinked homes, macOS `/var` ->
+/// `/private/var`); `strip_prefix` is purely lexical and would otherwise miss.
+fn home_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").filter(|value| !value.is_empty())?;
+    let home = PathBuf::from(home);
+    Some(fs::canonicalize(&home).unwrap_or(home))
+}
+
 fn path_id(root: &Path, key: &str) -> String {
     let name = root
         .file_name()
@@ -1257,6 +1301,70 @@ mod tests {
         assert_eq!(
             first.remote_url.as_deref(),
             Some("git@github.com:cgraf78/hive-memory.git")
+        );
+    }
+
+    #[test]
+    fn path_key_is_home_relative_and_host_stable() {
+        // Same layout under different OS home dirs must yield the same key.
+        let linux = Path::new("/home/cgraf/git/foo");
+        let macos = Path::new("/Users/chris/git/foo");
+        let k_linux = path_key_relative_to(linux, Some(Path::new("/home/cgraf")));
+        let k_macos = path_key_relative_to(macos, Some(Path::new("/Users/chris")));
+        assert_eq!(k_linux, "~/git/foo");
+        assert_eq!(k_linux, k_macos);
+    }
+
+    #[test]
+    fn path_id_is_identical_across_hosts_for_same_relative_layout() {
+        // The actual bug: project_id must match across machines so project-scoped
+        // memory written on one is recalled on the other.
+        let linux = Path::new("/home/cgraf/git/foo");
+        let macos = Path::new("/Users/chris/git/foo");
+        let id_linux = path_id(
+            linux,
+            &path_key_relative_to(linux, Some(Path::new("/home/cgraf"))),
+        );
+        let id_macos = path_id(
+            macos,
+            &path_key_relative_to(macos, Some(Path::new("/Users/chris"))),
+        );
+        assert_eq!(id_linux, id_macos);
+        assert!(id_linux.starts_with("foo-"));
+    }
+
+    #[test]
+    fn path_key_for_home_root_is_tilde() {
+        assert_eq!(
+            path_key_relative_to(Path::new("/home/cgraf"), Some(Path::new("/home/cgraf"))),
+            "~"
+        );
+    }
+
+    #[test]
+    fn path_key_outside_home_falls_back_to_absolute() {
+        // Paths outside $HOME stay host-local (documented residual).
+        assert_eq!(
+            path_key_relative_to(Path::new("/opt/work/foo"), Some(Path::new("/home/cgraf"))),
+            "/opt/work/foo"
+        );
+        // Unknown $HOME also falls back to the absolute path.
+        assert_eq!(
+            path_key_relative_to(Path::new("/home/cgraf/git/foo"), None),
+            "/home/cgraf/git/foo"
+        );
+    }
+
+    #[test]
+    fn path_key_does_not_strip_partial_home_prefix() {
+        // /home/cgraf2 is NOT under /home/cgraf; strip_prefix is path-component
+        // aware so this must fall back to absolute, not become "~2/...".
+        assert_eq!(
+            path_key_relative_to(
+                Path::new("/home/cgraf2/foo"),
+                Some(Path::new("/home/cgraf"))
+            ),
+            "/home/cgraf2/foo"
         );
     }
 }
