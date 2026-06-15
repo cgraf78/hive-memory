@@ -23,6 +23,13 @@ const HOOK_TOOL_COMPLETE_NO_RECEIPT_WARM_BUDGET_MS: u128 = 200;
 const SYNTHETIC_OUTBOX_ITEMS: usize = 100;
 const FLUSH_RUNS: usize = 10;
 const FLUSH_100_ITEM_BUDGET_MS: u128 = 2_000;
+// Project resolution must stay fast even when the `git` on PATH is pathologically
+// slow, because agent sessions set `HIVE_MEMORY_PROJECT` on every recall. The
+// guard installs a `git` shim that sleeps far longer than this budget, so the
+// only way to pass is for resolution to read the VCS config directly and never
+// exec git. Generous enough to absorb process startup on a busy CI host.
+const PROJECT_RESOLUTION_WARM_BUDGET_MS: u128 = 300;
+const SLOW_GIT_SHIM_SLEEP_SECS: u64 = 5;
 const PERF_BUDGET_MULTIPLIER_ENV: &str = "HIVE_MEMORY_PERF_BUDGET_MULTIPLIER";
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -66,6 +73,71 @@ fn context_and_search_stay_within_warm_budget() {
         search_p95 <= search_budget,
         "hm search p95 {search_p95}ms exceeded {search_budget}ms"
     );
+}
+
+#[test]
+#[ignore = "CI runs this explicitly because it creates a 5000-note synthetic store"]
+fn project_resolution_does_not_exec_git() {
+    let fixture = SyntheticStore::new();
+    fixture.refresh_index();
+
+    // A checkout whose remote identity is only discoverable from `.git/config`.
+    // If resolution still shelled out to `git`, it would hit the slow shim below
+    // and blow the budget by seconds.
+    let checkout = temp_dir("resolution-checkout");
+    let git_dir = checkout.join(".git");
+    fs::create_dir_all(&git_dir).expect("git dir");
+    fs::write(
+        git_dir.join("config"),
+        "[remote \"origin\"]\n\turl = git@github.com:cgraf78/hive-memory.git\n",
+    )
+    .expect("git config");
+
+    let shim_dir = temp_dir("slow-git-shim");
+    install_slow_git_shim(&shim_dir);
+    let shimmed_path = match std::env::var_os("PATH") {
+        Some(existing) => {
+            let mut paths = vec![shim_dir.clone()];
+            paths.extend(std::env::split_paths(&existing));
+            std::env::join_paths(paths).expect("join PATH")
+        }
+        None => shim_dir.clone().into_os_string(),
+    };
+
+    let checkout_str = checkout.to_str().expect("utf8 checkout").to_owned();
+    let resolution_p95 = p95_ms(repeat(RUNS, || {
+        hm_command(&fixture.config, ["search", "needle-4999", "--json"])
+            .env("PATH", &shimmed_path)
+            .env("HIVE_MEMORY_PROJECT", &checkout_str)
+            .assert()
+            .success();
+    }));
+    eprintln!("hm search (project resolution) warm p95: {resolution_p95}ms");
+
+    let budget = budget_ms(PROJECT_RESOLUTION_WARM_BUDGET_MS);
+    assert!(
+        resolution_p95 <= budget,
+        "project resolution p95 {resolution_p95}ms exceeded {budget}ms; the slow \
+         git shim was likely invoked, meaning resolution is not shell-free"
+    );
+}
+
+/// Install an executable `git` that sleeps far past the budget, so any exec of
+/// it during the test makes the latency assertion fail loudly.
+fn install_slow_git_shim(dir: &Path) {
+    let shim = dir.join("git");
+    fs::write(
+        &shim,
+        format!("#!/bin/sh\nsleep {SLOW_GIT_SHIM_SLEEP_SECS}\nexit 1\n"),
+    )
+    .expect("write git shim");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&shim).expect("shim metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&shim, perms).expect("chmod shim");
+    }
 }
 
 #[test]
