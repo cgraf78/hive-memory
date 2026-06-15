@@ -38,6 +38,10 @@ file-sync (Google Drive, Dropbox, git) carries the same memory to every machine.
   prompt time, and keep the index warm after tool calls.
 - **Plain files, human-readable.** Browse, grep, or hand-edit the store. No
   database, no server, no lock-in.
+- **Fast, no daemon.** Every command is a fresh process — no server to start or
+  keep warm. A typical recall returns in well under 50ms even on a synthetic
+  store of thousands of notes, and the per-turn agent hooks add only a few
+  milliseconds. See [Performance](#performance).
 - **Scoped recall.** Global memory follows you everywhere; project memory
   follows a repo via VCS-agnostic identity.
 - **Privacy-aware.** Secret-looking content is refused on the write path;
@@ -404,6 +408,83 @@ Detection is conservative and key-driven (private keys, AWS/GitHub tokens,
 secret *values* are never echoed back. Capture drops secret-bearing candidates
 silently. Hive Memory does not encrypt stores at rest — use filesystem, disk,
 vault, or sync-provider encryption for sensitive data.
+
+---
+
+## Performance
+
+Hive Memory is a **process-per-invocation** CLI: there is no daemon and nothing
+to keep warm. It is pure Rust, reads never call a model, and recall runs over a
+local, rebuildable index (deterministic lexical scan by default, opt-in Tantivy
+BM25). Whatever the index returns is a recall optimization only — store, scope,
+project, audience, and validity are always applied as a **mandatory post-filter**,
+so candidate generation is fast without ever becoming a trust boundary. Writes
+are append-only single files with no global lock, so a `remember` never waits on
+a reader.
+
+Two things are worth measuring separately, because they answer different
+questions:
+
+- **Interactive per-command latency** — what a user (or agent) feels per
+  invocation on a normal small store. This includes process startup.
+- **Core engine p95 at scale** — how the engine holds up at ~5000 notes, the
+  number that matters for "does this stay fast as my memory grows".
+
+**Interactive per-command latency** (small store, warm, single invocation):
+
+| Command | Core binary (mean) | Via `hm` launcher (mean) |
+| --- | --- | --- |
+| `hm search` | ~3ms | ~14ms |
+| `hm context` | ~5ms | ~19ms |
+| `hm remember` | ~4ms | ~14ms |
+| `hm doctor --quick` | ~3ms | ~12ms |
+| `hm sync-status` | ~3ms | ~13ms |
+
+The core binary is single-digit milliseconds per command. The `hm` launcher (a
+thin shell wrapper that detects the calling agent so writes can record a session
+receipt) adds roughly 10ms of shell startup on top — still well under what a
+human perceives as instant.
+
+**Core engine p95 at ~5000 notes** (release build, warm index, p95 over repeated
+runs, each measurement includes full process startup and JSON serialization
+because agent hooks pay those costs every time):
+
+| Operation | p95 |
+| --- | --- |
+| `hm context` (4000-token budget) | ~46ms |
+| `hm search` (term) | ~21ms |
+| `hm search` (multi-word / "semantic") | ~45ms |
+| `hm search` (supersession query) | ~23ms |
+| `hook tool-complete` (no receipt) | ~2ms |
+| `hook prompt-submit` (baseline) | ~23ms |
+| `hook prompt-submit` (with recall) | ~22ms |
+| `hook prompt-submit` (recall, store offline / cached) | ~18ms |
+| `hm flush` (100-item outbox) | ~660ms |
+
+The hot-path hooks that run on **every agent turn** — `session-start`,
+`prompt-submit`, and the high-frequency `tool-complete` — stay in the low tens of
+milliseconds or less, so wiring Hive Memory into an agent's lifecycle does not
+slow the turn down.
+
+**Honest caveats.** These numbers are approximate and machine-dependent —
+measured on a typical Linux devserver, so treat them as order-of-magnitude, not
+guarantees. Real-world conditions shift them:
+
+- A **cloud-synced store** (Google Drive, Dropbox) adds filesystem latency on
+  top of these local-disk figures.
+- The **first query after a write or change** rebuilds the local index before it
+  is warm; the figures above are warm-index numbers.
+- The **`hm` launcher** adds a few milliseconds of shell startup that the raw
+  core binary does not.
+- Writes are append-only single files (fast, no global lock) and the entire
+  index is rebuildable, so recovery is `hm refresh`, not a migration.
+
+**Reproduce it yourself.** The scaling numbers come from the `perf_budget`
+integration test, which builds a 5000-note synthetic store and prints each `p95`:
+
+```sh
+cargo test --release --test perf_budget -- --ignored --nocapture
+```
 
 ---
 
