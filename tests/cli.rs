@@ -7246,13 +7246,11 @@ fn search_falls_back_to_lexical_when_tantivy_index_empty_and_lock_held() {
     // Hold the cache-key rebuild lock the way a concurrent `hm refresh` would, so
     // `tantivy_search` cannot rebuild and is left facing a freshly created EMPTY
     // index. The path mirrors `index::rebuild_lock_path`.
-    let lock_path = cache
-        .join("locks")
-        .join("index")
-        .join(format!(
-            "{}.lock",
-            hive_memory::index::store_cache_key("personal", &personal)
-        ));
+    let lock_file = format!(
+        "{}.lock",
+        hive_memory::index::store_cache_key("personal", &personal)
+    );
+    let lock_path = cache.join("locks").join("index").join(lock_file);
     fs::create_dir_all(lock_path.parent().expect("lock parent")).expect("lock parent");
     let lock = OpenOptions::new()
         .read(true)
