@@ -22,8 +22,16 @@
 //! inactive there and current truth is always what gets injected.
 
 use crate::{index::IndexEntry, note};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use time::OffsetDateTime;
+
+/// Upper bound on how many candidates the natural-language heuristic compares
+/// pairwise. Explicit `supersedes` links are always resolved across the full set
+/// (an O(n) id lookup); only the inherently O(n²) heuristic is windowed, mirroring
+/// how `hm search` already caps its scan. Without this bound, `hm context` over a
+/// large store ran the full O(n²) heuristic over every candidate (≈9.6s at 5000
+/// notes). The window is generous enough to cover search's own ≤128 pre-window.
+const HEURISTIC_SCAN_WINDOW: usize = 256;
 
 /// Compute the set of record ids that should be hidden from broad recall.
 ///
@@ -38,14 +46,45 @@ use time::OffsetDateTime;
 #[must_use]
 pub fn suppressed_ids(entries: &[&IndexEntry], query: Option<&str>) -> BTreeSet<String> {
     let mut suppressed = BTreeSet::new();
-    for older in entries {
-        for newer in entries {
+
+    // Phase 1 — explicit `supersedes` links: authoritative and resolved across
+    // the FULL set via direct id lookup, so a superseded record is hidden no
+    // matter how large the store is or where the records rank. O(n + links).
+    let by_id: HashMap<&str, &IndexEntry> = entries
+        .iter()
+        .map(|entry| (entry.id.as_str(), *entry))
+        .collect();
+    for newer in entries {
+        for target_id in &newer.supersedes {
+            if let Some(older) = by_id.get(target_id.as_str())
+                && should_suppress_older(older, newer, query)
+            {
+                suppressed.insert(older.id.clone());
+            }
+        }
+    }
+
+    // Phase 2 — natural-language heuristic: inherently pairwise, so it is bounded
+    // to the top window of candidates (already priority/recency ordered by the
+    // caller). This is a best-effort lower-confidence layer; the authoritative
+    // explicit links above are unaffected by the bound. Pairs already joined by
+    // an explicit link are skipped here since Phase 1 owns them.
+    let window = &entries[..entries.len().min(HEURISTIC_SCAN_WINDOW)];
+    for older in window {
+        if suppressed.contains(&older.id) {
+            continue;
+        }
+        for newer in window {
+            if newer.supersedes.iter().any(|id| id == &older.id) {
+                continue;
+            }
             if should_suppress_older(older, newer, query) {
                 suppressed.insert(older.id.clone());
                 break;
             }
         }
     }
+
     suppressed
 }
 
