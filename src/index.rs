@@ -21,7 +21,11 @@ use time::OffsetDateTime;
 // count and max file mtime alongside directory mtime, AND the JSONL index began
 // carrying its fingerprint in an embedded header line. Older sidecar-based
 // caches (schema 8 and earlier, header-less) are treated as stale and rebuilt.
-const INDEX_FINGERPRINT_SCHEMA_VERSION: u32 = 9;
+// Bumped to 10 when the fingerprint added an order-independent XOR of per-file
+// name hashes, so a delete+add netting the same file count under an
+// mtime-preserving cloud sync still invalidates the cache. Schema-9 caches are
+// treated as stale and rebuilt cleanly on first read.
+const INDEX_FINGERPRINT_SCHEMA_VERSION: u32 = 10;
 
 /// Format version for the embedded index header line.
 ///
@@ -183,6 +187,15 @@ struct IndexFingerprint {
     // file, which the OS dirent cache already warms during enumeration).
     canonical_files: usize,
     latest_file_modified_nanos: u128,
+    // Order-independent combine (XOR) of a cheap hash of each canonical file's
+    // store-relative path. File count + newest mtime miss the cloud-sync case
+    // where a delete+add nets the SAME count and the added file's mtime is <=
+    // the prior newest (mtime-preserving sync): both signals stay identical, so
+    // the cache is served stale and the new note is invisible until `hm refresh`.
+    // Folding the path-set membership in makes the fingerprint sensitive to WHICH
+    // files exist, not just how many. The names are already in hand from
+    // enumeration, so this adds no stat or file read — just a hash per dirent.
+    canonical_names_combined: u64,
     entity_registry_modified_nanos: u128,
 }
 
@@ -828,14 +841,20 @@ fn collect_note_paths(root: &Path, paths: &mut Vec<PathBuf>) -> Result<(), Index
 /// ONE directory traversal: directory mtime catches most create/delete/rename
 /// changes cheaply, and the file count + newest file mtime catch in-place
 /// replaces and the cloud-sync case where a file lands under a date dir whose
-/// own mtime is preserved. We deliberately stop short of per-file content
-/// hashing, which would re-read every note on the hot path.
+/// own mtime is preserved. The XOR-combined name hash additionally catches a
+/// delete+add that nets the same count under an mtime-preserving sync, where
+/// neither count nor newest mtime would move. We deliberately stop short of
+/// per-file content hashing, which would re-read every note on the hot path.
 #[derive(Default)]
 struct CanonicalScan {
     dirs: usize,
     files: usize,
     latest_directory_modified_nanos: u128,
     latest_file_modified_nanos: u128,
+    // Running XOR of each file's name hash. XOR is order-independent, so the
+    // value depends on the file SET and not on enumeration order; a delete+add
+    // that swaps one file for a differently-named one flips it.
+    names_combined: u64,
 }
 
 fn canonical_fingerprint(store_root: &Path) -> Result<IndexFingerprint, IndexError> {
@@ -847,12 +866,16 @@ fn canonical_fingerprint(store_root: &Path) -> Result<IndexFingerprint, IndexErr
         // phrase links in addition to built-in aliases and the store registry.
         // v9: folds canonical file count + newest file mtime into freshness and
         // moves the fingerprint into the index header for atomic publish.
+        // v10: folds an order-independent XOR of per-file name hashes so a
+        // delete+add netting the same count under an mtime-preserving sync still
+        // invalidates the cache (file-SET membership, not just file count).
         schema_version: INDEX_FINGERPRINT_SCHEMA_VERSION,
         store_root: store_root.display().to_string(),
         canonical_dirs: scan.dirs,
         latest_directory_modified_nanos: scan.latest_directory_modified_nanos,
         canonical_files: scan.files,
         latest_file_modified_nanos: scan.latest_file_modified_nanos,
+        canonical_names_combined: scan.names_combined,
         entity_registry_modified_nanos: optional_modified_nanos(&store_root.join("entities.toml"))?,
     })
 }
@@ -892,6 +915,10 @@ fn collect_canonical(root: &Path, scan: &mut CanonicalScan) -> Result<(), IndexE
             collect_canonical(&path, scan)?;
         } else if file_type.is_file() {
             scan.files += 1;
+            // Fold the file's identity (its name) into the set membership signal.
+            // The name is already in hand from enumeration, so this is just a
+            // hash — no stat, no read. XOR keeps the combine order-independent.
+            scan.names_combined ^= name_hash(&entry.file_name());
             // One extra stat per file. The dirent is already warm from
             // enumeration, so this stays cheap relative to a full note re-read,
             // and it is what lets an mtime-preserving cloud-sync arrival be seen.
@@ -911,6 +938,23 @@ fn modified_nanos(time: SystemTime) -> u128 {
     time.duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0)
+}
+
+/// Cheap, stable 64-bit hash of a canonical file's name (FNV-1a over the raw
+/// `OsStr` bytes via its lossy UTF-8 view). Used only to give the freshness
+/// fingerprint sensitivity to file-set membership; it never needs to be
+/// cryptographic, just well-distributed and deterministic across runs so a
+/// delete+add of differently-named files flips the XOR combine. Note names are
+/// ULID-stamped (`note-<ulid>.md`), so even content-identical notes hash apart.
+fn name_hash(name: &std::ffi::OsStr) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for byte in name.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 fn relative_path(root: &Path, path: &Path, path_case: memory_path::PathCase) -> String {
@@ -1392,6 +1436,66 @@ mod tests {
         assert_eq!(after.canonical_files, before.canonical_files + 1);
     }
 
+    /// A delete+add that nets the SAME file count, under an mtime-preserving
+    /// cloud-sync arrival where the added file's mtime is <= the prior newest,
+    /// leaves dir count, file count, and newest mtime all unchanged. Only the
+    /// per-file name-hash combine moves, so without it the cache would be served
+    /// stale and the new note invisible until `hm refresh`. This is the real
+    /// false-negative the v10 name signal exists to close.
+    #[test]
+    fn freshness_detects_same_count_file_swap_under_preserved_mtime() {
+        let dir = temp_dir("freshness-file-swap");
+        let root = dir.join("store");
+        let note_dir = root.join("inbox/notes/2026/05/16");
+        fs::create_dir_all(&note_dir).expect("note dir");
+        fs::create_dir_all(root.join("inbox/events")).expect("events dir");
+
+        // Pin file A's mtime so we can land B at exactly the same instant,
+        // neutralizing the newest-mtime signal as a mtime-preserving sync would.
+        let pinned = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let path_a = note_dir.join("a.md");
+        fs::write(&path_a, "placeholder").expect("note a");
+        File::options()
+            .write(true)
+            .open(&path_a)
+            .expect("open a")
+            .set_modified(pinned)
+            .expect("set a mtime");
+
+        let before = canonical_fingerprint(&root).expect("before");
+
+        // Swap A for B: same count, B's mtime forced equal to A's (the prior
+        // newest), and the parent dir mtime left as-is to mimic the sync case.
+        fs::remove_file(&path_a).expect("remove a");
+        let path_b = note_dir.join("b.md");
+        fs::write(&path_b, "placeholder").expect("note b");
+        File::options()
+            .write(true)
+            .open(&path_b)
+            .expect("open b")
+            .set_modified(pinned)
+            .expect("set b mtime");
+
+        let after = canonical_fingerprint(&root).expect("after");
+
+        assert_eq!(
+            after.canonical_files, before.canonical_files,
+            "the swap must keep the file count identical"
+        );
+        assert_eq!(
+            after.latest_file_modified_nanos, before.latest_file_modified_nanos,
+            "B's mtime must equal A's so the mtime signal cannot move"
+        );
+        assert_ne!(
+            before.canonical_names_combined, after.canonical_names_combined,
+            "the name-hash combine must change so the swap is visible"
+        );
+        assert_ne!(
+            before, after,
+            "a same-count file swap must change the fingerprint"
+        );
+    }
+
     /// The canonical file count participates in fingerprint equality, so a
     /// file-set change is detected even when every directory mtime is identical
     /// (the mtime-preserving cloud-sync case directory mtime alone would miss).
@@ -1404,6 +1508,7 @@ mod tests {
             latest_directory_modified_nanos: 42,
             canonical_files: 10,
             latest_file_modified_nanos: 42,
+            canonical_names_combined: 0,
             entity_registry_modified_nanos: 0,
         };
         let one_more_file = IndexFingerprint {

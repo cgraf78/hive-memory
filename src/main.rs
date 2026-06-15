@@ -2453,6 +2453,14 @@ fn run_search_backend(
 /// Open (or create) the store's persistent Tantivy index, refresh it from the
 /// current entries when their fingerprint changed, and run a policy-filtered
 /// BM25 search. The index lives under the disposable cache dir, keyed by store.
+///
+/// The rebuild branch takes the same cache-key `RebuildLock` that `perform_refresh`
+/// holds, so an interactive `hm search` and a concurrent `hm refresh` cannot fight
+/// over the shared cache artifact. On contention we degrade to read-only/lexical
+/// rather than block this latency-sensitive read: a stale-but-valid index searches
+/// fine, and the rebuild the other holder is running will land for the next query.
+/// (Tantivy's own writer lock already prevents corruption; this is about honoring
+/// the documented single-writer contract and avoiding redundant rebuild scans.)
 fn tantivy_search(
     config: &Config,
     store_name: &str,
@@ -2464,10 +2472,21 @@ fn tantivy_search(
         .map_err(|err| search::SearchError::Retrieval(err.to_string()))?;
     let fingerprint = search::entries_fingerprint(input.entries);
     if !index.is_fresh(&fingerprint) {
-        let documents = search::search_documents(store_root, input.entries)?;
-        index
-            .rebuild_tagged(&documents, Some(&fingerprint))
-            .map_err(|err| search::SearchError::Retrieval(err.to_string()))?;
+        // Serialize the rebuild against refresh/other interactive rebuilds via the
+        // cache-key lock. `Ok(Some(lock))` lets us rebuild while holding it;
+        // `Ok(None)` means another rebuild already holds it, and a lock I/O error
+        // means we cannot coordinate — in both of those cases skip our rebuild and
+        // search the current (stale) index read-only instead of blocking this
+        // latency-sensitive read. The lock guard must outlive the rebuild, so it
+        // is bound for the whole branch.
+        if let Ok(Some(_rebuild_lock)) =
+            index::try_rebuild_lock(&config.cache_dir, store_name, store_root)
+        {
+            let documents = search::search_documents(store_root, input.entries)?;
+            index
+                .rebuild_tagged(&documents, Some(&fingerprint))
+                .map_err(|err| search::SearchError::Retrieval(err.to_string()))?;
+        }
     }
     search::search_indexed(input, &index)
 }
