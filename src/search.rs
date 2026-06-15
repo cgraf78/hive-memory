@@ -1587,6 +1587,63 @@ mod tests {
     }
 
     #[test]
+    fn historical_query_keeps_beyond_window_old_fact_visible() {
+        // The historical-recall exception must survive the full-set feed at
+        // scale: when the query names a token that lives ONLY in the older fact,
+        // that older record stays visible even though an explicit correction
+        // supersedes it and both rank far below the old top-128 pre-window. This
+        // pairs with `explicit_link_suppresses_target_ranked_beyond_window`: same
+        // beyond-window layout, but a historical query flips the outcome.
+        let dir = temp_dir("supersede-historical-beyond-window");
+        let root = dir.join("store");
+
+        let mut owned = Vec::new();
+        // 130 higher-ranked filler hits matching the shared token "deploys".
+        for i in 0..130 {
+            owned.push(search_entry(
+                &format!("filler-{i:03}"),
+                "Team deploys the service.",
+                "2026-06-10T00:00:00Z",
+                Vec::new(),
+            ));
+        }
+        // The older fact carries a unique token ("launchctl") absent from the
+        // correction; both records rank at the bottom (oldest).
+        owned.push(search_entry(
+            "old-target",
+            "Team deploys with launchctl.",
+            "2026-06-01T00:00:00Z",
+            Vec::new(),
+        ));
+        owned.push(search_entry(
+            "new-correction",
+            "Team deploys with deployctl.",
+            "2026-06-02T00:00:00Z",
+            vec!["old-target".to_owned()],
+        ));
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &owned,
+            // Query names the token unique to the old fact, triggering the
+            // historical exception even though an explicit link supersedes it.
+            query: "launchctl",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 200,
+        })
+        .expect("search");
+
+        assert!(
+            hits.iter().any(|hit| hit.entry.id == "old-target"),
+            "historical query naming the old-only token must keep the old fact visible"
+        );
+    }
+
+    #[test]
     fn indexed_search_suppresses_superseded_records() {
         let dir = temp_dir("indexed-supersede");
         let root = dir.join("store");

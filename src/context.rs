@@ -261,17 +261,43 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
     let markers = IncidentMarkers::default();
     let candidates = sorted_candidates(input.entries);
 
-    // Resolve supersession over the VIEWER-VISIBLE set only. Source/scope/
-    // project/audience filtering runs FIRST, so a record this viewer cannot see
-    // (another agent's `agent-private`, or an out-of-scope/project fact) can
-    // never suppress one the viewer CAN see — which would otherwise hide both
-    // the new (filtered-out) and the old (suppressed) fact, leaving the viewer
-    // with neither. Visibility reasons therefore take precedence over
-    // `superseded`: a record that fails a visibility check is recorded under
-    // that reason and is absent from the set fed to the resolver. Context has no
-    // query, so the historical-recall exception never fires and superseded
-    // survivors are always hidden. This uses the same shared resolver as search.
-    let mut visible = Vec::with_capacity(candidates.len());
+    // Supersession resolves over TWO distinct sets, kept separate on purpose:
+    //
+    //   suppressors = audience-allowed ∧ valid (NOT scope/project filtered)
+    //   rendered    = all filters (source/scope/project/audience/validity)
+    //
+    // explicit links cross scope, heuristic same-scope.
+    //
+    // Suppressors must NOT be scope/project filtered: per the frozen contract,
+    // an explicit `supersedes` correction is authoritative ACROSS scope, so a
+    // global (or other-project) correction must still retire its target even for
+    // a viewer who narrowed `--scope` and would never render the corrector. The
+    // NL heuristic stays conservative because it independently requires the same
+    // scope+project (`same_scope`), so widening the suppressor input can never
+    // make it fire across scope.
+    //
+    // Suppressors MUST still be audience-allowed: a record the viewer cannot see
+    // (another agent's `agent-private`) must never suppress one it can, or the
+    // viewer would lose both the hidden corrector and the suppressed target.
+    // Audience filtering therefore always wins over `superseded`.
+    //
+    // Suppressors MUST be valid: an expired or not-yet-valid corrector is itself
+    // dropped from rendering, so letting it suppress a live older fact would
+    // leave the viewer with neither (Fix A). This mirrors `search.rs`, which
+    // filters validity before feeding the resolver.
+    //
+    // Context has no query, so the historical-recall exception never fires and
+    // superseded survivors are always hidden. This uses the same shared resolver
+    // as search.
+    let suppressors = candidates
+        .iter()
+        .copied()
+        .filter(|entry| {
+            visibility::audience_allows(entry, input.agent_id) && validity::allows_current(entry)
+        })
+        .collect::<Vec<_>>();
+    let superseded = supersession::suppressed_ids(&suppressors, None);
+
     for entry in candidates {
         if !source_allowed(entry, input.sources, input.include_inbox) {
             push_decision(&mut decisions, &input, entry, "skipped", "source");
@@ -285,15 +311,12 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
             push_decision(&mut decisions, &input, entry, "skipped", "project");
             continue;
         }
+        // Audience precedes `superseded`: a record the viewer cannot see is
+        // recorded under its own visibility reason, never as superseded.
         if !visibility::audience_allows(entry, input.agent_id) {
             push_decision(&mut decisions, &input, entry, "skipped", "audience");
             continue;
         }
-        visible.push(entry);
-    }
-    let superseded = supersession::suppressed_ids(&visible, None);
-
-    for entry in visible {
         if superseded.contains(&entry.id) {
             push_decision(&mut decisions, &input, entry, "skipped", "superseded");
             continue;
@@ -1450,6 +1473,123 @@ mod tests {
                 .iter()
                 .any(|decision| { decision.id == old_id && decision.reason == "superseded" })
         );
+    }
+
+    #[test]
+    fn validity_failing_corrector_does_not_suppress_live_older() {
+        // Fix A: an expired (or not-yet-valid) newer record with an explicit
+        // `supersedes` link must NOT suppress the live older fact, because it is
+        // itself dropped for validity in the emit loop. If it could suppress, the
+        // viewer would see NEITHER the corrector (expired) nor the target
+        // (suppressed). Validity must gate suppressors, mirroring search.
+        let dir = temp_dir("supersede-expired-corrector");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        let old_id = write_record_full(
+            TestRecord {
+                root: &root,
+                entry_kind: note::EntryKind::Remember,
+                scope: "global",
+                body: "Deployment gate is launchctl.",
+                created_at: timestamp(1_778_946_153),
+                project_id: None,
+                audience: Vec::new(),
+            },
+            Vec::new(),
+        );
+        write_record_full(
+            TestRecord {
+                root: &root,
+                entry_kind: note::EntryKind::Remember,
+                scope: "global",
+                body: "Deployment gate is deployctl.",
+                created_at: timestamp(1_778_946_154),
+                project_id: None,
+                audience: Vec::new(),
+            },
+            vec![old_id.clone()],
+        );
+        let mut entries = entries(&root, &cache);
+        // Expire the newer corrector so it fails `validity::allows_current`.
+        for entry in &mut entries {
+            if entry.body == "Deployment gate is deployctl." {
+                entry.valid_to = Some("2000-01-01T00:00:00Z".to_owned());
+            }
+        }
+        let sources = ["remembered".to_owned()];
+        let mut request = input(&root, &entries, &[], &sources);
+        request.explain = true;
+
+        let output = assemble_context(request).expect("context");
+
+        // The live older fact survives; the expired corrector neither renders nor
+        // suppresses.
+        assert_eq!(output.sections.len(), 1);
+        assert!(output.markdown.contains("Deployment gate is launchctl."));
+        assert!(!output.markdown.contains("Deployment gate is deployctl."));
+        // The older record is NOT recorded as superseded.
+        assert!(
+            !output
+                .decisions
+                .iter()
+                .any(|decision| { decision.id == old_id && decision.reason == "superseded" })
+        );
+    }
+
+    #[test]
+    fn cross_scope_corrector_retires_target_when_scope_excludes_corrector() {
+        // Fix E: an explicit `supersedes` correction in a scope the viewer did
+        // NOT select must still retire its target. The corrector lives in
+        // `global`; the target in `project`. The viewer narrows `--scope project`,
+        // so the global corrector is never rendered, yet the explicit link is
+        // authoritative across scope and must still hide the stale target. The
+        // suppressor set is audience-allowed ∧ valid but NOT scope-filtered.
+        let dir = temp_dir("supersede-cross-scope-excluded");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        let old_id = write_record_full(
+            TestRecord {
+                root: &root,
+                entry_kind: note::EntryKind::Remember,
+                scope: "project",
+                body: "Release uses cargo-dist for project repo-a.",
+                created_at: timestamp(1_778_946_153),
+                project_id: Some("repo-a"),
+                audience: Vec::new(),
+            },
+            Vec::new(),
+        );
+        write_record_full(
+            TestRecord {
+                root: &root,
+                entry_kind: note::EntryKind::Remember,
+                scope: "global",
+                body: "Release uses cargo-release everywhere now.",
+                created_at: timestamp(1_778_946_154),
+                project_id: None,
+                audience: Vec::new(),
+            },
+            vec![old_id.clone()],
+        );
+        let entries = entries(&root, &cache);
+        let sources = ["remembered".to_owned()];
+        // Viewer selects ONLY project scope, excluding the global corrector from
+        // rendering. Round-2's filter-then-suppress would have dropped the global
+        // corrector from the suppressor set, leaving the stale target visible.
+        let scopes = ["project".to_owned()];
+        let mut request = input(&root, &entries, &scopes, &sources);
+        request.project_id = Some("repo-a");
+        request.explain = true;
+
+        let output = assemble_context(request).expect("context");
+
+        // The stale project-scoped target is retired by the out-of-scope global
+        // corrector; the corrector itself is not rendered (scope-filtered).
+        assert!(!output.markdown.contains("cargo-dist"));
+        assert!(!output.markdown.contains("cargo-release"));
+        assert!(output.decisions.iter().any(|decision| {
+            decision.id == old_id && decision.action == "skipped" && decision.reason == "superseded"
+        }));
     }
 
     #[test]
