@@ -1079,6 +1079,11 @@ mod tests {
             ..write::AtomicWriteOptions::default()
         };
         add_alias(&dir, "old-project", "current-project", &options).expect("add alias");
+        // A second, unrelated project with its own alias chain. It shares no id
+        // with the first, so it must NOT bleed into the first project's related
+        // set — without this negative case the link test would also pass for a
+        // buggy implementation that returned every known project id.
+        add_alias(&dir, "old-other", "unrelated-project", &options).expect("add unrelated alias");
 
         let from_current = related_project_ids(&dir, "current-project").expect("related ids");
         let from_old = related_project_ids(&dir, "old-project").expect("related ids");
@@ -1086,6 +1091,14 @@ mod tests {
         assert_eq!(from_current, from_old);
         assert!(from_current.contains("current-project"));
         assert!(from_current.contains("old-project"));
+        // Negative: the unrelated project and its alias must be excluded.
+        assert!(!from_current.contains("unrelated-project"));
+        assert!(!from_current.contains("old-other"));
+        // The related set is exactly the linked pair, nothing more.
+        assert_eq!(
+            from_current,
+            BTreeSet::from(["current-project".to_owned(), "old-project".to_owned()])
+        );
     }
 
     #[test]
@@ -1391,6 +1404,95 @@ mod tests {
             first.remote_url.as_deref(),
             Some("git@github.com:cgraf78/hive-memory.git")
         );
+    }
+
+    #[test]
+    fn resolve_falls_back_to_path_identity_without_marker_or_vcs() {
+        clear_discovery_cache();
+        // A bare directory with no `.hive-memory-project` marker and none of the
+        // VCS sentinels in `VCS_MARKERS` exercises the final identity rung: the
+        // path fallback that `resolve_project` reaches only after marker and
+        // git-remote discovery both come up empty.
+        let root = temp_dir("resolve-path-fallback");
+        for marker in VCS_MARKERS {
+            assert!(
+                !root.join(marker).exists(),
+                "fixture must have no {marker} so resolution reaches the path rung"
+            );
+        }
+
+        let resolved = resolve_project(ResolveProjectInput {
+            hint: root.clone(),
+            explicit_project_id: None,
+            env_project_id: None,
+        })
+        .expect("resolve project");
+
+        // The whole point of this test: the source is the path rung, not any of
+        // the higher-precedence rungs that other tests already cover.
+        assert_eq!(resolved.source, ProjectIdSource::Path);
+        // Root is the canonicalized hint (matches the resolver's contract; on
+        // macOS /var canonicalizes through /private/var).
+        let canonical = root.canonicalize().expect("canonical root");
+        assert_eq!(resolved.project_root, canonical);
+        // The id must be the `<dir-slug>-<12 hex>` shape produced by `path_id`,
+        // and must actually match what `path_id` derives for this root so the
+        // assertion is not a loose regex that any string could pass.
+        let expected_id = path_id(&canonical, &stable_path_key(&canonical));
+        assert_eq!(resolved.project_id, expected_id);
+        let (slug, hash) = resolved
+            .project_id
+            .rsplit_once('-')
+            .expect("id has a -<hash> suffix");
+        assert!(!slug.is_empty(), "slug part must be non-empty");
+        assert_eq!(hash.len(), 12, "hash suffix is 12 hex chars: {hash}");
+        assert!(
+            hash.chars().all(|ch| ch.is_ascii_hexdigit()),
+            "hash suffix must be hex: {hash}"
+        );
+    }
+
+    #[test]
+    fn discovery_cache_isolates_distinct_start_dirs() {
+        clear_discovery_cache();
+        // Two unrelated repos with different origins. The cache is keyed per
+        // start dir, so each must retain its OWN discovered identity; a bug that
+        // collapsed all keys into one slot would let B's resolution return A's
+        // remote (or vice versa). The single-key cache test cannot catch that.
+        let root_a = temp_dir("cache-isolation-a");
+        write_git_config(&root_a, "git@github.com:cgraf78/alpha.git");
+        let root_b = temp_dir("cache-isolation-b");
+        write_git_config(&root_b, "git@github.com:cgraf78/bravo.git");
+
+        let resolved_a = resolve_project(ResolveProjectInput {
+            hint: root_a.clone(),
+            explicit_project_id: None,
+            env_project_id: None,
+        })
+        .expect("resolve a");
+        // Resolve B AFTER A is cached, then clobber A's config. B is a first-time
+        // resolution, so it must read its own on-disk config and must NOT be
+        // contaminated by A's cached entry.
+        fs::write(root_a.join(".git/config"), "[core]\n").expect("clobber a config");
+        let resolved_b = resolve_project(ResolveProjectInput {
+            hint: root_b.clone(),
+            explicit_project_id: None,
+            env_project_id: None,
+        })
+        .expect("resolve b");
+
+        assert_eq!(resolved_a.source, ProjectIdSource::GitRemote);
+        assert_eq!(resolved_b.source, ProjectIdSource::GitRemote);
+        assert_eq!(
+            resolved_a.project_id,
+            derived_id(&normalize_remote_url("git@github.com:cgraf78/alpha.git"))
+        );
+        assert_eq!(
+            resolved_b.project_id,
+            derived_id(&normalize_remote_url("git@github.com:cgraf78/bravo.git"))
+        );
+        // The two ids must differ: cross-key leakage would make them equal.
+        assert_ne!(resolved_a.project_id, resolved_b.project_id);
     }
 
     #[test]
