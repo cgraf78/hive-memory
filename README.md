@@ -3,36 +3,49 @@
 [![CI](https://github.com/cgraf78/hive-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/cgraf78/hive-memory/actions/workflows/ci.yml)
 [![Release](https://github.com/cgraf78/hive-memory/actions/workflows/release.yml/badge.svg)](https://github.com/cgraf78/hive-memory/actions/workflows/release.yml)
 
-Hive Memory is a small command-line memory layer for AI agents. It gives agents
-one durable place to remember useful facts, project context, preferences, and
-follow-up notes without tying that memory to one vendor, model, editor, or chat
-session.
+**Durable, shareable, plain-text memory for AI agents — across sessions,
+agents, and machines.**
 
-The basic idea is simple:
+AI agents forget everything between sessions. Every new chat re-learns your
+preferences, re-discovers your project conventions, and re-asks questions you
+already answered. Hive Memory fixes that with one small command-line tool, `hm`,
+that gives any agent a durable place to remember facts, preferences, project
+context, and follow-ups — without tying that memory to a single vendor, model,
+editor, or chat session.
 
-1. You create one or more memory stores on disk.
-2. Agents write memories with `hm remember` or lower-confidence notes with
-   `hm note`.
-3. Future sessions call `hm context` or `hm search` to recover the right memory
-   for the current agent, project, and scope.
+The canonical data is just files on disk: Markdown notes with TOML front matter,
+JSON event sidecars, and curated Markdown. Indexes and caches are rebuildable. A
+human can read and edit the store without ever running the CLI, and any normal
+file-sync (Google Drive, Dropbox, git) carries the same memory to every machine.
 
-The canonical data is plain files: Markdown notes with TOML front matter, JSON
-event sidecars, and curated Markdown files. Indexes, caches, hook state, and
-generated context are rebuildable. A human can browse the store without running
-the CLI.
+---
 
-## Status
+## What you get
 
-The primary binary is `hm`. The crate is currently pre-1.0, and public release
-versions are generated from the UTC commit timestamp plus the commit suffix. The
-implemented command surface follows the v1 schema and behavior described in
-[SPEC.md](SPEC.md); broader design rationale lives in [PLAN.md](PLAN.md).
+- **One memory across sessions and agents.** Write a fact once with `hm
+  remember`; recall it from any future session, with `claude`, `codex`,
+  `gemini`, or your own tooling.
+- **Cross-machine by file-sync.** A store is a directory with a stable UUID
+  identity. Sync it however you already sync files; identity survives moves and
+  renames.
+- **Memory that updates itself.** Append-only with *supersession*: newer facts
+  quietly hide stale ones at query time. Nothing is ever hard-deleted, so
+  history stays auditable.
+- **Capture and reconcile.** Distill durable facts out of a conversation, then
+  fold each one into memory mem0-style (add / update / delete / noop) — with a
+  review gate so capture can never silently change what an agent sees.
+- **Agent lifecycle hooks.** Inject the right context at session start and at
+  prompt time, and keep the index warm after tool calls.
+- **Plain files, human-readable.** Browse, grep, or hand-edit the store. No
+  database, no server, no lock-in.
+- **Scoped recall.** Global memory follows you everywhere; project memory
+  follows a repo via VCS-agnostic identity.
+- **Privacy-aware.** Secret-looking content is refused on the write path;
+  capture silently drops credentials before they ever land on disk.
 
-Because the project is still `0.x`, storage schemas may change between releases.
-If a change affects public command behavior, file formats, or hook contracts,
-update [SPEC.md](SPEC.md) in the same commit.
+---
 
-## Quick Start
+## 60-second quick start
 
 Install the CLI from a checkout:
 
@@ -50,72 +63,357 @@ root = "${HOME}/hive-memory/personal"
 description = "Personal memory"
 ```
 
-Initialize the store root:
+Initialize the store, write a memory, recall it:
 
 ```sh
-hm stores init personal --root ~/hive-memory/personal --description "Personal memory"
-```
+hm stores init personal --root ~/hive-memory/personal
 
-Write a durable memory:
-
-```sh
 hm remember --text "Prefer small, focused patches with tests." --scope global
-```
 
-Search for it later:
-
-```sh
 hm search "focused patches"
 ```
 
-Ask Hive Memory for agent-readable context:
+Ask Hive Memory for agent-ready context (Markdown wrapped in trust-boundary
+blocks, fit to a token budget):
 
 ```sh
 hm context --max-tokens 1200
 ```
 
-For project-specific memory, pass a project path. `hm` derives a stable project
-id from an explicit id, environment, `.hive-memory/project.toml`, the git remote,
-or finally the local path.
+```text
+Hive Memory Context
+store: personal
+scopes: global,project
+sources: curated,remembered
 
-```sh
-hm remember \
-  --project ~/git/hive-memory \
-  --scope project \
-  --text "This repo keeps the v1 behavior contract in SPEC.md."
-
-hm context --project ~/git/hive-memory
+<memory id="…" agent="human" store="personal" scope="global" trust="remembered">
+Prefer small, focused patches with tests.
+</memory>
 ```
 
-## Mental Model
+That output is data, not instructions: every block is labeled with its source
+store, scope, and trust level so an agent can tell curated knowledge from a raw
+note.
 
-Hive Memory separates four things that are easy to accidentally mix together.
+---
 
-**Stores** are durable memory roots. A store can live in a local directory, a
-synced folder, a network mount, or any normal filesystem path. Each store has a
-`manifest.toml` with a stable UUID identity, so the folder can move or be
-renamed without changing what store it is.
+## Core concepts
 
-**Records** are append-only inbox entries written by agents or humans. `hm
-remember` writes durable remembered facts. `hm note` writes lower-confidence raw
-notes that can be searched or promoted later.
+Hive Memory keeps four things cleanly separated.
 
-**Curated memory** is human-readable Markdown under directories such as
-`memories/global`, `memories/projects`, `people`, and `rules`. It is the place
-for reviewed, stable knowledge. `hm promote` can turn a raw inbox note into
-curated memory.
+**Stores** are durable memory roots — a local directory, a synced folder, or a
+network mount. Each store has a `manifest.toml` with a stable **UUIDv7
+identity**, so the folder can move, sync, or be renamed without changing *which*
+store it is. There is no built-in sync daemon: a store is just a directory tree
+designed to ride on whatever file-sync you already use.
 
-**Context** is a generated view for agents. It is assembled on demand from
-curated files and remembered records, filtered by store, agent, project, scope,
-source, audience, and token budget. Context output is not the source of truth.
+**Memory vs notes.** `hm remember` writes a *durable* fact, preference, or
+project truth. `hm note` writes a *lower-confidence* raw note for triage. Raw
+notes are searchable but excluded from injected context by default, so they can
+never silently steer an agent.
 
-## Store Layout
+**Global vs project scope.** Global memory is recalled everywhere a synced store
+is present. Project memory is keyed to a project identity, so `hm search` and
+`hm context` only surface it when you are working in that project (or pass
+`--project`).
+
+**Supersession — memory that updates itself.** Writes are append-only. When a
+newer `remember` record replaces an older one (explicitly via `--supersedes`, or
+heuristically when the wording signals a change), the stale record is *suppressed
+at query time* rather than deleted. Broad recall sees only the current truth, but
+a direct historical search for the old fact still finds it.
+
+---
+
+## Use cases
+
+### Give every agent the same long-term memory across machines
+
+Put the store in a synced folder and point each machine's config at it. Identity
+travels with the manifest, not the path.
+
+```toml
+# ~/.config/hive-memory/config.toml  (on every machine)
+default_store = "personal"
+
+[stores.personal]
+root = "${HOME}/Google Drive/hive-memory/personal"
+```
+
+```sh
+# laptop
+hm remember --text "Always run the test suite before opening a PR." --scope global
+
+# desktop, later — same synced store
+hm search "before opening a PR"
+```
+
+Global memory recalls everywhere. Project-scoped memory recalls on another
+machine **as long as the project resolves to the same id there** (see
+[Scopes and cross-machine identity](#scopes-and-cross-machine-identity) for the
+honest caveat).
+
+### Inject relevant project context at prompt time via hooks
+
+Wire your agent host's lifecycle events to thin `hm hook` calls. The adapter
+passes the event shape; `hm` returns the context or action to apply.
+
+```sh
+hm hook session-start --project ~/git/acme-api
+hm hook prompt-submit --project ~/git/acme-api --text "remember to use the v2 client"
+hm hook tool-complete --status 0
+hm hook stop
+```
+
+- **`session-start`** assembles startup memory context for the session (fit to
+  `hook_context_max_tokens`) and emits it as an inject action.
+- **`prompt-submit`** refreshes context if the selection changed, runs
+  prompt-specific recall, and — using a small deterministic phrase heuristic
+  ("remember this", "don't forget", "from now on") — reminds the agent when the
+  user clearly wants something remembered.
+- **`tool-complete`** is the high-frequency post-tool hook. It keeps the search
+  index warm off the hot path and refreshes context using the project id from
+  the session's write receipt — never the process CWD — so home-launched,
+  multi-project sessions don't mistake `$HOME` for the active project.
+- **`stop`** reminds the agent at session end if a memory request was never
+  satisfied.
+
+> **Note:** There is no automatic capture-on-stop. Memory is written only when
+> an agent (or you) explicitly runs `hm remember` / `hm note` / `hm capture`.
+> The hooks *prompt* and *prepare*; they never silently persist memory.
+
+### Capture durable facts from a conversation and reconcile them in
+
+`hm capture` asks a model backend to distill a conversation into atomic, durable
+facts. By default it **stages** them as raw inbox notes for review — it never
+writes canonical memory by itself:
+
+```sh
+hm capture --dry-run < transcript.txt        # preview extracted facts
+cat transcript.txt | hm capture              # stage as inbox notes
+hm inbox list                                # review what was staged
+```
+
+When you trust the extraction, `--promote` folds each fact straight into durable
+memory mem0-style, comparing it against the most similar existing records and
+choosing one operation per fact:
+
+```sh
+cat transcript.txt | hm capture --promote
+```
+
+Or reconcile a single candidate directly:
+
+```sh
+echo "The default branch is now main, not master." | hm reconcile
+```
+
+```text
+update: wrote <new-id> in store personal
+```
+
+Reconciliation picks **add**, **update**, **delete**, or **noop**. Update and
+delete don't erase anything — they write a new record that supersedes the old
+one, which is retained for audit. Capture and reconcile both require a model
+backend (configured `[classifier]`, or an installed `codex` / `claude` /
+`gemini`), and both refuse to write secret-looking content.
+
+### Keep memory current without deleting history (supersession)
+
+State a replacement and Hive Memory suppresses the stale fact from broad recall
+while keeping it on disk:
+
+```sh
+hm remember --text "We deploy from the release branch." --scope project --project ~/git/acme-api
+# …later…
+hm remember --text "We now deploy from main instead." --scope project --project ~/git/acme-api \
+  --supersedes <old-id>
+```
+
+After this, `hm context --project ~/git/acme-api` shows only the current fact. A
+deliberate historical query (`hm search "release branch" --project ~/git/acme-api`)
+still surfaces the superseded record — append-only means nothing is lost.
+
+---
+
+## Going deeper
+
+### Retrieval backends
+
+Hive Memory ships two candidate-generation backends, selected by
+`defaults.search_backend`:
+
+| Backend | Value | Default | What it is |
+| --- | --- | --- | --- |
+| Lexical | `"lexical"` | ✅ | Deterministic, stable text scan. Phrase matches weighted above term matches; ties broken by confidence, temporal intent, then recency. |
+| Tantivy BM25 | `"tantivy"` | opt-in | Local **BM25** full-text index for higher recall (subject/tags field-boosted). |
+
+```toml
+[defaults]
+search_backend = "tantivy"
+```
+
+This is **full-text / BM25 lexical** search — there is no embedding, semantic, or
+vector search. Retrieval ranking is not yet tuned; an unrecognized
+`search_backend` value degrades to lexical rather than failing. In both backends
+the index returns ranked ids only; store, scope, project, audience, and validity
+policy are applied as a mandatory post-filter, so the index is a recall
+optimization, never a security boundary.
+
+Inspect scoring with `hm search --explain`, and measure ranking changes against
+labeled corpuses with `hm eval`.
+
+### Context assembly
+
+`hm context` filters indexed records and curated files by source, scope,
+project, audience, and validity, then renders each memory in a `<memory …>`
+trust-boundary block up to a token budget (`--max-tokens`, a deterministic
+byte/4 estimate in v1). The selection strategy is set by
+`defaults.context_strategy`:
+
+| Strategy | Default | Behavior |
+| --- | --- | --- |
+| `adaptive` | ✅ | Recall-safe. Withholds a remembered record only when it carries a non-startup `kind` (incident, reference, or a project-fact outside its own project). Untagged content is always kept. |
+| `recency` | | Everything in scope, ordered by recency. |
+| `relevance` | | Most aggressive; runs the content classifier and can withhold ambiguous global facts. |
+
+`--if-changed` suppresses output when the session already saw the same
+selection, which keeps hook output quiet.
+
+### Classification
+
+`hm classify` runs an optional background pass that asks a model backend to set
+the durable **kind** of remembered records — `preference`, `project-fact`,
+`incident`, or `reference`. Kind drives `adaptive` context selection: a
+project-scoped incident can stop appearing in every session while staying fully
+searchable.
+
+The classifier is deliberately off the hot path: `hm remember`, `hm search`,
+`hm context`, and hook output never invoke a model. Only `hm hook stop` may spawn
+a detached `hm classify --auto` after checking local stamp/lock files; it exits
+quietly when disabled, already running, fresh, or missing a backend.
+
+```toml
+[classifier]
+mode = "off"          # off | auto | on
+batch_limit = 25
+min_interval = "6h"
+timeout_seconds = 60
+apply_confidence = "high"
+```
+
+In `mode = "auto"`, Hive Memory only auto-detects backend CLIs whose labels also
+appear in `[agents]` (`claude`, `codex`, `gemini`) — those agents already read
+memory through context, so classification adds no new implicit reader. Set
+`mode = "on"` with an explicit `backend` (or a `command` that reads a prompt on
+stdin and prints a JSON verdict) to use any other CLI. Inspect or test without
+writing via `hm classify --pending` and `hm classify --dry-run`.
+
+`hm retag <id> --kind <kind>` corrects a record's kind by hand. Secret stores and
+audience-restricted (`agent-private`) records are never sent to any backend.
+
+### Doctor
+
+```sh
+hm doctor             # full diagnostics
+hm doctor --quick     # hook/update-safe subset
+hm doctor --fix       # safe layout repairs only
+hm doctor --json
+```
+
+`hm doctor` checks config, store availability and layout, generated `.gitignore`
+files, sensitive-store permissions and cloud-root policy, project bindings, agent
+policies, outbox state, event pairing, agent-private audiences, classifier
+status, secret-looking content, and cloud-sync conflicts. `--fix` performs only
+safe layout repairs — it never initializes missing stores or rewrites your
+memory. `hm sync-status` reports store and index freshness without mutating
+anything.
+
+### Offline writes and the outbox
+
+When offline fallback is enabled and a target store is temporarily unavailable,
+writes are queued under `data_dir/outbox` instead of being lost. Flush them when
+the store is reachable again:
+
+```sh
+hm refresh                              # rebuild local indexes/state
+hm flush                                # publish queued writes
+hm flush --bind <outbox-item-id> --store personal
+```
+
+Flushing verifies the target store's manifest identity before publishing. An item
+queued before the store identity was known stays unbound until you bind it
+explicitly.
+
+### Scopes and cross-machine identity
+
+Project identity lets memory follow a repo without depending on the agent
+process's current directory. Resolution is **shell-free and VCS-agnostic**,
+first match wins:
+
+1. `--project-id` (explicit)
+2. `HIVE_MEMORY_PROJECT_ID` (environment)
+3. a `.hive-memory-project` marker file (TOML with an `id`), found by walking
+   ancestors
+4. the normalized VCS remote URL — works across `.git`, `.hg`, `.jj`, and `.svn`
+   (read directly from on-disk VCS config, no subprocess on the common path)
+5. a `$HOME`-relative path key as a final fallback
+
+```sh
+hm projects resolve ~/git/acme-api
+hm projects bind ~/git/acme-api --store work
+hm projects alias old-project-id new-project-id
+```
+
+```text
+project_id: github-com-acme-api-…
+project_source: git-remote
+```
+
+SSH and HTTPS spellings of the same remote collapse to one identity, and project
+renames are handled by shared alias metadata so every machine maps old → new id.
+
+**Cross-machine caveat (be honest about this):** project-scoped memory recalls on
+another machine only when the project resolves to the **same id** there — which
+is guaranteed for explicit/env ids, marker files, VCS remotes, and
+`$HOME`-relative layouts. Projects *outside* `$HOME` (or hosts where `$HOME` is
+unknown) fall back to a host-local absolute path and won't match across machines;
+declare a `.hive-memory-project` marker or rely on a VCS remote for those.
+**Global-scope memory always recalls everywhere a synced store is present.**
+
+### Trust and privacy
+
+Hive Memory treats stored memory as **data, not instructions**, and wraps every
+context block in explicit source/trust boundaries. Store access is governed by
+config, project bindings, per-agent read/write allowlists, and explicit flags:
+
+```toml
+[agents.codex]
+default_store = "personal"
+read_stores = ["personal"]
+write_stores = ["personal"]
+allow_all_stores = false
+```
+
+`agent-private` records require an explicit `--audience`. Secret-looking writes
+are refused unless the target is a `secret` store **and**
+`privacy.allow_secret_writes = true` **and** the write passes
+`--allow-secret-write` (plus `privacy.allow_hook_secret_writes` for hooks).
+Detection is conservative and key-driven (private keys, AWS/GitHub tokens,
+`password=`/`api_key=` style assignments with real-looking values); matched
+secret *values* are never echoed back. Capture drops secret-bearing candidates
+silently. Hive Memory does not encrypt stores at rest — use filesystem, disk,
+vault, or sync-provider encryption for sensitive data.
+
+---
+
+## Store layout
 
 `hm stores init` creates this v1 skeleton:
 
 ```text
 <store-root>/
-  manifest.toml
+  manifest.toml        # stable UUID identity
   entities.toml        # optional search alias registry
   people/
   rules/
@@ -124,542 +422,129 @@ source, audience, and token budget. Context output is not the source of truth.
     agents/
     projects/
   inbox/
-    notes/
-    events/
+    notes/             # inbox/notes/YYYY/MM/DD/<note-id>.md
+    events/            # inbox/events/YYYY/MM/DD/<note-id>.json
   generated/
-    .gitignore
+    .gitignore         # rebuildable artifacts stay out of git
 ```
 
-Canonical note files live under:
+Canonical memory is plain Markdown with TOML front matter (delimited by `+++`)
+plus JSON event sidecars. The `generated/` tree is disposable.
 
-```text
-inbox/notes/YYYY/MM/DD/<note-id>.md
-```
-
-JSON event sidecars live under:
-
-```text
-inbox/events/YYYY/MM/DD/<note-id>.json
-```
-
-The `generated/` directory is disposable by default. Store-local `.gitignore`
-keeps generated artifacts out of version control unless a user intentionally
-force-adds something.
+---
 
 ## Configuration
 
-The default config path is:
-
-```text
-~/.config/hive-memory/config.toml
-```
-
-An optional machine-local override can live beside it:
-
-```text
-~/.config/hive-memory/config.local.toml
-```
-
-`--config <path>` overrides the default path. `HIVE_MEMORY_CONFIG` is used when
-`--config` is not supplied. The local override file is always named
-`config.local.toml` next to the selected main config.
-
-A fuller config looks like this:
+The default config path is `~/.config/hive-memory/config.toml`, with an optional
+machine-local override at `config.local.toml` beside it. `--config <path>`
+overrides the path; `HIVE_MEMORY_CONFIG` is used when `--config` is absent. A
+fuller config:
 
 ```toml
 schema_version = 1
 
 default_store = "personal"
-data_dir = "${XDG_DATA_HOME:-${HOME}/.local/share}/hive-memory"
+data_dir  = "${XDG_DATA_HOME:-${HOME}/.local/share}/hive-memory"
 state_dir = "${XDG_STATE_HOME:-${HOME}/.local/state}/hive-memory"
 cache_dir = "${XDG_CACHE_HOME:-${HOME}/.cache}/hive-memory"
-host_id = "auto"
-user_id = "default"
 
 [stores.personal]
 root = "${HOME}/hive-memory/personal"
 description = "Personal memory"
 sensitivity = "private"
 
-[stores.work]
-root = "${HOME}/hive-memory/work"
-description = "Work memory"
-sensitivity = "private"
-
-[storage]
-kind = "filesystem"
-case_sensitive = "auto"
-atomic_rename = "auto"
-fsync = "best-effort"
-
 [defaults]
 write_scope = "global"
 search_scopes = ["global", "project"]
 context_sources = ["curated", "remembered"]
-event_sidecar = "always"
+search_backend = "lexical"     # or "tantivy" for BM25 full-text
+context_strategy = "adaptive"  # adaptive | recency | relevance
 hook_context_max_tokens = 4000
-context_cache_max_age = "7d"
-
-[agents.codex]
-default_store = "personal"
-read_stores = ["personal"]
-write_stores = ["personal"]
-allow_all_stores = false
 
 [privacy]
-allow_all_stores_flag = true
 secret_refuses_cloud_roots = true
 allow_secret_writes = false
 allow_hook_secret_writes = false
 
 [offline]
 enabled = true
-mode = "auto"
-archive_retention_days = 30
 
-[performance]
-context_warm_p95_ms = 200
-context_cold_p95_ms = 500
-context_store_size_target = 5000
-
-[classifier]
-mode = "off"           # auto|on|off
-batch_limit = 25
-min_interval = "6h"
-timeout_seconds = 60
-apply_confidence = "high"
-```
-
-Supported store sensitivity values are `public`, `internal`, `private`, and
-`secret`. A `secret` store is a policy class, not encryption. By default, secret
-stores are refused under common cloud-sync roots.
-
-## Commands
-
-All commands accept these global options:
-
-```text
---config <CONFIG>      main config file to load
---store <STORE>        active store alias for one-store commands
---as-agent <AGENT>     agent identity for store-affinity policy
-```
-
-Most read/write commands also support `--json` for machine-readable output.
-
-### Store Commands
-
-Create, inspect, and diagnose store roots:
-
-```sh
-hm stores init personal --root ~/hive-memory/personal
-hm stores list
-hm stores show personal
-hm stores doctor
-hm stores migrate --dry-run
-```
-
-`hm stores init` writes a store manifest and canonical directories. `hm stores
-doctor` checks manifest availability, schema support, alias drift, and required
-layout for configured stores.
-
-### Writing Memory
-
-Use `remember` for durable facts and preferences:
-
-```sh
-hm remember --text "Release versions use UTC commit timestamp/hash tags."
-```
-
-Use `note` for lower-confidence observations or triage material:
-
-```sh
-hm note \
-  --text "Investigate whether context output should include stale-cache age." \
-  --confidence low \
-  --tags follow-up,context
-```
-
-Useful write flags:
-
-```text
---scope <SCOPE>              global, project, agent-private, or another policy scope
---confidence <LEVEL>         low, medium, or high
---project <PATH>             derive project identity from a path
---project-id <ID>            use an explicit project id
---subject <SUBJECT>          short grouping label
---valid-from <RFC3339>       when this memory starts being current
---valid-to <RFC3339>         when this memory stops being current
---supersedes <ID>            memory id superseded by this write; repeatable
---tags <A,B>                 comma-separated tags
---audience <AGENT,...>       permitted agents for agent-private writes
---audience-writer-only       make the writer the only audience
---source-kind <KIND>         source category, such as session, hook, import
---source-ref <REF>           source locator or opaque reference
---event / --no-event         override `hm note` sidecar behavior
---allow-secret-write         allow secret-looking content only when policy permits it
-```
-
-`hm remember` always writes a JSON event sidecar. `hm note` follows
-`defaults.event_sidecar`, unless `--event` or `--no-event` overrides it.
-Expired or not-yet-valid records are excluded from ordinary search and context
-injection. Historical queries such as "old" or "previous" can still retrieve
-expired records, but not records whose `valid_from` is still in the future.
-
-### Search and Context
-
-Search is deterministic text search over curated files and the local triage
-index:
-
-```sh
-hm search "release version" --limit 10
-hm search "context cache" --project ~/git/hive-memory
-hm search "triage" --include-inbox
-```
-
-Context assembles safe-to-inject Markdown for an agent:
-
-```sh
-hm context --project ~/git/hive-memory --max-tokens 4000
-hm context --scope global,project --source curated,remembered
-hm context --include-inbox
-hm context --if-changed
-```
-
-By default, context includes curated memory and remembered records. Raw `hm
-note` entries are excluded unless `--include-inbox`, `--source inbox`, or
-`--source all` is used.
-
-Store-level `entities.toml` can add durable aliases for search recall. Entity
-links are cache metadata: the canonical memories remain the Markdown notes and
-JSON events, and the local index recomputes entity ids when the registry
-changes.
-
-```toml
-schema_version = 1
-
-[[entity]]
-id = "tool:deployctl"
-aliases = ["deployctl", "release promotion gate"]
-```
-
-Use `hm search --explain` to inspect how body, metadata, combined text, and
-entity signals contributed to each hit.
-
-Retrieval changes should be measured against labeled corpuses:
-
-```sh
-hm eval retrieval --corpus tests/fixtures/deferred_feature_eval_corpus.toml
-hm eval retrieval --corpus tests/fixtures/deferred_feature_eval_corpus.toml --json
-```
-
-The default report scores two candidates over the same records and queries:
-`no-entity-baseline` strips entity links from the index, while `entity-linked`
-uses the current search pipeline. Each feature bucket reports recall, precision,
-MRR, forbidden hits, and p95 latency.
-
-Each rendered memory block is labeled with a trust level:
-
-```text
-curated     human-reviewed curated Markdown
-remembered  explicit durable memory from `hm remember`
-raw         lower-confidence inbox note from `hm note`
-```
-
-### Project Commands
-
-Project identity lets memory follow a repo or working directory without relying
-on the agent process's current directory.
-
-```sh
-hm projects resolve ~/git/hive-memory
-hm projects bind ~/git/hive-memory --store personal
-hm projects show
-hm projects list
-hm projects unbind ~/git/hive-memory
-hm projects alias old-project-id new-project-id
-```
-
-Resolution precedence is:
-
-1. `--project-id`
-2. `HIVE_MEMORY_PROJECT_ID`
-3. `.hive-memory/project.toml`
-4. normalized git origin URL
-5. local filesystem path
-
-Project bindings are local machine policy stored under `data_dir`. Project
-aliases are shared curated metadata stored inside the memory store, so every
-machine can understand a repo rename or remote migration.
-
-### Inbox and Curation
-
-Raw notes can be reviewed and promoted:
-
-```sh
-hm inbox list
-hm inbox stale --days 14
-hm inbox show <note-id>
-hm promote <note-id> --to memories/global/MEMORY.md
-hm promote <note-id> --to memories/projects/<project-id>/MEMORY.md --verbatim
-```
-
-By default, promotion converts the note body into a bullet. `--verbatim`
-preserves the original body.
-
-### Refresh, Outbox, and Offline Writes
-
-`hm refresh` rebuilds local operational state:
-
-```sh
-hm refresh
-hm refresh --force
-```
-
-When offline fallback is enabled and a selected store is temporarily
-unavailable, writes are queued under `data_dir/outbox` instead of being lost.
-Flush queued writes when the store is reachable again:
-
-```sh
-hm flush
-hm flush --bind <outbox-item-id> --store personal
-```
-
-Outbox flushing checks the target store's manifest identity before publishing.
-If a queued item was created before the store identity was known, it stays
-unbound until explicitly bound.
-
-### Hooks
-
-Hook commands are for agent host integrations. They keep shell adapters thin:
-the adapter passes the event shape, and `hm` returns context or actions.
-
-```sh
-hm hook session-start --project ~/git/hive-memory
-hm hook prompt-submit --project ~/git/hive-memory --text "remember this preference"
-hm hook tool-complete --status 0
-hm hook stop
-```
-
-Hook behavior uses session-local state under `state_dir`. It can detect memory
-intent in prompts, emit startup context, inject prompt-specific recalled memory,
-coalesce refresh work with a local lock, and remind the agent at session end
-when a memory request was never satisfied.
-
-`tool-complete` is optimized for high-frequency post-tool hooks. It does not use
-process cwd or payload cwd as the active project; after a successful memory
-write it refreshes context from the session write receipt's project id. This
-keeps home-launched, multi-project agent sessions from treating `$HOME` as the
-current project after every tool call.
-
-### Doctor
-
-Run top-level diagnostics:
-
-```sh
-hm doctor
-hm doctor --quick
-hm doctor --fix
-hm doctor --json
-```
-
-`hm doctor` checks config, store availability, required layout, generated
-gitignore files, sensitive-store permissions, cloud-root policy, project
-bindings, agent policies, outbox state, event pairing, agent-private audience,
-classifier status, secret-looking note content, and prompt-risk patterns.
-`--quick` skips the heavier note/content checks for hook-safe use. `--fix`
-performs safe layout repairs, but does not initialize missing stores or rewrite
-user memory.
-
-## Automatic LLM Classification
-
-`hm classify` can run an optional background pass that asks an agent CLI to set
-the durable memory kind for remembered records. The result affects relevance
-mode context selection: for example, a project-scoped status note can be marked
-`incident` and stop appearing in every project session, while remaining
-searchable.
-
-The worker is deliberately outside hot paths. `hm remember`, `hm context`,
-`hm search`, and hook output do not invoke or probe an LLM. `hm hook stop` may
-spawn `hm classify --auto` as a detached child after checking only local stamp
-and lock files; the worker exits quietly when disabled, already running, fresh,
-or missing a backend.
-
-Default config:
-
-```toml
-[classifier]
-mode = "off"
-batch_limit = 25
-min_interval = "6h"
-timeout_seconds = 60
-apply_confidence = "high"
-```
-
-`mode = "off"` disables hook-spawned background classification. An explicit
-`hm classify` command can still run a foreground pass when a backend is
-available.
-
-In `mode = "auto"`, Hive Memory only auto-detects backend CLIs whose labels also
-appear in `[agents]` (`claude`, `codex`, or `gemini`). Those agents already
-receive memory through context injection, so classification does not create a
-new implicit reader. When multiple allowed CLIs are installed, auto-detection
-prefers `codex`, then `claude`, then `gemini`. Enable detached hook-spawned
-classification with:
-
-```toml
-[classifier]
-mode = "auto"
-```
-
-To use another installed CLI, opt in explicitly:
-
-```toml
-[classifier]
-mode = "on"
-backend = "gemini"
-```
-
-or provide a command that reads the prompt from stdin and prints a JSON verdict:
-
-```toml
-[classifier]
-mode = "on"
-backend = "command"
-command = ["/path/to/classifier"]
-```
-
-Inspect pending records without invoking an LLM:
-
-```sh
-hm classify --pending --json
-```
-
-Judge through the configured backend without writing verdicts or stamps:
-
-```sh
-hm classify --dry-run --json
-```
-
-Disable hook-spawned classification:
-
-```toml
 [classifier]
 mode = "off"
 ```
 
-Secret stores are never sent to any classifier backend, regardless of config.
-Audience-restricted (`agent-private`) records are also excluded: their bodies
-are visible only to the listed agents, so they are never piped to a backend
-CLI and keep their write-time or manually retagged kind.
+Store `sensitivity` is `public`, `internal`, `private`, or `secret` — a policy
+class, not encryption. Secret stores are refused under common cloud-sync roots by
+default.
 
-## Trust and Privacy
+---
 
-Hive Memory treats stored memory as data, not instructions. Context output wraps
-memory in explicit source and trust-boundary blocks so agents can distinguish
-curated memory from raw notes.
+## Command reference
 
-Store access is selected through config, project bindings, agent policy, and
-explicit CLI flags. An agent can have its own default store plus separate
-read/write allowlists:
+All commands accept `--config`, `--store`, and `--as-agent`; most read/write
+commands also support `--json`.
 
-```toml
-[agents.codex]
-default_store = "personal"
-read_stores = ["personal"]
-write_stores = ["personal"]
-allow_all_stores = false
-```
+| Command | Purpose |
+| --- | --- |
+| `hm stores init\|list\|show\|doctor\|migrate` | Manage and diagnose store roots |
+| `hm remember` | Write a durable fact/preference/context note |
+| `hm note` | Write a lower-confidence raw note |
+| `hm search <query>` | Search remembered memory (`--include-inbox`, `--explain`) |
+| `hm context` | Assemble agent-readable context (`--max-tokens`, `--if-changed`) |
+| `hm capture` | Extract durable facts from a conversation; stage, or `--promote` |
+| `hm reconcile` | Reconcile one candidate fact mem0-style (add/update/delete/noop) |
+| `hm classify` | Run the LLM kind-classification pass (`--pending`, `--dry-run`) |
+| `hm retag <id> --kind` | Correct a record's persisted kind |
+| `hm projects resolve\|bind\|unbind\|alias\|list\|show` | Project identity and bindings |
+| `hm inbox list\|stale\|show` | Inspect raw inbox notes |
+| `hm promote <note-id> --to <path>` | Promote a raw note into curated memory |
+| `hm hook session-start\|prompt-submit\|tool-complete\|stop` | Agent lifecycle hooks |
+| `hm refresh` / `hm flush` / `hm outbox` | Rebuild state; publish queued offline writes |
+| `hm sync-status` | Report store/index freshness (read-only) |
+| `hm doctor` | Top-level diagnostics (`--quick`, `--fix`, `--json`) |
+| `hm eval` | Capture retrieval misses/bad hits as eval fixtures |
 
-`agent-private` records require an explicit audience. Secret-looking writes are
-refused unless all of these are true:
+Run `hm <command> --help` for the full flag set.
 
-1. The command targets a `secret` store.
-2. `privacy.allow_secret_writes = true`.
-3. The write uses `--allow-secret-write`.
-4. For hooks, `privacy.allow_hook_secret_writes = true`.
+---
 
-Hive Memory does not encrypt v1 stores at rest. Use filesystem, disk, vault, or
-sync-provider encryption when the store contains sensitive data.
+## Status
 
-## File Formats
+The primary binary is `hm`. The crate is pre-1.0; release versions are generated
+from the UTC commit timestamp plus the commit suffix. The implemented command
+surface follows the v1 schema and behavior in [SPEC.md](SPEC.md); broader design
+rationale lives in [PLAN.md](PLAN.md). Because the project is `0.x`, storage
+schemas may change between releases — changes to public command behavior, file
+formats, or hook contracts are tracked in [SPEC.md](SPEC.md).
 
-V1 uses:
-
-```text
-TOML      config, manifests, Markdown front matter, outbox metadata
-Markdown  canonical human-readable notes and curated memory
-JSON      event sidecars, indexes, hook state, machine output
-```
-
-Note front matter is TOML delimited by `+++`:
-
-```markdown
-+++
-schema_version = 1
-type = "note"
-entry_kind = "remember"
-id = "20260516T154233.184921Z_taylor_12345_codex_a8f31c"
-store_id = "018f5f57-bd9b-7d33-9e21-1f44f0c5a013"
-store_name = "personal"
-created_at = "2026-05-16T15:42:33.184921Z"
-agent_id = "codex"
-host_id = "taylor"
-scope = "global"
-confidence = "medium"
-+++
-
-Human-readable memory text.
-```
-
-See [SPEC.md](SPEC.md) for the complete schema contract.
+---
 
 ## Development
-
-Run the local checks before sending a change:
 
 ```sh
 cargo fmt --check
 cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS='-D missing-docs' cargo doc --no-deps
-tests/shell/release-scripts-test
 ```
 
-CI runs these checks through the shared `cgraf78/actions` Rust workflow:
-`cargo test` runs on the core portability matrix for push and pull requests,
-and on the full matrix for scheduled or manual runs. Formatting, clippy, and
-public-doc checks run as the Ubuntu quality gate. The library crate also uses
-`#![deny(missing_docs)]` so local Cargo linting catches undocumented public API
-before the CI rustdoc build. If a change affects public behavior, update
-[SPEC.md](SPEC.md). If it changes design rationale or non-goals, update
+CI runs these through the shared `cgraf78/actions` Rust workflow. The library
+crate uses `#![deny(missing_docs)]`. If a change affects public behavior, update
+[SPEC.md](SPEC.md); if it changes design rationale or non-goals, update
 [PLAN.md](PLAN.md).
 
 ## Release
 
-Hive Memory uses the same release identity scheme as `shdeps`:
-`YYYYMMDD-HHMMSS-<8hex>`, derived from the UTC commit timestamp and commit hash.
-To publish a release from an up-to-date clean `main`, run:
+Hive Memory uses the release identity scheme `YYYYMMDD-HHMMSS-<8hex>`, derived
+from the UTC commit timestamp and commit hash. To publish from a clean `main`:
 
 ```sh
 scripts/release.sh --push
 ```
 
-The script verifies local `main` matches `origin/main`, creates a lightweight
-release tag for the current commit, and pushes it. GitHub Actions uses the
-shared `cgraf78/actions` Rust release workflow to verify the exact generated tag
-before creating the release draft, building target archives, uploading assets,
-and publishing the release.
-
-Linux release archives use musl targets to avoid requiring a specific distro
-glibc version at runtime. Published archive labels use installer-facing platform
-names instead of Rust target triples:
-
-```text
-hm-YYYYMMDD-HHMMSS-<8hex>-linux-x86_64-musl.tar.gz
-hm-YYYYMMDD-HHMMSS-<8hex>-linux-aarch64-musl.tar.gz
-hm-YYYYMMDD-HHMMSS-<8hex>-macos-x86_64.tar.gz
-hm-YYYYMMDD-HHMMSS-<8hex>-macos-aarch64.tar.gz
-```
+Linux archives use musl targets; published assets use installer-facing platform
+names (e.g. `hm-<version>-linux-x86_64-musl.tar.gz`,
+`hm-<version>-macos-aarch64.tar.gz`).
 
 ## License
 
