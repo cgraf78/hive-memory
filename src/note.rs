@@ -181,6 +181,20 @@ pub struct NoteFrontMatter {
     pub audience: Vec<String>,
 }
 
+impl NoteFrontMatter {
+    /// Fold empty/whitespace-only optional timestamps to `None`.
+    ///
+    /// The spec documents `expires_at = ""` as the canonical "no expiry" value,
+    /// and the same blank-means-absent convention applies to the validity
+    /// window. TOML deserializes `key = ""` as `Some("")`, which would otherwise
+    /// fail RFC3339 validation, so collapse blanks to `None` before validating.
+    fn normalize_optional_timestamps(&mut self) {
+        normalize_blank_timestamp(&mut self.expires_at);
+        normalize_blank_timestamp(&mut self.valid_from);
+        normalize_blank_timestamp(&mut self.valid_to);
+    }
+}
+
 /// Parsed Markdown note.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkdownNote {
@@ -382,25 +396,43 @@ pub fn render_note(note: &MarkdownNote) -> Result<String, NoteError> {
 ///
 /// The parser enforces the v1 required-field contract at the boundary where
 /// search, context assembly, and repair tools will ingest on-disk notes.
+///
+/// Line endings are normalized to `\n` before delimiter matching so notes that
+/// round-trip through Windows or CRLF-rendering editors during cross-machine
+/// sync still parse. Stripping `\r` from the whole input also canonicalizes the
+/// returned body to LF; this is intentional, since a CRLF note's body is CRLF
+/// throughout and folding it to LF is normalization, not corruption.
 pub fn parse_note(input: &str) -> Result<MarkdownNote, NoteError> {
-    let Some(rest) = input.strip_prefix("+++\n") else {
+    let normalized = input.replace("\r\n", "\n").replace('\r', "\n");
+    let Some(rest) = normalized.strip_prefix("+++\n") else {
         return Err(NoteError::MissingFrontMatter);
     };
-    let (front_matter, body) = if let Some((front_matter, body)) = rest.split_once("\n+++\n\n") {
-        (front_matter, body)
-    } else {
-        let Some((front_matter, body)) = rest.split_once("\n+++\n") else {
-            return Err(NoteError::MissingFrontMatter);
-        };
-        (front_matter, body)
-    };
-    let front_matter: NoteFrontMatter = toml::from_str(front_matter)
+    let (front_matter, body) = split_front_matter(rest).ok_or(NoteError::MissingFrontMatter)?;
+    let mut front_matter: NoteFrontMatter = toml::from_str(front_matter)
         .map_err(|err| NoteError::InvalidFrontMatter(err.to_string()))?;
+    front_matter.normalize_optional_timestamps();
     validate_front_matter(&front_matter)?;
     Ok(MarkdownNote {
         front_matter,
         body: body.to_owned(),
     })
+}
+
+/// Split the post-opening-delimiter region into front matter and body.
+///
+/// The closing `+++` may be followed by a blank separator line (the canonical
+/// render form, which is dropped), by the body directly (preserving any leading
+/// body newline), or by end of input with no trailing newline (hand-edited or
+/// stripped notes). All three are accepted; `None` means no closing delimiter.
+fn split_front_matter(rest: &str) -> Option<(&str, &str)> {
+    if let Some(split) = rest.split_once("\n+++\n\n") {
+        return Some(split);
+    }
+    if let Some(split) = rest.split_once("\n+++\n") {
+        return Some(split);
+    }
+    rest.strip_suffix("\n+++")
+        .map(|front_matter| (front_matter, ""))
 }
 
 /// Write a note into `<store-root>/inbox/notes/YYYY/MM/DD/<id>.md`.
@@ -512,6 +544,19 @@ fn require_non_empty(field: &'static str, value: &str) -> Result<(), NoteError> 
         Err(NoteError::MissingRequiredField(field))
     } else {
         Ok(())
+    }
+}
+
+/// Collapse an empty/whitespace-only optional timestamp to `None`.
+///
+/// Shared by note and event parsing so the "blank means absent" convention for
+/// `expires_at`/`valid_from`/`valid_to` lives in one place.
+pub(crate) fn normalize_blank_timestamp(value: &mut Option<String>) {
+    if value
+        .as_deref()
+        .is_some_and(|inner| inner.trim().is_empty())
+    {
+        *value = None;
     }
 }
 
@@ -848,5 +893,83 @@ mod tests {
 
         assert_eq!(result.id, "note-id-2");
         assert!(result.path.ends_with("note-id-2.md"));
+    }
+
+    #[test]
+    fn empty_expires_at_parses_as_no_expiry() {
+        let front_matter = input()
+            .front_matter("note-id".to_owned())
+            .expect("front matter");
+        let rendered = render_note(&MarkdownNote {
+            front_matter,
+            body: "body".to_owned(),
+        })
+        .expect("render note");
+        // Inject the spec's canonical "no expiry" value, which TOML deserializes
+        // as `Some("")` and would otherwise fail RFC3339 validation.
+        let with_blank = rendered.replace("+++\n\n", "expires_at = \"\"\n+++\n\n");
+
+        let parsed = parse_note(&with_blank).expect("parse note with empty expires_at");
+
+        assert_eq!(parsed.front_matter.expires_at, None);
+    }
+
+    #[test]
+    fn blank_validity_window_parses_as_absent() {
+        let front_matter = input()
+            .front_matter("note-id".to_owned())
+            .expect("front matter");
+        let rendered = render_note(&MarkdownNote {
+            front_matter,
+            body: "body".to_owned(),
+        })
+        .expect("render note");
+        let with_blanks =
+            rendered.replace("+++\n\n", "valid_from = \"\"\nvalid_to = \"   \"\n+++\n\n");
+
+        let parsed = parse_note(&with_blanks).expect("parse note with blank validity window");
+
+        assert_eq!(parsed.front_matter.valid_from, None);
+        assert_eq!(parsed.front_matter.valid_to, None);
+    }
+
+    #[test]
+    fn parses_crlf_rendered_note() {
+        let front_matter = input()
+            .front_matter("note-id".to_owned())
+            .expect("front matter");
+        let rendered = render_note(&MarkdownNote {
+            front_matter,
+            body: "Body line one.\nBody line two.".to_owned(),
+        })
+        .expect("render note");
+        let crlf = rendered.replace('\n', "\r\n");
+
+        let parsed = parse_note(&crlf).expect("parse CRLF note");
+
+        assert_eq!(parsed.front_matter.id, "note-id");
+        // Body is canonicalized to LF on read.
+        assert_eq!(parsed.body, "Body line one.\nBody line two.");
+    }
+
+    #[test]
+    fn parses_note_without_trailing_newline() {
+        let front_matter = input()
+            .front_matter("note-id".to_owned())
+            .expect("front matter");
+        let rendered = render_note(&MarkdownNote {
+            front_matter,
+            body: String::new(),
+        })
+        .expect("render note");
+        // A hand-edited or stripped note can end with the closing `+++` and no
+        // trailing newline at all.
+        let trimmed = rendered.trim_end_matches('\n').to_owned();
+        assert!(trimmed.ends_with("+++"));
+
+        let parsed = parse_note(&trimmed).expect("parse note without trailing newline");
+
+        assert_eq!(parsed.front_matter.id, "note-id");
+        assert_eq!(parsed.body, "");
     }
 }
