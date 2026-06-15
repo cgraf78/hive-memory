@@ -310,7 +310,13 @@ machine-readable enough for filtering and auditing.
 
 #### Project Identity
 
-V1 project IDs are stable across hosts, clones, and protocol changes.
+V1 project IDs are stable across hosts, clones, and protocol changes when
+identity comes from an explicit ID, a `.hive-memory-project` marker, or a VCS
+remote. The path fallback (no marker, no remote) is keyed off the
+`$HOME`-relative path, so it is host-stable only when the project sits at the
+same location relative to `$HOME` on each machine; a path outside `$HOME`, or a
+different layout across machines, stays host-local and needs a marker or remote
+for cross-host identity.
 
 Project path inputs are hints, not identity by themselves. `--project PATH`,
 `HIVE_MEMORY_PROJECT`, `hm projects resolve PATH`, and
@@ -320,9 +326,13 @@ file. `hm` canonicalizes the hint before deriving identity:
 1. If the hint is a file, use its parent directory as the starting point.
 2. Walk upward for the nearest `.hive-memory-project`; when found, use that
    directory as the project root and the file's explicit ID as the identity.
-3. Otherwise, walk upward for the nearest git worktree root and use that root's
-   normalized `origin` URL when present.
-4. Otherwise, use the canonicalized starting directory as a local path project.
+3. Otherwise, walk upward for the nearest VCS worktree root (`.git`, `.hg`,
+   `.jj`, or `.svn`) and use that root's normalized remote URL when present. The
+   root and remote URL are read directly from the on-disk VCS config
+   (`.git/config`, `.hg/hgrc`, jj's git backend) rather than by invoking a VCS
+   binary, so resolution is fast and does not require git to be installed.
+4. Otherwise, use the starting directory as a local path project, keyed by its
+   `$HOME`-relative path.
 
 Process CWD is only a last-resort hint when no CLI/env/project-specific path is
 available. Launching an agent from a subdirectory should therefore resolve to
@@ -339,10 +349,16 @@ Derivation precedence (highest wins):
    the remote URL is unstable (forks, mirror moves), when a monorepo subtree is
    the real memory project, or when committing the binding is acceptable for the
    repo's privacy posture.
-4. Derived: `sha256(normalize(git_remote_origin_url))[:12]` prefixed with a
-   readable slug, e.g. `github-com-cgraf78-hive-memory-018f5f57bd9b`.
-5. Fallback: `sha256(canonical_path)[:12]` prefixed with the path basename
-   when no git remote exists.
+4. Derived: `sha256(normalize(vcs_remote_url))[:12]` prefixed with a readable
+   slug, e.g. `github-com-cgraf78-hive-memory-018f5f57bd9b`. The remote URL
+   comes from whichever VCS owns the root (git `origin`, hg/sl `paths.default`,
+   or jj's git backend).
+5. Fallback: `sha256(home_relative_path)[:12]` prefixed with the directory
+   basename when no remote exists. `home_relative_path` is `~/<path-under-HOME>`
+   when the root is under `$HOME`, else the absolute path. Keying off the
+   `$HOME`-relative path keeps the ID identical across machines whose home dirs
+   differ (`/home/u` vs `/Users/u`); absolute paths outside `$HOME` remain
+   host-local.
 
 URL normalization:
 
