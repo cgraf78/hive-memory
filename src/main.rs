@@ -1127,12 +1127,16 @@ fn run_project_show(args: ProjectShowArgs, context: CliContext) -> Result<()> {
     };
     let binding = project::load_binding(&config.data_dir, &project_id)?;
     let agent_id = resolve_agent_id(context.as_agent);
-    let store = resolve_store(
+    // Like `projects resolve`, this reports a checkout's effective store. Humans
+    // may inspect any configured store, including a non-default bound store;
+    // asserted agents are still held to their read policy.
+    let store = resolve_store_with_policy(
         &config,
         context.store.as_deref(),
         binding.as_ref().map(|binding| binding.store.as_str()),
         agent_id.as_deref(),
         StoreAccess::Read,
+        NoIdentityPolicy::AllowAnyStore,
     )?;
     let store_config = &config.stores[store.name.as_str()];
     let aliases = project::related_project_ids(&store_config.root, &project_id)?
@@ -1184,12 +1188,17 @@ fn run_project_resolve(args: ProjectResolveArgs, context: CliContext) -> Result<
     })?;
     let agent_id = resolve_agent_id(context.as_agent);
     let binding = project::load_binding(&config.data_dir, &project.project_id)?;
-    let store = resolve_store(
+    // `projects resolve` reports the effective store for a checkout. A human
+    // (no identity) may resolve any configured store, including a non-default
+    // bound store; an asserted agent is still held to its read policy so a
+    // binding cannot bless a store outside the agent's allowlist.
+    let store = resolve_store_with_policy(
         &config,
         context.store.as_deref(),
         binding.as_ref().map(|binding| binding.store.as_str()),
         agent_id.as_deref(),
         StoreAccess::Read,
+        NoIdentityPolicy::AllowAnyStore,
     )?;
 
     if args.json {
@@ -1225,19 +1234,30 @@ fn run_project_bind(args: ProjectBindArgs, context: CliContext) -> Result<()> {
     // A binding can affect both read and write commands. When an active agent
     // identity is present, validate both sides now so a local affinity file
     // cannot bless a store the agent would be unable to use safely.
-    resolve_store(
+    //
+    // `AllowAnyStore` keeps the human path intact: `hm projects bind PATH
+    // --store work` records a local, machine-private affinity decision ("this
+    // checkout belongs to work on this host") and a human may bind ANY
+    // configured store regardless of the global default. The no-identity
+    // default-store fail-closed protects memory read/write commands from a
+    // restricted agent dropping `--as-agent`; it must not block this local-data
+    // write. Agent store affinity is still enforced at memory use time, so a
+    // binding can never bypass affinity.
+    resolve_store_with_policy(
         &config,
         Some(args.store.as_str()),
         None,
         agent_id.as_deref(),
         StoreAccess::Read,
+        NoIdentityPolicy::AllowAnyStore,
     )?;
-    resolve_store(
+    resolve_store_with_policy(
         &config,
         Some(args.store.as_str()),
         None,
         agent_id.as_deref(),
         StoreAccess::Write,
+        NoIdentityPolicy::AllowAnyStore,
     )?;
     let binding = project::ProjectBinding {
         project_id: project.project_id.clone(),
@@ -5778,6 +5798,27 @@ impl std::fmt::Display for StoreSource {
     }
 }
 
+/// How store policy behaves when no agent identity is asserted.
+///
+/// Agent identity is self-asserted (`--as-agent`/`HIVE_MEMORY_AGENT_ID`), so
+/// these are defense-in-depth choices, not cryptographic boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoIdentityPolicy {
+    /// Apply the global default store's conservative policy when no identity is
+    /// present: the default store stays usable, but a NON-default store is
+    /// refused. This closes the bypass where a restricted agent drops
+    /// `--as-agent` to reach a store outside its allowlist. Used by the memory
+    /// read/write commands (`remember`, `note`, `search`, `context`, `promote`,
+    /// `inbox`, `classify`, `reconcile`, `alias`, hooks).
+    DefaultStoreOnly,
+    /// Skip per-store policy entirely when no identity is present, allowing a
+    /// human to select any configured store. Used only by local-affinity
+    /// commands (`projects bind`/`resolve`) where the spec grants humans
+    /// any-store access and agent affinity is still re-checked at memory use
+    /// time. Agent identities, when present, are always enforced.
+    AllowAnyStore,
+}
+
 /// Resolve the single store a CLI command should use and enforce agent policy.
 ///
 /// All one-store commands share the same precedence: explicit `--store`, then
@@ -5786,12 +5827,35 @@ impl std::fmt::Display for StoreSource {
 /// keeps read, write, context, and hook commands from drifting as the command
 /// surface grows. Callers that do not have project context pass `None` for the
 /// binding slot rather than trying to derive path policy locally.
+///
+/// This is the secure default entry point: when no agent identity is present it
+/// applies `NoIdentityPolicy::DefaultStoreOnly`. Local-affinity commands that
+/// must preserve human any-store access call `resolve_store_with_policy`.
 fn resolve_store(
     config: &Config,
     explicit_store: Option<&str>,
     project_binding: Option<&str>,
     agent_id: Option<&str>,
     access: StoreAccess,
+) -> Result<ResolvedStore> {
+    resolve_store_with_policy(
+        config,
+        explicit_store,
+        project_binding,
+        agent_id,
+        access,
+        NoIdentityPolicy::DefaultStoreOnly,
+    )
+}
+
+/// Resolve a store with an explicit no-identity policy. See `resolve_store`.
+fn resolve_store_with_policy(
+    config: &Config,
+    explicit_store: Option<&str>,
+    project_binding: Option<&str>,
+    agent_id: Option<&str>,
+    access: StoreAccess,
+    no_identity_policy: NoIdentityPolicy,
 ) -> Result<ResolvedStore> {
     let (name, source) = if let Some(store) = explicit_store {
         (store.to_owned(), StoreSource::Cli)
@@ -5812,21 +5876,52 @@ fn resolve_store(
         anyhow::bail!("unknown store: {name}");
     };
 
-    if let Some(agent_id) = agent_id {
-        let policy = config.effective_agent_policy(agent_id);
-        let (allowed_stores, access_name) = match access {
-            StoreAccess::Read => (&policy.read_stores, "read"),
-            StoreAccess::Write => (&policy.write_stores, "write"),
-        };
-        if !policy.allow_all_stores && !allowed_stores.iter().any(|store| store == &name) {
-            return Err(PrivacyRefusal {
-                message: format!(
-                    "agent {agent_id} may not {access_name} store {name}; configured {access_name} stores: {}",
-                    allowed_stores.join(",")
-                ),
-            }
-            .into());
+    // Fail closed for missing identity WITHOUT breaking the human path.
+    //
+    // Agent identity is self-asserted (just `--as-agent`/`HIVE_MEMORY_AGENT_ID`),
+    // so this is defense in depth, not a cryptographic boundary: a determined
+    // process can claim any agent id. The bypass we close (for memory commands,
+    // via `NoIdentityPolicy::DefaultStoreOnly`) is the cheaper one: previously,
+    // when no identity was set, per-agent `read_stores`/`write_stores`
+    // enforcement was skipped entirely while `--store`/`HIVE_MEMORY_STORE` could
+    // still target ANY store. A restricted agent could therefore sidestep its
+    // allowlist simply by NOT passing `--as-agent`.
+    //
+    // Rather than skip policy when no identity is present, we apply the global
+    // default store's conservative policy: the default store stays usable (so a
+    // plain human shell running `hm remember`/`hm search` with no `--as-agent`
+    // keeps working), but reaching a NON-default restricted store with no
+    // identity is refused. This mirrors the conservative missing-agent policy:
+    // {read,write}_stores = [default_store], allow_all_stores = false.
+    //
+    // `NoIdentityPolicy::AllowAnyStore` opts the local-affinity commands out of
+    // this no-identity tightening so a human keeps any-store access there, per
+    // the spec; an asserted agent identity is enforced under either policy.
+    let policy = match agent_id {
+        Some(agent_id) => config.effective_agent_policy(agent_id),
+        None => match no_identity_policy {
+            NoIdentityPolicy::AllowAnyStore => return Ok(ResolvedStore { name, source }),
+            NoIdentityPolicy::DefaultStoreOnly => config::EffectiveAgentPolicy {
+                default_store: config.default_store.clone(),
+                read_stores: vec![config.default_store.clone()],
+                write_stores: vec![config.default_store.clone()],
+                allow_all_stores: false,
+            },
+        },
+    };
+    let subject = agent_id.unwrap_or("no-identity caller");
+    let (allowed_stores, access_name) = match access {
+        StoreAccess::Read => (&policy.read_stores, "read"),
+        StoreAccess::Write => (&policy.write_stores, "write"),
+    };
+    if !policy.allow_all_stores && !allowed_stores.iter().any(|store| store == &name) {
+        return Err(PrivacyRefusal {
+            message: format!(
+                "agent {subject} may not {access_name} store {name}; configured {access_name} stores: {}",
+                allowed_stores.join(",")
+            ),
         }
+        .into());
     }
 
     Ok(ResolvedStore { name, source })

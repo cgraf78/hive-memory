@@ -381,6 +381,14 @@ Aliases:
 
 - `memories/projects/<id>/aliases.toml` lists prior IDs (e.g., after a repo
   rename). Search/context follow the alias chain so memory survives moves.
+- Project ids derived from on-disk alias metadata are untrusted input: a synced
+  or tampered store could list ids like `../../../../etc` or an absolute path,
+  which would otherwise be joined onto `memories/projects/` and inject arbitrary
+  `.md` at the highest (`curated`) trust level. Every alias/project id is
+  validated at the resolution boundary and must be a single normal path
+  component (no `..`, absolute, rooted, prefix, or separator components);
+  unsafe ids are dropped rather than followed, with defense-in-depth re-checks
+  at the curated filesystem join.
 - `hm projects alias <old-id> <new-id>` updates this file under the same
   single-user constraint as other curated writes.
 - `hm doctor` warns when unclaimed `project_id` values exist that no alias
@@ -678,10 +686,30 @@ dotfiles hooks should not orchestrate them directly.
 
 ### Store Affinity and Resolution
 
-Store selection is a privacy boundary, not just a convenience default.
+Store selection is a privacy boundary, not just a convenience default. Agent
+identity is **self-asserted** via `--as-agent`/`HIVE_MEMORY_AGENT_ID`: any
+process can claim any agent id, so per-agent store affinity is defense in depth,
+not a cryptographic boundary. The rules below are written so that *dropping*
+identity does not silently widen access.
 
-- Human commands without `HIVE_MEMORY_AGENT_ID` may use any configured store,
-  subject to sensitivity rules and explicit `--include-secret` refusals.
+- Memory read/write commands (`remember`, `note`, `search`, `context`,
+  `promote`, `inbox`, `classify`, `reconcile`, `projects alias`, hooks) without
+  any asserted agent identity fail closed to the **global default store's**
+  conservative policy: `read_stores = [default_store]`,
+  `write_stores = [default_store]`, `allow_all_stores = false`. A plain human
+  shell running `hm remember`/`hm search` with no `--as-agent` therefore keeps
+  working against the default store, but a no-identity request for a NON-default
+  store via `--store`/`HIVE_MEMORY_STORE` is exit `4` (`privacy_refusal`). This
+  closes the bypass where a restricted agent reaches an out-of-allowlist store
+  by simply not passing `--as-agent`. Because identity is self-asserted, this is
+  a guardrail against accidental/lazy widening, not a hard security boundary.
+- Local-affinity commands that only manage machine-private binding metadata
+  (`projects bind`, `projects resolve`, `projects show`) keep human any-store
+  access: a human may bind/inspect any configured store regardless of the global
+  default, since the binding is local data under `data_dir` and agent affinity
+  is still re-checked when memory is actually read or written. An asserted agent
+  identity is enforced under these commands too, so a binding can never bless a
+  store outside the agent's allowlist.
 - Agent/hook commands with `HIVE_MEMORY_AGENT_ID` are constrained by
   `[agents.<id>]`. If no matching section exists, v1 creates a conservative
   effective policy with `default_store = <global default_store>`,

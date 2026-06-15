@@ -91,6 +91,15 @@ pub fn collect(
     )?;
     if let Some(project_id) = project_id {
         for id in project::related_project_ids(store_root, project_id).map_err(alias_error)? {
+            // Defense in depth: `related_project_ids` already sanitizes ids at
+            // the identity boundary, but this join is the actual filesystem
+            // sink for an attacker-controlled, synced `aliases.toml`. Re-check
+            // here so any future caller path that reaches this join cannot turn
+            // a poisoned id (`..`, absolute, separators) into a store escape
+            // that injects arbitrary `.md` at the highest `curated` trust level.
+            if !project::is_safe_project_id(&id) {
+                continue;
+            }
             collect_tree(
                 store_root,
                 &Path::new("memories/projects").join(id),

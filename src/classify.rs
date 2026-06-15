@@ -109,18 +109,30 @@ pub struct RunInput<'a> {
 
 /// Records still owed an LLM review at `verdict_version`.
 ///
-/// Audience-restricted (`agent-private`) records are excluded entirely: their
-/// bodies are visible only to the listed agents, while the classifier pipes
-/// bodies to whichever backend CLI wins detection. Skipping them keeps the
-/// classifier consistent with the store's own visibility model; such records
-/// keep write-time/manual kinds and read-time relevance handling.
+/// Agent-private records are excluded entirely: their bodies are visible only to
+/// the writer (and any listed audience), while the classifier pipes bodies to
+/// whichever backend CLI wins detection. Two independent signals mark a record
+/// agent-private, and BOTH must gate the queue:
+///
+/// - a non-empty `audience` (explicitly listed permitted readers), and
+/// - `scope == "agent-private"` even with an EMPTY `audience`. The spec
+///   tolerates writer-only agent-private records that carry no audience field
+///   (readable only by the writing `agent_id`); filtering on audience alone
+///   would leak those bodies to the backend.
+///
+/// Skipping both keeps the classifier consistent with the store's own
+/// visibility model; such records keep write-time/manual kinds and read-time
+/// relevance handling.
 pub fn pending_entries(
     entries: &[index::IndexEntry],
     verdict_version: u32,
 ) -> Vec<&index::IndexEntry> {
     let mut pending: Vec<&index::IndexEntry> = entries
         .iter()
-        .filter(|entry| entry.audience.is_empty())
+        // "agent-private" is the durable scope literal used across note/event/
+        // visibility modules; matching it here keeps the classifier queue aligned
+        // with the same visibility model rather than inventing a divergent one.
+        .filter(|entry| entry.audience.is_empty() && entry.scope != "agent-private")
         .filter(|entry| match &entry.classified {
             None => true,
             Some(classified) => match classified.source {
@@ -595,6 +607,27 @@ mod tests {
         // one must never be piped to an arbitrary backend CLI.
         assert_eq!(pending.len(), 1);
         assert!(pending[0].audience.is_empty());
+        assert_ne!(pending[0].scope, "agent-private");
+    }
+
+    #[test]
+    fn pending_excludes_agent_private_scope_with_empty_audience() {
+        // The spec tolerates writer-only `agent-private` records that omit the
+        // audience field (readable only by the writing agent). Filtering on
+        // audience alone would leak their bodies to whichever backend CLI wins
+        // detection, so the scope itself must gate the classifier queue.
+        let mut writer_only = entry(None, None);
+        writer_only.id = "writer-only".to_owned();
+        writer_only.scope = "agent-private".to_owned();
+        writer_only.audience = Vec::new();
+
+        let normal = entry(None, None);
+        let entries = vec![writer_only, normal];
+
+        let pending = pending_entries(&entries, 1);
+
+        assert_eq!(pending.len(), 1);
+        assert_ne!(pending[0].scope, "agent-private");
     }
 
     #[test]
