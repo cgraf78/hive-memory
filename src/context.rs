@@ -286,6 +286,12 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
     // leave the viewer with neither (Fix A). This mirrors `search.rs`, which
     // filters validity before feeding the resolver.
     //
+    // Suppressors MUST be source-allowed: a raw inbox note is excluded from
+    // context by default, so it must not retire a durable remembered/curated
+    // fact the viewer can actually see. Scope is widened for cross-scope
+    // explicit links; source is not — a low-confidence note overriding canonical
+    // memory would be a footgun, not authority.
+    //
     // Context has no query, so the historical-recall exception never fires and
     // superseded survivors are always hidden. This uses the same shared resolver
     // as search.
@@ -293,7 +299,9 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
         .iter()
         .copied()
         .filter(|entry| {
-            visibility::audience_allows(entry, input.agent_id) && validity::allows_current(entry)
+            source_allowed(entry, input.sources, input.include_inbox)
+                && visibility::audience_allows(entry, input.agent_id)
+                && validity::allows_current(entry)
         })
         .collect::<Vec<_>>();
     let superseded = supersession::suppressed_ids(&suppressors, None);
@@ -1533,6 +1541,58 @@ mod tests {
                 .decisions
                 .iter()
                 .any(|decision| { decision.id == old_id && decision.reason == "superseded" })
+        );
+    }
+
+    #[test]
+    fn inbox_note_does_not_suppress_remembered_fact_when_inbox_excluded() {
+        // Suppressors are source-filtered: a raw inbox note carrying an explicit
+        // `supersedes` link must NOT retire a durable remembered fact in context
+        // when inbox is excluded (the default). Otherwise a low-confidence triage
+        // note that the viewer never sees would silently hide canonical memory.
+        let dir = temp_dir("supersede-inbox-source");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        let remembered_id = write_record_full(
+            TestRecord {
+                root: &root,
+                entry_kind: note::EntryKind::Remember,
+                scope: "global",
+                body: "The deploy gate is deployctl.",
+                created_at: timestamp(1_778_946_153),
+                project_id: None,
+                audience: Vec::new(),
+            },
+            Vec::new(),
+        );
+        // A newer raw inbox NOTE that explicitly supersedes the remembered fact.
+        write_record_full(
+            TestRecord {
+                root: &root,
+                entry_kind: note::EntryKind::Note,
+                scope: "global",
+                body: "scratch: maybe the deploy gate changed?",
+                created_at: timestamp(1_778_946_154),
+                project_id: None,
+                audience: Vec::new(),
+            },
+            vec![remembered_id.clone()],
+        );
+        let entries = entries(&root, &cache);
+        // Default context sources exclude inbox, so the note is not a suppressor.
+        let sources = ["remembered".to_owned()];
+        let request = input(&root, &entries, &[], &sources);
+
+        let output = assemble_context(request).expect("context");
+
+        assert_eq!(output.sections.len(), 1);
+        assert!(output.markdown.contains("The deploy gate is deployctl."));
+        assert!(
+            !output
+                .decisions
+                .iter()
+                .any(|decision| decision.id == remembered_id && decision.reason == "superseded"),
+            "inbox note must not suppress a remembered fact when inbox is excluded"
         );
     }
 
