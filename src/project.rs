@@ -585,13 +585,26 @@ pub fn add_alias(
 /// the file plus every historical id listed there. Doctor uses this as the
 /// authoritative set for deciding whether project-scoped inbox notes are
 /// attached to a durable project identity or were produced from stale hints.
+///
+/// Every returned id is filtered through [`is_safe_project_id`] so a hostile
+/// synced `aliases.toml` cannot inject path-escaping ids (`..`, absolute, or
+/// multi-component) into the claimed set. Poisoned entries are dropped and the
+/// scan continues, mirroring [`related_project_ids`], so one bad alias does not
+/// blind the rest of a project's legitimate metadata.
 pub fn claimed_project_ids(store_root: &Path) -> Result<BTreeSet<String>, ProjectError> {
     let mut ids = BTreeSet::new();
+    let insert_safe = |ids: &mut BTreeSet<String>, candidate: String| {
+        if is_safe_project_id(&candidate) {
+            ids.insert(candidate);
+        }
+    };
     for directory_id in project_directories(store_root)? {
-        ids.insert(directory_id.clone());
+        insert_safe(&mut ids, directory_id.clone());
         if let Some(aliases) = load_aliases(store_root, &directory_id)? {
-            ids.insert(aliases.project_id);
-            ids.extend(aliases.aliases);
+            insert_safe(&mut ids, aliases.project_id);
+            for alias in aliases.aliases {
+                insert_safe(&mut ids, alias);
+            }
         }
     }
     Ok(ids)
@@ -1069,6 +1082,30 @@ mod tests {
 
         assert!(ids.contains("current-project"));
         assert!(ids.contains("old-project"));
+    }
+
+    #[test]
+    fn claimed_project_ids_drops_path_escaping_aliases() {
+        let dir = temp_dir("claimed-poisoned");
+        let projects = dir.join("memories/projects/current-project");
+        fs::create_dir_all(&projects).expect("project dir");
+        // A hostile synced store can list path-escaping ids in `aliases.toml`.
+        // The claimed set must drop them so no downstream path-sink consumer can
+        // be steered outside `memories/projects/`, while legitimate ids survive.
+        fs::write(
+            projects.join("aliases.toml"),
+            "schema_version = 1\nproject_id = \"current-project\"\naliases = [\"../../../../tmp/evil\", \"/etc/passwd\", \"a/b\", \"old-project\"]\n",
+        )
+        .expect("write aliases");
+
+        let ids = claimed_project_ids(&dir).expect("claimed ids");
+
+        assert!(ids.contains("current-project"));
+        assert!(ids.contains("old-project"));
+        assert!(!ids.contains("../../../../tmp/evil"));
+        assert!(!ids.contains("/etc/passwd"));
+        assert!(!ids.contains("a/b"));
+        assert!(ids.iter().all(|id| is_safe_project_id(id)));
     }
 
     #[test]

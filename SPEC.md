@@ -227,6 +227,17 @@ manifest, Markdown front matter, JSON events, outbox metadata. The contract:
 - v1 ships with NO migrators (only schema 1 exists). The contract is committed
   so future migrations are not retrofitted into a hostile design.
 
+The rebuildable cache under `cache/indexes` is deliberately OUTSIDE this frozen
+store/record schema. It carries its own private versions — an
+`INDEX_FINGERPRINT_SCHEMA_VERSION` for the freshness fingerprint and an index
+header format version for the embedded header line — that may be bumped at any
+time without a store migration. Bumping either simply marks existing cache files
+stale so they are rebuilt from the canonical notes/events on the next read; no
+data is migrated because the cache holds no canonical data. Accordingly, the
+schema reported by `hm --version` is the store/record `schema_version`, not the
+cache's internal versions, which are an implementation detail of the local
+triage index and never appear in the stability contract.
+
 ### Markdown Note Schema
 
 Canonical notes live under:
@@ -719,27 +730,33 @@ identity does not silently widen access.
   local project binding for `--project` / `HIVE_MEMORY_PROJECT`, then
   `agents.<id>.default_store`, then global `default_store`. The resolved write
   store MUST be present in `write_stores` for agent/hook commands.
-- Read store resolution is: explicit `--stores`, explicit `--store`,
-  `HIVE_MEMORY_STORES`, `HIVE_MEMORY_STORE`, local project binding for
-  `--project` / `HIVE_MEMORY_PROJECT`, then `agents.<id>.default_store`, then
-  global `default_store`. The resolved stores MUST be a subset of `read_stores`
-  for agent/hook commands.
-- `--all-stores` is read-only. For humans, it expands to all configured stores
-  allowed by privacy flags. For agents, it expands only to `read_stores` and is
-  refused unless `agents.<id>.allow_all_stores = true`.
+- Read store resolution is: explicit `--store`, `HIVE_MEMORY_STORE`, local
+  project binding for `--project` / `HIVE_MEMORY_PROJECT`, then
+  `agents.<id>.default_store`, then global `default_store`. The resolved store
+  MUST be within `read_stores` for agent/hook commands. **Multi-store reads
+  (`--stores`, `HIVE_MEMORY_STORES`, `--all-stores`) are DEFERRED — see below —
+  so v1 read commands resolve exactly one store.** When implemented, the
+  resolution order will prepend explicit `--stores` and `HIVE_MEMORY_STORES`,
+  and the resolved set MUST be a subset of `read_stores` for agent/hook commands.
+- `--all-stores` is DEFERRED (not in the v1 implemented surface). The frozen
+  contract, once shipped, is: read-only; for humans it expands to all configured
+  stores allowed by privacy flags, and for agents it expands only to
+  `read_stores` and is refused unless `agents.<id>.allow_all_stores = true`.
 - A named-store request outside the effective policy is exit `4`
   (`privacy_refusal`) rather than silently falling back to another store.
 
 General CLI behavior:
 
 - `--config PATH` selects config path.
-- `--store NAME` selects one active store for write commands and is a
-  single-store shorthand for read/search/context commands.
-- `--stores a,b` selects multiple explicit store aliases for read/search/context
-  commands.
-- `--all-stores` is read-only and explicit.
-- `HIVE_MEMORY_STORES=a,b` provides the launcher or low-level integration
-  default for read commands; explicit `--stores` wins.
+- `--store NAME` selects one active store for write commands and for
+  read/search/context commands. In v1, read commands operate on this single
+  resolved store.
+- `--stores a,b` (multiple explicit store aliases for read/search/context) is
+  DEFERRED and not accepted in v1.
+- `--all-stores` (read-only fan-out across stores) is DEFERRED and not accepted
+  in v1.
+- `HIVE_MEMORY_STORES=a,b` (multi-store launcher default) is DEFERRED and not
+  read in v1; use `HIVE_MEMORY_STORE` for the single read/write store.
 - `HIVE_MEMORY_HOOK_ACTIVE=1` tells `hm` the caller is an agent lifecycle hook,
   not an interactive human command. In this mode `hm context` enables safe cache
   fallback, and maintenance commands such as `hm refresh` use hook-safe
@@ -814,7 +831,9 @@ Stable `--json` success field sets. Fields are mandatory unless explicitly noted
   body, `stale` is `true` only for last-success cache fallback,
   `cache_created_at` is `null` for fresh context, and each section contains
   `{ "id", "store", "scope", "trust", "audience", "source_path",
-  "estimated_tokens", "body" }`.
+  "estimated_tokens", "body" }`. `stores` is an array, but because multi-store
+  reads are DEFERRED (see Read store resolution), v1 always emits exactly one
+  resolved store in it; consumers should not yet rely on more than one element.
 - `hm flush --json`:
   `{ "flushed", "skipped", "failed", "unbound", "pending", "items" }`, where
   each item contains `{ "id", "store", "state", "result", "message" }`.
@@ -958,7 +977,7 @@ Examples:
 
 ```bash
 hm search "TOML config"
-hm search "release" --stores personal,work --scope project
+hm search "release" --store work --scope project
 hm search "Chris prefers" --json --include-inbox
 ```
 
@@ -971,9 +990,10 @@ V1 behavior:
   canonical files for snippets.
 - collapses note/event pairs (same `id`) into a single hit; the Markdown body
   is the source of the snippet.
-- default store only unless `--stores` or `--all-stores` is passed.
-- under agent policy, default store means the agent's `default_store`, and
-  explicit stores must be within the agent's `read_stores`.
+- single resolved store only; multi-store reads (`--stores` / `--all-stores`)
+  are DEFERRED (see Read store resolution).
+- under agent policy, the resolved store means the agent's `default_store` (or an
+  explicit `--store`), which must be within the agent's `read_stores`.
 - default scopes from config; default sources from `[defaults].context_sources`
   (`curated` and `remembered` unless overridden).
 - returns path, score/rank, title/snippet, store, scope, audience, and
@@ -998,7 +1018,7 @@ Examples:
 
 ```bash
 hm context --as-agent codex --project /repo --max-tokens 4000
-hm context --stores personal,work --scope global,project
+hm context --store work --scope global,project
 hm context --include-inbox --as-agent codex
 HIVE_MEMORY_HOOK_ACTIVE=1 HIVE_MEMORY_AGENT_ID=codex HIVE_MEMORY_PROJECT=/repo hm context
 HIVE_MEMORY_HOOK_ACTIVE=1 HIVE_MEMORY_SESSION_ID=abc hm context --if-changed
@@ -1006,9 +1026,10 @@ HIVE_MEMORY_HOOK_ACTIVE=1 HIVE_MEMORY_SESSION_ID=abc hm context --if-changed
 
 Behavior:
 
-- reads selected stores/scopes only.
-- under agent policy, default store means the agent's `default_store`, and
-  explicit stores must be within the agent's `read_stores`.
+- reads the single resolved store and selected scopes only; multi-store reads
+  (`--stores` / `--all-stores`) are DEFERRED (see Read store resolution).
+- under agent policy, the resolved store means the agent's `default_store` (or an
+  explicit `--store`), which must be within the agent's `read_stores`.
 - when `HIVE_MEMORY_HOOK_ACTIVE=1`, uses `defaults.hook_context_max_tokens`
   when no explicit `--max-tokens` is provided, enables last-success cache
   fallback, and still enforces the active agent's read policy before returning
@@ -1016,9 +1037,10 @@ Behavior:
 - includes active store name, sources used, and render policy in a small
   header. The header MUST also include the active agent ID (when known), resolved
   project ID, path hint, store source (`cli`, `env`, `project-binding`,
-  `agent-default`, or `global-default`), and selected store aliases. Cached
+  `agent-default`, or `global-default`), and the resolved store alias (a
+  single-element list in v1; see deferred multi-store reads). Cached
   fallback context MUST mark itself stale/offline in that header, including the
-  cache creation time and selected store aliases.
+  cache creation time and the resolved store alias.
 - v1 default sources include curated memory (rules/, people/, memories/global/,
   memories/projects/<id>/) and high-signal `hm remember` entries. Raw `hm note`
   inbox entries are EXCLUDED unless `--include-inbox` is passed (see Trust
@@ -1030,7 +1052,8 @@ Behavior:
   when `--include-inbox` is passed.
 - respects `--max-tokens` approximately; the v1 heuristic is `len(utf8_bytes) / 4`
   for budget estimation. Default token-ish budget: 4000.
-- refuses `--all-stores` when config disables broad reads.
+- `--all-stores` is DEFERRED (not accepted in v1); once shipped it MUST be
+  refused when config disables broad reads.
 - audience filter: when `--as-agent <id>` is set, agent-private notes whose
   audience does not include `<id>` are filtered out.
 - escape rule: when rendering any memory body, the CLI escapes lines that begin
@@ -1729,8 +1752,8 @@ this rather than implying otherwise.
 
 Refusal cases:
 
-- `--all-stores` with a `secret` store unless `--include-secret` is passed
-  and config allows it.
+- `--all-stores` (DEFERRED; see Read store resolution) with a `secret` store
+  unless `--include-secret` is passed and config allows it.
 - writing to a store whose manifest identity conflicts with config unless
   `--force` is used. `--force` does NOT bypass identity checks on outbox
   flush; unbound outbox items require `hm flush --bind`.
@@ -1996,8 +2019,9 @@ Test categories per module:
 ### Search
 
 - case-insensitive exact phrase match, with all-term fallback.
-- `--stores` / `--scope` filters.
-- agent policy constrains default and explicit read stores.
+- `--store` / `--scope` filters; multi-store `--stores` / `--all-stores` are
+  DEFERRED (single resolved store in v1).
+- agent policy constrains the default and explicit read store.
 - `--include-inbox` opt-in.
 - deterministic ordering (score → newer timestamp → lexical path).
 - default limit 20; `--limit N` respected.
@@ -2010,11 +2034,12 @@ Test categories per module:
   including curated content.
 - data-boundary block emitted with required attributes.
 - audience filter under `--as-agent`.
-- agent policy constrains default and explicit context stores.
+- agent policy constrains the default and explicit context store; multi-store
+  `--stores` / `--all-stores` are DEFERRED (single resolved store in v1).
 - `--max-tokens` byte/4 approximation respected.
 - active store name in header.
 - header and JSON include active agent ID, resolved project ID, original path
-  hint, selected stores, and store source.
+  hint, the resolved store (single-element list in v1), and store source.
 - hook-active default max tokens comes from `defaults.hook_context_max_tokens`.
 - fresh context writes last-success cache.
 - `--if-changed` emits no Markdown when session context selection is unchanged,
@@ -2022,9 +2047,10 @@ Test categories per module:
   the session context cursor.
 - backend-unavailable hook context falls back to non-expired cache only when
   current agent policy still permits the cached stores.
-- stale fallback context header names cache age and selected stores.
+- stale fallback context header names cache age and the resolved store.
 - privacy refusal never falls back to cached context.
-- `--all-stores` refused when config disables broad reads.
+- `--all-stores` is DEFERRED; once shipped it MUST be refused when config
+  disables broad reads.
 - performance budget: p95 ≤ 200ms warm on synthetic 5000-note store.
 - `hm remember` entries are visible by default; `hm note` entries are not visible
   unless `--include-inbox` is passed.
