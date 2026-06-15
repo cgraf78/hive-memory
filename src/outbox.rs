@@ -498,11 +498,19 @@ pub fn bind_item(input: BindInput<'_>) -> Result<BindReport, OutboxError> {
 /// Flush all auto-bindable pending outbox items.
 ///
 /// Same-hash collisions are treated as already flushed and remove the outbox
-/// item after archiving. Different-hash collisions fail hard because continuing
-/// would overwrite unrelated canonical memory. Unbound items are counted and
-/// left untouched for a future explicit bind operation. Temporarily unreachable
-/// stores are reported as pending rather than failures so hook-time refresh can
-/// run safely when a user is away from one of their store locations.
+/// item after archiving. Different-hash collisions are recorded as `failed`
+/// because continuing would overwrite unrelated canonical memory. Unbound items
+/// are counted and left untouched for a future explicit bind operation.
+/// Temporarily unreachable stores are reported as pending rather than failures
+/// so hook-time refresh can run safely when a user is away from one of their
+/// store locations.
+///
+/// A single corrupt or unwritable item must never strand the rest of the queue:
+/// the outbox exists precisely to preserve offline writes, so every recoverable
+/// per-item problem (unparseable metadata, payload I/O failure, archive write
+/// failure) is bucketed into the item's own `FlushItemReport` and the loop keeps
+/// going. The only hard error is failing to scan the outbox root itself, because
+/// without a directory listing there is no per-item work to report against.
 pub fn flush(input: FlushInput<'_>) -> Result<FlushReport, OutboxError> {
     let mut report = FlushReport::default();
     let outbox_root = input.data_dir.join("outbox");
@@ -513,7 +521,7 @@ pub fn flush(input: FlushInput<'_>) -> Result<FlushReport, OutboxError> {
     };
 
     for item_dir in item_dirs {
-        let item = flush_item(&input, &item_dir)?;
+        let item = flush_item(&input, &item_dir);
         match item.result.as_str() {
             "flushed" => report.flushed += 1,
             "skipped" => report.skipped += 1,
@@ -528,57 +536,71 @@ pub fn flush(input: FlushInput<'_>) -> Result<FlushReport, OutboxError> {
     Ok(report)
 }
 
-fn flush_item(input: &FlushInput<'_>, item_dir: &Path) -> Result<FlushItemReport, OutboxError> {
+/// Flush one outbox item, returning its bucketed result.
+///
+/// This function never returns `Err`: a flush batch must survive a single bad
+/// item, so every recoverable failure is mapped to a `failed`/`pending`/
+/// `skipped` `FlushItemReport` instead of aborting the whole run. Policy and
+/// safety refusals (identity mismatch, different-content conflict, hash
+/// mismatch, incomplete event metadata) are likewise `failed` reports, so the
+/// manifest-identity safety gate and idempotency behavior are unchanged.
+fn flush_item(input: &FlushInput<'_>, item_dir: &Path) -> FlushItemReport {
     let meta_path = item_dir.join("meta.toml");
-    let meta = read_meta(&meta_path)?;
+    let meta = match read_meta(&meta_path) {
+        Ok(meta) => meta,
+        Err(err) => {
+            // A concurrent flusher may have removed the item (and its meta.toml)
+            // between the directory scan and this read. A missing meta file is
+            // "already done", not a corruption to surface. Anything else
+            // (unparseable, unreadable, unsupported schema) is a per-item repair
+            // problem: bucket it as failed -- deriving id/store from the path,
+            // since we have no parsed metadata -- and keep flushing the rest.
+            if meta_path
+                .try_exists()
+                .map(|exists| !exists)
+                .unwrap_or(false)
+            {
+                return path_item_report(
+                    item_dir,
+                    "skipped",
+                    "item already removed by another flush",
+                );
+            }
+            return path_item_report(item_dir, "failed", err.to_string());
+        }
+    };
     if meta.state == OutboxState::Unbound {
-        return Ok(item_report(
-            &meta,
-            "unbound",
-            "item requires explicit binding",
-        ));
+        return item_report(&meta, "unbound", "item requires explicit binding");
     }
     let Some(expected_store_id) = meta.expected_store_id.as_deref() else {
-        return Ok(item_report(
-            &meta,
-            "unbound",
-            "item has no expected store id",
-        ));
+        return item_report(&meta, "unbound", "item has no expected store id");
     };
     let Some(store_config) = input.stores.get(&meta.store) else {
-        return Ok(item_report(
-            &meta,
-            "failed",
-            "target store is not configured",
-        ));
+        return item_report(&meta, "failed", "target store is not configured");
     };
     let manifest = match store::read_manifest(&store_config.root) {
         Ok(manifest) => manifest,
         Err(err) => {
-            return Ok(item_report(
+            return item_report(
                 &meta,
                 "pending",
                 format!("target store is unavailable: {err}"),
-            ));
+            );
         }
     };
     if manifest.store.id != expected_store_id {
-        return Ok(item_report(
+        return item_report(
             &meta,
             "failed",
             "target store manifest id does not match outbox metadata",
-        ));
+        );
     }
 
     let event_payload = match (&meta.final_event_path, &meta.event_sha256) {
         (Some(path), Some(hash)) => Some((path.as_str(), hash.as_str())),
         (None, None) => None,
         _ => {
-            return Ok(item_report(
-                &meta,
-                "failed",
-                "event path/hash metadata is incomplete",
-            ));
+            return item_report(&meta, "failed", "event path/hash metadata is incomplete");
         }
     };
 
@@ -586,52 +608,75 @@ fn flush_item(input: &FlushInput<'_>, item_dir: &Path) -> Result<FlushItemReport
     // Publish both payloads before removing the local recovery copy. If either
     // payload collides or fails validation, the item remains in the outbox so a
     // later human repair can inspect the original bytes and metadata together.
-    let note_result = publish_payload(
+    // A payload I/O failure (missing/unreadable source, unreadable destination)
+    // is recoverable per-item: report it as failed and leave the item in place
+    // rather than aborting the whole flush.
+    let note_result = match publish_payload(
         &note_source,
         &store_config.root,
         &meta.final_note_path,
         &meta.note_sha256,
         &input.options,
-    )?;
+    ) {
+        Ok(result) => result,
+        Err(err) => return item_report(&meta, "failed", err.to_string()),
+    };
     let event_result = match event_payload {
-        Some((path, hash)) => Some(publish_payload(
+        Some((path, hash)) => match publish_payload(
             &item_dir.join("event.json"),
             &store_config.root,
             path,
             hash,
             &input.options,
-        )?),
+        ) {
+            Ok(result) => Some(result),
+            Err(err) => return item_report(&meta, "failed", err.to_string()),
+        },
         None => None,
     };
 
     if note_result == PublishResult::HashMismatch
         || event_result == Some(PublishResult::HashMismatch)
     {
-        return Ok(item_report(
+        return item_report(
             &meta,
             "failed",
             "payload hash does not match outbox metadata",
-        ));
+        );
     }
     if note_result == PublishResult::Conflict || event_result == Some(PublishResult::Conflict) {
-        return Ok(item_report(
-            &meta,
-            "failed",
-            "final path exists with different content",
-        ));
+        return item_report(&meta, "failed", "final path exists with different content");
     }
 
-    write_archive(input, &store_config.root, item_dir, &meta)?;
-    fs::remove_dir_all(item_dir).map_err(|err| io_error("remove flushed item", item_dir, err))?;
+    // Payloads are now safely in the store. Archiving and removing the local
+    // recovery copy are best-effort post-flush bookkeeping: an archive write
+    // failure should not poison the rest of the batch, and a NotFound while
+    // removing the item means a concurrent flusher already cleaned it up.
+    if let Err(err) = write_archive(input, &store_config.root, item_dir, &meta) {
+        return item_report(&meta, "failed", err.to_string());
+    }
+    match fs::remove_dir_all(item_dir) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return item_report(&meta, "skipped", "item already removed by another flush");
+        }
+        Err(err) => {
+            return item_report(
+                &meta,
+                "failed",
+                io_error("remove flushed item", item_dir, err).to_string(),
+            );
+        }
+    }
 
     if note_result == PublishResult::AlreadyPresent
         && event_result
             .map(|result| result == PublishResult::AlreadyPresent)
             .unwrap_or(true)
     {
-        Ok(item_report(&meta, "skipped", "payload already present"))
+        item_report(&meta, "skipped", "payload already present")
     } else {
-        Ok(item_report(&meta, "flushed", "payload flushed"))
+        item_report(&meta, "flushed", "payload flushed")
     }
 }
 
@@ -906,6 +951,33 @@ fn item_report(meta: &OutboxMeta, result: &str, message: impl Into<String>) -> F
     }
 }
 
+/// Build a per-item report when metadata could not be parsed.
+///
+/// Without parsed metadata we still want a stable, human-locatable result, so
+/// the id and store are recovered from the on-disk layout
+/// (`outbox/<store>/<id>/`). The `state` is reported as `unknown` because the
+/// metadata that records it is exactly what we failed to read.
+fn path_item_report(item_dir: &Path, result: &str, message: impl Into<String>) -> FlushItemReport {
+    let id = item_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_owned();
+    let store = item_dir
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_owned();
+    FlushItemReport {
+        id,
+        store,
+        state: "unknown".to_owned(),
+        result: result.to_owned(),
+        message: message.into(),
+    }
+}
+
 fn sha256(contents: &[u8]) -> String {
     format!("{:x}", Sha256::digest(contents))
 }
@@ -915,5 +987,84 @@ fn io_error(action: &'static str, path: &Path, err: std::io::Error) -> OutboxErr
         action,
         path: path.to_path_buf(),
         message: err.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `validate_relative_path` is the last-line guard that keeps corrupted or
+    /// malicious outbox metadata from writing outside the target store root, so
+    /// it must reject every escape shape and accept a normal store-relative path.
+    #[test]
+    fn validate_relative_path_rejects_parent_components() {
+        let err = validate_relative_path("../escape.md").expect_err("`..` must be rejected");
+        match err {
+            OutboxError::Io { message, .. } => {
+                assert!(
+                    message.contains("parent or prefix"),
+                    "unexpected: {message}"
+                );
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_relative_path_rejects_parent_in_middle() {
+        // A `..` deeper in the path must be refused too, not just a leading one.
+        validate_relative_path("inbox/../../escape.md")
+            .expect_err("interior `..` must be rejected");
+    }
+
+    #[test]
+    fn validate_relative_path_rejects_absolute() {
+        let err = validate_relative_path("/etc/passwd").expect_err("absolute must be rejected");
+        match err {
+            OutboxError::Io { message, .. } => {
+                assert!(
+                    message.contains("must be relative"),
+                    "unexpected: {message}"
+                );
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_relative_path_rejects_empty() {
+        let err = validate_relative_path("").expect_err("empty must be rejected");
+        match err {
+            OutboxError::Io { message, .. } => {
+                assert!(
+                    message.contains("must not be empty"),
+                    "unexpected: {message}"
+                );
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_relative_path_rejects_curdir_only() {
+        // `.` normalizes away to nothing, which is an empty target, not a file.
+        validate_relative_path("./").expect_err("curdir-only must be rejected");
+    }
+
+    #[test]
+    fn validate_relative_path_accepts_normal_note_path() {
+        let normalized = validate_relative_path("inbox/notes/2026/05/16/note.md")
+            .expect("normal store-relative path must be accepted");
+        assert_eq!(normalized, PathBuf::from("inbox/notes/2026/05/16/note.md"));
+    }
+
+    #[test]
+    fn validate_relative_path_strips_curdir_segments() {
+        // Leading/interior `.` segments are noise, not traversal; they should be
+        // dropped while the rest of the path is preserved.
+        let normalized =
+            validate_relative_path("./inbox/./note.md").expect("curdir segments are harmless");
+        assert_eq!(normalized, PathBuf::from("inbox/note.md"));
     }
 }
