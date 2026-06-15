@@ -1,0 +1,64 @@
+# Corpus for the auto-capture-on-stop eval (tests/autocapture_eval.rs).
+#
+# Each scenario is an ordered list of raw conversation transcripts (`sessions`),
+# as they would be seen at session-stop time, plus `queries` asked AFTER every
+# session has been ingested. Unlike reconcile_corpus.toml (which feeds
+# pre-extracted atomic facts), these transcripts are full conversations with
+# chatter, so the eval exercises `capture::extract` end to end — that extraction
+# step is exactly what the auto-capture-on-stop policy adds on top of reconcile.
+#
+# Marker rules (mirrors reconcile_corpus.toml): `current` is a distinctive token
+# from the latest fact; `stale` is a distinctive token from a superseded earlier
+# fact. `stale` MUST NOT be a substring of `current` (or every retrieval of the
+# current fact would falsely count as a stale leak). Use distinctive proper
+# nouns that survive paraphrasing by the extraction model.
+
+# --- Scenario 1: editor switch across two sessions ------------------------
+[[scenario]]
+name = "editor-switch"
+sessions = [
+  "user: I write all my code in Sublime Text, been my editor for years. assistant: nice, solid choice. user: anyway, did you see the game last night? assistant: I did, great finish.",
+  "user: heads up, I've fully switched my dev setup to VS Code now and dropped Sublime entirely. assistant: got it, I'll remember that. user: also remind me to buy milk. assistant: noted (but I can't really shop for you).",
+]
+[[scenario.queries]]
+ask = "what code editor does the user use now"
+current = "VS Code"
+stale = "Sublime"
+
+# --- Scenario 2: database migration ---------------------------------------
+[[scenario]]
+name = "db-migration"
+sessions = [
+  "user: our backend stores everything in MySQL right now. assistant: understood. user: the deploy is at 5pm today. assistant: good luck with it.",
+  "user: big update — we finished migrating the database off MySQL and onto PostgreSQL this sprint. assistant: great, that's a big one. user: yeah the team is relieved. assistant: I bet.",
+]
+[[scenario.queries]]
+ask = "which database does the project use"
+current = "PostgreSQL"
+stale = "MySQL"
+
+# --- Scenario 3: search-tool switch ---------------------------------------
+[[scenario]]
+name = "search-tool-switch"
+sessions = [
+  "user: I grep through code with ripgrep, it's super fast. assistant: agreed, rg is great. user: lol the coffee machine broke again. assistant: the eternal office struggle.",
+  "user: I've moved to ast-grep for structural code searches instead of ripgrep now. assistant: interesting, structural search is powerful. user: random: what's the capital of France. assistant: Paris.",
+]
+[[scenario.queries]]
+ask = "what search tool does the user prefer for code"
+current = "ast-grep"
+stale = "ripgrep"
+
+# --- Scenario 4: pure add + recall under noise (no update) -----------------
+# Stale marker names a fact never stated, so it should never leak in any arm;
+# this scenario isolates whether auto-capture surfaces a single durable fact
+# buried in chatter (recall), independent of supersession.
+[[scenario]]
+name = "location-recall"
+sessions = [
+  "user: morning! the standup ran long again. assistant: those do drag. user: oh by the way I'm based in Austin and work fully remote. assistant: noted. user: ok back to it. assistant: talk later.",
+]
+[[scenario.queries]]
+ask = "where is the user located"
+current = "Austin"
+stale = "Seattle"
