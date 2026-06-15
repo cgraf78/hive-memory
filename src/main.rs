@@ -4408,6 +4408,17 @@ fn perform_refresh(config: &Config, forced: bool) -> Result<HookRefreshReport> {
 
     let mut indexes = 0usize;
     for (store_name, store_config) in &config.stores {
+        // Serialize the whole rebuild+publish (JSONL + Tantivy) for this store's
+        // shared cache artifact under one host-local, cache-key-scoped lock so
+        // concurrent `hm refresh` runs or lazy read rebuilds cannot redundantly
+        // scan the store or fight over the Tantivy writer. If another rebuild
+        // already holds the lock, skip this store: that other run is producing
+        // the same artifact, so this is a safe coalesce, not a dropped update.
+        let _rebuild_lock =
+            match index::try_rebuild_lock(&config.cache_dir, store_name, &store_config.root)? {
+                Some(lock) => lock,
+                None => continue,
+            };
         let report = rebuild_store_index(config, store_name)?;
         // Keep the full-text index fresh off the hot path so the prompt-submit
         // hook can query BM25 cheaply (it never rebuilds). No-op unless the

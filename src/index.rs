@@ -7,16 +7,37 @@
 
 use crate::{entity, note};
 use crate::{event, path as memory_path, write};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fmt::{self, Display};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 
-const INDEX_FINGERPRINT_SCHEMA_VERSION: u32 = 8;
+// Bumped to 9 when the freshness fingerprint started folding canonical file
+// count and max file mtime alongside directory mtime, AND the JSONL index began
+// carrying its fingerprint in an embedded header line. Older sidecar-based
+// caches (schema 8 and earlier, header-less) are treated as stale and rebuilt.
+const INDEX_FINGERPRINT_SCHEMA_VERSION: u32 = 9;
+
+/// Format version for the embedded index header line.
+///
+/// The header is the first physical line of `cache/indexes/<key>.jsonl`. It
+/// publishes the freshness fingerprint INSIDE the data file so a single atomic
+/// rename makes data and fingerprint visible together; a reader can no longer
+/// validate a fingerprint against entries from a different rebuild run.
+const INDEX_HEADER_FORMAT_VERSION: u32 = 1;
+
+/// Cap on how many bytes a cached index file may be before a read declines it.
+///
+/// A torn or pathologically large synced file must not OOM the prompt hot path.
+/// Real stores stay far under this: ~1 KiB per entry, so 256 MiB tolerates well
+/// over 100k notes while still bounding a runaway/corrupt file. A file over the
+/// cap is treated as a cache miss (rebuild), never a hard error.
+const MAX_CACHED_INDEX_BYTES: u64 = 256 * 1024 * 1024;
 
 /// One line in `cache/indexes/<store-alias>.jsonl`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,7 +174,32 @@ struct IndexFingerprint {
     store_root: String,
     canonical_dirs: usize,
     latest_directory_modified_nanos: u128,
+    // Canonical note/event FILE count and the newest file mtime are folded in
+    // alongside directory mtime so adds/replaces that preserve a parent
+    // directory's mtime — some cloud-sync arrivals land files with an older
+    // mtime under an unchanged date dir — still invalidate the cache. Both are
+    // computed during the same single walk that enumerates directories, so this
+    // adds no extra directory traversal on the hot path (one extra `stat` per
+    // file, which the OS dirent cache already warms during enumeration).
+    canonical_files: usize,
+    latest_file_modified_nanos: u128,
     entity_registry_modified_nanos: u128,
+}
+
+/// First physical line of a JSONL index file: the embedded freshness header.
+///
+/// Embedding the fingerprint in the data file is the atomicity fix: `rebuild_index`
+/// publishes header + entries with one atomic rename, so a reader cannot pair a
+/// "fresh" fingerprint with stale/partial entries from a different rebuild. The
+/// distinctive `hm_index_format` key lets readers tell a header line apart from
+/// an [`IndexEntry`] line (entries never carry that field).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct IndexHeader {
+    /// Header line format version; gates header parsing independent of the
+    /// freshness schema so the two can evolve separately.
+    hm_index_format: u32,
+    /// Freshness fingerprint this index was built against.
+    fingerprint: IndexFingerprint,
 }
 
 /// Non-fatal index rebuild warning.
@@ -209,18 +255,104 @@ impl Display for IndexError {
 
 impl Error for IndexError {}
 
+/// Held advisory lock serializing rebuilds of one store's cache artifact.
+///
+/// The cache artifact (JSONL + Tantivy dir) is SHARED across agents and
+/// sessions, so the rebuild lock is keyed by the store CACHE KEY rather than by
+/// agent/session identity — that is the wrong granularity for a shared file. It
+/// is a host-local `flock`, not a distributed lock: it only serializes rebuilds
+/// on this machine; another host rebuilds its own synced copy independently.
+///
+/// The lock lives under `cache_dir/locks/index/`, never inside a synced store,
+/// and uses a different path namespace from the hook session refresh lock
+/// (`state_dir/locks/refresh/...`), so the two locks can never nest into a
+/// deadlock even when `hm refresh` holds both at once.
+#[derive(Debug)]
+pub struct RebuildLock {
+    file: File,
+    /// Lock file path, exposed for diagnostics and tests.
+    pub path: PathBuf,
+}
+
+impl Drop for RebuildLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+/// Return the rebuild lock path for one store cache key under `cache_dir`.
+fn rebuild_lock_path(cache_dir: &Path, store_name: &str, store_root: &Path) -> PathBuf {
+    cache_dir
+        .join("locks")
+        .join("index")
+        .join(format!("{}.lock", store_cache_key(store_name, store_root)))
+}
+
+/// Try to acquire the non-blocking rebuild lock for one store cache key.
+///
+/// `Ok(None)` means another rebuild is already running on this host for the same
+/// cache artifact; callers fall back gracefully (re-check freshness, then
+/// rebuild lock-free) rather than block a latency-sensitive read. Any other I/O
+/// error surfaces so the caller knows local coordination state is untrustworthy.
+pub fn try_rebuild_lock(
+    cache_dir: &Path,
+    store_name: &str,
+    store_root: &Path,
+) -> Result<Option<RebuildLock>, IndexError> {
+    let path = rebuild_lock_path(cache_dir, store_name, store_root);
+    let Some(parent) = path.parent() else {
+        return Err(IndexError::Io {
+            action: "create rebuild lock parent",
+            path,
+            message: "lock path has no parent".to_owned(),
+        });
+    };
+    fs::create_dir_all(parent)
+        .map_err(|err| io_error("create rebuild lock parent", parent, err))?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|err| io_error("open rebuild lock", &path, err))?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(RebuildLock { file, path })),
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(err) => Err(io_error("lock rebuild", &path, err)),
+    }
+}
+
 /// Read a fresh index when possible, otherwise rebuild it from canonical files.
 ///
 /// Context and search run on latency-sensitive hook paths. They should pay for
 /// full Markdown/event parsing only when canonical inbox files changed; the
-/// fingerprint sidecar uses directory metadata so hot reads do not stat every
-/// note. That catches create/delete/rename changes cheaply; content-only manual
-/// edits rely on explicit `hm refresh`, which is the same maintenance path hooks
-/// already run after writes.
+/// embedded-header fingerprint uses directory + file metadata so hot reads do
+/// not stat every note for content. That catches create/delete/rename/replace
+/// changes cheaply; content-only manual edits rely on explicit `hm refresh`,
+/// which is the same maintenance path hooks already run after writes.
+///
+/// Concurrent rebuilds of the same store are serialized by a cache-key-scoped
+/// advisory lock so two sessions cannot redundantly scan the store or fight over
+/// the Tantivy writer. If the lock is already held, another rebuild just ran, so
+/// we re-check freshness once before falling back to a lock-free rebuild (the
+/// atomic header publish keeps that safe).
 pub fn load_or_rebuild_index(input: LoadIndexInput<'_>) -> Result<LoadIndexReport, IndexError> {
     if let Some(report) = load_fresh_index(&input)? {
         return Ok(report);
     }
+
+    let _lock = match try_rebuild_lock(input.cache_dir, input.store_name, input.store_root)? {
+        Some(lock) => Some(lock),
+        None => {
+            // Another rebuild is in flight. It may have just published a fresh
+            // index; re-check before doing redundant work.
+            if let Some(report) = load_fresh_index(&input)? {
+                return Ok(report);
+            }
+            None
+        }
+    };
 
     let report = rebuild_index(RebuildIndexInput {
         store_name: input.store_name,
@@ -244,13 +376,14 @@ pub fn load_or_rebuild_index(input: LoadIndexInput<'_>) -> Result<LoadIndexRepor
 /// into a full store scan.
 pub fn load_fresh_index(input: &LoadIndexInput<'_>) -> Result<Option<LoadIndexReport>, IndexError> {
     let path = scoped_index_path(input.cache_dir, input.store_name, input.store_root);
-    let fingerprint_path =
-        index_fingerprint_path(input.cache_dir, input.store_name, input.store_root);
     let current = canonical_fingerprint(input.store_root)?;
-    if let Ok(cached) = read_fingerprint(&fingerprint_path)
+    // The fingerprint now lives in the index file's header, so one read both
+    // proves freshness and yields entries — and the fingerprint can never refer
+    // to a different rebuild's data. A missing/old-format header, a stale
+    // fingerprint, an oversized file, or any read/parse error is a cache miss
+    // (rebuild), never a hard error on this latency-sensitive boundary.
+    if let Ok(Some((cached, entries))) = read_index_with_fingerprint(&path)
         && cached == current
-        && path.is_file()
-        && let Ok(entries) = read_index(&path)
     {
         return Ok(Some(LoadIndexReport {
             path,
@@ -274,22 +407,24 @@ pub fn load_cached_index(
     input: &LoadIndexInput<'_>,
 ) -> Result<Option<LoadIndexReport>, IndexError> {
     let path = scoped_index_path(input.cache_dir, input.store_name, input.store_root);
-    let fingerprint_path =
-        index_fingerprint_path(input.cache_dir, input.store_name, input.store_root);
-    let cached = match read_fingerprint(&fingerprint_path) {
-        Ok(cached) => cached,
-        Err(_) => return Ok(None),
+    // Prompt-submit is the most latency-sensitive boundary and must degrade, not
+    // fail. A torn write or a partially synced line previously made the whole
+    // read return `Err` and bubbled up as a hard error; now any unreadable
+    // header (missing, old-format, oversized, or corrupt) is simply a cache miss
+    // that callers turn into a rebuild. Per-line corruption inside the body is
+    // already tolerated by `read_index_with_fingerprint` (skip-and-warn).
+    let Ok(Some((cached, entries))) = read_index_with_fingerprint(&path) else {
+        return Ok(None);
     };
     if cached.schema_version != INDEX_FINGERPRINT_SCHEMA_VERSION
         || cached.store_root != input.store_root.display().to_string()
-        || !path.is_file()
     {
         return Ok(None);
     }
 
     Ok(Some(LoadIndexReport {
-        path: path.clone(),
-        entries: read_index(&path)?,
+        path,
+        entries,
         warnings: Vec::new(),
         rebuilt: false,
     }))
@@ -350,16 +485,17 @@ pub fn rebuild_index(input: RebuildIndexInput<'_>) -> Result<RebuildIndexReport,
     }
 
     let path = scoped_index_path(input.cache_dir, input.store_name, input.store_root);
-    let jsonl = render_jsonl(&entries)?;
+    // Compute the fingerprint BEFORE serializing so it is published in the same
+    // atomic rename as the entries it describes. This closes the two-file race:
+    // a reader can no longer see a fresh fingerprint paired with stale/partial
+    // data, because there is exactly one file and one rename.
+    let fingerprint = canonical_fingerprint(input.store_root)?;
+    let jsonl = render_jsonl(&fingerprint, &entries)?;
     write::write_atomic(&path, jsonl.as_bytes(), &input.options).map_err(|err| IndexError::Io {
         action: "write index",
         path: path.clone(),
         message: err.to_string(),
     })?;
-    let fingerprint = canonical_fingerprint(input.store_root)?;
-    let fingerprint_path =
-        index_fingerprint_path(input.cache_dir, input.store_name, input.store_root);
-    write_fingerprint(&fingerprint_path, &fingerprint, &input.options)?;
 
     Ok(RebuildIndexReport {
         path,
@@ -368,14 +504,85 @@ pub fn rebuild_index(input: RebuildIndexInput<'_>) -> Result<RebuildIndexReport,
     })
 }
 
-/// Read an existing JSONL index file.
+/// Read an existing JSONL index file, returning only its entries.
+///
+/// The index is a rebuildable cache, never a security boundary, so a single torn
+/// or partially synced line must degrade — not abort the whole read. A leading
+/// embedded fingerprint header is skipped, and any malformed body line is
+/// skipped with a stderr warning (mirroring how `rebuild_index` tolerates one
+/// bad note) so the remaining good entries are still returned. The file size is
+/// capped so a pathological synced file cannot OOM the hot path; an oversized
+/// file yields an `Io` error that callers treat as a cache miss.
 pub fn read_index(path: &Path) -> Result<Vec<IndexEntry>, IndexError> {
+    Ok(read_index_inner(path)?.1)
+}
+
+/// Read an index file as `(fingerprint, entries)` when it carries a valid
+/// embedded header, or `Ok(None)` for an old/header-less or unreadable file.
+///
+/// Returning `None` (rather than an error) for the old two-file format is what
+/// lets freshness checks treat a legacy index as stale and rebuild it without
+/// panicking. Genuine I/O failures (including the size cap) still surface as
+/// errors so the caller can decide; on the hot path that decision is a miss.
+fn read_index_with_fingerprint(
+    path: &Path,
+) -> Result<Option<(IndexFingerprint, Vec<IndexEntry>)>, IndexError> {
+    let (header, entries) = read_index_inner(path)?;
+    Ok(header.map(|header| (header.fingerprint, entries)))
+}
+
+/// Shared index reader: parses an optional leading header and the entry body,
+/// skipping malformed body lines with a warning and enforcing the size cap.
+fn read_index_inner(path: &Path) -> Result<(Option<IndexHeader>, Vec<IndexEntry>), IndexError> {
+    // Bound the read before slurping the file: a torn/runaway synced file must
+    // not be loaded wholesale into memory. `metadata` is cheap relative to the
+    // read it guards.
+    if let Ok(metadata) = fs::metadata(path)
+        && metadata.len() > MAX_CACHED_INDEX_BYTES
+    {
+        return Err(IndexError::Io {
+            action: "read index",
+            path: path.to_path_buf(),
+            message: format!(
+                "index file is {} bytes, over the {MAX_CACHED_INDEX_BYTES}-byte cache cap",
+                metadata.len()
+            ),
+        });
+    }
     let contents = fs::read_to_string(path).map_err(|err| io_error("read index", path, err))?;
-    contents
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).map_err(|err| IndexError::Json(err.to_string())))
-        .collect()
+    let mut lines = contents.lines().filter(|line| !line.trim().is_empty());
+
+    // The header, when present, is always the first non-empty line. Peek it
+    // without consuming a real entry: an entry line never parses as a header
+    // (entries lack `hm_index_format`), and an old-format first line is an
+    // entry that we must still keep.
+    let mut entries = Vec::new();
+    let mut header = None;
+    if let Some(first) = lines.next() {
+        match serde_json::from_str::<IndexHeader>(first) {
+            Ok(parsed) if parsed.hm_index_format == INDEX_HEADER_FORMAT_VERSION => {
+                header = Some(parsed);
+            }
+            // Not a header (old format or future header version): treat as a
+            // body line so legacy header-less indexes are still readable.
+            _ => push_entry_line(first, path, &mut entries),
+        }
+    }
+    for line in lines {
+        push_entry_line(line, path, &mut entries);
+    }
+    Ok((header, entries))
+}
+
+/// Parse one JSONL entry line, skipping it with a warning when it is malformed.
+fn push_entry_line(line: &str, path: &Path, entries: &mut Vec<IndexEntry>) {
+    match serde_json::from_str::<IndexEntry>(line) {
+        Ok(entry) => entries.push(entry),
+        Err(err) => eprintln!(
+            "warning: {}: skipping malformed index line: {err}",
+            path.display()
+        ),
+    }
 }
 
 /// Return the cache path for one store alias.
@@ -395,17 +602,14 @@ pub fn scoped_index_path(cache_dir: &Path, store_name: &str, store_root: &Path) 
         .join(format!("{}.jsonl", store_cache_key(store_name, store_root)))
 }
 
-fn index_fingerprint_path(cache_dir: &Path, store_name: &str, store_root: &Path) -> PathBuf {
-    cache_dir.join("indexes").join(format!(
-        "{}.fingerprint.json",
-        store_cache_key(store_name, store_root)
-    ))
-}
-
-fn store_cache_key(store_name: &str, store_root: &Path) -> String {
-    // Store aliases are local labels, not durable identities. Include the root
-    // spelling in the cache filename so tests, alternate configs, and moved
-    // stores do not race through one shared `personal.jsonl` file.
+/// Return the stable cache key for one store alias + root.
+///
+/// Store aliases are local labels, not durable identities, so the root spelling
+/// is hashed into the key. This is the same key the JSONL filename is built
+/// from, which makes it the right granularity for the rebuild lock: every host
+/// process touching one store's cache artifact converges on one lock, regardless
+/// of which agent or session triggered the rebuild.
+pub fn store_cache_key(store_name: &str, store_root: &Path) -> String {
     let mut hasher = Sha256::new();
     hasher.update(store_root.display().to_string().as_bytes());
     let digest = hasher.finalize();
@@ -414,27 +618,6 @@ fn store_cache_key(store_name: &str, store_root: &Path) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     format!("{store_name}-{suffix}")
-}
-
-fn read_fingerprint(path: &Path) -> Result<IndexFingerprint, IndexError> {
-    let contents =
-        fs::read_to_string(path).map_err(|err| io_error("read index fingerprint", path, err))?;
-    serde_json::from_str(&contents).map_err(|err| IndexError::Json(err.to_string()))
-}
-
-fn write_fingerprint(
-    path: &Path,
-    fingerprint: &IndexFingerprint,
-    options: &write::AtomicWriteOptions,
-) -> Result<(), IndexError> {
-    let contents =
-        serde_json::to_string(fingerprint).map_err(|err| IndexError::Json(err.to_string()))?;
-    write::write_atomic(path, contents.as_bytes(), options).map_err(|err| IndexError::Io {
-        action: "write index fingerprint",
-        path: path.to_path_buf(),
-        message: err.to_string(),
-    })?;
-    Ok(())
 }
 
 fn read_paired_event(
@@ -592,8 +775,19 @@ fn entry_entities(
     )
 }
 
-fn render_jsonl(entries: &[IndexEntry]) -> Result<String, IndexError> {
+fn render_jsonl(
+    fingerprint: &IndexFingerprint,
+    entries: &[IndexEntry],
+) -> Result<String, IndexError> {
     let mut output = String::new();
+    let header = IndexHeader {
+        hm_index_format: INDEX_HEADER_FORMAT_VERSION,
+        fingerprint: fingerprint.clone(),
+    };
+    let header_line =
+        serde_json::to_string(&header).map_err(|err| IndexError::Json(err.to_string()))?;
+    output.push_str(&header_line);
+    output.push('\n');
     for entry in entries {
         let line = serde_json::to_string(entry).map_err(|err| IndexError::Json(err.to_string()))?;
         output.push_str(&line);
@@ -628,31 +822,37 @@ fn collect_note_paths(root: &Path, paths: &mut Vec<PathBuf>) -> Result<(), Index
     Ok(())
 }
 
+/// Running totals for the single canonical-files walk.
+///
+/// Folding file count and max file mtime in here keeps the freshness signal to
+/// ONE directory traversal: directory mtime catches most create/delete/rename
+/// changes cheaply, and the file count + newest file mtime catch in-place
+/// replaces and the cloud-sync case where a file lands under a date dir whose
+/// own mtime is preserved. We deliberately stop short of per-file content
+/// hashing, which would re-read every note on the hot path.
+#[derive(Default)]
+struct CanonicalScan {
+    dirs: usize,
+    files: usize,
+    latest_directory_modified_nanos: u128,
+    latest_file_modified_nanos: u128,
+}
+
 fn canonical_fingerprint(store_root: &Path) -> Result<IndexFingerprint, IndexError> {
-    let mut dirs = Vec::new();
-    collect_canonical_dirs(&store_root.join("inbox/notes"), &mut dirs)?;
-    collect_canonical_dirs(&store_root.join("inbox/events"), &mut dirs)?;
-    let mut latest_directory_modified_nanos = 0u128;
-    // Directory metadata is the deliberate hot-path compromise: writes, deletes,
-    // renames, and cloud-sync file arrivals update parent directories without
-    // forcing every `hm context` or `hm search` call to stat thousands of notes.
-    // Content-only manual edits are handled by explicit `hm refresh --force`.
-    for path in &dirs {
-        let metadata = fs::metadata(path)
-            .map_err(|err| io_error("read canonical directory metadata", path, err))?;
-        latest_directory_modified_nanos = latest_directory_modified_nanos.max(modified_nanos(
-            metadata
-                .modified()
-                .map_err(|err| io_error("read canonical directory modified time", path, err))?,
-        ));
-    }
+    let mut scan = CanonicalScan::default();
+    collect_canonical(&store_root.join("inbox/notes"), &mut scan)?;
+    collect_canonical(&store_root.join("inbox/events"), &mut scan)?;
     Ok(IndexFingerprint {
         // v8: entity extraction includes deterministic quoted/proper-name
         // phrase links in addition to built-in aliases and the store registry.
+        // v9: folds canonical file count + newest file mtime into freshness and
+        // moves the fingerprint into the index header for atomic publish.
         schema_version: INDEX_FINGERPRINT_SCHEMA_VERSION,
         store_root: store_root.display().to_string(),
-        canonical_dirs: dirs.len(),
-        latest_directory_modified_nanos,
+        canonical_dirs: scan.dirs,
+        latest_directory_modified_nanos: scan.latest_directory_modified_nanos,
+        canonical_files: scan.files,
+        latest_file_modified_nanos: scan.latest_file_modified_nanos,
         entity_registry_modified_nanos: optional_modified_nanos(&store_root.join("entities.toml"))?,
     })
 }
@@ -667,11 +867,19 @@ fn optional_modified_nanos(path: &Path) -> Result<u128, IndexError> {
     }
 }
 
-fn collect_canonical_dirs(root: &Path, paths: &mut Vec<PathBuf>) -> Result<(), IndexError> {
+fn collect_canonical(root: &Path, scan: &mut CanonicalScan) -> Result<(), IndexError> {
     if !root.is_dir() {
         return Ok(());
     }
-    paths.push(root.to_path_buf());
+    scan.dirs += 1;
+    let metadata = fs::metadata(root)
+        .map_err(|err| io_error("read canonical directory metadata", root, err))?;
+    scan.latest_directory_modified_nanos =
+        scan.latest_directory_modified_nanos.max(modified_nanos(
+            metadata
+                .modified()
+                .map_err(|err| io_error("read canonical directory modified time", root, err))?,
+        ));
     for entry in
         fs::read_dir(root).map_err(|err| io_error("read canonical directory", root, err))?
     {
@@ -681,7 +889,19 @@ fn collect_canonical_dirs(root: &Path, paths: &mut Vec<PathBuf>) -> Result<(), I
             .file_type()
             .map_err(|err| io_error("read canonical file type", &path, err))?;
         if file_type.is_dir() {
-            collect_canonical_dirs(&path, paths)?;
+            collect_canonical(&path, scan)?;
+        } else if file_type.is_file() {
+            scan.files += 1;
+            // One extra stat per file. The dirent is already warm from
+            // enumeration, so this stays cheap relative to a full note re-read,
+            // and it is what lets an mtime-preserving cloud-sync arrival be seen.
+            let file_metadata = fs::metadata(&path)
+                .map_err(|err| io_error("read canonical file metadata", &path, err))?;
+            scan.latest_file_modified_nanos = scan.latest_file_modified_nanos.max(modified_nanos(
+                file_metadata
+                    .modified()
+                    .map_err(|err| io_error("read canonical file modified time", &path, err))?,
+            ));
         }
     }
     Ok(())
@@ -1003,5 +1223,252 @@ mod tests {
 
         assert!(report.entries.is_empty());
         assert_eq!(report.warnings.len(), 1);
+    }
+
+    fn load_input<'a>(store_name: &'a str, root: &'a Path, cache: &'a Path) -> LoadIndexInput<'a> {
+        LoadIndexInput {
+            store_name,
+            store_root: root,
+            cache_dir: cache,
+            options: options(),
+            path_case: memory_path::PathCase::Sensitive,
+        }
+    }
+
+    /// A single torn JSONL body line (a partial sync / interrupted write) must
+    /// not make `load_cached_index` return `Err` on the prompt hot path. The
+    /// header still validates, so the cache is reused and the good entry survives
+    /// while the corrupt line is dropped.
+    #[test]
+    fn load_cached_index_tolerates_corrupt_body_line() {
+        let dir = temp_dir("cached-corrupt-line");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(&root, true);
+        let report = rebuild_index(RebuildIndexInput {
+            store_name: "personal",
+            store_root: &root,
+            cache_dir: &cache,
+            options: options(),
+            path_case: memory_path::PathCase::Sensitive,
+        })
+        .expect("rebuild");
+
+        let contents = fs::read_to_string(&report.path).expect("read index");
+        // Append a torn line after the valid header + entry.
+        fs::write(&report.path, format!("{contents}{{partial line\n")).expect("corrupt body");
+
+        let loaded = load_cached_index(&load_input("personal", &root, &cache))
+            .expect("load cached must not error on a torn line");
+        let loaded = loaded.expect("header still valid, cache reused");
+        assert_eq!(loaded.entries.len(), 1);
+    }
+
+    /// `read_index` skips one malformed body line and returns the rest rather
+    /// than aborting the whole index on a single torn write.
+    #[test]
+    fn read_index_skips_bad_line_returns_rest() {
+        let dir = temp_dir("read-skip-line");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(&root, true);
+        let report = rebuild_index(RebuildIndexInput {
+            store_name: "personal",
+            store_root: &root,
+            cache_dir: &cache,
+            options: options(),
+            path_case: memory_path::PathCase::Sensitive,
+        })
+        .expect("rebuild");
+        let contents = fs::read_to_string(&report.path).expect("read index");
+        fs::write(&report.path, format!("{contents}{{garbled\n")).expect("append bad line");
+
+        let entries = read_index(&report.path).expect("read index skips bad line");
+        assert_eq!(entries.len(), 1);
+    }
+
+    /// An index file over the size cap is declined as a cache miss, never loaded
+    /// into memory and never a hard error to the caller.
+    #[test]
+    fn read_index_rejects_oversized_file() {
+        let dir = temp_dir("read-oversized");
+        let path = dir.join("huge.jsonl");
+        // Sparse file: set a length past the cap without writing the bytes.
+        let file = File::create(&path).expect("create");
+        file.set_len(MAX_CACHED_INDEX_BYTES + 1).expect("grow");
+        drop(file);
+
+        let err = read_index(&path).expect_err("oversized file is an error");
+        assert!(matches!(err, IndexError::Io { .. }));
+    }
+
+    /// The fingerprint travels inside the index header, so one read recovers both
+    /// the freshness fingerprint and the entries that were published with it.
+    #[test]
+    fn embedded_fingerprint_round_trips_atomically() {
+        let dir = temp_dir("embedded-fingerprint");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(&root, true);
+        let report = rebuild_index(RebuildIndexInput {
+            store_name: "personal",
+            store_root: &root,
+            cache_dir: &cache,
+            options: options(),
+            path_case: memory_path::PathCase::Sensitive,
+        })
+        .expect("rebuild");
+
+        let (fingerprint, entries) = read_index_with_fingerprint(&report.path)
+            .expect("read")
+            .expect("header present");
+        assert_eq!(
+            fingerprint,
+            canonical_fingerprint(&root).expect("fingerprint")
+        );
+        assert_eq!(entries, report.entries);
+    }
+
+    /// An old-format, header-less index (the pre-9 two-file layout) must be
+    /// treated as stale and rebuilt, never trusted and never a panic.
+    #[test]
+    fn old_format_index_triggers_rebuild() {
+        let dir = temp_dir("old-format");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(&root, true);
+        let path = scoped_index_path(&cache, "personal", &root);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mk cache");
+        // Simulate an old index: entry lines only, no embedded header.
+        let entry_line = serde_json::to_string(
+            &rebuild_index(RebuildIndexInput {
+                store_name: "personal",
+                store_root: &root,
+                cache_dir: &cache,
+                options: options(),
+                path_case: memory_path::PathCase::Sensitive,
+            })
+            .expect("rebuild")
+            .entries[0],
+        )
+        .expect("serialize entry");
+        fs::write(&path, format!("{entry_line}\n")).expect("write old-format index");
+
+        // Header-less file yields no fingerprint, so it is a cache miss.
+        assert!(read_index_with_fingerprint(&path).expect("read").is_none());
+        let loaded =
+            load_cached_index(&load_input("personal", &root, &cache)).expect("load cached");
+        assert!(loaded.is_none(), "old format must miss, not be trusted");
+
+        // And the lazy path rebuilds cleanly into the new format.
+        let rebuilt =
+            load_or_rebuild_index(load_input("personal", &root, &cache)).expect("rebuild");
+        assert!(rebuilt.rebuilt);
+        assert!(
+            read_index_with_fingerprint(&rebuilt.path)
+                .expect("read")
+                .is_some()
+        );
+    }
+
+    /// Adding a new note file into an existing date directory changes the
+    /// fingerprint and bumps the canonical file count. The file count + newest
+    /// file mtime are the signals that catch an mtime-preserving cloud-sync
+    /// arrival, which a directory-mtime-only fingerprint can miss.
+    #[test]
+    fn freshness_detects_new_file_in_existing_dir() {
+        let dir = temp_dir("freshness-new-file");
+        let root = dir.join("store");
+        let note_dir = root.join("inbox/notes/2026/05/16");
+        fs::create_dir_all(&note_dir).expect("note dir");
+        fs::create_dir_all(root.join("inbox/events")).expect("events dir");
+        fs::write(note_dir.join("a.md"), "placeholder").expect("first note");
+
+        let before = canonical_fingerprint(&root).expect("before");
+        fs::write(note_dir.join("b.md"), "placeholder").expect("second note");
+        let after = canonical_fingerprint(&root).expect("after");
+
+        assert_ne!(before, after, "adding a file must change the fingerprint");
+        assert_eq!(after.canonical_files, before.canonical_files + 1);
+    }
+
+    /// The canonical file count participates in fingerprint equality, so a
+    /// file-set change is detected even when every directory mtime is identical
+    /// (the mtime-preserving cloud-sync case directory mtime alone would miss).
+    #[test]
+    fn fingerprint_file_count_drives_freshness() {
+        let base = IndexFingerprint {
+            schema_version: INDEX_FINGERPRINT_SCHEMA_VERSION,
+            store_root: "/store".to_owned(),
+            canonical_dirs: 3,
+            latest_directory_modified_nanos: 42,
+            canonical_files: 10,
+            latest_file_modified_nanos: 42,
+            entity_registry_modified_nanos: 0,
+        };
+        let one_more_file = IndexFingerprint {
+            canonical_files: 11,
+            ..base.clone()
+        };
+        assert_ne!(base, one_more_file);
+    }
+
+    /// Two threads racing `load_or_rebuild_index` against the same cache key must
+    /// not corrupt the index: the cache-key lock serializes the rebuild+publish,
+    /// and the atomic header publish means whoever wins leaves a valid index.
+    #[test]
+    fn cache_key_lock_serializes_concurrent_rebuilds() {
+        let dir = temp_dir("lock-serialize");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(&root, true);
+
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    let root = root.clone();
+                    let cache = cache.clone();
+                    scope.spawn(move || {
+                        load_or_rebuild_index(load_input("personal", &root, &cache))
+                            .map(|report| report.entries.len())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("thread join"))
+                .collect::<Vec<_>>()
+        });
+
+        for result in results {
+            assert_eq!(result.expect("rebuild result"), 1);
+        }
+        // The final on-disk index is valid and fresh for the canonical store.
+        let path = scoped_index_path(&cache, "personal", &root);
+        let (fingerprint, entries) = read_index_with_fingerprint(&path)
+            .expect("read")
+            .expect("valid header after races");
+        assert_eq!(
+            fingerprint,
+            canonical_fingerprint(&root).expect("fingerprint")
+        );
+        assert_eq!(entries.len(), 1);
+    }
+
+    /// The rebuild lock is held while taken and released on drop, so a second
+    /// non-blocking acquire reports the existing holder rather than blocking.
+    #[test]
+    fn rebuild_lock_reports_existing_holder_without_blocking() {
+        let dir = temp_dir("rebuild-lock");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        let first = try_rebuild_lock(&cache, "personal", &root)
+            .expect("first lock")
+            .expect("acquired");
+        let second = try_rebuild_lock(&cache, "personal", &root).expect("second lock");
+        assert!(second.is_none(), "held lock must report existing holder");
+        drop(first);
+        let third = try_rebuild_lock(&cache, "personal", &root).expect("third lock");
+        assert!(third.is_some(), "lock is reacquirable after drop");
     }
 }
