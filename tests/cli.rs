@@ -5812,6 +5812,9 @@ fn hook_prompt_submit_skips_recall_when_index_is_not_fresh() {
 
             [stores.work]
             root = "{}"
+
+            [defaults]
+            search_sources = ["remembered"]
             "#,
             state.display(),
             personal.display(),
