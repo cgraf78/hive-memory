@@ -5712,6 +5712,82 @@ fn hook_prompt_submit_recalls_relevant_search_only_project_memory_once() {
 }
 
 #[test]
+fn hook_prompt_submit_uses_search_source_defaults_for_curated_recall() {
+    let dir = temp_dir("hook-prompt-curated-search-sources");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let state = dir.join("state");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            state_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+
+            [defaults]
+            search_sources = ["curated"]
+            context_sources = ["remembered"]
+            context_strategy = "relevance"
+            "#,
+            state.display(),
+            personal.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+    fs::create_dir_all(personal.join("rules")).expect("rules dir");
+    fs::write(
+        personal.join("rules/runbooks.md"),
+        "The apogee runbook lives in curated memory for prompt recall.\n",
+    )
+    .expect("curated memory");
+
+    // Prompt-submit reads a cached index so it can stay cheap on the hook path;
+    // refresh establishes that cache while the search itself still discovers
+    // curated files through the configured source policy.
+    cargo_bin_cmd!("hm")
+        .args(["--config", config.to_str().expect("utf8 config"), "refresh"])
+        .assert()
+        .success();
+
+    let mut prompt = cargo_bin_cmd!("hm");
+    let output = prompt
+        .env("HIVE_MEMORY_SESSION_ID", "session-prompt-curated-recall")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "prompt-submit",
+            "--text",
+            "Where is the apogee runbook?",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).expect("utf8 stdout");
+    assert!(
+        stdout.contains("\"kind\": \"inject_context\""),
+        "prompt stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\"reason\": \"selected\""),
+        "prompt stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("The apogee runbook lives in curated memory"),
+        "prompt stdout:\n{stdout}"
+    );
+}
+
+#[test]
 fn hook_prompt_submit_skips_recall_when_index_is_not_fresh() {
     let dir = temp_dir("hook-prompt-stale-index");
     let config = dir.join("config.toml");
