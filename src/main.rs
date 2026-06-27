@@ -2707,6 +2707,12 @@ fn source_filter_includes_inbox(sources: &[String]) -> bool {
         .any(|source| source == "inbox" || source == "all")
 }
 
+fn source_filter_includes_curated(sources: &[String]) -> bool {
+    sources
+        .iter()
+        .any(|source| source == "curated" || source == "all")
+}
+
 fn search_since_cutoff(value: &str) -> Result<OffsetDateTime> {
     let trimmed = value.trim();
     if trimmed.eq_ignore_ascii_case("today") {
@@ -5134,27 +5140,55 @@ fn hook_prompt_recall_action(
     // Prompt recall is an automatic `hm search`, so it follows the same source
     // defaults. Raw inbox material remains opt-in through that policy.
     let sources = &config.defaults.search_sources;
-    let include_inbox = source_filter_includes_inbox(sources);
-    let report = match load_cached_store_index(config, &store_name) {
-        Ok(Some(report)) => report,
+    let curated_allowed = source_filter_includes_curated(sources);
+    let cached_report = match load_cached_store_index(config, &store_name) {
+        Ok(Some(report)) => Some(report),
         Ok(None) => {
-            let mut recall = HookRecallReport::skipped("index-not-fresh");
-            recall.retrieval_ms = started.elapsed().as_millis();
-            return Ok((None, recall));
+            if curated_allowed {
+                None
+            } else {
+                let mut recall = HookRecallReport::skipped("index-not-fresh");
+                recall.retrieval_ms = started.elapsed().as_millis();
+                return Ok((None, recall));
+            }
         }
         Err(err) => {
-            let mut recall = HookRecallReport::skipped("index-unavailable");
-            recall.retrieval_ms = started.elapsed().as_millis();
-            eprintln!("warning: prompt recall skipped: {err}");
-            return Ok((None, recall));
+            if curated_allowed {
+                eprintln!(
+                    "warning: prompt recall using curated-only search because indexed recall is unavailable: {err}"
+                );
+                None
+            } else {
+                let mut recall = HookRecallReport::skipped("index-unavailable");
+                recall.retrieval_ms = started.elapsed().as_millis();
+                eprintln!("warning: prompt recall skipped: {err}");
+                return Ok((None, recall));
+            }
         }
     };
+    let empty_entries = Vec::new();
+    let entries = cached_report
+        .as_ref()
+        .map(|report| report.entries.as_slice())
+        .unwrap_or_else(|| empty_entries.as_slice());
+    let curated_only_sources;
+    let search_sources = if cached_report.is_some() {
+        sources.as_slice()
+    } else {
+        // When the note index is stale/missing, remembered/raw recall would be
+        // incomplete. Curated Markdown is read directly, so keep that part of
+        // the configured recall surface available without pretending the JSONL
+        // note corpus was searched.
+        curated_only_sources = vec!["curated".to_owned()];
+        curated_only_sources.as_slice()
+    };
+    let include_inbox = search_include_inbox(false, search_sources);
     let search_input = search::SearchInput {
         store_root: &store_config.root,
-        entries: &report.entries,
+        entries,
         query: &query,
         scopes: &config.defaults.search_scopes,
-        sources,
+        sources: search_sources,
         include_inbox,
         agent_id: agent_id.as_deref(),
         project_id: project_id.as_deref(),
@@ -5226,7 +5260,7 @@ fn hook_prompt_recall_action(
         store_root: &store_config.root,
         entries: &selected_entries,
         scopes: &config.defaults.search_scopes,
-        sources,
+        sources: search_sources,
         include_inbox,
         include_search_only: true,
         agent_id: agent_id.as_deref(),

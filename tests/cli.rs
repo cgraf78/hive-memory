@@ -5751,14 +5751,6 @@ fn hook_prompt_submit_uses_search_source_defaults_for_curated_recall() {
     )
     .expect("unrelated curated memory");
 
-    // Prompt-submit reads a cached index so it can stay cheap on the hook path;
-    // refresh establishes that cache while the search itself still discovers
-    // curated files through the configured source policy.
-    cargo_bin_cmd!("hm")
-        .args(["--config", config.to_str().expect("utf8 config"), "refresh"])
-        .assert()
-        .success();
-
     let mut prompt = cargo_bin_cmd!("hm");
     let output = prompt
         .env("HIVE_MEMORY_SESSION_ID", "session-prompt-curated-recall")

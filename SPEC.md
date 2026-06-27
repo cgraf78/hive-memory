@@ -1308,7 +1308,7 @@ Behavior:
   records the session context selection and emitted memory ids, and returns an
   `inject_context` action.
 - `prompt-submit`: resolves the current project/store selection, emits context
-  when the selection changed, otherwise runs bounded prompt-specific lexical
+  when the selection changed, otherwise runs bounded prompt-specific
   recall against `[defaults].search_sources`. Prompt recall keeps raw inbox
   records opt-in through that source policy, suppresses memories already emitted
   to the session, and returns an `inject_context` action only when it selects new
@@ -2121,7 +2121,7 @@ Test categories per module:
 - `hm hook prompt-submit --text ... --json` records memory-pending and returns a
   reminder action for durable-memory intent, without writing canonical memory.
 - `hm hook prompt-submit` emits context only when the resolved
-  project/store/scope/source selection changed, or when prompt-specific lexical
+  project/store/scope/source selection changed, or when prompt-specific
   recall finds memory from `[defaults].search_sources` that was not already
   emitted to the session.
   Repeated equivalent prompt recall returns valid JSON with
