@@ -578,7 +578,7 @@ commands also support `--json`.
 | `hm stores init\|list\|show\|doctor\|migrate` | Manage and diagnose store roots |
 | `hm remember` | Write a durable fact/preference/context note |
 | `hm note` | Write a lower-confidence raw note |
-| `hm search <query>` | Search remembered memory (`--since`, `--include-inbox`, `--explain`) |
+| `hm search <query>` | Search curated and remembered memory (`--since`, `--include-inbox`, `--explain`) |
 | `hm context` | Assemble agent-readable context (`--max-tokens`, `--if-changed`) |
 | `hm capture` | Extract durable facts from a conversation; stage, or `--promote` |
 | `hm reconcile` | Reconcile one candidate fact mem0-style (add/update/delete/noop) |

@@ -1007,8 +1007,10 @@ V1 behavior:
 - default scopes from config; default sources from `[defaults].search_sources`
   (`curated` and `remembered` unless overridden).
 - `--since` accepts `today`, durations such as `30m`/`2h`/`1d`, or an RFC3339
-  timestamp, and applies before the lexical or full-text backend sees
-  candidates so both backends search the same time-bounded dataset.
+  timestamp, and filters indexed note records before the lexical or full-text
+  backend sees candidates. Curated files do not carry indexed creation
+  timestamps, so curated search remains governed by the selected source and
+  scope filters.
 - returns path, score/rank, title/snippet, store, scope, audience, and
   timestamp.
 - deterministic ordering: exactness/term score, newer timestamp, then
