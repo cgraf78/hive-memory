@@ -2381,10 +2381,7 @@ fn run_search(args: SearchArgs, context: CliContext) -> Result<()> {
     } else {
         args.source
     };
-    let include_inbox = args.include_inbox
-        || sources
-            .iter()
-            .any(|source| source == "inbox" || source == "all");
+    let include_inbox = search_include_inbox(args.include_inbox, &sources);
 
     let filtered_entries;
     let entries = if let Some(cutoff) = since {
@@ -2696,6 +2693,18 @@ fn display_filter_values(values: &[String]) -> String {
     } else {
         values.join(",")
     }
+}
+
+fn search_include_inbox(include_inbox: bool, sources: &[String]) -> bool {
+    include_inbox || source_filter_includes_inbox(sources)
+}
+
+/// Source filters are machine policy, not display text: `inbox` and `all`
+/// both grant access to raw notes everywhere search policy is applied.
+fn source_filter_includes_inbox(sources: &[String]) -> bool {
+    sources
+        .iter()
+        .any(|source| source == "inbox" || source == "all")
 }
 
 fn search_since_cutoff(value: &str) -> Result<OffsetDateTime> {
@@ -5122,6 +5131,10 @@ fn hook_prompt_recall_action(
     )?;
     let store_name = resolved_store.name.clone();
     let store_config = &config.stores[store_name.as_str()];
+    // Prompt recall is an automatic `hm search`, so it follows the same source
+    // defaults. Raw inbox material remains opt-in through that policy.
+    let sources = &config.defaults.search_sources;
+    let include_inbox = source_filter_includes_inbox(sources);
     let report = match load_cached_store_index(config, &store_name) {
         Ok(Some(report)) => report,
         Ok(None) => {
@@ -5141,8 +5154,8 @@ fn hook_prompt_recall_action(
         entries: &report.entries,
         query: &query,
         scopes: &config.defaults.search_scopes,
-        sources: &["remembered".to_owned()],
-        include_inbox: false,
+        sources,
+        include_inbox,
         agent_id: agent_id.as_deref(),
         project_id: project_id.as_deref(),
         limit: 10,
@@ -5213,8 +5226,8 @@ fn hook_prompt_recall_action(
         store_root: &store_config.root,
         entries: &selected_entries,
         scopes: &config.defaults.search_scopes,
-        sources: &["remembered".to_owned()],
-        include_inbox: false,
+        sources,
+        include_inbox,
         include_search_only: true,
         agent_id: agent_id.as_deref(),
         project_id: project_id.as_deref(),
