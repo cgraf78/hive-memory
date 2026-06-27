@@ -82,6 +82,7 @@ fsync = "best-effort"   # never|best-effort|required
 [defaults]
 write_scope = "global"
 search_scopes = ["global", "project"]
+search_sources = ["curated", "remembered"] # curated|remembered|inbox|all
 context_sources = ["curated", "remembered"] # curated|remembered|inbox|all
 event_sidecar = "always" # never|always
 hook_context_max_tokens = 4000
@@ -987,6 +988,7 @@ Examples:
 hm search "TOML config"
 hm search "release" --store work --scope project
 hm search "Chris prefers" --json --include-inbox
+hm search "remaining work" --since 30m --include-inbox
 ```
 
 V1 behavior:
@@ -1002,8 +1004,11 @@ V1 behavior:
   are DEFERRED (see Read store resolution).
 - under agent policy, the resolved store means the agent's `default_store` (or an
   explicit `--store`), which must be within the agent's `read_stores`.
-- default scopes from config; default sources from `[defaults].context_sources`
+- default scopes from config; default sources from `[defaults].search_sources`
   (`curated` and `remembered` unless overridden).
+- `--since` accepts `today`, durations such as `30m`/`2h`/`1d`, or an RFC3339
+  timestamp, and applies before the lexical or full-text backend sees
+  candidates so both backends search the same time-bounded dataset.
 - returns path, score/rank, title/snippet, store, scope, audience, and
   timestamp.
 - deterministic ordering: exactness/term score, newer timestamp, then

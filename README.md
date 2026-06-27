@@ -267,6 +267,13 @@ optimization, never a security boundary.
 Inspect scoring with `hm search --explain`, and measure ranking changes against
 labeled corpuses with `hm eval`.
 
+Search has its own source defaults (`defaults.search_sources`) so explicit
+recall remains broad even when prompt context is tuned for precision. Use
+`--since 30m`, `--since 2h`, `--since 1d`, `--since today`, or an RFC3339
+timestamp to constrain recall to recently created indexed records. Raw
+lower-confidence `hm note` entries stay opt-in through `--include-inbox` or
+`--source inbox`.
+
 ### Context assembly
 
 `hm context` filters indexed records and curated files by source, scope,
@@ -537,6 +544,7 @@ sensitivity = "private"
 [defaults]
 write_scope = "global"
 search_scopes = ["global", "project"]
+search_sources = ["curated", "remembered"]
 context_sources = ["curated", "remembered"]
 search_backend = "lexical"     # or "tantivy" for BM25 full-text
 context_strategy = "adaptive"  # adaptive | recency | relevance
@@ -570,7 +578,7 @@ commands also support `--json`.
 | `hm stores init\|list\|show\|doctor\|migrate` | Manage and diagnose store roots |
 | `hm remember` | Write a durable fact/preference/context note |
 | `hm note` | Write a lower-confidence raw note |
-| `hm search <query>` | Search remembered memory (`--include-inbox`, `--explain`) |
+| `hm search <query>` | Search remembered memory (`--since`, `--include-inbox`, `--explain`) |
 | `hm context` | Assemble agent-readable context (`--max-tokens`, `--if-changed`) |
 | `hm capture` | Extract durable facts from a conversation; stage, or `--promote` |
 | `hm reconcile` | Reconcile one candidate fact mem0-style (add/update/delete/noop) |

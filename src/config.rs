@@ -38,6 +38,7 @@ const STORAGE_KEYS: &[&str] = &["kind", "case_sensitive", "atomic_rename", "fsyn
 const DEFAULTS_KEYS: &[&str] = &[
     "write_scope",
     "search_scopes",
+    "search_sources",
     "context_sources",
     "event_sidecar",
     "hook_context_max_tokens",
@@ -199,6 +200,12 @@ pub struct DefaultsConfig {
     pub write_scope: String,
     /// Default scopes for search commands.
     pub search_scopes: Vec<String>,
+    /// Default source classes searched by recall/search commands.
+    ///
+    /// Search is an explicit retrieval surface, so it has a separate source
+    /// policy from prompt context. Tightening startup context should never make
+    /// saved remembered facts disappear from `hm search`.
+    pub search_sources: Vec<String>,
     /// Default source classes included in context.
     pub context_sources: Vec<String>,
     /// Whether `hm note` writes a JSON sidecar by default.
@@ -903,6 +910,9 @@ impl DefaultsConfig {
             search_scopes: raw
                 .search_scopes
                 .unwrap_or_else(|| vec!["global".to_owned(), "project".to_owned()]),
+            search_sources: raw
+                .search_sources
+                .unwrap_or_else(|| vec!["curated".to_owned(), "remembered".to_owned()]),
             context_sources: raw
                 .context_sources
                 .unwrap_or_else(|| vec!["curated".to_owned(), "remembered".to_owned()]),
@@ -1102,6 +1112,7 @@ struct RawStorageConfig {
 struct RawDefaultsConfig {
     write_scope: Option<String>,
     search_scopes: Option<Vec<String>>,
+    search_sources: Option<Vec<String>>,
     context_sources: Option<Vec<String>>,
     event_sidecar: Option<EventSidecarPolicy>,
     hook_context_max_tokens: Option<u32>,
@@ -1477,6 +1488,7 @@ mod tests {
             [defaults]
             write_scope = "project"
             search_scopes = ["project"]
+            search_sources = ["remembered"]
             context_sources = ["remembered"]
             event_sidecar = "never"
             hook_context_max_tokens = 1234
@@ -1509,6 +1521,7 @@ mod tests {
         assert_eq!(loaded.config.storage.fsync, FsyncMode::Required);
         assert_eq!(loaded.config.defaults.write_scope, "project");
         assert_eq!(loaded.config.defaults.search_scopes, vec!["project"]);
+        assert_eq!(loaded.config.defaults.search_sources, vec!["remembered"]);
         assert_eq!(loaded.config.defaults.context_sources, vec!["remembered"]);
         assert_eq!(
             loaded.config.defaults.event_sidecar,
