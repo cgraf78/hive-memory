@@ -411,11 +411,10 @@ pub fn load_fresh_index(input: &LoadIndexInput<'_>) -> Result<Option<LoadIndexRe
 
 /// Read a locally cached index without touching the canonical store root.
 ///
-/// This is intentionally weaker than [`load_fresh_index`]. Prompt-submit hooks
-/// run inside short agent timeouts, and the canonical store may live on a
-/// cloud-backed FUSE mount that takes seconds to wake after idle. For that
-/// boundary, stale-but-local recall is more useful than blocking the prompt.
-/// Refresh and normal read commands still own freshness validation.
+/// This is intentionally weaker than [`load_fresh_index`]. It exists for the
+/// offline prompt-submit fallback after a freshness check fails because the
+/// canonical store cannot be inspected. Normal indexed recall must try the
+/// fresh path first so a reachable-but-stale cache cannot inject old memory.
 pub fn load_cached_index(
     input: &LoadIndexInput<'_>,
 ) -> Result<Option<LoadIndexReport>, IndexError> {

@@ -4347,6 +4347,107 @@ fn load_cached_store_index(
     })?)
 }
 
+fn load_fresh_store_index(
+    config: &Config,
+    store_name: &str,
+) -> Result<Option<index::LoadIndexReport>> {
+    let store_config = &config.stores[store_name];
+    let options = write::AtomicWriteOptions {
+        fsync: config.storage.fsync.into(),
+        ..write::AtomicWriteOptions::default()
+    };
+    Ok(index::load_fresh_index(&index::LoadIndexInput {
+        store_name,
+        store_root: &store_config.root,
+        cache_dir: &config.cache_dir,
+        options,
+        path_case: memory_path::resolve_case(&config.storage.case_sensitive, &store_config.root),
+    })?)
+}
+
+enum PromptRecallIndex {
+    Indexed(index::LoadIndexReport),
+    CuratedOnly,
+    Skip(&'static str),
+}
+
+fn load_prompt_recall_index(
+    config: &Config,
+    store_name: &str,
+    curated_allowed: bool,
+) -> Result<PromptRecallIndex> {
+    let store_config = &config.stores[store_name];
+    match load_fresh_store_index(config, store_name) {
+        Ok(Some(report)) => Ok(PromptRecallIndex::Indexed(report)),
+        Ok(None) if !store_config.root.is_dir() => {
+            match load_cached_store_index(config, store_name) {
+                Ok(Some(report)) => {
+                    // `load_fresh_index` intentionally reports missing canonical
+                    // roots as cache misses, not errors. The hook policy still
+                    // distinguishes that offline case from a reachable stale cache:
+                    // cache-only remembered recall is useful when the store root is
+                    // unavailable, but stale indexed recall must not fire when the
+                    // store can be inspected.
+                    eprintln!(
+                        "warning: prompt recall using cache-only indexed recall because store root is unavailable: {}",
+                        store_config.root.display()
+                    );
+                    Ok(PromptRecallIndex::Indexed(report))
+                }
+                Ok(None) if curated_allowed => Ok(PromptRecallIndex::CuratedOnly),
+                Ok(None) => Ok(PromptRecallIndex::Skip("index-not-fresh")),
+                Err(err) if curated_allowed => {
+                    eprintln!(
+                        "warning: prompt recall using curated-only search because indexed cache fallback is unavailable: {err}"
+                    );
+                    Ok(PromptRecallIndex::CuratedOnly)
+                }
+                Err(err) => {
+                    eprintln!("warning: prompt recall skipped: {err}");
+                    Ok(PromptRecallIndex::Skip("index-unavailable"))
+                }
+            }
+        }
+        Ok(None) if curated_allowed => Ok(PromptRecallIndex::CuratedOnly),
+        Ok(None) => Ok(PromptRecallIndex::Skip("index-not-fresh")),
+        Err(err) => match load_cached_store_index(config, store_name) {
+            Ok(Some(report)) => {
+                // Freshness checks touch the canonical store root. When a
+                // cloud/offline store is temporarily unavailable, prefer a
+                // local cache-only recall over dropping remembered context
+                // entirely; reachable-but-stale stores take the `Ok(None)` path
+                // above and cannot serve stale indexed hits.
+                eprintln!(
+                    "warning: prompt recall using cache-only indexed recall because freshness check failed: {err}"
+                );
+                Ok(PromptRecallIndex::Indexed(report))
+            }
+            Ok(None) if curated_allowed => {
+                eprintln!(
+                    "warning: prompt recall using curated-only search because indexed recall is unavailable: {err}"
+                );
+                Ok(PromptRecallIndex::CuratedOnly)
+            }
+            Ok(None) => {
+                eprintln!("warning: prompt recall skipped: {err}");
+                Ok(PromptRecallIndex::Skip("index-unavailable"))
+            }
+            Err(cache_err) if curated_allowed => {
+                eprintln!(
+                    "warning: prompt recall using curated-only search because indexed recall is unavailable: {err}; cache fallback failed: {cache_err}"
+                );
+                Ok(PromptRecallIndex::CuratedOnly)
+            }
+            Err(cache_err) => {
+                eprintln!(
+                    "warning: prompt recall skipped: {err}; cache fallback failed: {cache_err}"
+                );
+                Ok(PromptRecallIndex::Skip("index-unavailable"))
+            }
+        },
+    }
+}
+
 fn run_refresh(args: RefreshArgs, context: CliContext) -> Result<()> {
     let config = load_config(context.config_path.as_deref())?;
     let receipt_cursor = refresh_receipt_cursor(&config, &context)?;
@@ -5141,29 +5242,13 @@ fn hook_prompt_recall_action(
     // defaults. Raw inbox material remains opt-in through that policy.
     let sources = &config.defaults.search_sources;
     let curated_allowed = source_filter_includes_curated(sources);
-    let cached_report = match load_cached_store_index(config, &store_name) {
-        Ok(Some(report)) => Some(report),
-        Ok(None) => {
-            if curated_allowed {
-                None
-            } else {
-                let mut recall = HookRecallReport::skipped("index-not-fresh");
-                recall.retrieval_ms = started.elapsed().as_millis();
-                return Ok((None, recall));
-            }
-        }
-        Err(err) => {
-            if curated_allowed {
-                eprintln!(
-                    "warning: prompt recall using curated-only search because indexed recall is unavailable: {err}"
-                );
-                None
-            } else {
-                let mut recall = HookRecallReport::skipped("index-unavailable");
-                recall.retrieval_ms = started.elapsed().as_millis();
-                eprintln!("warning: prompt recall skipped: {err}");
-                return Ok((None, recall));
-            }
+    let cached_report = match load_prompt_recall_index(config, &store_name, curated_allowed)? {
+        PromptRecallIndex::Indexed(report) => Some(report),
+        PromptRecallIndex::CuratedOnly => None,
+        PromptRecallIndex::Skip(reason) => {
+            let mut recall = HookRecallReport::skipped(reason);
+            recall.retrieval_ms = started.elapsed().as_millis();
+            return Ok((None, recall));
         }
     };
     let empty_entries = Vec::new();

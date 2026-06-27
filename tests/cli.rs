@@ -5859,6 +5859,90 @@ fn hook_prompt_submit_skips_recall_when_index_is_not_fresh() {
 }
 
 #[test]
+fn hook_prompt_submit_skips_recall_when_populated_index_is_stale() {
+    let dir = temp_dir("hook-prompt-populated-stale-index");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let state = dir.join("state");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            state_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+
+            [defaults]
+            search_sources = ["remembered"]
+            "#,
+            state.display(),
+            personal.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "remember",
+            "--text",
+            "Prompt-submit stale cache recall must not mention copper adapters.",
+        ])
+        .assert()
+        .success();
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "remember",
+            "--text",
+            "A later remembered write invalidates the prompt recall cache.",
+        ])
+        .assert()
+        .success();
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", "session-populated-stale-index")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "prompt-submit",
+            "--text",
+            "Should prompt-submit mention copper adapters?",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"event\": \"prompt-submit\""))
+        .stdout(predicate::str::contains("\"reason\": \"index-not-fresh\""))
+        .stdout(predicate::str::contains("\"context_emitted\": false"))
+        .stdout(predicate::str::contains("\"actions\": []"))
+        .stdout(predicate::str::contains("copper adapters").not());
+}
+
+#[test]
 fn hook_prompt_submit_recalls_from_cache_when_store_root_is_unavailable() {
     let dir = temp_dir("hook-prompt-cache-store-unavailable");
     let config = dir.join("config.toml");
