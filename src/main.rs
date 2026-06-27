@@ -2381,10 +2381,7 @@ fn run_search(args: SearchArgs, context: CliContext) -> Result<()> {
     } else {
         args.source
     };
-    let include_inbox = args.include_inbox
-        || sources
-            .iter()
-            .any(|source| source == "inbox" || source == "all");
+    let include_inbox = search_include_inbox(args.include_inbox, &sources);
 
     let filtered_entries;
     let entries = if let Some(cutoff) = since {
@@ -2696,6 +2693,24 @@ fn display_filter_values(values: &[String]) -> String {
     } else {
         values.join(",")
     }
+}
+
+fn search_include_inbox(include_inbox: bool, sources: &[String]) -> bool {
+    include_inbox || source_filter_includes_inbox(sources)
+}
+
+/// Source filters are machine policy, not display text: `inbox` and `all`
+/// both grant access to raw notes everywhere search policy is applied.
+fn source_filter_includes_inbox(sources: &[String]) -> bool {
+    sources
+        .iter()
+        .any(|source| source == "inbox" || source == "all")
+}
+
+fn source_filter_includes_curated(sources: &[String]) -> bool {
+    sources
+        .iter()
+        .any(|source| source == "curated" || source == "all")
 }
 
 fn search_since_cutoff(value: &str) -> Result<OffsetDateTime> {
@@ -4332,6 +4347,107 @@ fn load_cached_store_index(
     })?)
 }
 
+fn load_fresh_store_index(
+    config: &Config,
+    store_name: &str,
+) -> Result<Option<index::LoadIndexReport>> {
+    let store_config = &config.stores[store_name];
+    let options = write::AtomicWriteOptions {
+        fsync: config.storage.fsync.into(),
+        ..write::AtomicWriteOptions::default()
+    };
+    Ok(index::load_fresh_index(&index::LoadIndexInput {
+        store_name,
+        store_root: &store_config.root,
+        cache_dir: &config.cache_dir,
+        options,
+        path_case: memory_path::resolve_case(&config.storage.case_sensitive, &store_config.root),
+    })?)
+}
+
+enum PromptRecallIndex {
+    Indexed(index::LoadIndexReport),
+    CuratedOnly,
+    Skip(&'static str),
+}
+
+fn load_prompt_recall_index(
+    config: &Config,
+    store_name: &str,
+    curated_allowed: bool,
+) -> Result<PromptRecallIndex> {
+    let store_config = &config.stores[store_name];
+    match load_fresh_store_index(config, store_name) {
+        Ok(Some(report)) => Ok(PromptRecallIndex::Indexed(report)),
+        Ok(None) if !store_config.root.is_dir() => {
+            match load_cached_store_index(config, store_name) {
+                Ok(Some(report)) => {
+                    // `load_fresh_index` intentionally reports missing canonical
+                    // roots as cache misses, not errors. The hook policy still
+                    // distinguishes that offline case from a reachable stale cache:
+                    // cache-only remembered recall is useful when the store root is
+                    // unavailable, but stale indexed recall must not fire when the
+                    // store can be inspected.
+                    eprintln!(
+                        "warning: prompt recall using cache-only indexed recall because store root is unavailable: {}",
+                        store_config.root.display()
+                    );
+                    Ok(PromptRecallIndex::Indexed(report))
+                }
+                Ok(None) if curated_allowed => Ok(PromptRecallIndex::CuratedOnly),
+                Ok(None) => Ok(PromptRecallIndex::Skip("index-not-fresh")),
+                Err(err) if curated_allowed => {
+                    eprintln!(
+                        "warning: prompt recall using curated-only search because indexed cache fallback is unavailable: {err}"
+                    );
+                    Ok(PromptRecallIndex::CuratedOnly)
+                }
+                Err(err) => {
+                    eprintln!("warning: prompt recall skipped: {err}");
+                    Ok(PromptRecallIndex::Skip("index-unavailable"))
+                }
+            }
+        }
+        Ok(None) if curated_allowed => Ok(PromptRecallIndex::CuratedOnly),
+        Ok(None) => Ok(PromptRecallIndex::Skip("index-not-fresh")),
+        Err(err) => match load_cached_store_index(config, store_name) {
+            Ok(Some(report)) => {
+                // Freshness checks touch the canonical store root. When a
+                // cloud/offline store is temporarily unavailable, prefer a
+                // local cache-only recall over dropping remembered context
+                // entirely; reachable-but-stale stores take the `Ok(None)` path
+                // above and cannot serve stale indexed hits.
+                eprintln!(
+                    "warning: prompt recall using cache-only indexed recall because freshness check failed: {err}"
+                );
+                Ok(PromptRecallIndex::Indexed(report))
+            }
+            Ok(None) if curated_allowed => {
+                eprintln!(
+                    "warning: prompt recall using curated-only search because indexed recall is unavailable: {err}"
+                );
+                Ok(PromptRecallIndex::CuratedOnly)
+            }
+            Ok(None) => {
+                eprintln!("warning: prompt recall skipped: {err}");
+                Ok(PromptRecallIndex::Skip("index-unavailable"))
+            }
+            Err(cache_err) if curated_allowed => {
+                eprintln!(
+                    "warning: prompt recall using curated-only search because indexed recall is unavailable: {err}; cache fallback failed: {cache_err}"
+                );
+                Ok(PromptRecallIndex::CuratedOnly)
+            }
+            Err(cache_err) => {
+                eprintln!(
+                    "warning: prompt recall skipped: {err}; cache fallback failed: {cache_err}"
+                );
+                Ok(PromptRecallIndex::Skip("index-unavailable"))
+            }
+        },
+    }
+}
+
 fn run_refresh(args: RefreshArgs, context: CliContext) -> Result<()> {
     let config = load_config(context.config_path.as_deref())?;
     let receipt_cursor = refresh_receipt_cursor(&config, &context)?;
@@ -5122,27 +5238,43 @@ fn hook_prompt_recall_action(
     )?;
     let store_name = resolved_store.name.clone();
     let store_config = &config.stores[store_name.as_str()];
-    let report = match load_cached_store_index(config, &store_name) {
-        Ok(Some(report)) => report,
-        Ok(None) => {
-            let mut recall = HookRecallReport::skipped("index-not-fresh");
+    // Prompt recall is an automatic `hm search`, so it follows the same source
+    // defaults. Raw inbox material remains opt-in through that policy.
+    let sources = &config.defaults.search_sources;
+    let curated_allowed = source_filter_includes_curated(sources);
+    let cached_report = match load_prompt_recall_index(config, &store_name, curated_allowed)? {
+        PromptRecallIndex::Indexed(report) => Some(report),
+        PromptRecallIndex::CuratedOnly => None,
+        PromptRecallIndex::Skip(reason) => {
+            let mut recall = HookRecallReport::skipped(reason);
             recall.retrieval_ms = started.elapsed().as_millis();
-            return Ok((None, recall));
-        }
-        Err(err) => {
-            let mut recall = HookRecallReport::skipped("index-unavailable");
-            recall.retrieval_ms = started.elapsed().as_millis();
-            eprintln!("warning: prompt recall skipped: {err}");
             return Ok((None, recall));
         }
     };
+    let empty_entries = Vec::new();
+    let entries = cached_report
+        .as_ref()
+        .map(|report| report.entries.as_slice())
+        .unwrap_or_else(|| empty_entries.as_slice());
+    let curated_only_sources;
+    let search_sources = if cached_report.is_some() {
+        sources.as_slice()
+    } else {
+        // When the note index is stale/missing, remembered/raw recall would be
+        // incomplete. Curated Markdown is read directly, so keep that part of
+        // the configured recall surface available without pretending the JSONL
+        // note corpus was searched.
+        curated_only_sources = vec!["curated".to_owned()];
+        curated_only_sources.as_slice()
+    };
+    let include_inbox = search_include_inbox(false, search_sources);
     let search_input = search::SearchInput {
         store_root: &store_config.root,
-        entries: &report.entries,
+        entries,
         query: &query,
         scopes: &config.defaults.search_scopes,
-        sources: &["remembered".to_owned()],
-        include_inbox: false,
+        sources: search_sources,
+        include_inbox,
         agent_id: agent_id.as_deref(),
         project_id: project_id.as_deref(),
         limit: 10,
@@ -5208,13 +5340,13 @@ fn hook_prompt_recall_action(
     }
 
     let max_tokens = usize::try_from(config.defaults.hook_context_max_tokens)?.clamp(200, 1_200);
-    let output = memory_context::assemble_context(memory_context::ContextInput {
+    let output = memory_context::assemble_selected_context(memory_context::ContextInput {
         store_name: store_name.as_str(),
         store_root: &store_config.root,
         entries: &selected_entries,
         scopes: &config.defaults.search_scopes,
-        sources: &["remembered".to_owned()],
-        include_inbox: false,
+        sources: search_sources,
+        include_inbox,
         include_search_only: true,
         agent_id: agent_id.as_deref(),
         project_id: project_id.as_deref(),
