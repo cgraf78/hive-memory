@@ -1036,7 +1036,7 @@ pub fn search_indexed(
         .query(input.query, over_fetch)
         .map_err(|err| SearchError::Retrieval(err.to_string()))?;
 
-    let mut hits = Vec::new();
+    let mut indexed_hits = Vec::new();
     for ranked_hit in ranked {
         let Some(entry) = by_id.get(ranked_hit.id.as_str()) else {
             continue;
@@ -1058,7 +1058,7 @@ pub fn search_indexed(
         } else {
             0
         };
-        hits.push(SearchHit {
+        indexed_hits.push(SearchHit {
             entry: (*entry).clone(),
             score,
             trace: SearchScoreTrace::default(),
@@ -1069,16 +1069,52 @@ pub fn search_indexed(
     // is intentionally read directly elsewhere because it is tiny and can be
     // scoped by the active project; merge those lexical hits here so selecting
     // the Tantivy backend never silently drops configured curated sources.
-    hits.extend(curated_hits(&input, &query, &registry)?);
-    // Apply the same supersession suppression as the lexical path so a record
-    // explicitly replaced by a newer one does not resurface.
     finish_hits(
-        &mut hits,
+        &mut indexed_hits,
         &query.phrase,
         query.temporal_intent(),
         input.limit,
     );
-    Ok(hits)
+    let mut curated_hits = curated_hits(&input, &query, &registry)?;
+    finish_hits(
+        &mut curated_hits,
+        &query.phrase,
+        query.temporal_intent(),
+        input.limit,
+    );
+    // BM25 scores and lexical scores are meaningful only inside their own
+    // source streams. Interleave per-source rankings instead of globally sorting
+    // incompatible scores, so a configured source cannot be crowded out by a
+    // different backend's scale.
+    Ok(merge_ranked_sources(
+        vec![indexed_hits, curated_hits],
+        input.limit,
+    ))
+}
+
+fn merge_ranked_sources(mut sources: Vec<Vec<SearchHit>>, limit: usize) -> Vec<SearchHit> {
+    let mut hits = Vec::new();
+    let mut seen_ids = BTreeSet::new();
+    loop {
+        let mut advanced = false;
+        for source in &mut sources {
+            while let Some(hit) = source.first() {
+                let hit = hit.clone();
+                source.remove(0);
+                if seen_ids.insert(hit.entry.id.clone()) {
+                    hits.push(hit);
+                    advanced = true;
+                    break;
+                }
+            }
+            if hits.len() >= limit {
+                return hits;
+            }
+        }
+        if !advanced {
+            return hits;
+        }
+    }
 }
 
 /// Map index entries to search documents for indexing. Resolves the canonical

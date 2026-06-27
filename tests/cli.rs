@@ -2848,6 +2848,74 @@ fn search_tantivy_backend_keeps_curated_source_results() {
 }
 
 #[test]
+fn search_tantivy_backend_interleaves_curated_with_remembered_results() {
+    let dir = temp_dir("search-tantivy-curated-mixed");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+            state_dir = "{}"
+            cache_dir = "{}"
+
+            [defaults]
+            search_backend = "tantivy"
+
+            [stores.personal]
+            root = "{}"
+            "#,
+            dir.join("data").display(),
+            dir.join("state").display(),
+            dir.join("cache").display(),
+            personal.display(),
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    for text in [
+        "Remembered apogee note one.",
+        "Remembered apogee note two.",
+        "Remembered apogee note three.",
+    ] {
+        cargo_bin_cmd!("hm")
+            .args([
+                "--config",
+                config.to_str().expect("utf8 config"),
+                "remember",
+                "--text",
+                text,
+            ])
+            .assert()
+            .success();
+    }
+    fs::create_dir_all(personal.join("rules")).expect("rules dir");
+    fs::write(
+        personal.join("rules/apogee.md"),
+        "Curated apogee guidance must remain visible under tight limits.\n",
+    )
+    .expect("curated memory");
+
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "apogee",
+            "--limit",
+            "3",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hits: 3"))
+        .stdout(predicate::str::contains("id: curated:rules/apogee.md"));
+}
+
+#[test]
 fn search_finds_curated_memory_from_default_sources() {
     let dir = temp_dir("search-curated-default");
     let config = dir.join("config.toml");
