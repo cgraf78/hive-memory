@@ -2122,7 +2122,8 @@ Test categories per module:
   reminder action for durable-memory intent, without writing canonical memory.
 - `hm hook prompt-submit` emits context only when the resolved
   project/store/scope/source selection changed, or when prompt-specific lexical
-  recall finds remembered memory that was not already emitted to the session.
+  recall finds memory from `[defaults].search_sources` that was not already
+  emitted to the session.
   Repeated equivalent prompt recall returns valid JSON with
   `recall.reason = "unchanged"` and no duplicate `inject_context` action.
 - `hm hook tool-complete` emits context only when it receives a project/path hint

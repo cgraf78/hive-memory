@@ -5728,6 +5728,7 @@ fn hook_prompt_submit_uses_search_source_defaults_for_curated_recall() {
             root = "{}"
 
             [defaults]
+            search_backend = "tantivy"
             search_sources = ["curated"]
             context_sources = ["remembered"]
             context_strategy = "relevance"
