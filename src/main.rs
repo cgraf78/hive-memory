@@ -62,7 +62,7 @@ enum Command {
     Remember(WriteMemoryArgs),
     /// Write a lower-confidence raw note.
     Note(WriteMemoryArgs),
-    /// Search remembered memory.
+    /// Search curated and remembered memory.
     Search(SearchArgs),
     /// Assemble agent-readable memory context.
     Context(ContextArgs),
@@ -533,6 +533,9 @@ struct SearchArgs {
     /// Maximum hits to show.
     #[arg(long, default_value_t = 20)]
     limit: usize,
+    /// Only search indexed records created within this age (for example 30m, 2h, 1d) or today.
+    #[arg(long)]
+    since: Option<String>,
     /// Include lower-confidence raw `hm note` entries.
     #[arg(long)]
     include_inbox: bool,
@@ -2366,6 +2369,7 @@ fn run_search(args: SearchArgs, context: CliContext) -> Result<()> {
     let store_config = &config.stores[resolved_store.name.as_str()];
     let manifest = read_store_manifest(&config, &resolved_store.name, store_config)?;
     let report = rebuild_store_index(&config, &resolved_store.name)?;
+    let since = args.since.as_deref().map(search_since_cutoff).transpose()?;
 
     let scopes = if args.scope.is_empty() {
         config.defaults.search_scopes.clone()
@@ -2373,7 +2377,7 @@ fn run_search(args: SearchArgs, context: CliContext) -> Result<()> {
         args.scope
     };
     let sources = if args.source.is_empty() {
-        config.defaults.context_sources.clone()
+        config.defaults.search_sources.clone()
     } else {
         args.source
     };
@@ -2382,9 +2386,22 @@ fn run_search(args: SearchArgs, context: CliContext) -> Result<()> {
             .iter()
             .any(|source| source == "inbox" || source == "all");
 
+    let filtered_entries;
+    let entries = if let Some(cutoff) = since {
+        filtered_entries = report
+            .entries
+            .iter()
+            .filter(|entry| entry_created_at_is_since(entry, cutoff))
+            .cloned()
+            .collect::<Vec<_>>();
+        filtered_entries.as_slice()
+    } else {
+        report.entries.as_slice()
+    };
+
     let search_input = search::SearchInput {
         store_root: &store_config.root,
-        entries: &report.entries,
+        entries,
         query: &args.query,
         scopes: &scopes,
         sources: &sources,
@@ -2410,6 +2427,19 @@ fn run_search(args: SearchArgs, context: CliContext) -> Result<()> {
     }
 
     println!("store: {}", resolved_store.name);
+    println!("scopes: {}", display_filter_values(&scopes));
+    println!("sources: {}", display_filter_values(&sources));
+    println!(
+        "inbox: {}",
+        if include_inbox {
+            "included"
+        } else {
+            "excluded (use --include-inbox or --source inbox)"
+        }
+    );
+    if let Some(since) = args.since.as_deref() {
+        println!("since: {since}");
+    }
     println!("hits: {}", hits.len());
     for hit in hits {
         println!("id: {}", hit.entry.id);
@@ -2658,6 +2688,35 @@ fn print_score_trace(trace: &search::SearchScoreTrace) {
         trace.entity,
         trace.total()
     );
+}
+
+fn display_filter_values(values: &[String]) -> String {
+    if values.is_empty() {
+        "(none)".to_owned()
+    } else {
+        values.join(",")
+    }
+}
+
+fn search_since_cutoff(value: &str) -> Result<OffsetDateTime> {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("today") {
+        return Ok(OffsetDateTime::now_utc().date().midnight().assume_utc());
+    }
+    if let Some(duration) = config::parse_duration_time(trimmed) {
+        return Ok(OffsetDateTime::now_utc() - duration);
+    }
+    OffsetDateTime::parse(trimmed, &time::format_description::well_known::Rfc3339).map_err(|err| {
+        anyhow::anyhow!("--since must be today, a duration like 30m/2h/1d, or RFC3339: {err}")
+    })
+}
+
+fn entry_created_at_is_since(entry: &index::IndexEntry, cutoff: OffsetDateTime) -> bool {
+    OffsetDateTime::parse(
+        &entry.created_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .is_ok_and(|created_at| created_at >= cutoff)
 }
 
 fn search_trust(entry: &index::IndexEntry) -> &'static str {

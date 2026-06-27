@@ -2794,6 +2794,128 @@ fn search_tantivy_backend_returns_results_end_to_end() {
 }
 
 #[test]
+fn search_tantivy_backend_keeps_curated_source_results() {
+    let dir = temp_dir("search-tantivy-curated");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+            state_dir = "{}"
+            cache_dir = "{}"
+
+            [defaults]
+            search_backend = "tantivy"
+            search_sources = ["curated"]
+
+            [stores.personal]
+            root = "{}"
+            "#,
+            dir.join("data").display(),
+            dir.join("state").display(),
+            dir.join("cache").display(),
+            personal.display(),
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+    fs::create_dir_all(personal.join("rules")).expect("rules dir");
+    fs::write(
+        personal.join("rules/backend.md"),
+        "Curated Tantivy recall keeps apogee backend guidance searchable.\n",
+    )
+    .expect("curated memory");
+
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "apogee backend",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("sources: curated"))
+        .stdout(predicate::str::contains("hits: 1"))
+        .stdout(predicate::str::contains("id: curated:rules/backend.md"))
+        .stdout(predicate::str::contains(
+            "snippet: Curated Tantivy recall keeps apogee backend guidance searchable.",
+        ));
+}
+
+#[test]
+fn search_tantivy_backend_interleaves_curated_with_remembered_results() {
+    let dir = temp_dir("search-tantivy-curated-mixed");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+            state_dir = "{}"
+            cache_dir = "{}"
+
+            [defaults]
+            search_backend = "tantivy"
+
+            [stores.personal]
+            root = "{}"
+            "#,
+            dir.join("data").display(),
+            dir.join("state").display(),
+            dir.join("cache").display(),
+            personal.display(),
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    for text in [
+        "Remembered apogee note one.",
+        "Remembered apogee note two.",
+        "Remembered apogee note three.",
+    ] {
+        cargo_bin_cmd!("hm")
+            .args([
+                "--config",
+                config.to_str().expect("utf8 config"),
+                "remember",
+                "--text",
+                text,
+            ])
+            .assert()
+            .success();
+    }
+    fs::create_dir_all(personal.join("rules")).expect("rules dir");
+    fs::write(
+        personal.join("rules/apogee.md"),
+        "Curated apogee guidance must remain visible under tight limits.\n",
+    )
+    .expect("curated memory");
+
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "apogee",
+            "--limit",
+            "3",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hits: 3"))
+        .stdout(predicate::str::contains("id: curated:rules/apogee.md"));
+}
+
+#[test]
 fn search_finds_curated_memory_from_default_sources() {
     let dir = temp_dir("search-curated-default");
     let config = dir.join("config.toml");
@@ -2822,6 +2944,58 @@ fn search_finds_curated_memory_from_default_sources() {
         .stdout(predicate::str::contains("id: curated:rules/preferences.md"))
         .stdout(predicate::str::contains(
             "snippet: Search should find curated TOML preferences.",
+        ));
+}
+
+#[test]
+fn search_sources_do_not_inherit_context_sources() {
+    let dir = temp_dir("search-sources-independent");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "{}"
+
+            [defaults]
+            context_sources = ["curated"]
+            "#,
+            personal.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Search source policy should still find remembered apogee facts.",
+        ])
+        .assert()
+        .success();
+
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "apogee",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("sources: curated,remembered"))
+        .stdout(predicate::str::contains("hits: 1"))
+        .stdout(predicate::str::contains(
+            "snippet: Search source policy should still find remembered apogee facts.",
         ));
 }
 
@@ -2870,6 +3044,86 @@ fn search_json_reports_stable_hit_fields() {
         ))
         .stdout(predicate::str::contains("\"score\": "))
         .stdout(predicate::str::contains("\"created_at\": \"\""));
+}
+
+#[test]
+fn search_since_filters_created_records() {
+    let dir = temp_dir("search-since");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Recent recall should find zirconium source policy.",
+        ])
+        .assert()
+        .success();
+
+    let mut today = cargo_bin_cmd!("hm");
+    today
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "zirconium",
+            "--since",
+            "today",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("since: today"))
+        .stdout(predicate::str::contains("hits: 1"))
+        .stdout(predicate::str::contains(
+            "snippet: Recent recall should find zirconium source policy.",
+        ));
+
+    let mut future = cargo_bin_cmd!("hm");
+    future
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "zirconium",
+            "--since",
+            "2999-01-01T00:00:00Z",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hits: 0"));
+}
+
+#[test]
+fn search_since_rejects_invalid_age() {
+    let dir = temp_dir("search-since-invalid");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "zirconium",
+            "--since",
+            "soon",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--since must be today, a duration like 30m/2h/1d, or RFC3339",
+        ));
 }
 
 #[test]
