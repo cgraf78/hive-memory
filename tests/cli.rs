@@ -2794,6 +2794,60 @@ fn search_tantivy_backend_returns_results_end_to_end() {
 }
 
 #[test]
+fn search_tantivy_backend_keeps_curated_source_results() {
+    let dir = temp_dir("search-tantivy-curated");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+            state_dir = "{}"
+            cache_dir = "{}"
+
+            [defaults]
+            search_backend = "tantivy"
+            search_sources = ["curated"]
+
+            [stores.personal]
+            root = "{}"
+            "#,
+            dir.join("data").display(),
+            dir.join("state").display(),
+            dir.join("cache").display(),
+            personal.display(),
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+    fs::create_dir_all(personal.join("rules")).expect("rules dir");
+    fs::write(
+        personal.join("rules/backend.md"),
+        "Curated Tantivy recall keeps apogee backend guidance searchable.\n",
+    )
+    .expect("curated memory");
+
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "apogee backend",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("sources: curated"))
+        .stdout(predicate::str::contains("hits: 1"))
+        .stdout(predicate::str::contains("id: curated:rules/backend.md"))
+        .stdout(predicate::str::contains(
+            "snippet: Curated Tantivy recall keeps apogee backend guidance searchable.",
+        ));
+}
+
+#[test]
 fn search_finds_curated_memory_from_default_sources() {
     let dir = temp_dir("search-curated-default");
     let config = dir.join("config.toml");

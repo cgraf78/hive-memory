@@ -194,30 +194,7 @@ pub fn search(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
     let query = SearchQuery::parse(input.query, &registry)?;
     let project_ids = project_filter_ids(input.store_root, input.project_id)?;
 
-    let mut hits = Vec::new();
-    if curated_source_allowed(input.sources) {
-        for curated in crate::curated::collect(input.store_root, input.project_id)? {
-            if !curated_scope_allowed(&curated, input.scopes) {
-                continue;
-            }
-            let text_score = score_text_trace(&curated.body, &query);
-            let trace = SearchScoreTrace {
-                body_phrase: text_score.phrase,
-                body_terms: text_score.terms,
-                ..SearchScoreTrace::default()
-            };
-            let score = trace.total();
-            if score == 0 {
-                continue;
-            }
-            hits.push(SearchHit {
-                entry: curated_entry(&curated, input.project_id, &registry),
-                score,
-                trace,
-                snippet: curated_snippet(&curated.body, &query),
-            });
-        }
-    }
+    let mut hits = curated_hits(&input, &query, &registry)?;
 
     for entry in input.entries {
         if !source_allowed(entry, input.sources, input.include_inbox) {
@@ -250,7 +227,56 @@ pub fn search(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
         });
     }
 
-    let temporal_intent = query.temporal_intent();
+    finish_hits(
+        &mut hits,
+        &query.phrase,
+        query.temporal_intent(),
+        input.limit,
+    );
+    Ok(hits)
+}
+
+fn curated_hits(
+    input: &SearchInput<'_>,
+    query: &SearchQuery,
+    registry: &entity::EntityRegistry,
+) -> Result<Vec<SearchHit>, SearchError> {
+    let mut hits = Vec::new();
+    if !curated_source_allowed(input.sources) {
+        return Ok(hits);
+    }
+
+    for curated in crate::curated::collect(input.store_root, input.project_id)? {
+        if !curated_scope_allowed(&curated, input.scopes) {
+            continue;
+        }
+        let text_score = score_text_trace(&curated.body, query);
+        let trace = SearchScoreTrace {
+            body_phrase: text_score.phrase,
+            body_terms: text_score.terms,
+            ..SearchScoreTrace::default()
+        };
+        let score = trace.total();
+        if score == 0 {
+            continue;
+        }
+        hits.push(SearchHit {
+            entry: curated_entry(&curated, input.project_id, registry),
+            score,
+            trace,
+            snippet: curated_snippet(&curated.body, query),
+        });
+    }
+
+    Ok(hits)
+}
+
+fn finish_hits(
+    hits: &mut Vec<SearchHit>,
+    phrase: &str,
+    temporal_intent: Option<TemporalIntent>,
+    limit: usize,
+) {
     hits.sort_by(|left, right| {
         right
             .score
@@ -267,11 +293,10 @@ pub fn search(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
             })
             .then_with(|| left.entry.note_path.cmp(&right.entry.note_path))
     });
-    let suppressed = suppress_superseded_hits(&hits, &query.phrase);
+    let suppressed = suppress_superseded_hits(hits, phrase);
     hits.retain(|hit| !suppressed.contains(&hit.entry.id));
-    collapse_duplicate_hits(&mut hits);
-    hits.truncate(input.limit);
-    Ok(hits)
+    collapse_duplicate_hits(hits);
+    hits.truncate(limit);
 }
 
 fn suppress_superseded_hits(hits: &[SearchHit], phrase: &str) -> BTreeSet<String> {
@@ -988,6 +1013,9 @@ pub fn search_indexed(
     input: SearchInput<'_>,
     index: &SearchIndex,
 ) -> Result<Vec<SearchHit>, SearchError> {
+    let registry = entity::EntityRegistry::load_for_store(input.store_root)
+        .map_err(|err| SearchError::EntityRegistry(err.to_string()))?;
+    let query = SearchQuery::parse(input.query, &registry)?;
     let project_ids = project_filter_ids(input.store_root, input.project_id)?;
     let by_id: HashMap<&str, &IndexEntry> = input
         .entries
@@ -1037,13 +1065,19 @@ pub fn search_indexed(
             snippet: retrieval_snippet(&body),
         });
     }
+    // The persistent BM25 cache indexes the JSONL note corpus. Curated Markdown
+    // is intentionally read directly elsewhere because it is tiny and can be
+    // scoped by the active project; merge those lexical hits here so selecting
+    // the Tantivy backend never silently drops configured curated sources.
+    hits.extend(curated_hits(&input, &query, &registry)?);
     // Apply the same supersession suppression as the lexical path so a record
-    // explicitly replaced by a newer one does not resurface. The query phrase is
-    // lowercased to match how the lexical path builds it.
-    let suppressed = suppress_superseded_hits(&hits, &input.query.to_ascii_lowercase());
-    hits.retain(|hit| !suppressed.contains(&hit.entry.id));
-    collapse_duplicate_hits(&mut hits);
-    hits.truncate(input.limit);
+    // explicitly replaced by a newer one does not resurface.
+    finish_hits(
+        &mut hits,
+        &query.phrase,
+        query.temporal_intent(),
+        input.limit,
+    );
     Ok(hits)
 }
 

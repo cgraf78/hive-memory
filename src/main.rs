@@ -62,7 +62,7 @@ enum Command {
     Remember(WriteMemoryArgs),
     /// Write a lower-confidence raw note.
     Note(WriteMemoryArgs),
-    /// Search remembered memory.
+    /// Search curated and remembered memory.
     Search(SearchArgs),
     /// Assemble agent-readable memory context.
     Context(ContextArgs),
