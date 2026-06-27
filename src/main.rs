@@ -5221,7 +5221,7 @@ fn hook_prompt_recall_action(
     }
 
     let max_tokens = usize::try_from(config.defaults.hook_context_max_tokens)?.clamp(200, 1_200);
-    let output = memory_context::assemble_context(memory_context::ContextInput {
+    let output = memory_context::assemble_selected_context(memory_context::ContextInput {
         store_name: store_name.as_str(),
         store_root: &store_config.root,
         entries: &selected_entries,

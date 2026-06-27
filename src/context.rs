@@ -216,6 +216,24 @@ impl From<crate::curated::CuratedError> for ContextError {
 /// wrapped as data and escaped so memory content cannot forge or terminate the
 /// boundary block that tells agents how to treat it.
 pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, ContextError> {
+    assemble_context_with_mode(input, true)
+}
+
+/// Assemble context from an already-selected candidate set.
+///
+/// Prompt-specific recall first searches across configured sources and then
+/// asks context rendering to inject only those selected hits. Reusing the normal
+/// renderer keeps trust labels, escaping, budgets, and search-only filtering in
+/// one place, while skipping broad curated collection prevents one curated hit
+/// from pulling every curated file in scope into a prompt-specific recall block.
+pub fn assemble_selected_context(input: ContextInput<'_>) -> Result<ContextOutput, ContextError> {
+    assemble_context_with_mode(input, false)
+}
+
+fn assemble_context_with_mode(
+    input: ContextInput<'_>,
+    collect_curated: bool,
+) -> Result<ContextOutput, ContextError> {
     let header = render_header(&input);
     let mut markdown = header;
     let mut sections = Vec::new();
@@ -225,7 +243,7 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
     let project_ids = project_filter_ids(input.store_root, input.project_id)?;
     let mut seen_bodies = BTreeSet::new();
 
-    if curated_source_allowed(input.sources) {
+    if collect_curated && curated_source_allowed(input.sources) {
         for curated in crate::curated::collect(input.store_root, input.project_id)? {
             if !curated_scope_allowed(&curated, input.scopes) {
                 continue;
@@ -382,7 +400,7 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
             push_decision(&mut decisions, &input, entry, "skipped", "duplicate");
             continue;
         }
-        let trust = trust_for(entry.entry_kind);
+        let trust = trust_for(entry);
         let body = escape_memory_body(&record_body);
         let block = render_memory_block(input.store_name, entry, trust, &record_body);
         let block_tokens = estimate_tokens(&block);
@@ -490,8 +508,8 @@ fn render_header(input: &ContextInput<'_>) -> String {
 fn sorted_candidates(entries: &[IndexEntry]) -> Vec<&IndexEntry> {
     let mut entries = entries.iter().collect::<Vec<_>>();
     entries.sort_by(|left, right| {
-        source_rank(left.entry_kind)
-            .cmp(&source_rank(right.entry_kind))
+        source_rank(left)
+            .cmp(&source_rank(right))
             .then_with(|| confidence_rank(right.confidence).cmp(&confidence_rank(left.confidence)))
             .then_with(|| timestamp_rank(&right.created_at).cmp(&timestamp_rank(&left.created_at)))
             .then_with(|| left.note_path.cmp(&right.note_path))
@@ -504,11 +522,30 @@ fn source_allowed(entry: &IndexEntry, sources: &[String], include_inbox: bool) -
         return true;
     }
 
-    match entry.entry_kind {
-        note::EntryKind::Remember => {
+    match entry_source(entry) {
+        EntrySource::Curated => sources.iter().any(|source| source == "curated"),
+        EntrySource::Remembered => {
             sources.is_empty() || sources.iter().any(|source| source == "remembered")
         }
-        note::EntryKind::Note => include_inbox || sources.iter().any(|source| source == "inbox"),
+        EntrySource::Inbox => include_inbox || sources.iter().any(|source| source == "inbox"),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntrySource {
+    Curated,
+    Remembered,
+    Inbox,
+}
+
+fn entry_source(entry: &IndexEntry) -> EntrySource {
+    if entry.id.starts_with("curated:") {
+        return EntrySource::Curated;
+    }
+
+    match entry.entry_kind {
+        note::EntryKind::Remember => EntrySource::Remembered,
+        note::EntryKind::Note => EntrySource::Inbox,
     }
 }
 
@@ -567,10 +604,11 @@ fn project_allowed(entry: &IndexEntry, project_ids: Option<&BTreeSet<String>>) -
         .is_some_and(|project_id| project_ids.contains(project_id))
 }
 
-fn trust_for(entry_kind: note::EntryKind) -> TrustLevel {
-    match entry_kind {
-        note::EntryKind::Remember => TrustLevel::Remembered,
-        note::EntryKind::Note => TrustLevel::Raw,
+fn trust_for(entry: &IndexEntry) -> TrustLevel {
+    match entry_source(entry) {
+        EntrySource::Curated => TrustLevel::Curated,
+        EntrySource::Remembered => TrustLevel::Remembered,
+        EntrySource::Inbox => TrustLevel::Raw,
     }
 }
 
@@ -652,10 +690,11 @@ fn escape_memory_body(body: &str) -> String {
         .join("\n")
 }
 
-fn source_rank(entry_kind: note::EntryKind) -> usize {
-    match entry_kind {
-        note::EntryKind::Remember => 0,
-        note::EntryKind::Note => 1,
+fn source_rank(entry: &IndexEntry) -> usize {
+    match entry_source(entry) {
+        EntrySource::Curated => 0,
+        EntrySource::Remembered => 1,
+        EntrySource::Inbox => 2,
     }
 }
 

@@ -5744,6 +5744,11 @@ fn hook_prompt_submit_uses_search_source_defaults_for_curated_recall() {
         "The apogee runbook lives in curated memory for prompt recall.\n",
     )
     .expect("curated memory");
+    fs::write(
+        personal.join("rules/unrelated.md"),
+        "The unrelated zephyr policy must not ride along with apogee recall.\n",
+    )
+    .expect("unrelated curated memory");
 
     // Prompt-submit reads a cached index so it can stay cheap on the hook path;
     // refresh establishes that cache while the search itself still discovers
@@ -5783,6 +5788,14 @@ fn hook_prompt_submit_uses_search_source_defaults_for_curated_recall() {
     );
     assert!(
         stdout.contains("The apogee runbook lives in curated memory"),
+        "prompt stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("trust=\\\"curated\\\""),
+        "prompt stdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("The unrelated zephyr policy"),
         "prompt stdout:\n{stdout}"
     );
 }

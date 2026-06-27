@@ -1309,12 +1309,12 @@ Behavior:
   `inject_context` action.
 - `prompt-submit`: resolves the current project/store selection, emits context
   when the selection changed, otherwise runs bounded prompt-specific lexical
-  recall against remembered memory. Prompt recall excludes raw inbox records,
-  suppresses memories already emitted to the session, and returns an
-  `inject_context` action only when it selects new useful context. It also runs
-  the durable-memory intent heuristic and records `memory-pending` when the
-  heuristic matches. It returns `inject_context` and/or `remind` actions as
-  needed.
+  recall against `[defaults].search_sources`. Prompt recall keeps raw inbox
+  records opt-in through that source policy, suppresses memories already emitted
+  to the session, and returns an `inject_context` action only when it selects new
+  useful context. It also runs the durable-memory intent heuristic and records
+  `memory-pending` when the heuristic matches. It returns `inject_context`
+  and/or `remind` actions as needed.
 - `tool-complete`: resolves the current project/store selection when the hook
   supplies a project/path hint, emits context only when that hinted selection
   changed, runs receipt-aware refresh after successful tool events, and clears
