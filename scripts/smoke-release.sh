@@ -43,6 +43,7 @@ trap cleanup EXIT
 
 tar -xzf "$archive" -C "$smoke"
 
+test -f "$smoke/man/man1/hm.1"
 "$smoke/hm" --version
 "$smoke/hm" stores init personal --root "$smoke_store"
 

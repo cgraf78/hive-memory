@@ -633,7 +633,8 @@ scripts/release.sh --push
 
 Linux archives use musl targets; published assets use installer-facing platform
 names (e.g. `hm-<version>-linux-x86_64-musl.tar.gz`,
-`hm-<version>-macos-aarch64.tar.gz`).
+`hm-<version>-macos-aarch64.tar.gz`). Release archives include the `hm`
+binary, project metadata, and the `man/man1/hm.1` manual page.
 
 ## License
 

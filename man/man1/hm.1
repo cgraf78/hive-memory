@@ -1,0 +1,151 @@
+.TH HM 1 "2026-06-30" "hive-memory" "User Commands"
+.SH NAME
+hm \- durable plain-text memory for AI agents
+.SH SYNOPSIS
+.B hm
+.RI [ global-options ]
+.I command
+.RI [ args ...]
+.SH DESCRIPTION
+.B hm
+is the Hive Memory command-line interface. It manages durable, shareable,
+plain-text memory for AI agents across sessions, agents, machines, and
+projects.
+.PP
+The canonical store is ordinary files on disk: Markdown notes with TOML front
+matter, JSON event sidecars, curated Markdown, and rebuildable indexes. Hive
+Memory uses store and project identities so synced folders can move across
+machines without losing scope.
+.SH GLOBAL OPTIONS
+.TP
+.BI --config " path"
+Use a specific config file instead of the default XDG config path.
+.TP
+.BI --store " name"
+Select a configured store.
+.TP
+.BI --as-agent " id"
+Attribute writes and hook events to a specific agent identity.
+.TP
+.BR -h ", " --help
+Show help.
+.TP
+.BR -V ", " --version
+Print version information.
+.SH COMMANDS
+.TP
+.B stores
+Initialize, list, show, diagnose, and migrate memory stores.
+.TP
+.B remember
+Write a durable fact, preference, project context note, or reminder.
+.TP
+.B note
+Write a lower-confidence raw note for later triage.
+.TP
+.B search
+Search curated and remembered memory, with optional inbox inclusion and
+explanations.
+.TP
+.B context
+Assemble agent-readable context within a token budget.
+.TP
+.B sync-status
+Report store and index freshness without mutating state.
+.TP
+.B retag
+Correct a record's persisted kind.
+.TP
+.B classify
+Run the LLM kind-classification pass for pending or selected records.
+.TP
+.B capture
+Extract durable fact candidates from a conversation and stage or promote them.
+.TP
+.B reconcile
+Reconcile a candidate fact into memory using add, update, delete, or noop
+decisions.
+.TP
+.B refresh
+Rebuild indexes and derived state.
+.TP
+.B flush
+Publish queued offline writes where the selected store supports it.
+.TP
+.B outbox
+Flush queued offline writes to reachable stores.
+.TP
+.B projects
+Resolve, bind, unbind, alias, list, and show project identities.
+.TP
+.B hook
+Handle agent lifecycle events such as session start, prompt submit, tool
+complete, and stop.
+.TP
+.B doctor
+Run top-level diagnostics. Use
+.B --quick
+for hook-friendly checks.
+.TP
+.B promote
+Promote a raw inbox note into curated memory.
+.TP
+.B inbox
+Inspect raw inbox notes.
+.TP
+.B eval
+Run retrieval corpus metrics and capture retrieval misses or bad hits as eval
+fixtures.
+.SH CONFIGURATION
+The default config path is
+.IR ~/.config/hive-memory/config.toml .
+A minimal config selects a default store and maps store names to roots:
+.PP
+.RS
+.nf
+default_store = "personal"
+
+[stores.personal]
+root = "${HOME}/hive-memory/personal"
+description = "Personal memory"
+.fi
+.RE
+.SH FILES
+.TP
+.I ~/.config/hive-memory/config.toml
+Default configuration file.
+.TP
+.I <store>/manifest.toml
+Store identity and metadata.
+.TP
+.I <store>/memories/
+Remembered and curated memory content.
+.TP
+.I <store>/inbox/
+Raw notes and staged capture candidates.
+.SH SECURITY
+Hive Memory refuses common secret-looking content on the write path and labels
+context blocks by source, scope, store, and trust. Context output is data for an
+agent to consider; it is not a higher-priority instruction channel.
+.SH EXIT STATUS
+.TP
+.B 0
+The command completed successfully.
+.TP
+.B 1
+Operational or user error.
+.TP
+.B 2
+Invalid CLI usage.
+.TP
+.B 3
+Configuration or schema validation failure.
+.TP
+.B 4
+Privacy or safety refusal.
+.TP
+.B 5
+Backend unavailable and no outbox fallback was available.
+.SH SEE ALSO
+.BR hm " " help ,
+.BR hm " " "<command> --help"

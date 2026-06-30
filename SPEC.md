@@ -1929,6 +1929,7 @@ Each archive contains:
 hm
 README.md
 LICENSE
+man/man1/hm.1
 completions/   # optional after CLI stabilizes
 ```
 
