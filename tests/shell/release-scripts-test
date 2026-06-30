@@ -41,6 +41,15 @@ _release_workflow=$(cat "$HIVE_MEMORY_DIR/.github/workflows/release.yml")
 _assert_contains "release workflow: uses exact reusable tag command" \
   'tag-command: scripts/release-tag.sh' "$_release_workflow"
 
+if [[ -f "$HIVE_MEMORY_DIR/man/man1/hm.1" ]]; then
+  _pass "manpage: hm.1 exists"
+else
+  _fail "manpage: hm.1 exists"
+fi
+_hm_manpage=$(cat "$HIVE_MEMORY_DIR/man/man1/hm.1")
+_assert_contains "manpage: documents hm command" "hm \\-" "$_hm_manpage"
+_assert_contains "manpage: documents hook command" ".B hook" "$_hm_manpage"
+
 rc=0
 (
   cd "$HIVE_MEMORY_DIR" || exit 1

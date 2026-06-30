@@ -52,6 +52,8 @@ HIVE_MEMORY_BUILD_COMMIT="$commit" HIVE_MEMORY_BUILD_VERSION="$tag" \
 install -m 0755 "target/${target}/release/hm" "$staging/hm"
 install -m 0644 README.md "$staging/README.md"
 install -m 0644 LICENSE "$staging/LICENSE"
+mkdir -p "$staging/man/man1"
+install -m 0644 man/man1/hm.1 "$staging/man/man1/hm.1"
 
 mkdir -p "$dist_dir"
 # Local package+smoke loops should test the archive that was actually produced,
