@@ -73,7 +73,7 @@ Rebuild indexes and derived state.
 Publish queued offline writes where the selected store supports it.
 .TP
 .B outbox
-Inspect or manage queued offline writes.
+Flush queued offline writes to reachable stores.
 .TP
 .B projects
 Resolve, bind, unbind, alias, list, and show project identities.
@@ -94,7 +94,8 @@ Promote a raw inbox note into curated memory.
 Inspect raw inbox notes.
 .TP
 .B eval
-Capture retrieval misses and bad hits as eval fixtures.
+Run retrieval corpus metrics and capture retrieval misses or bad hits as eval
+fixtures.
 .SH CONFIGURATION
 The default config path is
 .IR ~/.config/hive-memory/config.toml .
@@ -132,11 +133,19 @@ agent to consider; it is not a higher-priority instruction channel.
 The command completed successfully.
 .TP
 .B 1
-The command could not complete because of failed checks, missing data, or store
-state.
+Operational or user error.
 .TP
 .B 2
-Usage or configuration error.
+Invalid CLI usage.
+.TP
+.B 3
+Configuration or schema validation failure.
+.TP
+.B 4
+Privacy or safety refusal.
+.TP
+.B 5
+Backend unavailable and no outbox fallback was available.
 .SH SEE ALSO
 .BR hm " " help ,
 .BR hm " " "<command> --help"
