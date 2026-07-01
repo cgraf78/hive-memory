@@ -48,7 +48,7 @@ pub enum ProjectIdSource {
     Explicit,
     /// Environment supplied `HIVE_MEMORY_PROJECT_ID`.
     Env,
-    /// A `.hive-memory/project.toml` marker supplied the id.
+    /// A `.hive-memory-project` marker file supplied the id.
     Marker,
     /// Git remote identity was normalized into a project id.
     GitRemote,
