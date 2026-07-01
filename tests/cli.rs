@@ -57,17 +57,26 @@ fn write_data_config(
     data_dir: &std::path::Path,
     personal_root: &std::path::Path,
 ) {
+    // Isolate state_dir/cache_dir under the config's temp dir. Without them the
+    // config falls back to the live ${XDG_STATE_HOME}/${XDG_CACHE_HOME} paths,
+    // so doctor reads the real machine's classifier stamps and index cache and
+    // the tests become machine-dependent (they fail wherever live state exists).
+    let root = path.parent().expect("config parent");
     fs::write(
         path,
         format!(
             r#"
             default_store = "personal"
             data_dir = "{}"
+            state_dir = "{}"
+            cache_dir = "{}"
 
             [stores.personal]
             root = "{}"
             "#,
             data_dir.display(),
+            root.join("state").display(),
+            root.join("cache").display(),
             personal_root.display()
         ),
     )
@@ -671,6 +680,9 @@ fn doctor_warns_for_agent_all_store_access_with_sensitive_stores() {
         format!(
             r#"
             default_store = "personal"
+            data_dir = "{}"
+            state_dir = "{}"
+            cache_dir = "{}"
 
             [stores.personal]
             root = "{}"
@@ -684,6 +696,9 @@ fn doctor_warns_for_agent_all_store_access_with_sensitive_stores() {
             write_stores = ["personal"]
             allow_all_stores = true
             "#,
+            dir.join("data").display(),
+            dir.join("state").display(),
+            dir.join("cache").display(),
             personal.display(),
             work.display()
         ),
@@ -720,21 +735,7 @@ fn doctor_warns_for_unknown_project_binding_store() {
         "project_id = \"bound-project\"\nstore = \"missing\"\n",
     )
     .expect("binding");
-    fs::write(
-        &config,
-        format!(
-            r#"
-            default_store = "personal"
-            data_dir = "{}"
-
-            [stores.personal]
-            root = "{}"
-            "#,
-            data.display(),
-            personal.display()
-        ),
-    )
-    .expect("write config");
+    write_data_config(&config, &data, &personal);
     init_store(&personal, "personal");
 
     let mut doctor = cargo_bin_cmd!("hm");
@@ -1216,12 +1217,16 @@ fn doctor_uses_manifest_sensitivity_for_permission_warnings() {
             r#"
             default_store = "personal"
             data_dir = "{}"
+            state_dir = "{}"
+            cache_dir = "{}"
 
             [stores.personal]
             root = "{}"
             sensitivity = "public"
             "#,
             data.display(),
+            dir.join("state").display(),
+            dir.join("cache").display(),
             personal.display()
         ),
     )
