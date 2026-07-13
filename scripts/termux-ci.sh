@@ -1,11 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 set -euo pipefail
 
-# Run the suite natively under Android/Bionic and ensure the user-facing binary
-# starts successfully in Termux's application sandbox.
-pkg update -y
-pkg install -y git rust
-export CARGO_BUILD_JOBS=1
-export RUST_MIN_STACK=67108864
-cargo test --locked
-cargo run --locked --bin hm -- --help
+# The standard matrix owns the full test suite. Ensure the NDK-built Android
+# binary starts successfully inside the real Termux app sandbox.
+.termux-ci/hm --help

@@ -17,16 +17,23 @@ env:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@5bf6211ec3c3365f0310dd0aa22a6bd282554db5
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@a3ccc9312378c38a9d33074ea021f96ce93bfb84
     with:
       android-package-smoke-command: |
         scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
         scripts/smoke-release.sh "$ASSET_PLATFORM"
       doc-command: RUSTDOCFLAGS='-D missing-docs' cargo doc --no-deps
       termux-command: scripts/termux-ci.sh
+      termux-host-command: |
+        target_dir="$RUNNER_TEMP/hive-memory-termux-target"
+        cargo build --release --locked --target "$RUST_TARGET" --target-dir "$target_dir"
+        mkdir -p .termux-ci
+        install -m 0755 \
+          "$target_dir/$RUST_TARGET/release/hm" \
+          .termux-ci/hm
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@5bf6211ec3c3365f0310dd0aa22a6bd282554db5
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@a3ccc9312378c38a9d33074ea021f96ce93bfb84
     with:
       profiles: base,shellcheck
       # Shell-owned release behavior lives under tests/shell. Cargo integration
