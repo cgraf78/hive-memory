@@ -17,12 +17,15 @@ env:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@main # zizmor: ignore[unpinned-uses]
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@5562ff583af6696a44c18b53f092ba8dda5923e7
     with:
+      android-package-smoke-command: |
+        scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
+        scripts/smoke-release.sh "$ASSET_PLATFORM"
       doc-command: RUSTDOCFLAGS='-D missing-docs' cargo doc --no-deps
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@main # zizmor: ignore[unpinned-uses]
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@5562ff583af6696a44c18b53f092ba8dda5923e7
     with:
       profiles: base,shellcheck
       # Shell-owned release behavior lives under tests/shell. Cargo integration

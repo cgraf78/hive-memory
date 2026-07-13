@@ -1892,14 +1892,17 @@ Recommended jobs:
   (see issue list) to validate atomic-rename safety, conflict detection, and
   eventual-delivery behavior.
 - `release-build`: build target archives for release tags.
-- `smoke-install`: download release archive and run `hm --version`, `hm doctor`
-  against a temp config.
+- `smoke-install`: on native CI targets, download the release archive and run
+  `hm --version` plus `hm doctor` against a temp config. On Android, hosted
+  Linux CI verifies the AArch64 ELF and Bionic interpreter; a real Termux launch
+  remains a post-release smoke check.
 
 Initial release target matrix:
 
 ```text
 x86_64-unknown-linux-musl
 aarch64-unknown-linux-musl
+aarch64-linux-android
 x86_64-apple-darwin
 aarch64-apple-darwin
 ```
@@ -1910,6 +1913,7 @@ Installer target mapping:
 | --- | --- |
 | Linux x86_64, including WSL | `linux-x86_64-musl` |
 | Linux aarch64 | `linux-aarch64-musl` |
+| Android aarch64, including Termux | `android-aarch64` |
 | macOS Intel | `macos-x86_64` |
 | macOS Apple Silicon | `macos-aarch64` |
 
@@ -1918,6 +1922,7 @@ Artifact layout:
 ```text
 hm-YYYYMMDD-HHMMSS-<8hex>-linux-x86_64-musl.tar.gz
 hm-YYYYMMDD-HHMMSS-<8hex>-linux-aarch64-musl.tar.gz
+hm-YYYYMMDD-HHMMSS-<8hex>-android-aarch64.tar.gz
 hm-YYYYMMDD-HHMMSS-<8hex>-macos-x86_64.tar.gz
 hm-YYYYMMDD-HHMMSS-<8hex>-macos-aarch64.tar.gz
 hm-YYYYMMDD-HHMMSS-<8hex>-<platform>.tar.gz.sha256

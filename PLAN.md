@@ -119,6 +119,7 @@ Release artifacts use the same generated release identity format as `shdeps`:
 ```text
 hm-YYYYMMDD-HHMMSS-<8hex>-linux-x86_64-musl.tar.gz
 hm-YYYYMMDD-HHMMSS-<8hex>-linux-aarch64-musl.tar.gz
+hm-YYYYMMDD-HHMMSS-<8hex>-android-aarch64.tar.gz
 hm-YYYYMMDD-HHMMSS-<8hex>-macos-x86_64.tar.gz
 hm-YYYYMMDD-HHMMSS-<8hex>-macos-aarch64.tar.gz
 ```
@@ -127,6 +128,7 @@ WSL should use the Linux binaries. Linux release artifacts use musl targets to
 avoid requiring the install host to provide the same or newer glibc as the build
 runner. Archive names use installer-facing platform labels instead of raw Rust
 target triples.
+Termux and other aarch64 Android environments use the Android/Bionic artifact.
 
 ## Implementation Language
 
