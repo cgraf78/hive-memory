@@ -504,7 +504,7 @@ mod tests {
 
     #[test]
     fn invoke_runs_fake_backend() {
-        let backend = Backend::command(vec![fixture_path("fake-llm")]);
+        let backend = Backend::command(vec!["bash".to_owned(), fixture_path("fake-llm")]);
         let verdict =
             invoke(&backend, "judge this", Duration::from_secs(10)).expect("invocation succeeds");
 
@@ -513,7 +513,7 @@ mod tests {
 
     #[test]
     fn invoke_times_out_on_hanging_backend() {
-        let backend = Backend::command(vec![fixture_path("fake-llm")]);
+        let backend = Backend::command(vec!["bash".to_owned(), fixture_path("fake-llm")]);
         let result = invoke_with_env(
             &backend,
             "judge this",
@@ -526,7 +526,7 @@ mod tests {
 
     #[test]
     fn invoke_surfaces_nonzero_exit_and_garbage() {
-        let backend = Backend::command(vec![fixture_path("fake-llm")]);
+        let backend = Backend::command(vec!["bash".to_owned(), fixture_path("fake-llm")]);
 
         // Backend errors must carry the stderr excerpt: quota and auth
         // failures from agent CLIs are only diagnosable from that text.

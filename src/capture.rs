@@ -174,7 +174,10 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&fixture, perms).expect("chmod");
 
-        let backend = Backend::command(vec![fixture.to_string_lossy().into_owned()]);
+        let backend = Backend::command(vec![
+            "bash".to_owned(),
+            fixture.to_string_lossy().into_owned(),
+        ]);
         let facts = extract(&backend, "user: I like fd", Duration::from_secs(30))
             .expect("extract succeeds");
         assert_eq!(facts, vec!["prefers fd over find".to_owned()]);
