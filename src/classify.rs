@@ -748,7 +748,7 @@ mod tests {
                 [classifier]
                 mode = "on"
                 backend = "command"
-                command = ["{fixture}"]
+                command = ["bash", "{fixture}"]
                 timeout_seconds = 5
                 "#,
                 state = dir.join("state").display(),

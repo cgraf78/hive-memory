@@ -216,7 +216,10 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&fixture, perms).expect("chmod");
 
-        let backend = Backend::command(vec![fixture.to_string_lossy().into_owned()]);
+        let backend = Backend::command(vec![
+            "bash".to_owned(),
+            fixture.to_string_lossy().into_owned(),
+        ]);
         let op = reconcile(
             &backend,
             "user now strongly prefers fd",

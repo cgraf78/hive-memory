@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   release:
-    uses: cgraf78/actions/.github/workflows/rust-release.yml@5562ff583af6696a44c18b53f092ba8dda5923e7
+    uses: cgraf78/actions/.github/workflows/rust-release.yml@a3ccc9312378c38a9d33074ea021f96ce93bfb84
     permissions:
       contents: write
     with:
