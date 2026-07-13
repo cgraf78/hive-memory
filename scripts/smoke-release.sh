@@ -44,6 +44,16 @@ trap cleanup EXIT
 tar -xzf "$archive" -C "$smoke"
 
 test -f "$smoke/man/man1/hm.1"
+test -x "$smoke/hm"
+
+if [[ "$asset_platform" == "android-aarch64" ]]; then
+  # The Android artifact is cross-built on an x86_64 runner. Validate its
+  # architecture and Bionic loader without trying to execute it on glibc.
+  readelf -h "$smoke/hm" | grep -Eq 'Machine:[[:space:]]+AArch64'
+  readelf -l "$smoke/hm" | grep -Fq '/system/bin/linker64'
+  exit 0
+fi
+
 "$smoke/hm" --version
 "$smoke/hm" stores init personal --root "$smoke_store"
 

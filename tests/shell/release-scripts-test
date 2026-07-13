@@ -72,6 +72,44 @@ rc=0
 ) || rc=$?
 _assert_exit "smoke release: rejects Rust target label" 2 "$rc"
 
+_android_smoke=$(_tmpdir)
+mkdir -p "$_android_smoke/scripts" "$_android_smoke/dist" \
+  "$_android_smoke/stage/man/man1"
+cp "$HIVE_MEMORY_DIR/scripts/smoke-release.sh" "$_android_smoke/scripts/smoke-release.sh"
+cat >"$_android_smoke/scripts/release-tag.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'unused\n'
+SH
+chmod +x "$_android_smoke/scripts/release-tag.sh"
+printf '#!/system/bin/sh\n' >"$_android_smoke/stage/hm"
+chmod +x "$_android_smoke/stage/hm"
+printf '.TH HM 1\n' >"$_android_smoke/stage/man/man1/hm.1"
+_android_tag=20990207-080910-abcdef12
+printf '%s\n' "$_android_tag" >"$_android_smoke/dist/.hive-memory-release-version"
+tar -C "$_android_smoke/stage" -czf \
+  "$_android_smoke/dist/hm-${_android_tag}-android-aarch64.tar.gz" .
+_android_bin=$(_mock_bin)
+cat >"$_android_bin/readelf" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >>"$ANDROID_READELF_LOG"
+case "$1" in
+  -h) printf '  Machine:                           AArch64\n' ;;
+  -l) printf '      [Requesting program interpreter: /system/bin/linker64]\n' ;;
+  *) exit 2 ;;
+esac
+SH
+chmod +x "$_android_bin/readelf"
+rc=0
+(
+  cd "$_android_smoke" || exit 1
+  ANDROID_READELF_LOG="$_android_smoke/readelf.log" \
+    PATH="$_android_bin:$PATH" scripts/smoke-release.sh android-aarch64
+) || rc=$?
+_assert_exit "smoke release: validates cross-built Android archive" 0 "$rc"
+_android_readelf=$(cat "$_android_smoke/readelf.log")
+_assert_contains "smoke release: checks Android ELF architecture" "-h" "$_android_readelf"
+_assert_contains "smoke release: checks Android Bionic loader" "-l" "$_android_readelf"
+
 _release_script_origin=$(_tmpdir)/release-origin.git
 _release_script_repo=$(_tmpdir)/release-repo
 git init --bare "$_release_script_origin" >/dev/null 2>&1

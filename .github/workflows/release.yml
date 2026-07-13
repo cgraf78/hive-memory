@@ -12,10 +12,11 @@ permissions:
 
 jobs:
   release:
-    uses: cgraf78/actions/.github/workflows/rust-release.yml@main # zizmor: ignore[unpinned-uses]
+    uses: cgraf78/actions/.github/workflows/rust-release.yml@5562ff583af6696a44c18b53f092ba8dda5923e7
     permissions:
       contents: write
     with:
+      android-aarch64: true
       # Hive Memory's public version is generated from the UTC committer
       # timestamp plus the commit suffix, not from Cargo.toml semver. Ask the
       # shared workflow to validate the exact release tag instead of forcing
