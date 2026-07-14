@@ -10,7 +10,7 @@ use hive_memory::config::{Config, ConfigPaths, EventSidecarPolicy, Sensitivity, 
 use hive_memory::{
     capture, classify, config, context as memory_context, curation, doctor, eval as memory_eval,
     event, hook as memory_hook, id, index, inject, llm, memory, note, outbox, path as memory_path,
-    project, reconcile, retrieval, search, secret, store, write, write_classify,
+    project, reconcile, retrieval, search, secret, store, visibility, write, write_classify,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -68,7 +68,7 @@ enum Command {
     Context(ContextArgs),
     /// Report store/index freshness without mutating memory.
     SyncStatus(SyncStatusArgs),
-    /// Correct the persisted memory kind on an existing record.
+    /// Correct persisted kind, scope, or project metadata on a record.
     Retag(RetagArgs),
     /// Run the background LLM classification pass now.
     Classify(ClassifyArgs),
@@ -551,6 +551,9 @@ struct SearchArgs {
     /// Active project path or file hint.
     #[arg(long)]
     project: Option<String>,
+    /// Restrict results to memory owned by the active project.
+    #[arg(long)]
+    project_only: bool,
     /// Include structured scoring diagnostics.
     #[arg(long)]
     explain: bool,
@@ -610,7 +613,16 @@ struct RetagArgs {
     /// New kind: preference, project-fact, incident, reference, or `none` to
     /// clear the tag and fall back to read-time classification.
     #[arg(long)]
-    kind: String,
+    kind: Option<String>,
+    /// New memory scope.
+    #[arg(long)]
+    scope: Option<String>,
+    /// New explicit project id.
+    #[arg(long, conflicts_with = "project")]
+    project_id: Option<String>,
+    /// Project path or file hint used to resolve the new project id.
+    #[arg(long, conflicts_with = "project_id")]
+    project: Option<PathBuf>,
     /// Emit machine-readable output.
     #[arg(long)]
     json: bool,
@@ -1780,34 +1792,44 @@ struct WriteScopeDecision {
     reason: Option<&'static str>,
 }
 
-fn resolve_write_scope(
+struct ResolveWriteScopeInput<'a> {
     entry_kind: note::EntryKind,
-    explicit: Option<&str>,
+    explicit: Option<&'a str>,
     no_infer: bool,
-    default_scope: &str,
-    project_id: Option<&str>,
+    default_scope: &'a str,
+    project_id: Option<&'a str>,
+    explicit_project: bool,
     explicit_kind: Option<note::MemoryKind>,
-    body: &str,
-) -> WriteScopeDecision {
-    if let Some(scope) = explicit {
+    body: &'a str,
+}
+
+fn resolve_write_scope(input: ResolveWriteScopeInput<'_>) -> WriteScopeDecision {
+    if let Some(scope) = input.explicit {
         return WriteScopeDecision {
             scope: scope.to_owned(),
             inferred: false,
             reason: None,
         };
     }
-    if no_infer || entry_kind != note::EntryKind::Remember {
+    if input.no_infer || input.entry_kind != note::EntryKind::Remember {
         return WriteScopeDecision {
-            scope: default_scope.to_owned(),
+            scope: input.default_scope.to_owned(),
             inferred: false,
             reason: None,
         };
     }
+    if input.explicit_project && input.project_id.is_some() {
+        return WriteScopeDecision {
+            scope: "project".to_owned(),
+            inferred: true,
+            reason: Some("explicit-project"),
+        };
+    }
 
     match write_classify::infer_scope(write_classify::InferScopeInput {
-        project_id,
-        explicit_kind,
-        body,
+        project_id: input.project_id,
+        explicit_kind: input.explicit_kind,
+        body: input.body,
     }) {
         Some(inference) => WriteScopeDecision {
             scope: inference.scope.to_owned(),
@@ -1815,7 +1837,7 @@ fn resolve_write_scope(
             reason: Some(inference.reason),
         },
         None => WriteScopeDecision {
-            scope: default_scope.to_owned(),
+            scope: input.default_scope.to_owned(),
             inferred: false,
             reason: None,
         },
@@ -1981,19 +2003,28 @@ fn run_write_memory(
         .project
         .as_ref()
         .map(|path| path.to_string_lossy().to_string());
+    // Command-line project selection is intentional write metadata. Ambient
+    // launcher context is only a hint: long-lived sessions commonly move among
+    // repositories and should not trap global preferences in one project.
+    let explicit_project = args.project.is_some()
+        || args
+            .project_id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
     // Store affinity can come from a local project binding, so resolve project
     // identity before choosing the write store. This keeps work/personal routing
     // centralized in `hm` instead of requiring hook scripts or agents to infer it.
     let project_id = resolve_project_id(args.project_id.clone(), project_hint.as_deref())?;
-    let scope_decision = resolve_write_scope(
+    let scope_decision = resolve_write_scope(ResolveWriteScopeInput {
         entry_kind,
-        args.scope.as_deref(),
-        args.no_infer_scope,
-        &config.defaults.write_scope,
-        project_id.as_deref(),
-        args.kind,
-        &args.text,
-    );
+        explicit: args.scope.as_deref(),
+        no_infer: args.no_infer_scope,
+        default_scope: &config.defaults.write_scope,
+        project_id: project_id.as_deref(),
+        explicit_project,
+        explicit_kind: args.kind,
+        body: &args.text,
+    });
     let scope = scope_decision.scope;
     let kind_decision = resolve_write_kind(
         entry_kind,
@@ -2359,6 +2390,9 @@ fn run_search(args: SearchArgs, context: CliContext) -> Result<()> {
     let config = load_config(context.config_path.as_deref())?;
     let agent_id = resolve_agent_id(context.as_agent);
     let project_id = resolve_project_id(args.project_id, args.project.as_deref())?;
+    if args.project_only && project_id.is_none() {
+        anyhow::bail!("--project-only requires --project or --project-id");
+    }
     let resolved_store = resolve_store(
         &config,
         context.store.as_deref(),
@@ -2412,6 +2446,7 @@ fn run_search(args: SearchArgs, context: CliContext) -> Result<()> {
         &resolved_store.name,
         &store_config.root,
         search_input,
+        args.project_only,
     )?;
 
     if args.json {
@@ -2458,6 +2493,7 @@ fn run_search_backend(
     store_name: &str,
     store_root: &Path,
     input: search::SearchInput<'_>,
+    project_only: bool,
 ) -> Result<Vec<search::SearchHit>> {
     if config
         .defaults
@@ -2465,7 +2501,7 @@ fn run_search_backend(
         .trim()
         .eq_ignore_ascii_case("tantivy")
     {
-        match tantivy_search(config, store_name, store_root, input.clone()) {
+        match tantivy_search(config, store_name, store_root, input.clone(), project_only) {
             Ok(hits) => return Ok(hits),
             Err(err) => {
                 eprintln!(
@@ -2474,7 +2510,11 @@ fn run_search_backend(
             }
         }
     }
-    Ok(search::search(input)?)
+    if project_only {
+        Ok(search::search_project_only(input)?)
+    } else {
+        Ok(search::search(input)?)
+    }
 }
 
 /// Open (or create) the store's persistent Tantivy index, refresh it from the
@@ -2493,6 +2533,7 @@ fn tantivy_search(
     store_name: &str,
     store_root: &Path,
     input: search::SearchInput<'_>,
+    project_only: bool,
 ) -> std::result::Result<Vec<search::SearchHit>, search::SearchError> {
     let dir = config.cache_dir.join("search").join(store_name);
     let index = retrieval::SearchIndex::open_or_create_in_dir(&dir)
@@ -2530,7 +2571,11 @@ fn tantivy_search(
             _ => {}
         }
     }
-    search::search_indexed(input, &index)
+    if project_only {
+        search::search_indexed_project_only(input, &index)
+    } else {
+        search::search_indexed(input, &index)
+    }
 }
 
 /// Hook-safe BM25 search: query the persistent index ONLY when it is already
@@ -2607,6 +2652,7 @@ struct SearchJsonHit {
     store: String,
     store_id: String,
     scope: String,
+    project_id: Option<String>,
     trust: &'static str,
     audience: Vec<String>,
     path: String,
@@ -2620,6 +2666,7 @@ struct SearchJsonHit {
 
 #[derive(Debug, Serialize)]
 struct SearchJsonScoreTrace {
+    retrieval: usize,
     body_phrase: usize,
     body_terms: usize,
     metadata_phrase: usize,
@@ -2627,6 +2674,7 @@ struct SearchJsonScoreTrace {
     combined_phrase: usize,
     combined_terms: usize,
     entity: usize,
+    project: usize,
     total: usize,
 }
 
@@ -2646,6 +2694,7 @@ fn search_json_hit(
             entry.store_id.clone()
         },
         scope: entry.scope.clone(),
+        project_id: entry.project_id.clone(),
         trust: search_trust(entry),
         audience: entry.audience.clone(),
         path: entry.note_path.clone(),
@@ -2662,6 +2711,7 @@ fn search_json_hit(
 
 fn search_json_score_trace(trace: &search::SearchScoreTrace) -> SearchJsonScoreTrace {
     SearchJsonScoreTrace {
+        retrieval: trace.retrieval,
         body_phrase: trace.body_phrase,
         body_terms: trace.body_terms,
         metadata_phrase: trace.metadata_phrase,
@@ -2669,13 +2719,15 @@ fn search_json_score_trace(trace: &search::SearchScoreTrace) -> SearchJsonScoreT
         combined_phrase: trace.combined_phrase,
         combined_terms: trace.combined_terms,
         entity: trace.entity,
+        project: trace.project,
         total: trace.total(),
     }
 }
 
 fn print_score_trace(trace: &search::SearchScoreTrace) {
     println!(
-        "score_trace: body_phrase={} body_terms={} metadata_phrase={} metadata_terms={} combined_phrase={} combined_terms={} entity={} total={}",
+        "score_trace: retrieval={} body_phrase={} body_terms={} metadata_phrase={} metadata_terms={} combined_phrase={} combined_terms={} entity={} project={} total={}",
+        trace.retrieval,
         trace.body_phrase,
         trace.body_terms,
         trace.metadata_phrase,
@@ -2683,6 +2735,7 @@ fn print_score_trace(trace: &search::SearchScoreTrace) {
         trace.combined_phrase,
         trace.combined_terms,
         trace.entity,
+        trace.project,
         trace.total()
     );
 }
@@ -3054,6 +3107,8 @@ struct ContextSectionJson {
     store: String,
     /// Memory scope used for filtering.
     scope: String,
+    /// Owning project identity for project-scoped memory.
+    project_id: Option<String>,
     /// Trust label: curated, remembered, or raw.
     trust: &'static str,
     /// Explicit agent audience for agent-private memory.
@@ -3118,6 +3173,8 @@ struct ContextCacheSection {
     id: String,
     store: String,
     scope: String,
+    #[serde(default)]
+    project_id: Option<String>,
     trust: String,
     audience: Vec<String>,
     source_path: String,
@@ -3165,6 +3222,7 @@ fn write_context_cache(config: &Config, assembly: &CliContextAssembly) -> Result
                 id: section.id.clone(),
                 store: section.store.clone(),
                 scope: section.scope.clone(),
+                project_id: section.project_id.clone(),
                 trust: section.trust.as_str().to_owned(),
                 audience: section.audience.clone(),
                 source_path: section.source_path.clone(),
@@ -3238,6 +3296,7 @@ fn load_context_cache(
             id: section.id,
             store: section.store,
             scope: section.scope,
+            project_id: section.project_id,
             trust: cached_trust(&section.trust),
             audience: section.audience,
             source_path: section.source_path,
@@ -3355,6 +3414,7 @@ fn context_json(
                 id: section.id,
                 store: section.store,
                 scope: section.scope,
+                project_id: section.project_id,
                 trust: section.trust.as_str(),
                 audience: section.audience,
                 source_path: section.source_path,
@@ -3492,6 +3552,14 @@ struct RetagJsonOutput {
     previous_kind: Option<&'static str>,
     /// Kind persisted by the rewrite; absent when cleared.
     kind: Option<&'static str>,
+    /// Scope carried before the rewrite.
+    previous_scope: String,
+    /// Scope persisted by the rewrite.
+    scope: String,
+    /// Project identity carried before the rewrite.
+    previous_project_id: Option<String>,
+    /// Project identity persisted by the rewrite.
+    project_id: Option<String>,
     /// Store-relative note path that was rewritten.
     note_path: String,
     /// Whether a paired event sidecar was rewritten too.
@@ -3528,7 +3596,7 @@ struct ClassifyPendingRecord {
     project_id: Option<String>,
 }
 
-/// Correct the persisted kind on one existing record.
+/// Correct persisted classification or project metadata on one record.
 ///
 /// This is the recovery path for wrong write-time inference: kind is a
 /// persisted search-only/always-on verdict, and without a retag command the
@@ -3536,6 +3604,13 @@ struct ClassifyPendingRecord {
 /// the same note+event pair as ordinary writes so the index (which prefers
 /// event metadata) converges on the corrected value at the next rebuild.
 fn run_retag(args: RetagArgs, context: CliContext) -> Result<()> {
+    if args.kind.is_none()
+        && args.scope.is_none()
+        && args.project_id.is_none()
+        && args.project.is_none()
+    {
+        anyhow::bail!("retag requires at least one of --kind, --scope, --project-id, or --project");
+    }
     let config = load_config(context.config_path.as_deref())?;
     let agent_id = resolve_agent_id(context.as_agent.clone());
     let resolved_store = resolve_store(
@@ -3543,15 +3618,35 @@ fn run_retag(args: RetagArgs, context: CliContext) -> Result<()> {
         context.store.as_deref(),
         None,
         agent_id.as_deref(),
+        StoreAccess::Read,
+    )?;
+    // Mutating an existing record requires both capabilities: the command
+    // reads current metadata and must not turn a write-only store grant into a
+    // way to inspect or alter records the caller cannot otherwise read.
+    resolve_store(
+        &config,
+        Some(&resolved_store.name),
+        None,
+        agent_id.as_deref(),
         StoreAccess::Write,
     )?;
     let store_config = &config.stores[resolved_store.name.as_str()];
-    let kind = match args.kind.as_str() {
-        "none" => None,
-        other => Some(
+    let update_kind = args.kind.is_some();
+    let kind = match args.kind.as_deref() {
+        None | Some("none") => None,
+        Some(other) => Some(
             parse_memory_kind(other)
                 .map_err(|message| anyhow::anyhow!("invalid --kind: {message}, or none"))?,
         ),
+    };
+    let project_hint = args
+        .project
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string());
+    let project_update = if args.project_id.is_some() || args.project.is_some() {
+        resolve_project_id(args.project_id, project_hint.as_deref())?
+    } else {
+        None
     };
 
     let report = rebuild_store_index(&config, &resolved_store.name)?;
@@ -3566,28 +3661,52 @@ fn run_retag(args: RetagArgs, context: CliContext) -> Result<()> {
                 resolved_store.name
             )
         })?;
-    // Same invariant as write time: kind and scope must not disagree, or a
-    // project fact would classify as project-scoped without a project filter.
-    validate_memory_kind_context(kind, &entry.scope, entry.project_id.as_deref())?;
+    if !visibility::audience_allows(entry, agent_id.as_deref()) {
+        anyhow::bail!(
+            "memory record {} is not visible to the active agent",
+            args.id
+        );
+    }
+    if args.scope.as_deref().is_some_and(|scope| {
+        scope != entry.scope && (scope == "agent-private" || entry.scope == "agent-private")
+    }) {
+        anyhow::bail!(
+            "retag cannot change agent-private visibility; rewrite the record with an explicit audience"
+        );
+    }
+    if args.scope.as_deref() == Some("project")
+        && project_update
+            .as_ref()
+            .or(entry.project_id.as_ref())
+            .is_none()
+    {
+        anyhow::bail!(
+            "--scope project requires --project, --project-id, or existing project metadata"
+        );
+    }
 
     let options = write::AtomicWriteOptions {
         fsync: config.storage.fsync.into(),
         ..write::AtomicWriteOptions::default()
     };
-    let classified = match kind {
-        Some(_) => memory::ClassifiedUpdate::Set(note::ClassifiedBy {
+    let classified = match (update_kind, kind) {
+        (false, _) => memory::ClassifiedUpdate::Keep,
+        (true, Some(_)) => memory::ClassifiedUpdate::Set(note::ClassifiedBy {
             source: note::ClassifierSource::Manual,
             backend: None,
             at: now_rfc3339(),
             verdict_version: 0,
             confidence: None,
         }),
-        None => memory::ClassifiedUpdate::Clear,
+        (true, None) => memory::ClassifiedUpdate::Clear,
     };
     let result = memory::retag_record(memory::RetagRecordInput {
         root: &store_config.root,
         note_path: &entry.note_path,
+        update_kind,
         kind,
+        scope: args.scope,
+        project_id: project_update,
         classified,
         options,
     })?;
@@ -3598,6 +3717,10 @@ fn run_retag(args: RetagArgs, context: CliContext) -> Result<()> {
             store: resolved_store.name.clone(),
             previous_kind: result.previous_kind.map(memory_kind_label),
             kind: result.kind.map(memory_kind_label),
+            previous_scope: result.previous_scope,
+            scope: result.scope,
+            previous_project_id: result.previous_project_id,
+            project_id: result.project_id,
             note_path: entry.note_path.clone(),
             event_updated: result.event_path.is_some(),
         };
@@ -3609,6 +3732,12 @@ fn run_retag(args: RetagArgs, context: CliContext) -> Result<()> {
             "kind: {} -> {}",
             result.previous_kind.map_or("none", memory_kind_label),
             result.kind.map_or("none", memory_kind_label)
+        );
+        println!("scope: {} -> {}", result.previous_scope, result.scope);
+        println!(
+            "project_id: {} -> {}",
+            result.previous_project_id.as_deref().unwrap_or("none"),
+            result.project_id.as_deref().unwrap_or("none")
         );
         if result.event_path.is_some() {
             println!("event: updated");
@@ -3853,9 +3982,19 @@ struct PromoteCtx<'a> {
 /// Decide the mem0-style operation for one candidate against the store's nearest
 /// durable memories.
 fn decide_candidate(ctx: &PromoteCtx<'_>, candidate: &str) -> Result<reconcile::Operation> {
+    // Reconciliation can supersede records, so it is not a read-only recall
+    // surface. Capture/reconcile currently write without project ownership;
+    // keep project records out of mutation candidates until those commands gain
+    // an explicit project-selection contract.
+    let entries = ctx
+        .entries
+        .iter()
+        .filter(|entry| entry.scope != "project")
+        .cloned()
+        .collect::<Vec<_>>();
     let hits = search::search(search::SearchInput {
         store_root: ctx.store_root,
-        entries: ctx.entries,
+        entries: &entries,
         query: candidate,
         scopes: &ctx.config.defaults.search_scopes,
         sources: &["remembered".to_owned()],
@@ -5470,6 +5609,7 @@ fn is_prompt_stopword(token: &str) -> bool {
             | "from"
             | "into"
             | "please"
+            | "recall"
             | "remember"
             | "should"
             | "that"
@@ -5584,7 +5724,21 @@ fn hook_context_key_for_project(
 
 #[cfg(test)]
 mod tests {
-    use super::{context_selection_key, normalize_supersedes, validate_validity_window};
+    use super::{
+        context_selection_key, normalize_supersedes, prompt_recall_query, validate_validity_window,
+    };
+
+    #[test]
+    fn prompt_recall_query_ignores_recall_intent_words() {
+        assert_eq!(
+            prompt_recall_query(
+                "Recall the Grafhome Cedar and Rego policy format comparison.",
+                None
+            )
+            .as_deref(),
+            Some("grafhome cedar")
+        );
+    }
 
     #[test]
     fn context_key_tracks_inbox_and_search_only_policy() {

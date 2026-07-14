@@ -1424,7 +1424,6 @@ fn doctor_full_warns_for_prompt_risk_without_echoing_body() {
         ])
         .assert()
         .success();
-
     let mut doctor = cargo_bin_cmd!("hm");
     doctor
         .args([
@@ -2738,6 +2737,89 @@ fn search_finds_remembered_note() {
 }
 
 #[test]
+fn search_without_project_finds_project_scoped_memory() {
+    let dir = temp_dir("search-cross-project");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--scope",
+            "project",
+            "--project-id",
+            "repo-alpha",
+            "--text",
+            "Enrollment policy alternatives include Cedar and Rego.",
+        ])
+        .assert()
+        .success();
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "Cedar Rego",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hits: 1"))
+        .stdout(predicate::str::contains("Enrollment policy alternatives"));
+}
+
+#[test]
+fn search_project_only_restricts_to_selected_project() {
+    let dir = temp_dir("search-project-only");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+
+    for (project_id, text) in [
+        ("repo-alpha", "Alpha policy evaluation uses Cedar."),
+        ("repo-beta", "Beta policy evaluation uses Cedar."),
+    ] {
+        cargo_bin_cmd!("hm")
+            .args([
+                "--config",
+                config.to_str().expect("utf8 config"),
+                "remember",
+                "--scope",
+                "project",
+                "--project-id",
+                project_id,
+                "--text",
+                text,
+            ])
+            .assert()
+            .success();
+    }
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "Cedar",
+            "--project-id",
+            "repo-alpha",
+            "--project-only",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hits: 1"))
+        .stdout(predicate::str::contains("Alpha policy evaluation"))
+        .stdout(predicate::str::contains("Beta policy evaluation").not());
+}
+
+#[test]
 fn search_tantivy_backend_returns_results_end_to_end() {
     let dir = temp_dir("search-tantivy");
     let config = dir.join("config.toml");
@@ -3036,6 +3118,7 @@ fn search_json_reports_stable_hit_fields() {
         .stdout(predicate::str::contains("\"store\": \"personal\""))
         .stdout(predicate::str::contains("\"store_id\": \""))
         .stdout(predicate::str::contains("\"scope\": \"global\""))
+        .stdout(predicate::str::contains("\"project_id\": null"))
         .stdout(predicate::str::contains("\"trust\": \"curated\""))
         .stdout(predicate::str::contains("\"audience\": []"))
         .stdout(predicate::str::contains(
@@ -4105,6 +4188,79 @@ fn remember_project_hint_infers_project_scope_and_kind() {
 }
 
 #[test]
+fn remember_explicit_project_defaults_to_project_scope_for_generic_text() {
+    let dir = temp_dir("remember-explicit-project-scope");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    let repo = dir.join("repo");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    fs::create_dir_all(&repo).expect("repo dir");
+    let init = Command::new("git")
+        .args(["-C", repo.to_str().expect("utf8 repo"), "init"])
+        .output()
+        .expect("git init");
+    assert!(init.status.success());
+
+    let output = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--project",
+            repo.to_str().expect("utf8 repo"),
+            "--text",
+            "Cedar and Rego were evaluated as policy formats.",
+            "--json",
+        ])
+        .output()
+        .expect("run remember");
+    assert!(output.status.success(), "remember failed: {output:?}");
+    let remembered: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("remember json");
+    assert_eq!(remembered["scope"], "project");
+    assert_eq!(remembered["scope_inferred"], true);
+    assert_eq!(remembered["scope_reason"], "explicit-project");
+    assert!(remembered["project_id"].as_str().is_some());
+}
+
+#[test]
+fn remember_ambient_project_hint_keeps_generic_preference_global() {
+    let dir = temp_dir("remember-ambient-project-scope");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    let repo = dir.join("repo");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    fs::create_dir_all(&repo).expect("repo dir");
+    let init = Command::new("git")
+        .args(["-C", repo.to_str().expect("utf8 repo"), "init"])
+        .output()
+        .expect("git init");
+    assert!(init.status.success());
+
+    let output = cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_PROJECT", &repo)
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Chris prefers broad memory search across projects.",
+            "--json",
+        ])
+        .output()
+        .expect("run remember");
+    assert!(output.status.success(), "remember failed: {output:?}");
+    let remembered: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("remember json");
+    assert_eq!(remembered["scope"], "global");
+    assert!(remembered["project_id"].as_str().is_some());
+}
+
+#[test]
 fn sync_status_reports_reachable_store_and_index_freshness() {
     let dir = temp_dir("sync-status");
     let config = dir.join("config.toml");
@@ -4275,6 +4431,72 @@ fn retag_updates_kind_and_relevance_selection() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Always run the linter"));
+}
+
+#[test]
+fn retag_repairs_scope_while_preserving_existing_project_identity() {
+    let dir = temp_dir("retag-scope");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+
+    let remembered = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--scope",
+            "global",
+            "--project-id",
+            "repo-alpha",
+            "--text",
+            "Cedar and Rego were evaluated as policy formats.",
+            "--json",
+        ])
+        .output()
+        .expect("run remember");
+    assert!(
+        remembered.status.success(),
+        "remember failed: {remembered:?}"
+    );
+    let remembered: serde_json::Value =
+        serde_json::from_slice(&remembered.stdout).expect("remember json");
+    let id = remembered["id"].as_str().expect("memory id");
+
+    let repaired = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "retag",
+            id,
+            "--scope",
+            "project",
+            "--json",
+        ])
+        .output()
+        .expect("run retag");
+    assert!(repaired.status.success(), "retag failed: {repaired:?}");
+    let repaired: serde_json::Value = serde_json::from_slice(&repaired.stdout).expect("retag json");
+    assert_eq!(repaired["previous_scope"], "global");
+    assert_eq!(repaired["scope"], "project");
+    assert_eq!(repaired["previous_project_id"], "repo-alpha");
+    assert_eq!(repaired["project_id"], "repo-alpha");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "Cedar Rego",
+            "--project-id",
+            "repo-alpha",
+            "--project-only",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hits: 1"));
 }
 
 #[test]
@@ -5714,6 +5936,102 @@ fn hook_prompt_submit_recalls_relevant_search_only_project_memory_once() {
         tests_stdout.contains("Project maintainers inspect tests"),
         "tests stdout:\n{tests_stdout}"
     );
+}
+
+#[test]
+fn hook_prompt_submit_recalls_other_project_memory_from_home_or_another_project() {
+    let dir = temp_dir("hook-prompt-cross-project-recall");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    let repo_a = dir.join("repo-a");
+    fs::create_dir_all(&repo_a).expect("repo a");
+    fs::write(repo_a.join(".hive-memory-project"), "id = \"repo-a\"\n").expect("marker");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--project-id",
+            "repo-b",
+            "--kind",
+            "reference",
+            "--text",
+            "Grafhome policy formats compare Cedar and Rego semantics.",
+        ])
+        .assert()
+        .success();
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--project-id",
+            "repo-c",
+            "--kind",
+            "reference",
+            "--text",
+            "Grafhome policy formats compare Cedar and Rego semantics.",
+        ])
+        .assert()
+        .success();
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--quiet",
+        ])
+        .assert()
+        .success();
+
+    for (session, project) in [
+        ("session-cross-project-home", None),
+        (
+            "session-cross-project-repo-a",
+            Some(repo_a.to_str().expect("utf8 repo a")),
+        ),
+    ] {
+        let mut command = cargo_bin_cmd!("hm");
+        command.env("HIVE_MEMORY_SESSION_ID", session).args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "hook",
+            "prompt-submit",
+        ]);
+        if let Some(project) = project {
+            command.args(["--project", project]);
+        }
+        let output = command
+            .args([
+                "--text",
+                "Recall the Grafhome Cedar and Rego policy format comparison.",
+                "--json",
+            ])
+            .output()
+            .expect("run prompt hook");
+        assert!(output.status.success(), "prompt hook failed: {output:?}");
+        let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+        assert!(
+            stdout.contains("Grafhome policy formats compare Cedar and Rego semantics"),
+            "cross-project recall missing for {session}:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("project_id=\\\"repo-b\\\""),
+            "cross-project owner missing for {session}:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("project_id=\\\"repo-c\\\""),
+            "independent same-body project missing for {session}:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("\"reason\": \"selected\""),
+            "cross-project recall was not selected for {session}:\n{stdout}"
+        );
+    }
 }
 
 #[test]

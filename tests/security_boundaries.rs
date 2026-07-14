@@ -386,6 +386,147 @@ fn agent_private_audience_is_filtered_by_invoking_agent() {
     );
 }
 
+#[test]
+fn retag_cannot_read_or_declassify_agent_private_memory() {
+    let dir = temp_dir("agent-private-retag");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    write_single_store_config(&config, &dir, &personal);
+    init_store(&personal, "personal");
+
+    let remembered = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "claude",
+            "remember",
+            "--scope",
+            "agent-private",
+            "--audience",
+            "claude",
+            "--text",
+            "Only claude may retag this memory.",
+            "--json",
+        ])
+        .output()
+        .expect("write private memory");
+    assert!(
+        remembered.status.success(),
+        "remember failed: {remembered:?}"
+    );
+    let remembered: serde_json::Value =
+        serde_json::from_slice(&remembered.stdout).expect("remember json");
+    let id = remembered["id"].as_str().expect("memory id");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "retag",
+            id,
+            "--kind",
+            "reference",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("not visible to the active agent"));
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "claude",
+            "retag",
+            id,
+            "--scope",
+            "global",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "cannot change agent-private visibility",
+        ));
+}
+
+#[test]
+fn retag_requires_read_and_write_store_access() {
+    let dir = temp_dir("retag-store-access");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+            state_dir = "{}"
+            cache_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+
+            [agents.writer]
+            default_store = "personal"
+            read_stores = []
+            write_stores = ["personal"]
+            "#,
+            dir.join("data").display(),
+            dir.join("state").display(),
+            dir.join("cache").display(),
+            personal.display(),
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+
+    let remembered = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "A write-only agent must not retag existing memory.",
+            "--json",
+        ])
+        .output()
+        .expect("write memory");
+    assert!(
+        remembered.status.success(),
+        "remember failed: {remembered:?}"
+    );
+    let remembered: serde_json::Value =
+        serde_json::from_slice(&remembered.stdout).expect("remember json");
+    let id = remembered["id"].as_str().expect("memory id");
+
+    let retag = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "writer",
+            "retag",
+            id,
+            "--kind",
+            "reference",
+        ])
+        .output()
+        .expect("run retag");
+    assert_eq!(
+        retag.status.code(),
+        Some(4),
+        "expected privacy refusal: {retag:?}"
+    );
+    assert!(
+        String::from_utf8(retag.stderr)
+            .expect("utf8 stderr")
+            .contains("may not read store personal")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // (Tier-3) curated `collect`: surfaces curated files; never follows symlinks
 // ---------------------------------------------------------------------------

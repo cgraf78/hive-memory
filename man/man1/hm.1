@@ -45,7 +45,10 @@ Write a lower-confidence raw note for later triage.
 .TP
 .B search
 Search curated and remembered memory, with optional inbox inclusion and
-explanations.
+explanations. Search spans project identities by default; a project hint boosts
+related results, while
+.B --project-only
+narrows to that project.
 .TP
 .B context
 Assemble agent-readable context within a token budget.
@@ -54,7 +57,7 @@ Assemble agent-readable context within a token budget.
 Report store and index freshness without mutating state.
 .TP
 .B retag
-Correct a record's persisted kind.
+Correct a record's persisted kind, scope, or project identity.
 .TP
 .B classify
 Run the LLM kind-classification pass for pending or selected records.

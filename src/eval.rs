@@ -184,6 +184,8 @@ struct RetrievalCase {
     feature: String,
     query: String,
     project_id: Option<String>,
+    #[serde(default)]
+    project_only: bool,
     expected: Vec<String>,
     forbidden: Vec<String>,
 }
@@ -291,7 +293,7 @@ fn score_retrieval(
     let mut by_feature = BTreeMap::<String, Vec<CaseResult>>::new();
     for case in &corpus.retrieval_case {
         let start = Instant::now();
-        let hits = search::search(SearchInput {
+        let input = SearchInput {
             store_root: root,
             entries,
             query: &case.query,
@@ -301,7 +303,12 @@ fn score_retrieval(
             agent_id: Some("eval"),
             project_id: case.project_id.as_deref(),
             limit,
-        })?;
+        };
+        let hits = if case.project_only {
+            search::search_project_only(input)?
+        } else {
+            search::search(input)?
+        };
         let elapsed = start.elapsed();
         let actual = hits
             .iter()
