@@ -8,7 +8,7 @@ use crate::curated::CuratedFile;
 use crate::index::IndexEntry;
 use crate::inject::{self, ClassifyInput, IncidentMarkers, InjectClass};
 use crate::{note, project, supersession, validity, visibility};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt::{self, Display};
 use std::fs;
@@ -103,6 +103,8 @@ pub struct ContextSection {
     pub store: String,
     /// Memory scope used for filtering and rendered trust boundaries.
     pub scope: String,
+    /// Owning project identity for project-scoped memory.
+    pub project_id: Option<String>,
     /// Trust label exposed in the data-boundary block.
     pub trust: TrustLevel,
     /// Explicit agent audience for agent-private data.
@@ -216,7 +218,7 @@ impl From<crate::curated::CuratedError> for ContextError {
 /// wrapped as data and escaped so memory content cannot forge or terminate the
 /// boundary block that tells agents how to treat it.
 pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, ContextError> {
-    assemble_context_with_mode(input, true)
+    assemble_context_with_mode(input, true, true)
 }
 
 /// Assemble context from an already-selected candidate set.
@@ -226,13 +228,16 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
 /// renderer keeps trust labels, escaping, budgets, and search-only filtering in
 /// one place, while skipping broad curated collection prevents one curated hit
 /// from pulling every curated file in scope into a prompt-specific recall block.
+/// Search has already applied its broad cross-project policy, so this rendering
+/// pass must not narrow the selected hits back to the active project.
 pub fn assemble_selected_context(input: ContextInput<'_>) -> Result<ContextOutput, ContextError> {
-    assemble_context_with_mode(input, false)
+    assemble_context_with_mode(input, false, false)
 }
 
 fn assemble_context_with_mode(
     input: ContextInput<'_>,
     collect_curated: bool,
+    filter_project: bool,
 ) -> Result<ContextOutput, ContextError> {
     let header = render_header(&input);
     let mut markdown = header;
@@ -266,6 +271,7 @@ fn assemble_context_with_mode(
                 id: curated.id,
                 store: input.store_name.to_owned(),
                 scope: curated.scope,
+                project_id: curated.project_id,
                 trust: TrustLevel::Curated,
                 audience: Vec::new(),
                 source_path: curated.relative_path,
@@ -278,6 +284,7 @@ fn assemble_context_with_mode(
     // Built once and reused; the Relevance strategy consults it per candidate.
     let markers = IncidentMarkers::default();
     let candidates = sorted_candidates(input.entries);
+    let project_keys = project_family_keys(input.entries, input.store_root);
 
     // Supersession resolves over TWO distinct sets, kept separate on purpose:
     //
@@ -333,7 +340,7 @@ fn assemble_context_with_mode(
             push_decision(&mut decisions, &input, entry, "skipped", "scope");
             continue;
         }
-        if !project_allowed(entry, project_ids.as_ref()) {
+        if filter_project && !project_allowed(entry, project_ids.as_ref()) {
             push_decision(&mut decisions, &input, entry, "skipped", "project");
             continue;
         }
@@ -396,7 +403,7 @@ fn assemble_context_with_mode(
                 continue;
             }
         }
-        if !seen_bodies.insert(duplicate_key(&record_body)) {
+        if !seen_bodies.insert(duplicate_key(entry, &record_body, &project_keys)) {
             push_decision(&mut decisions, &input, entry, "skipped", "duplicate");
             continue;
         }
@@ -420,6 +427,7 @@ fn assemble_context_with_mode(
             id: entry.id.clone(),
             store: input.store_name.to_owned(),
             scope: entry.scope.clone(),
+            project_id: entry.project_id.clone(),
             trust,
             audience: entry.audience.clone(),
             source_path: entry.note_path.clone(),
@@ -450,11 +458,45 @@ fn read_note_body(note_path: &Path) -> Result<String, String> {
         .map_err(|err| format!("parse note: {err}"))
 }
 
-fn duplicate_key(body: &str) -> String {
-    body.split_whitespace()
+fn project_family_keys(entries: &[IndexEntry], store_root: &Path) -> HashMap<String, String> {
+    let mut keys = HashMap::new();
+    for entry in entries {
+        let Some(project_id) = entry.project_id.as_ref() else {
+            continue;
+        };
+        if keys.contains_key(project_id) {
+            continue;
+        }
+        let related = project::related_project_ids(store_root, project_id)
+            .unwrap_or_else(|_| BTreeSet::from([project_id.clone()]));
+        let family_key = related
+            .iter()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| project_id.clone());
+        for related_id in related {
+            keys.insert(related_id, family_key.clone());
+        }
+    }
+    keys
+}
+
+fn duplicate_key(entry: &IndexEntry, body: &str, project_keys: &HashMap<String, String>) -> String {
+    let normalized = body
+        .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-        .to_ascii_lowercase()
+        .to_ascii_lowercase();
+    if entry.scope != "project" {
+        return normalized;
+    }
+    let project_key = entry
+        .project_id
+        .as_deref()
+        .and_then(|project_id| project_keys.get(project_id).cloned())
+        .or_else(|| entry.project_id.clone())
+        .unwrap_or_default();
+    format!("project:{project_key}:{normalized}")
 }
 
 fn push_decision(
@@ -618,23 +660,35 @@ fn render_memory_block(
     trust: TrustLevel,
     body: &str,
 ) -> String {
+    let project = entry
+        .project_id
+        .as_deref()
+        .map(|project_id| format!(" project_id=\"{}\"", escape_attr(project_id)))
+        .unwrap_or_default();
     format!(
-        "<memory id=\"{}\" agent=\"{}\" store=\"{}\" scope=\"{}\" trust=\"{}\">\n{}\n</memory>\n\n",
+        "<memory id=\"{}\" agent=\"{}\" store=\"{}\" scope=\"{}\"{} trust=\"{}\">\n{}\n</memory>\n\n",
         escape_attr(&entry.id),
         escape_attr(&entry.agent_id),
         escape_attr(store_name),
         escape_attr(&entry.scope),
+        project,
         trust.as_str(),
         escape_memory_body(body)
     )
 }
 
 fn render_curated_memory_block(store_name: &str, candidate: &CuratedFile) -> String {
+    let project = candidate
+        .project_id
+        .as_deref()
+        .map(|project_id| format!(" project_id=\"{}\"", escape_attr(project_id)))
+        .unwrap_or_default();
     format!(
-        "<memory id=\"{}\" agent=\"human\" store=\"{}\" scope=\"{}\" trust=\"{}\">\n{}\n</memory>\n\n",
+        "<memory id=\"{}\" agent=\"human\" store=\"{}\" scope=\"{}\"{} trust=\"{}\">\n{}\n</memory>\n\n",
         escape_attr(&candidate.id),
         escape_attr(store_name),
         escape_attr(&candidate.scope),
+        project,
         TrustLevel::Curated.as_str(),
         escape_memory_body(&candidate.body)
     )

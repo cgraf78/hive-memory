@@ -90,7 +90,7 @@ store: personal
 scopes: global,project
 sources: curated,remembered
 
-<memory id="…" agent="human" store="personal" scope="global" trust="remembered">
+<memory id="…" agent="human" store="personal" scope="project" project_id="github-com-acme-api-…" trust="remembered">
 Prefer small, focused patches with tests.
 </memory>
 ```
@@ -116,10 +116,11 @@ project truth. `hm note` writes a *lower-confidence* raw note for triage. Raw
 notes are searchable but excluded from injected context by default, so they can
 never silently steer an agent.
 
-**Global vs project scope.** Global memory is recalled everywhere a synced store
-is present. Project memory is keyed to a project identity, so `hm search` and
-`hm context` only surface it when you are working in that project (or pass
-`--project`).
+**Global vs project scope.** Global memory is eligible for automatic context in
+every session. Project memory has an owning project identity. Explicit
+`hm search` is cross-project by default; `--project` boosts related hits without
+hiding other projects, and `--project-only` narrows deliberately. Automatic
+`hm context` remains bounded to global plus the active project.
 
 **Supersession — memory that updates itself.** Writes are append-only. When a
 newer `remember` record replaces an older one (explicitly via `--supersedes`, or
@@ -260,8 +261,9 @@ search_backend = "tantivy"
 This is **full-text / BM25 lexical** search — there is no embedding, semantic, or
 vector search. Retrieval ranking is not yet tuned; an unrecognized
 `search_backend` value degrades to lexical rather than failing. In both backends
-the index returns ranked ids only; store, scope, project, audience, and validity
-policy are applied as a mandatory post-filter, so the index is a recall
+the index returns ranked ids only; store, scope, audience, and validity policy
+are applied as mandatory post-filters. Project identity is a ranking signal
+unless `--project-only` requests a hard project filter. The index is a recall
 optimization, never a security boundary.
 
 Inspect scoring with `hm search --explain`, and measure ranking changes against
@@ -269,6 +271,8 @@ labeled corpuses with `hm eval`.
 
 Search has its own source defaults (`defaults.search_sources`) so explicit
 recall remains broad even when prompt context is tuned for precision. Use
+`--project <path>` to rank the active project's matches first without excluding
+other projects, or add `--project-only` to narrow. Use
 `--since 30m`, `--since 2h`, `--since 1d`, `--since today`, or an RFC3339
 timestamp to constrain recall to recently created indexed records. Raw
 lower-confidence `hm note` entries stay opt-in through `--include-inbox` or
@@ -320,8 +324,12 @@ memory through context, so classification adds no new implicit reader. Set
 stdin and prints a JSON verdict) to use any other CLI. Inspect or test without
 writing via `hm classify --pending` and `hm classify --dry-run`.
 
-`hm retag <id> --kind <kind>` corrects a record's kind by hand. Secret stores and
+`hm retag <id> --kind <kind>` corrects a record's kind by hand. It can also
+repair persisted scope/project metadata, for example
+`hm retag <id> --scope project --project ~/git/acme-api`. Secret stores and
 audience-restricted (`agent-private`) records are never sent to any backend.
+Retagging an existing record requires both read and write store access, respects
+its audience, and cannot change agent-private visibility.
 
 ### Doctor
 
@@ -380,6 +388,12 @@ hm projects alias old-project-id new-project-id
 project_id: github-com-acme-api-…
 project_source: git-remote
 ```
+
+On remembered writes, an explicit `--project` or `--project-id` is deliberate
+ownership metadata and defaults the record to project scope. Pass
+`--scope global` to override that choice. An ambient `HIVE_MEMORY_PROJECT` hint
+does not force project scope, so a long-lived multi-project session can still
+write global preferences safely.
 
 SSH and HTTPS spellings of the same remote collapse to one identity, and project
 renames are handled by shared alias metadata so every machine maps old → new id.
@@ -578,12 +592,12 @@ commands also support `--json`.
 | `hm stores init\|list\|show\|doctor\|migrate` | Manage and diagnose store roots |
 | `hm remember` | Write a durable fact/preference/context note |
 | `hm note` | Write a lower-confidence raw note |
-| `hm search <query>` | Search curated and remembered memory (`--since`, `--include-inbox`, `--explain`) |
+| `hm search <query>` | Search across curated and remembered memory (`--project-only`, `--since`, `--include-inbox`, `--explain`) |
 | `hm context` | Assemble agent-readable context (`--max-tokens`, `--if-changed`) |
 | `hm capture` | Extract durable facts from a conversation; stage, or `--promote` |
 | `hm reconcile` | Reconcile one candidate fact mem0-style (add/update/delete/noop) |
 | `hm classify` | Run the LLM kind-classification pass (`--pending`, `--dry-run`) |
-| `hm retag <id> --kind` | Correct a record's persisted kind |
+| `hm retag <id>` | Correct persisted kind, scope, or project metadata |
 | `hm projects resolve\|bind\|unbind\|alias\|list\|show` | Project identity and bindings |
 | `hm inbox list\|stale\|show` | Inspect raw inbox notes |
 | `hm promote <note-id> --to <path>` | Promote a raw note into curated memory |

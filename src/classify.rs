@@ -392,7 +392,10 @@ fn apply_update(
     let _ = memory::retag_record(memory::RetagRecordInput {
         root: input.store_root,
         note_path: &entry.note_path,
+        update_kind: true,
         kind,
+        scope: None,
+        project_id: None,
         classified: memory::ClassifiedUpdate::Set(classified),
         options: input.options.clone(),
     });

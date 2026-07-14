@@ -246,7 +246,7 @@ pub enum ClassifiedUpdate {
     Set(note::ClassifiedBy),
 }
 
-/// Input for retagging one existing record's memory kind.
+/// Input for repairing one existing record's classification or project metadata.
 ///
 /// Retag exists so a wrong write-time inference is correctable: kind is a
 /// persisted, behavior-shaping verdict (search-only vs always-on), and the
@@ -257,8 +257,14 @@ pub struct RetagRecordInput<'a> {
     pub root: &'a Path,
     /// Store-relative Markdown note path, as carried by the index.
     pub note_path: &'a str,
-    /// New kind; `None` clears the tag so read-time classification applies.
+    /// Whether to replace the persisted kind.
+    pub update_kind: bool,
+    /// New kind; `None` clears the tag when `update_kind` is true.
     pub kind: Option<note::MemoryKind>,
+    /// New scope, or `None` to preserve the current scope.
+    pub scope: Option<String>,
+    /// New project identity, or `None` to preserve the current identity.
+    pub project_id: Option<String>,
     /// Provenance update applied together with the kind.
     pub classified: ClassifiedUpdate,
     /// Atomic write durability options.
@@ -274,13 +280,21 @@ pub struct RetagRecordResult {
     pub previous_kind: Option<note::MemoryKind>,
     /// Kind persisted by the rewrite.
     pub kind: Option<note::MemoryKind>,
+    /// Scope carried by the record before the rewrite.
+    pub previous_scope: String,
+    /// Scope persisted by the rewrite.
+    pub scope: String,
+    /// Project identity carried before the rewrite.
+    pub previous_project_id: Option<String>,
+    /// Project identity persisted by the rewrite.
+    pub project_id: Option<String>,
     /// Absolute note path that was rewritten.
     pub note_path: PathBuf,
     /// Absolute event path that was rewritten, when a sidecar existed.
     pub event_path: Option<PathBuf>,
 }
 
-/// Rewrite the persisted memory kind on an existing note/event pair.
+/// Repair persisted classification or project metadata on a note/event pair.
 ///
 /// Both copies must change together: the index prefers event metadata, so a
 /// note-only rewrite would be silently undone by the next index rebuild. Like
@@ -294,14 +308,24 @@ pub fn retag_record(input: RetagRecordInput<'_>) -> Result<RetagRecordResult, Me
         .map_err(|err| MemoryError::Note(format!("read {}: {err}", note_path.display())))?;
     let mut parsed =
         note::parse_note(&contents).map_err(|err| MemoryError::Note(err.to_string()))?;
+    let previous_kind = parsed.front_matter.kind;
+    let previous_scope = parsed.front_matter.scope.clone();
+    let previous_project_id = parsed.front_matter.project_id.clone();
+    if input.update_kind {
+        parsed.front_matter.kind = input.kind;
+        apply_classified_update(&mut parsed.front_matter.classified, &input.classified);
+    }
+    if let Some(scope) = input.scope.as_ref() {
+        parsed.front_matter.scope.clone_from(scope);
+    }
+    if let Some(project_id) = input.project_id.as_ref() {
+        parsed.front_matter.project_id = Some(project_id.clone());
+    }
     validate_kind_context(
-        input.kind,
+        parsed.front_matter.kind,
         &parsed.front_matter.scope,
         parsed.front_matter.project_id.as_deref(),
     )?;
-    let previous_kind = parsed.front_matter.kind;
-    parsed.front_matter.kind = input.kind;
-    apply_classified_update(&mut parsed.front_matter.classified, &input.classified);
     let rendered = note::render_note(&parsed).map_err(|err| MemoryError::Note(err.to_string()))?;
     write::write_atomic(&note_path, rendered.as_bytes(), &input.options)
         .map_err(|err| MemoryError::Note(err.to_string()))?;
@@ -319,8 +343,19 @@ pub fn retag_record(input: RetagRecordInput<'_>) -> Result<RetagRecordResult, Me
         Ok(event_contents) => {
             let mut event = event::parse_event(&event_contents)
                 .map_err(|err| MemoryError::Event(err.to_string()))?;
-            event.kind = input.kind;
-            apply_classified_update(&mut event.classified, &input.classified);
+            if input.update_kind {
+                event.kind = input.kind;
+                apply_classified_update(&mut event.classified, &input.classified);
+            }
+            // Repair only the fields the caller selected. A kind-only retag
+            // must not copy unrelated note metadata onto a divergent event:
+            // the event is index-authoritative and may carry tighter privacy.
+            if let Some(scope) = input.scope.as_ref() {
+                event.scope.clone_from(scope);
+            }
+            if let Some(project_id) = input.project_id.as_ref() {
+                event.project_id = Some(project_id.clone());
+            }
             let rendered_event =
                 event::render_event(&event).map_err(|err| MemoryError::Event(err.to_string()))?;
             write::write_atomic(&event_path, rendered_event.as_bytes(), &input.options)
@@ -339,7 +374,11 @@ pub fn retag_record(input: RetagRecordInput<'_>) -> Result<RetagRecordResult, Me
     Ok(RetagRecordResult {
         id: parsed.front_matter.id,
         previous_kind,
-        kind: input.kind,
+        kind: parsed.front_matter.kind,
+        previous_scope,
+        scope: parsed.front_matter.scope,
+        previous_project_id,
+        project_id: parsed.front_matter.project_id,
         note_path,
         event_path,
     })
@@ -435,7 +474,10 @@ mod tests {
         let result = retag_record(RetagRecordInput {
             root: &root,
             note_path: &relative(&root, &written.note_path),
+            update_kind: true,
             kind: Some(note::MemoryKind::Incident),
+            scope: None,
+            project_id: None,
             classified: ClassifiedUpdate::Keep,
             options: options(),
         })
@@ -455,6 +497,39 @@ mod tests {
     }
 
     #[test]
+    fn kind_only_retag_preserves_event_visibility_metadata() {
+        let root = temp_dir("retag-divergent-event");
+        let written = write(&root, Some(note::MemoryKind::Preference), true);
+        let event_path = written.event_path.as_ref().expect("event path");
+        let mut event = event::parse_event(
+            &fs::read_to_string(event_path).expect("read event before divergence"),
+        )
+        .expect("parse event before divergence");
+        event.scope = "agent-private".to_owned();
+        event.audience = vec!["codex".to_owned()];
+        let rendered = event::render_event(&event).expect("render divergent event");
+        fs::write(event_path, rendered).expect("write divergent event");
+
+        retag_record(RetagRecordInput {
+            root: &root,
+            note_path: &relative(&root, &written.note_path),
+            update_kind: true,
+            kind: Some(note::MemoryKind::Incident),
+            scope: None,
+            project_id: None,
+            classified: ClassifiedUpdate::Keep,
+            options: options(),
+        })
+        .expect("retag");
+
+        let event = event::parse_event(&fs::read_to_string(event_path).expect("read event"))
+            .expect("parse event");
+        assert_eq!(event.kind, Some(note::MemoryKind::Incident));
+        assert_eq!(event.scope, "agent-private");
+        assert_eq!(event.audience, vec!["codex"]);
+    }
+
+    #[test]
     fn retag_clears_kind() {
         let root = temp_dir("retag-clear");
         let written = write(&root, Some(note::MemoryKind::Reference), true);
@@ -462,7 +537,10 @@ mod tests {
         let result = retag_record(RetagRecordInput {
             root: &root,
             note_path: &relative(&root, &written.note_path),
+            update_kind: true,
             kind: None,
+            scope: None,
+            project_id: None,
             classified: ClassifiedUpdate::Clear,
             options: options(),
         })
@@ -483,7 +561,10 @@ mod tests {
         let result = retag_record(RetagRecordInput {
             root: &root,
             note_path: &relative(&root, &written.note_path),
+            update_kind: true,
             kind: Some(note::MemoryKind::Reference),
+            scope: None,
+            project_id: None,
             classified: ClassifiedUpdate::Keep,
             options: options(),
         })
@@ -497,12 +578,47 @@ mod tests {
     }
 
     #[test]
+    fn retag_rescopes_note_and_event_together() {
+        let root = temp_dir("retag-scope");
+        let written = write(&root, None, true);
+
+        let result = retag_record(RetagRecordInput {
+            root: &root,
+            note_path: &relative(&root, &written.note_path),
+            update_kind: false,
+            kind: None,
+            scope: Some("project".to_owned()),
+            project_id: Some("repo-alpha".to_owned()),
+            classified: ClassifiedUpdate::Keep,
+            options: options(),
+        })
+        .expect("rescope");
+
+        assert_eq!(result.previous_scope, "global");
+        assert_eq!(result.scope, "project");
+        assert_eq!(result.previous_project_id, None);
+        assert_eq!(result.project_id.as_deref(), Some("repo-alpha"));
+        let note = note::parse_note(&fs::read_to_string(&written.note_path).expect("read note"))
+            .expect("parse note");
+        assert_eq!(note.front_matter.scope, "project");
+        assert_eq!(note.front_matter.project_id.as_deref(), Some("repo-alpha"));
+        let event_path = result.event_path.expect("event rewritten");
+        let event = event::parse_event(&fs::read_to_string(event_path).expect("read event"))
+            .expect("parse event");
+        assert_eq!(event.scope, "project");
+        assert_eq!(event.project_id.as_deref(), Some("repo-alpha"));
+    }
+
+    #[test]
     fn retag_fails_on_missing_note() {
         let root = temp_dir("retag-missing");
         let result = retag_record(RetagRecordInput {
             root: &root,
             note_path: "inbox/notes/2026-05-16/missing.md",
+            update_kind: true,
             kind: Some(note::MemoryKind::Incident),
+            scope: None,
+            project_id: None,
             classified: ClassifiedUpdate::Keep,
             options: options(),
         });
@@ -524,7 +640,10 @@ mod tests {
         retag_record(RetagRecordInput {
             root: &root,
             note_path: &relative(&root, &written.note_path),
+            update_kind: true,
             kind: Some(note::MemoryKind::Preference),
+            scope: None,
+            project_id: None,
             classified: ClassifiedUpdate::Set(classified.clone()),
             options: options(),
         })
@@ -561,7 +680,10 @@ mod tests {
         retag_record(RetagRecordInput {
             root: &root,
             note_path: &relative(&root, &written.note_path),
+            update_kind: true,
             kind: Some(note::MemoryKind::Preference),
+            scope: None,
+            project_id: None,
             classified: ClassifiedUpdate::Set(classified),
             options: options(),
         })
@@ -570,7 +692,10 @@ mod tests {
         retag_record(RetagRecordInput {
             root: &root,
             note_path: &relative(&root, &written.note_path),
+            update_kind: true,
             kind: None,
+            scope: None,
+            project_id: None,
             classified: ClassifiedUpdate::Clear,
             options: options(),
         })

@@ -39,7 +39,7 @@ pub struct SearchInput<'a> {
     pub include_inbox: bool,
     /// Active agent identity for agent-private audience filtering.
     pub agent_id: Option<&'a str>,
-    /// Active project identity. Project-scoped records must match it.
+    /// Active project identity used as a ranking preference.
     pub project_id: Option<&'a str>,
     /// Maximum hits to return.
     pub limit: usize,
@@ -64,6 +64,8 @@ pub struct SearchHit {
 /// Structured scoring components for one search hit.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchScoreTrace {
+    /// Persistent-retrieval score (for example scaled BM25).
+    pub retrieval: usize,
     /// Phrase match score from canonical body text.
     pub body_phrase: usize,
     /// Term/alias match score from canonical body text.
@@ -78,19 +80,23 @@ pub struct SearchScoreTrace {
     pub combined_terms: usize,
     /// Entity overlap boost.
     pub entity: usize,
+    /// Active-project ranking boost.
+    pub project: usize,
 }
 
 impl SearchScoreTrace {
     /// Total deterministic score used for ranking.
     #[must_use]
     pub fn total(&self) -> usize {
-        self.body_phrase
+        self.retrieval
+            + self.body_phrase
             + self.body_terms
             + self.metadata_phrase
             + self.metadata_terms
             + self.combined_phrase
             + self.combined_terms
             + self.entity
+            + self.project
     }
 }
 
@@ -189,12 +195,27 @@ impl From<crate::curated::CuratedError> for SearchError {
 /// score subject/tags so metadata searches do not need to parse every note
 /// twice.
 pub fn search(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
+    search_with_mode(input, false)
+}
+
+/// Search only memory owned by the active project.
+///
+/// This is an explicit narrowing surface. Ordinary search is cross-project and
+/// uses project identity only to rank related results higher.
+pub fn search_project_only(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
+    search_with_mode(input, true)
+}
+
+fn search_with_mode(
+    input: SearchInput<'_>,
+    project_only: bool,
+) -> Result<Vec<SearchHit>, SearchError> {
     let registry = entity::EntityRegistry::load_for_store(input.store_root)
         .map_err(|err| SearchError::EntityRegistry(err.to_string()))?;
     let query = SearchQuery::parse(input.query, &registry)?;
     let project_ids = project_filter_ids(input.store_root, input.project_id)?;
 
-    let mut hits = curated_hits(&input, &query, &registry)?;
+    let mut hits = curated_hits(&input, &query, &registry, project_only)?;
 
     for entry in input.entries {
         if !source_allowed(entry, input.sources, input.include_inbox) {
@@ -203,7 +224,7 @@ pub fn search(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
         if !scope_allowed(entry, input.scopes) {
             continue;
         }
-        if !project_allowed(entry, project_ids.as_ref()) {
+        if !project_allowed(entry, project_ids.as_ref(), project_only) {
             continue;
         }
         if !visibility::audience_allows(entry, input.agent_id) {
@@ -214,7 +235,8 @@ pub fn search(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
         }
 
         let body = indexed_body(input.store_root, entry)?;
-        let trace = score_entry(entry, &body, &query);
+        let mut trace = score_entry(entry, &body, &query);
+        trace.project = project_boost(trace.total(), entry, project_ids.as_ref());
         let score = trace.total();
         if score == 0 {
             continue;
@@ -229,6 +251,7 @@ pub fn search(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
 
     finish_hits(
         &mut hits,
+        input.store_root,
         &query.phrase,
         query.temporal_intent(),
         input.limit,
@@ -240,28 +263,40 @@ fn curated_hits(
     input: &SearchInput<'_>,
     query: &SearchQuery,
     registry: &entity::EntityRegistry,
+    project_only: bool,
 ) -> Result<Vec<SearchHit>, SearchError> {
     let mut hits = Vec::new();
     if !curated_source_allowed(input.sources) {
         return Ok(hits);
     }
 
-    for curated in crate::curated::collect(input.store_root, input.project_id)? {
+    let curated_files = if project_only {
+        crate::curated::collect(input.store_root, input.project_id)?
+    } else {
+        crate::curated::collect_all(input.store_root)?
+    };
+    let project_ids = project_filter_ids(input.store_root, input.project_id)?;
+    for curated in curated_files {
         if !curated_scope_allowed(&curated, input.scopes) {
             continue;
         }
+        let entry = curated_entry(&curated, registry);
+        if !project_allowed(&entry, project_ids.as_ref(), project_only) {
+            continue;
+        }
         let text_score = score_text_trace(&curated.body, query);
-        let trace = SearchScoreTrace {
+        let mut trace = SearchScoreTrace {
             body_phrase: text_score.phrase,
             body_terms: text_score.terms,
             ..SearchScoreTrace::default()
         };
+        trace.project = project_boost(trace.total(), &entry, project_ids.as_ref());
         let score = trace.total();
         if score == 0 {
             continue;
         }
         hits.push(SearchHit {
-            entry: curated_entry(&curated, input.project_id, registry),
+            entry,
             score,
             trace,
             snippet: curated_snippet(&curated.body, query),
@@ -273,6 +308,7 @@ fn curated_hits(
 
 fn finish_hits(
     hits: &mut Vec<SearchHit>,
+    store_root: &Path,
     phrase: &str,
     temporal_intent: Option<TemporalIntent>,
     limit: usize,
@@ -295,13 +331,14 @@ fn finish_hits(
     });
     let suppressed = suppress_superseded_hits(hits, phrase);
     hits.retain(|hit| !suppressed.contains(&hit.entry.id));
-    collapse_duplicate_hits(hits);
+    collapse_duplicate_hits(hits, store_root);
     hits.truncate(limit);
 }
 
 fn suppress_superseded_hits(hits: &[SearchHit], phrase: &str) -> BTreeSet<String> {
-    // Feed the FULL (already audience/scope/project-filtered) hit set to the
-    // shared resolver. Pre-windowing by rank would let an explicit `supersedes`
+    // Feed the FULL query-matched, audience/scope/validity-filtered hit set to
+    // the shared resolver. Project filtering applies only in explicit
+    // project-only mode. Pre-windowing by rank would let an explicit `supersedes`
     // correction ranked beyond the window miss its target, violating the frozen
     // contract that explicit links are authoritative in both surfaces. The
     // resolver keeps explicit-link resolution O(n) over the full set and bounds
@@ -313,21 +350,62 @@ fn suppress_superseded_hits(hits: &[SearchHit], phrase: &str) -> BTreeSet<String
     supersession::suppressed_ids(&entries, Some(phrase))
 }
 
-fn collapse_duplicate_hits(hits: &mut Vec<SearchHit>) {
+fn collapse_duplicate_hits(hits: &mut Vec<SearchHit>, store_root: &Path) {
     let mut seen = BTreeSet::new();
+    let project_keys = project_family_keys(hits, store_root);
     hits.retain(|hit| {
-        let key = duplicate_key(&hit.entry, &hit.snippet);
+        let key = duplicate_key(&hit.entry, &hit.snippet, &project_keys);
         seen.insert(key)
     });
 }
 
-fn duplicate_key(entry: &IndexEntry, fallback: &str) -> String {
+fn project_family_keys(hits: &[SearchHit], store_root: &Path) -> HashMap<String, String> {
+    let mut keys = HashMap::new();
+    for hit in hits {
+        let Some(project_id) = hit.entry.project_id.as_ref() else {
+            continue;
+        };
+        if keys.contains_key(project_id) {
+            continue;
+        }
+        let related = project::related_project_ids(store_root, project_id)
+            .unwrap_or_else(|_| BTreeSet::from([project_id.clone()]));
+        let family_key = related
+            .iter()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| project_id.clone());
+        for related_id in related {
+            keys.insert(related_id, family_key.clone());
+        }
+    }
+    keys
+}
+
+fn duplicate_key(
+    entry: &IndexEntry,
+    fallback: &str,
+    project_keys: &HashMap<String, String>,
+) -> String {
     let body = if entry.body.is_empty() {
         fallback
     } else {
         entry.body.as_str()
     };
-    normalize_duplicate_text(body)
+    let normalized = normalize_duplicate_text(body);
+    if entry.scope == "project" {
+        // Identical wording in two projects can represent two independently
+        // owned facts. Cross-project search must not collapse one merely
+        // because their bodies match byte-for-byte.
+        let project_key = entry
+            .project_id
+            .as_deref()
+            .and_then(|project_id| project_keys.get(project_id).cloned())
+            .or_else(|| entry.project_id.clone())
+            .unwrap_or_default();
+        return format!("project:{project_key}:{normalized}");
+    }
+    normalized
 }
 
 fn normalize_duplicate_text(value: &str) -> String {
@@ -408,19 +486,38 @@ fn project_alias_error(err: project::ProjectError) -> SearchError {
     }
 }
 
-fn project_allowed(entry: &IndexEntry, project_ids: Option<&BTreeSet<String>>) -> bool {
-    if entry.scope != "project" {
+fn project_allowed(
+    entry: &IndexEntry,
+    project_ids: Option<&BTreeSet<String>>,
+    project_only: bool,
+) -> bool {
+    if !project_only {
         return true;
     }
-
     let Some(project_ids) = project_ids else {
         return false;
     };
+    entry.scope == "project" && project_matches(entry, project_ids)
+}
 
+fn project_matches(entry: &IndexEntry, project_ids: &BTreeSet<String>) -> bool {
     entry
         .project_id
         .as_deref()
         .is_some_and(|project_id| project_ids.contains(project_id))
+}
+
+fn project_boost(
+    base_score: usize,
+    entry: &IndexEntry,
+    project_ids: Option<&BTreeSet<String>>,
+) -> usize {
+    if base_score == 0
+        || !project_ids.is_some_and(|project_ids| project_matches(entry, project_ids))
+    {
+        return 0;
+    }
+    base_score.saturating_div(10).max(1)
 }
 
 fn validity_allows(entry: &IndexEntry, query: &SearchQuery) -> bool {
@@ -865,6 +962,7 @@ fn score_entry(entry: &IndexEntry, body: &str, query: &SearchQuery) -> SearchSco
             TextScoreTrace::default()
         };
     SearchScoreTrace {
+        retrieval: 0,
         body_phrase: body_score.phrase,
         body_terms: body_score.terms,
         metadata_phrase: metadata_score.phrase,
@@ -872,6 +970,7 @@ fn score_entry(entry: &IndexEntry, body: &str, query: &SearchQuery) -> SearchSco
         combined_phrase: combined_score.phrase,
         combined_terms: combined_score.terms,
         entity: score_entities(entry, query),
+        project: 0,
     }
 }
 
@@ -906,17 +1005,13 @@ fn score_entities(entry: &IndexEntry, query: &SearchQuery) -> usize {
     overlap * 45
 }
 
-fn curated_entry(
-    curated: &CuratedFile,
-    project_id: Option<&str>,
-    registry: &entity::EntityRegistry,
-) -> IndexEntry {
+fn curated_entry(curated: &CuratedFile, registry: &entity::EntityRegistry) -> IndexEntry {
     IndexEntry {
         id: curated.id.clone(),
         store_id: String::new(),
         entry_kind: note::EntryKind::Remember,
         scope: curated.scope.clone(),
-        project_id: (curated.scope == "project").then(|| project_id.unwrap_or_default().to_owned()),
+        project_id: curated.project_id.clone(),
         audience: Vec::new(),
         tags: Vec::new(),
         subject: None,
@@ -1013,6 +1108,22 @@ pub fn search_indexed(
     input: SearchInput<'_>,
     index: &SearchIndex,
 ) -> Result<Vec<SearchHit>, SearchError> {
+    search_indexed_with_mode(input, index, false)
+}
+
+/// Search the prebuilt index only for memory owned by the active project.
+pub fn search_indexed_project_only(
+    input: SearchInput<'_>,
+    index: &SearchIndex,
+) -> Result<Vec<SearchHit>, SearchError> {
+    search_indexed_with_mode(input, index, true)
+}
+
+fn search_indexed_with_mode(
+    input: SearchInput<'_>,
+    index: &SearchIndex,
+    project_only: bool,
+) -> Result<Vec<SearchHit>, SearchError> {
     let registry = entity::EntityRegistry::load_for_store(input.store_root)
         .map_err(|err| SearchError::EntityRegistry(err.to_string()))?;
     let query = SearchQuery::parse(input.query, &registry)?;
@@ -1029,9 +1140,11 @@ pub fn search_indexed(
     // Tantivy backend only.
     let include_expired = contains_temporal_indicator(input.query, OLDEST_TERMS);
 
-    // Over-fetch so policy post-filtering cannot empty the result below the
-    // requested limit when high-ranked candidates are filtered out.
-    let over_fetch = input.limit.saturating_mul(5).max(20);
+    // Policy filtering and the bounded active-project boost happen after BM25
+    // candidate generation. Query every indexed candidate so filtered records
+    // cannot empty the result and an active-project near-tie just outside an
+    // arbitrary pre-window cannot be lost before reranking.
+    let over_fetch = input.entries.len().max(input.limit);
     let ranked = index
         .query(input.query, over_fetch)
         .map_err(|err| SearchError::Retrieval(err.to_string()))?;
@@ -1043,7 +1156,7 @@ pub fn search_indexed(
         };
         if !source_allowed(entry, input.sources, input.include_inbox)
             || !scope_allowed(entry, input.scopes)
-            || !project_allowed(entry, project_ids.as_ref())
+            || !project_allowed(entry, project_ids.as_ref(), project_only)
             || !visibility::audience_allows(entry, input.agent_id)
             || !validity::allows_search(entry, include_expired)
         {
@@ -1053,15 +1166,20 @@ pub fn search_indexed(
         // BM25 scores are small non-negative floats; scale to the integer score
         // contract while preserving rank order. Guard against a non-finite score
         // (NaN/inf) so a pathological corpus cannot mint a `usize::MAX` rank.
-        let score = if ranked_hit.score.is_finite() && ranked_hit.score >= 0.0 {
+        let base_score = if ranked_hit.score.is_finite() && ranked_hit.score >= 0.0 {
             (f64::from(ranked_hit.score) * 1000.0) as usize
         } else {
             0
         };
+        let project = project_boost(base_score, entry, project_ids.as_ref());
         indexed_hits.push(SearchHit {
             entry: (*entry).clone(),
-            score,
-            trace: SearchScoreTrace::default(),
+            score: base_score.saturating_add(project),
+            trace: SearchScoreTrace {
+                retrieval: base_score,
+                project,
+                ..SearchScoreTrace::default()
+            },
             snippet: retrieval_snippet(&body),
         });
     }
@@ -1071,13 +1189,15 @@ pub fn search_indexed(
     // the Tantivy backend never silently drops configured curated sources.
     finish_hits(
         &mut indexed_hits,
+        input.store_root,
         &query.phrase,
         query.temporal_intent(),
         input.limit,
     );
-    let mut curated_hits = curated_hits(&input, &query, &registry)?;
+    let mut curated_hits = curated_hits(&input, &query, &registry, project_only)?;
     finish_hits(
         &mut curated_hits,
+        input.store_root,
         &query.phrase,
         query.temporal_intent(),
         input.limit,
@@ -1089,19 +1209,28 @@ pub fn search_indexed(
     Ok(merge_ranked_sources(
         vec![indexed_hits, curated_hits],
         input.limit,
+        input.store_root,
     ))
 }
 
-fn merge_ranked_sources(mut sources: Vec<Vec<SearchHit>>, limit: usize) -> Vec<SearchHit> {
+fn merge_ranked_sources(
+    mut sources: Vec<Vec<SearchHit>>,
+    limit: usize,
+    store_root: &Path,
+) -> Vec<SearchHit> {
+    let all_hits = sources.iter().flatten().cloned().collect::<Vec<_>>();
+    let project_keys = project_family_keys(&all_hits, store_root);
     let mut hits = Vec::new();
     let mut seen_ids = BTreeSet::new();
+    let mut seen_content = BTreeSet::new();
     loop {
         let mut advanced = false;
         for source in &mut sources {
             while let Some(hit) = source.first() {
                 let hit = hit.clone();
                 source.remove(0);
-                if seen_ids.insert(hit.entry.id.clone()) {
+                let duplicate = duplicate_key(&hit.entry, &hit.snippet, &project_keys);
+                if seen_ids.insert(hit.entry.id.clone()) && seen_content.insert(duplicate) {
                     hits.push(hit);
                     advanced = true;
                     break;
@@ -1427,7 +1556,45 @@ mod tests {
     }
 
     #[test]
-    fn indexed_search_enforces_project_scope() {
+    fn indexed_and_lexical_search_deduplicate_identical_cross_source_memory() {
+        let dir = temp_dir("indexed-cross-source-duplicate");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        let body = "Policy format guidance compares Cedar and Rego.";
+        fs::create_dir_all(root.join("rules")).expect("rules dir");
+        fs::write(root.join("rules/policy.md"), format!("{body}\n")).expect("curated memory");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            body,
+            timestamp(1_778_946_153),
+            Vec::new(),
+        );
+        let entries = entries(&root, &cache);
+        let index = build_index(&root, &entries);
+        let sources = ["all".to_owned()];
+        let input = SearchInput {
+            store_root: &root,
+            entries: &entries,
+            query: "Cedar Rego",
+            scopes: &[],
+            sources: &sources,
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        };
+
+        let lexical = search(input.clone()).expect("lexical search");
+        let indexed = search_indexed(input, &index).expect("indexed search");
+
+        assert_eq!(lexical.len(), 1);
+        assert_eq!(indexed.len(), 1);
+    }
+
+    #[test]
+    fn indexed_search_is_broad_and_supports_explicit_project_narrowing() {
         let dir = temp_dir("indexed-project");
         let root = dir.join("store");
         let cache = dir.join("cache");
@@ -1435,16 +1602,14 @@ mod tests {
         let entries = entries(&root, &cache);
         let index = build_index(&root, &entries);
 
-        // A project-scoped record must not surface without the matching project,
-        // even though BM25 ranked it as a candidate.
-        let leaked = search_indexed(
+        let broad = search_indexed(
             indexed_input(&root, &entries, "deploy tag push", &[], None, None),
             &index,
         )
         .expect("search");
-        assert!(leaked.is_empty(), "project record leaked without a project");
+        assert_eq!(broad.len(), 1);
 
-        let matched = search_indexed(
+        let matched = search_indexed_project_only(
             indexed_input(
                 &root,
                 &entries,
@@ -1457,6 +1622,90 @@ mod tests {
         )
         .expect("search");
         assert_eq!(matched.len(), 1);
+
+        let wrong = search_indexed_project_only(
+            indexed_input(
+                &root,
+                &entries,
+                "deploy tag push",
+                &[],
+                None,
+                Some("proj-beta"),
+            ),
+            &index,
+        )
+        .expect("search");
+        assert!(wrong.is_empty());
+    }
+
+    #[test]
+    fn search_boosts_active_project_without_excluding_other_projects() {
+        let dir = temp_dir("project-boost");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_project_record(
+            &root,
+            "Policy format evaluation compares Cedar and Rego.",
+            "proj-alpha",
+        );
+        write_project_record(
+            &root,
+            "Policy format evaluation compares Cedar and Rego.",
+            "proj-beta",
+        );
+        let entries = entries(&root, &cache);
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries,
+            query: "Cedar Rego",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: None,
+            project_id: Some("proj-alpha"),
+            limit: 20,
+        })
+        .expect("search");
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].entry.project_id.as_deref(), Some("proj-alpha"));
+        assert!(hits[0].trace.project > 0);
+        assert_eq!(hits[1].entry.project_id.as_deref(), Some("proj-beta"));
+        assert_eq!(hits[1].trace.project, 0);
+    }
+
+    #[test]
+    fn indexed_project_boost_reranks_beyond_the_previous_candidate_window() {
+        let dir = temp_dir("indexed-project-boost-window");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        for _ in 0..25 {
+            write_project_record(
+                &root,
+                "Policy evaluation compares Cedar and Rego.",
+                "proj-beta",
+            );
+        }
+        // Equal BM25 text written after more than the old 20-candidate window.
+        // The active-project boost must still see and rerank this record.
+        write_project_record(
+            &root,
+            "Policy evaluation compares Cedar and Rego.",
+            "proj-alpha",
+        );
+        let entries = entries(&root, &cache);
+        let index = build_index(&root, &entries);
+
+        let mut input = indexed_input(&root, &entries, "Cedar Rego", &[], None, Some("proj-alpha"));
+        input.limit = 1;
+        let hits = search_indexed(input, &index).expect("search");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entry.project_id.as_deref(), Some("proj-alpha"));
+        assert!(hits[0].trace.retrieval > 0);
+        assert!(hits[0].trace.project > 0);
+        assert_eq!(hits[0].trace.total(), hits[0].score);
     }
 
     #[test]
@@ -2549,7 +2798,7 @@ mod tests {
         let sources = vec!["curated".to_owned()];
         let scopes = vec!["project".to_owned()];
 
-        let hits = search(SearchInput {
+        let hits = search_project_only(SearchInput {
             store_root: &root,
             entries: &entries(&root, &cache),
             query: "toml",
@@ -2568,6 +2817,77 @@ mod tests {
             "memories/projects/proj-a/MEMORY.md"
         );
         assert_eq!(hits[0].entry.project_id.as_deref(), Some("proj-a"));
+    }
+
+    #[test]
+    fn search_without_project_finds_curated_memory_from_all_projects() {
+        let dir = temp_dir("curated-all-projects");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        fs::create_dir_all(root.join("memories/projects/proj-a")).expect("project a dir");
+        fs::create_dir_all(root.join("memories/projects/proj-b")).expect("project b dir");
+        fs::write(
+            root.join("memories/projects/proj-a/MEMORY.md"),
+            "Project A policy format uses Cedar.\n",
+        )
+        .expect("project a memory");
+        fs::write(
+            root.join("memories/projects/proj-b/MEMORY.md"),
+            "Project B policy format uses Cedar.\n",
+        )
+        .expect("project b memory");
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "Cedar",
+            scopes: &["project".to_owned()],
+            sources: &["curated".to_owned()],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].entry.project_id.as_deref(), Some("proj-a"));
+        assert_eq!(hits[1].entry.project_id.as_deref(), Some("proj-b"));
+    }
+
+    #[test]
+    fn broad_curated_search_skips_a_corrupt_unrelated_project() {
+        let dir = temp_dir("curated-corrupt-project");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        fs::create_dir_all(root.join("memories/projects/proj-good")).expect("good dir");
+        fs::create_dir_all(root.join("memories/projects/proj-broken")).expect("broken dir");
+        fs::write(
+            root.join("memories/projects/proj-good/MEMORY.md"),
+            "Healthy project policy uses Cedar.\n",
+        )
+        .expect("good memory");
+        fs::write(
+            root.join("memories/projects/proj-broken/MEMORY.md"),
+            [0xff, 0xfe, 0xfd],
+        )
+        .expect("invalid utf8 memory");
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "Cedar",
+            scopes: &["project".to_owned()],
+            sources: &["curated".to_owned()],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entry.project_id.as_deref(), Some("proj-good"));
     }
 
     #[test]
@@ -2595,7 +2915,7 @@ mod tests {
         let sources = vec!["curated".to_owned()];
         let scopes = vec!["project".to_owned()];
 
-        let hits = search(SearchInput {
+        let hits = search_project_only(SearchInput {
             store_root: &root,
             entries: &entries(&root, &cache),
             query: "toml",
@@ -2622,6 +2942,42 @@ mod tests {
     }
 
     #[test]
+    fn broad_search_deduplicates_identical_memory_within_project_alias_family() {
+        let dir = temp_dir("curated-project-alias-duplicate");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        fs::create_dir_all(root.join("memories/projects/proj-current")).expect("current dir");
+        fs::create_dir_all(root.join("memories/projects/proj-old")).expect("old dir");
+        for project_id in ["proj-current", "proj-old"] {
+            fs::write(
+                root.join(format!("memories/projects/{project_id}/MEMORY.md")),
+                "Shared project policy uses Cedar.\n",
+            )
+            .expect("project memory");
+        }
+        fs::write(
+            root.join("memories/projects/proj-current/aliases.toml"),
+            "schema_version = 1\nproject_id = \"proj-current\"\naliases = [\"proj-old\"]\n",
+        )
+        .expect("aliases");
+
+        let hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries(&root, &cache),
+            query: "Cedar",
+            scopes: &["project".to_owned()],
+            sources: &["curated".to_owned()],
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
     fn search_follows_project_aliases_for_indexed_notes() {
         let dir = temp_dir("indexed-project-alias");
         let root = dir.join("store");
@@ -2636,7 +2992,7 @@ mod tests {
         let sources = vec!["remembered".to_owned()];
         let scopes = vec!["project".to_owned()];
 
-        let hits = search(SearchInput {
+        let hits = search_project_only(SearchInput {
             store_root: &root,
             entries: &entries(&root, &cache),
             query: "toml",
@@ -2770,7 +3126,7 @@ mod tests {
             "index should carry extracted sley entity links: {entries:?}"
         );
 
-        let hits = search(SearchInput {
+        let hits = search_project_only(SearchInput {
             store_root: &root,
             entries: &entries,
             query: "pre landing verification gate",

@@ -786,9 +786,12 @@ General CLI behavior:
 - `--as-agent ID` declares the invoking agent identity for audience filtering
   and write metadata. Launchers and hook adapters may provide
   `HIVE_MEMORY_AGENT_ID`; `--as-agent` wins when both are present.
-- `--project PATH` provides the project path hint for project-scoped commands.
-  Launchers and hook adapters should provide the best available active file,
-  buffer, tool working path, or launch path via `--project` or
+- `--project PATH` provides a project path hint. Explicit search uses it as a
+  ranking preference; `--project-only` opts into hard narrowing. Automatic
+  context uses it to bound project-scoped injection. On `hm remember`, an
+  explicit CLI project hint defaults the write to project scope unless
+  `--scope` overrides it. Launchers and hook adapters should provide the best
+  available active file, buffer, tool working path, or launch path via `--project` or
   `HIVE_MEMORY_PROJECT` so agent commands do not have to interpolate `$PWD`
   themselves. CWD is only the fallback when no hint is provided.
 - `--json` prints machine-readable output.
@@ -825,13 +828,17 @@ Stable `--json` success field sets. Fields are mandatory unless explicitly noted
 - `hm remember` / `hm note`:
   `{ "id", "store", "store_id", "store_source", "scope", "project_id",
   "audience", "note_path", "event_path", "created", "duplicate_of" }`, where
-  `project_id` is `null` for non-project writes, `event_path` is `null` when no
+  `project_id` is `null` when no project identity metadata was resolved (global
+  records may retain one as a ranking hint), `event_path` is `null` when no
   sidecar is written, `created` is `false` when an idempotency/dedupe rule
   returned an existing item, and `duplicate_of` is `null` unless a prior item
   was reused.
 - `hm search`:
-  `[ { "id", "store", "store_id", "scope", "trust", "audience", "path",
-  "title", "snippet", "score", "created_at" } ]`.
+  `[ { "id", "store", "store_id", "scope", "project_id", "trust",
+  "audience", "path", "title", "snippet", "score", "created_at" } ]`.
+- `hm retag`:
+  `{ "id", "store", "previous_kind", "kind", "previous_scope", "scope",
+  "previous_project_id", "project_id", "note_path", "event_updated" }`.
 - `hm context --json`:
   `{ "agent_id", "project_id", "project_hint", "stores", "store_source",
   "scopes", "sources", "estimated_tokens", "emitted", "stale",
@@ -839,7 +846,7 @@ Stable `--json` success field sets. Fields are mandatory unless explicitly noted
   `--if-changed` found no context-selection change and produced no Markdown
   body, `stale` is `true` only for last-success cache fallback,
   `cache_created_at` is `null` for fresh context, and each section contains
-  `{ "id", "store", "scope", "trust", "audience", "source_path",
+  `{ "id", "store", "scope", "project_id", "trust", "audience", "source_path",
   "estimated_tokens", "body" }`. `stores` is an array, but because multi-store
   reads are DEFERRED (see Read store resolution), v1 always emits exactly one
   resolved store in it; consumers should not yet rely on more than one element.
@@ -925,9 +932,11 @@ Inputs:
 - optional `--scope`, `--project`, `--subject`, `--tags`, `--confidence`,
   `--audience` (repeatable), `--idempotency-key`, `--allow-secret-write`.
 - defaults: active store, configured default write scope `global`, confidence
-  `high`, empty audience. Project-scoped writes use `--project`,
-  `HIVE_MEMORY_PROJECT`, or the current working directory as a last-resort hint
-  in that order.
+  `high`, empty audience. An explicit CLI `--project` or `--project-id` defaults
+  a remembered write to project scope. Ambient `HIVE_MEMORY_PROJECT` context
+  preserves conservative text/kind inference so a long-lived session does not
+  accidentally trap global preferences in whichever repository was last active.
+  Explicit `--scope` always wins.
 
 Writes:
 
@@ -987,6 +996,8 @@ Examples:
 ```bash
 hm search "TOML config"
 hm search "release" --store work --scope project
+hm search "release" --project /repo              # boost, do not exclude
+hm search "release" --project /repo --project-only
 hm search "Chris prefers" --json --include-inbox
 hm search "remaining work" --since 30m --include-inbox
 ```
@@ -1006,6 +1017,12 @@ V1 behavior:
   explicit `--store`), which must be within the agent's `read_stores`.
 - default scopes from config; default sources from `[defaults].search_sources`
   (`curated` and `remembered` unless overridden).
+- project-scoped indexed and curated memory from every project is eligible by
+  default. `--project`/`--project-id` adds a bounded ranking boost for the active
+  project without excluding other project identities. `--project-only` requires
+  one of those hints and hard-filters to the active project and its aliases.
+  Store authorization, audience, source, scope, and validity filters remain
+  mandatory in both modes; raw inbox notes remain opt-in.
 - `--since` accepts `today`, durations such as `30m`/`2h`/`1d`, or an RFC3339
   timestamp, and filters indexed note records before the lexical or full-text
   backend sees candidates. Curated files do not carry indexed creation
@@ -1061,7 +1078,9 @@ Behavior:
   inbox entries are EXCLUDED unless `--include-inbox` is passed (see Trust
   Boundary).
 - each rendered memory is wrapped in an explicit data-boundary block:
-  `<memory id=X agent=Y store=Z scope=W trust=raw|remembered|curated>...</memory>`.
+  `<memory id=X agent=Y store=Z scope=W project_id=P trust=raw|remembered|curated>...</memory>`.
+  `project_id` is present for project-owned memory so cross-project prompt recall
+  cannot be mistaken for active-project truth.
 - prioritizes rules/preferences, project memory, recent high-confidence notes
   from `hm remember`, and relevant search results. Raw notes only participate
   when `--include-inbox` is passed.
@@ -1129,11 +1148,14 @@ conservative regardless, because it independently requires the corrector and
 target to share the same scope and project, so widening the suppressor input can
 never make the heuristic fire across scope. The RENDERED set still applies every
 filter (source, scope, project, audience, validity); supersession then removes
-any rendered record that an audience-permitted, valid record supersedes.
+any rendered record that an audience-permitted, valid record supersedes. This
+hard project filter describes automatic context; explicit search is broad unless
+`--project-only` is present.
 
 For `hm search` the suppressor and rendered sets coincide in the query-matched,
-audience/scope/project/validity-filtered hits: search inherently considers only
-records that match the query, which is its legitimate scope. The cross-scope
+audience/scope/validity-filtered hits (plus project filtering only when
+`--project-only` is explicit): search inherently considers only records that
+match the query, which is its legitimate scope. The cross-scope
 behavior above is specific to `hm context`, whose suppressor set is every
 audience-permitted, valid record regardless of the viewer's selected scope.
 
@@ -1550,8 +1572,8 @@ instruct agents:
 - never store secrets, credentials, one-off task details, or noisy transcript
   summaries by default.
 - when working across multiple repositories/projects in one session, pass
-  `--project <path>` explicitly for memories about a project other than the
-  active context header.
+  `--project <path>` explicitly for project-owned writes; the explicit hint
+  selects project scope unless `--scope global` overrides it.
 - prefer not writing when unsure; hooks may remind, but should not force memory
   creation.
 
@@ -1577,9 +1599,9 @@ There are two related but separate environments:
 
 If a host integration cannot inject env vars into normal agent tool subprocesses,
 the static agent guidance must tell agents to include `--project <path>` on
-project-scoped writes. That is acceptable but less ergonomic; the preferred path
-is env-backed session context plus explicit `--project` only for cross-project
-writes.
+project-scoped writes. That explicit flag both selects the identity and defaults
+`hm remember` to project scope. Ambient env-backed context remains conservative
+so ordinary global preferences are not accidentally narrowed.
 
 ### Hook Contract
 
@@ -1656,7 +1678,7 @@ agent that reads context. The v1 trust boundary mitigates this:
    in an explicit data-boundary block:
 
    ```text
-   <memory id="..." agent="..." store="..." scope="..." trust="curated|remembered|raw" created="...">
+   <memory id="..." agent="..." store="..." scope="..." project_id="..." trust="curated|remembered|raw" created="...">
    ...body...
    </memory>
    ```

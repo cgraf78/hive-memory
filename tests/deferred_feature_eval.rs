@@ -2,7 +2,7 @@
 //! before entering the hot hook path.
 //!
 //! This file is a scoreboard, not a product feature. The baseline candidate is
-//! the current deterministic lexical/project-scoped implementation. Follow-up
+//! the current deterministic lexical implementation. Follow-up
 //! branches can add candidate runners and compare them against these labels
 //! without relying on anecdotes.
 
@@ -11,7 +11,7 @@ use hive_memory::index::{self, IndexEntry, RebuildIndexInput};
 use hive_memory::memory::{self, WriteRecordInput};
 use hive_memory::note::{Confidence, EntryKind, MemoryKind};
 use hive_memory::path::PathCase;
-use hive_memory::search::{SearchInput, search};
+use hive_memory::search::{SearchInput, search, search_project_only};
 use hive_memory::store::StoreManifest;
 use hive_memory::write::{AtomicWriteOptions, FsyncPolicy};
 use serde::Deserialize;
@@ -46,6 +46,8 @@ struct RetrievalCase {
     feature: String,
     query: String,
     project_id: Option<String>,
+    #[serde(default)]
+    project_only: bool,
     expected: Vec<String>,
     forbidden: Vec<String>,
     target_recall_at_5: f64,
@@ -295,7 +297,7 @@ fn score_retrieval(
     let mut by_feature = BTreeMap::<String, Vec<CaseResult>>::new();
     for case in &corpus.retrieval_case {
         let start = Instant::now();
-        let hits = search(SearchInput {
+        let input = SearchInput {
             store_root: &materialized.root,
             entries: &materialized.entries,
             query: &case.query,
@@ -305,7 +307,12 @@ fn score_retrieval(
             agent_id: Some("codex"),
             project_id: case.project_id.as_deref(),
             limit: 5,
-        })
+        };
+        let hits = if case.project_only {
+            search_project_only(input)
+        } else {
+            search(input)
+        }
         .unwrap_or_else(|err| panic!("retrieval case {} failed: {err}", case.name));
         let elapsed = start.elapsed();
         let actual = hits
