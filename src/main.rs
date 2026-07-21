@@ -8,8 +8,8 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use hive_memory::config::{Config, ConfigPaths, EventSidecarPolicy, Sensitivity, StoreConfig};
 use hive_memory::{
-    capture, classify, config, context as memory_context, curation, doctor, eval as memory_eval,
-    event, hook as memory_hook, id, index, inject, llm, memory, note, outbox, path as memory_path,
+    capture, classify, config, context as memory_context, curation, doctor, event,
+    hook as memory_hook, id, index, inject, llm, memory, note, outbox, path as memory_path,
     project, reconcile, retrieval, search, secret, store, visibility, write, write_classify,
 };
 use serde::{Deserialize, Serialize};
@@ -17,11 +17,14 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{self, Display};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Instant, SystemTime};
 use time::OffsetDateTime;
+
+mod cli;
+
+use cli::eval::EvalCommand;
 
 // Clap derives user-facing help from doc comments, so keep implementation
 // rationale as normal comments and reserve CLI docs for actual help text.
@@ -151,80 +154,6 @@ enum InboxCommand {
     Stale(InboxStaleArgs),
     /// Show one raw inbox note.
     Show(InboxShowArgs),
-}
-
-/// Eval fixture helper commands.
-#[derive(Debug, Subcommand)]
-enum EvalCommand {
-    /// Run a retrieval corpus and report A/B metrics.
-    Retrieval(EvalRetrievalArgs),
-    /// Capture a recall miss as a retrieval eval case.
-    CaptureMiss(EvalCaptureMissArgs),
-    /// Capture an irrelevant retrieval hit as a retrieval eval case.
-    CaptureBadHit(EvalCaptureBadHitArgs),
-}
-
-/// Arguments for `hm eval retrieval`.
-#[derive(Debug, Args)]
-struct EvalRetrievalArgs {
-    /// TOML corpus file containing records and retrieval_case labels.
-    #[arg(long)]
-    corpus: PathBuf,
-    /// Search limit used for each retrieval case.
-    #[arg(long, default_value_t = 5)]
-    limit: usize,
-    /// Emit machine-readable output.
-    #[arg(long)]
-    json: bool,
-}
-
-/// Shared arguments for `hm eval capture-*`.
-#[derive(Debug, Args)]
-struct EvalCaptureCommonArgs {
-    /// Prompt or query that exposed the retrieval behavior.
-    #[arg(long)]
-    prompt: String,
-    /// Optional human-readable case name. Defaults to a prompt-derived name.
-    #[arg(long)]
-    name: Option<String>,
-    /// Feature bucket this case should score.
-    #[arg(long, default_value = "semantic")]
-    feature: String,
-    /// Project id the query should run under, when project-scoped.
-    #[arg(long)]
-    project_id: Option<String>,
-    /// Append the generated case to this TOML fixture file.
-    #[arg(long)]
-    to: Option<PathBuf>,
-    /// Emit machine-readable output.
-    #[arg(long)]
-    json: bool,
-}
-
-/// Arguments for `hm eval capture-miss`.
-#[derive(Debug, Args)]
-struct EvalCaptureMissArgs {
-    #[command(flatten)]
-    common: EvalCaptureCommonArgs,
-    /// Subject id that should have been retrieved. Repeat for multiple labels.
-    #[arg(long, required = true)]
-    expected: Vec<String>,
-    /// Subject id that must not be retrieved. Repeat for multiple labels.
-    #[arg(long)]
-    forbidden: Vec<String>,
-}
-
-/// Arguments for `hm eval capture-bad-hit`.
-#[derive(Debug, Args)]
-struct EvalCaptureBadHitArgs {
-    #[command(flatten)]
-    common: EvalCaptureCommonArgs,
-    /// Subject id that was incorrectly retrieved. Repeat for multiple labels.
-    #[arg(long, required = true)]
-    bad: Vec<String>,
-    /// Subject id that should be retrieved, if known. Repeat for multiple labels.
-    #[arg(long)]
-    expected: Vec<String>,
 }
 
 /// Arguments for `hm inbox list`.
@@ -817,7 +746,7 @@ fn run(cli: Cli) -> Result<()> {
         Some(Command::Doctor(args)) => run_doctor(args, context),
         Some(Command::Promote(args)) => run_promote(args, context),
         Some(Command::Inbox(command)) => run_inbox(command, context),
-        Some(Command::Eval(command)) => run_eval(command, context),
+        Some(Command::Eval(command)) => cli::eval::run(command),
         None => Ok(()),
     }
 }
@@ -857,8 +786,7 @@ impl Cli {
             Some(Command::Inbox(InboxCommand::List(args))) => args.json,
             Some(Command::Inbox(InboxCommand::Stale(args))) => args.json,
             Some(Command::Inbox(InboxCommand::Show(args))) => args.json,
-            Some(Command::Eval(EvalCommand::CaptureMiss(args))) => args.common.json,
-            Some(Command::Eval(EvalCommand::CaptureBadHit(args))) => args.common.json,
+            Some(Command::Eval(command)) => command.wants_json(),
             _ => false,
         }
     }
@@ -1467,197 +1395,6 @@ fn run_inbox_show(args: InboxShowArgs, context: CliContext) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn run_eval(command: EvalCommand, _context: CliContext) -> Result<()> {
-    match command {
-        EvalCommand::Retrieval(args) => run_eval_retrieval(args),
-        EvalCommand::CaptureMiss(args) => run_eval_capture_miss(args),
-        EvalCommand::CaptureBadHit(args) => run_eval_capture_bad_hit(args),
-    }
-}
-
-fn run_eval_retrieval(args: EvalRetrievalArgs) -> Result<()> {
-    let report = memory_eval::run_retrieval_eval(memory_eval::RetrievalEvalInput {
-        corpus_path: args.corpus,
-        limit: args.limit,
-    })?;
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        print_retrieval_eval_report(&report, args.limit);
-    }
-    Ok(())
-}
-
-fn print_retrieval_eval_report(report: &memory_eval::RetrievalEvalReport, limit: usize) {
-    println!("corpus: {}", report.corpus);
-    for candidate in &report.candidates {
-        println!("candidate: {}", candidate.name);
-        for metric in &candidate.features {
-            println!(
-                "  {} cases={} recall@{}={:.3} precision@{}={:.3} mrr={:.3} forbidden_hits={} p95_ms={}",
-                metric.feature,
-                metric.cases,
-                limit,
-                metric.recall_at_k,
-                limit,
-                metric.precision_at_k,
-                metric.mrr,
-                metric.forbidden_hits,
-                metric.p95_ms
-            );
-        }
-    }
-}
-
-fn run_eval_capture_miss(args: EvalCaptureMissArgs) -> Result<()> {
-    let snippet = render_retrieval_case(EvalRetrievalCaseInput {
-        common: &args.common,
-        expected: &args.expected,
-        forbidden: &args.forbidden,
-        note: "Captured from hm eval capture-miss; verify labels before relying on this case.",
-    })?;
-    emit_eval_capture(&args.common, snippet)
-}
-
-fn run_eval_capture_bad_hit(args: EvalCaptureBadHitArgs) -> Result<()> {
-    let snippet = render_retrieval_case(EvalRetrievalCaseInput {
-        common: &args.common,
-        expected: &args.expected,
-        forbidden: &args.bad,
-        note: "Captured from hm eval capture-bad-hit; verify labels before relying on this case.",
-    })?;
-    emit_eval_capture(&args.common, snippet)
-}
-
-struct EvalRetrievalCaseInput<'a> {
-    common: &'a EvalCaptureCommonArgs,
-    expected: &'a [String],
-    forbidden: &'a [String],
-    note: &'a str,
-}
-
-#[derive(Debug, Serialize)]
-struct EvalCaptureOutput {
-    snippet: String,
-    path: Option<String>,
-    appended: bool,
-}
-
-fn render_retrieval_case(input: EvalRetrievalCaseInput<'_>) -> Result<String> {
-    if input.common.prompt.trim().is_empty() {
-        anyhow::bail!("--prompt must not be empty");
-    }
-    if input.common.feature.trim().is_empty() {
-        anyhow::bail!("--feature must not be empty");
-    }
-
-    let name = input
-        .common
-        .name
-        .clone()
-        .unwrap_or_else(|| captured_case_name(&input.common.prompt));
-    let mut snippet = String::new();
-    snippet.push_str("[[retrieval_case]]\n");
-    snippet.push_str(&format!("name = {}\n", toml_string(&name)?));
-    snippet.push_str(&format!(
-        "feature = {}\n",
-        toml_string(&input.common.feature)?
-    ));
-    snippet.push_str(&format!("query = {}\n", toml_string(&input.common.prompt)?));
-    if let Some(project_id) = input.common.project_id.as_deref() {
-        if project_id.trim().is_empty() {
-            anyhow::bail!("--project-id must not be empty when provided");
-        }
-        snippet.push_str(&format!("project_id = {}\n", toml_string(project_id)?));
-    }
-    snippet.push_str(&format!(
-        "expected = {}\n",
-        toml_string_list(input.expected)?
-    ));
-    snippet.push_str(&format!(
-        "forbidden = {}\n",
-        toml_string_list(input.forbidden)?
-    ));
-    snippet.push_str("target_recall_at_5 = 1.0\n");
-    snippet.push_str("target_precision_at_5 = 1.0\n");
-    snippet.push_str(&format!("note = {}\n", toml_string(input.note)?));
-    Ok(snippet)
-}
-
-fn emit_eval_capture(common: &EvalCaptureCommonArgs, snippet: String) -> Result<()> {
-    let mut appended = false;
-    if let Some(path) = &common.to {
-        append_eval_snippet(path, &snippet)?;
-        appended = true;
-    }
-
-    if common.json {
-        let output = EvalCaptureOutput {
-            snippet,
-            path: common.to.as_ref().map(|path| path.display().to_string()),
-            appended,
-        };
-        println!("{}", serde_json::to_string_pretty(&output)?);
-    } else {
-        print!("{snippet}");
-        if !snippet.ends_with('\n') {
-            println!();
-        }
-        if let Some(path) = &common.to {
-            eprintln!("appended: {}", path.display());
-        }
-    }
-    Ok(())
-}
-
-fn append_eval_snippet(path: &Path, snippet: &str) -> Result<()> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    let needs_separator = file.metadata()?.len() > 0;
-    if needs_separator {
-        writeln!(file)?;
-    }
-    file.write_all(snippet.as_bytes())?;
-    Ok(())
-}
-
-fn captured_case_name(prompt: &str) -> String {
-    let mut words = prompt
-        .split_whitespace()
-        .filter_map(|word| {
-            let normalized = word
-                .trim_matches(|ch: char| !ch.is_ascii_alphanumeric())
-                .to_ascii_lowercase();
-            (!normalized.is_empty()).then_some(normalized)
-        })
-        .take(8)
-        .collect::<Vec<_>>();
-    if words.is_empty() {
-        words.push("prompt".to_owned());
-    }
-    format!("captured {}", words.join(" "))
-}
-
-fn toml_string(value: &str) -> Result<String> {
-    Ok(serde_json::to_string(value)?)
-}
-
-fn toml_string_list(values: &[String]) -> Result<String> {
-    let rendered = values
-        .iter()
-        .map(|value| toml_string(value))
-        .collect::<Result<Vec<_>>>()?;
-    Ok(format!("[{}]", rendered.join(", ")))
 }
 
 fn run_promote(args: PromoteArgs, context: CliContext) -> Result<()> {

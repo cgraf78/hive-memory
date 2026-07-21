@@ -4,8 +4,10 @@ This directory owns the `hm` CLI and library implementation.
 
 ## Module Ownership
 
-- `main.rs` and `lib.rs` are entrypoints. Keep user intent translation in the
-  CLI and reusable behavior in modules.
+- `main.rs` and `lib.rs` are entrypoints. `main.rs` owns top-level parsing,
+  shared CLI context, dispatch, error rendering, and exit status policy.
+- `cli/*.rs` modules own one command family's argument types, structured output
+  models, and handlers. Reusable behavior still belongs in library modules.
 - `config.rs`, `path.rs`, and `context.rs` resolve runtime configuration and
   project-aware defaults.
 - `memory.rs`, `note.rs`, `write.rs`, and `visibility.rs` own stored record
