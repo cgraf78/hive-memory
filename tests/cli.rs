@@ -2504,6 +2504,7 @@ fn flush_refuses_different_hash_collision() {
 fn inbox_lists_shows_and_promotes_raw_notes_idempotently() {
     let dir = temp_dir("inbox-promote");
     let config = dir.join("config.toml");
+    let data = dir.join("data");
     let personal = dir.join("personal");
     let work = dir.join("work");
     write_config(&config, &personal, &work);
@@ -2576,6 +2577,7 @@ fn inbox_lists_shows_and_promotes_raw_notes_idempotently() {
     assert!(curated.contains(&format!("hive-memory:promoted source=\"{note_id}\"")));
     assert!(promotion_event.contains("\"type\": \"memory.promotion\""));
     assert!(promotion_event.contains(&format!("\"ref\": \"{note_id}\"")));
+    assert!(data.join("store-identities.toml").is_file());
 
     cargo_bin_cmd!("hm")
         .args([
@@ -2656,6 +2658,359 @@ fn inbox_lists_shows_and_promotes_raw_notes_idempotently() {
         curated_after_retry.matches("hive-memory:promoted").count(),
         1
     );
+}
+
+#[test]
+fn inbox_and_promote_json_outputs_are_structured() {
+    let dir = temp_dir("inbox-promote-json");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+
+    let note = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "note",
+            "--text",
+            "Structured curation note.",
+        ])
+        .output()
+        .expect("write raw note");
+    assert!(note.status.success());
+    let note_stdout = String::from_utf8(note.stdout).expect("UTF-8 note output");
+    let note_id = stdout_value(&note_stdout, "id:");
+
+    let list = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "inbox",
+            "list",
+            "--json",
+        ])
+        .output()
+        .expect("list inbox");
+    assert!(list.status.success());
+    let list: serde_json::Value = serde_json::from_slice(&list.stdout).expect("inbox list JSON");
+    assert_eq!(list["store"], "personal");
+    assert_eq!(list["items"][0]["entry"]["id"], note_id);
+    assert_eq!(list["items"][0]["promoted"], false);
+
+    let show = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "inbox",
+            "show",
+            &note_id,
+            "--json",
+        ])
+        .output()
+        .expect("show inbox item");
+    assert!(show.status.success());
+    let show: serde_json::Value = serde_json::from_slice(&show.stdout).expect("inbox show JSON");
+    assert_eq!(show["store"], "personal");
+    assert_eq!(show["item"]["entry"]["id"], note_id);
+    assert_eq!(show["body"], "Structured curation note.");
+
+    let promote = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "promote",
+            &note_id,
+            "--json",
+        ])
+        .output()
+        .expect("promote inbox item");
+    assert!(promote.status.success());
+    let promote: serde_json::Value =
+        serde_json::from_slice(&promote.stdout).expect("promotion JSON");
+    assert_eq!(promote["note_id"], note_id);
+    assert_eq!(promote["target_path"], "memories/global/MEMORY.md");
+    assert_eq!(promote["promoted"], true);
+    assert!(promote["target_full_path"].is_string());
+    assert!(promote["event_path"].is_string());
+}
+
+#[test]
+fn curation_json_errors_remain_structured() {
+    let missing = temp_dir("curation-json-errors").join("missing-config.toml");
+    let config = missing.to_str().expect("utf8 config");
+    let commands = [
+        vec!["inbox", "list", "--json"],
+        vec!["inbox", "stale", "--days", "1", "--json"],
+        vec!["inbox", "show", "missing-note", "--json"],
+        vec!["promote", "missing-note", "--json"],
+    ];
+
+    for args in commands {
+        let output = cargo_bin_cmd!("hm")
+            .args(["--config", config])
+            .args(args)
+            .output()
+            .expect("run JSON curation command");
+        assert_eq!(output.status.code(), Some(3));
+        let error: serde_json::Value =
+            serde_json::from_slice(&output.stderr).expect("structured curation error");
+        assert_eq!(error["ok"], false);
+        assert_eq!(error["error"]["code"], "config_error");
+    }
+}
+
+#[test]
+fn inbox_stale_rejects_negative_days_before_loading_config() {
+    let missing = temp_dir("inbox-stale-negative").join("missing-config.toml");
+    let output = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            missing.to_str().expect("utf8 config"),
+            "inbox",
+            "stale",
+            "--days=-1",
+            "--json",
+        ])
+        .output()
+        .expect("run stale validation");
+
+    assert_eq!(output.status.code(), Some(1));
+    let error: serde_json::Value =
+        serde_json::from_slice(&output.stderr).expect("structured validation error");
+    assert_eq!(error["error"]["code"], "error");
+    assert_eq!(error["error"]["message"], "--days must be non-negative");
+}
+
+#[test]
+fn inbox_stale_filters_by_requested_age() {
+    let dir = temp_dir("inbox-stale-filter");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "note",
+            "--text",
+            "Fresh inbox note.",
+        ])
+        .assert()
+        .success();
+
+    let today = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "inbox",
+            "stale",
+            "--days",
+            "0",
+            "--json",
+        ])
+        .output()
+        .expect("list today's stale notes");
+    assert!(today.status.success());
+    let today: serde_json::Value = serde_json::from_slice(&today.stdout).expect("today stale JSON");
+    assert_eq!(today["items"].as_array().expect("items").len(), 1);
+
+    let yesterday = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "inbox",
+            "stale",
+            "--days",
+            "1",
+            "--json",
+        ])
+        .output()
+        .expect("list one-day-old stale notes");
+    assert!(yesterday.status.success());
+    let yesterday: serde_json::Value =
+        serde_json::from_slice(&yesterday.stdout).expect("yesterday stale JSON");
+    assert!(yesterday["items"].as_array().expect("items").is_empty());
+}
+
+#[test]
+fn inbox_enforces_explicit_store_read_policy_before_rebuild() {
+    let dir = temp_dir("inbox-read-policy");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+            state_dir = "{}"
+            cache_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+
+            [stores.work]
+            root = "{}"
+
+            [agents.codex]
+            default_store = "personal"
+            read_stores = ["personal"]
+            write_stores = ["personal"]
+            "#,
+            dir.join("data").display(),
+            dir.join("state").display(),
+            dir.join("cache").display(),
+            personal.display(),
+            work.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&work, "work");
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_STORE", "personal")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "--store",
+            "work",
+            "inbox",
+            "list",
+            "--json",
+        ])
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains(
+            "agent codex may not read store work",
+        ));
+
+    assert!(!dir.join("cache/indexes").exists());
+}
+
+#[test]
+fn promote_checks_write_policy_before_read_and_mutation() {
+    let dir = temp_dir("promote-write-policy");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+            state_dir = "{}"
+            cache_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+
+            [stores.work]
+            root = "{}"
+
+            [agents.codex]
+            default_store = "personal"
+            read_stores = ["personal", "work"]
+            write_stores = ["personal"]
+            "#,
+            data.display(),
+            dir.join("state").display(),
+            dir.join("cache").display(),
+            personal.display(),
+            work.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&work, "work");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "--store",
+            "work",
+            "promote",
+            "missing-note",
+            "--json",
+        ])
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains(
+            "agent codex may not write store work",
+        ));
+
+    assert!(!data.join("store-identities.toml").exists());
+    assert!(!work.join("memories/global/MEMORY.md").exists());
+}
+
+#[test]
+fn promote_checks_read_policy_before_manifest_and_mutation() {
+    let dir = temp_dir("promote-read-policy");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+            state_dir = "{}"
+            cache_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+
+            [stores.work]
+            root = "{}"
+
+            [agents.codex]
+            default_store = "personal"
+            read_stores = ["personal"]
+            write_stores = ["personal", "work"]
+            "#,
+            data.display(),
+            dir.join("state").display(),
+            dir.join("cache").display(),
+            personal.display(),
+            work.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&work, "work");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "--store",
+            "work",
+            "promote",
+            "missing-note",
+            "--json",
+        ])
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains(
+            "agent codex may not read store work",
+        ));
+
+    assert!(!data.join("store-identities.toml").exists());
+    assert!(!work.join("memories/global/MEMORY.md").exists());
 }
 
 #[test]
