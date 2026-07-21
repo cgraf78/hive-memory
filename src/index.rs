@@ -7,7 +7,7 @@
 
 use crate::{entity, note};
 use crate::{event, path as memory_path, write};
-use fs2::FileExt;
+use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::error::Error;
@@ -330,8 +330,8 @@ pub fn try_rebuild_lock(
         .open(&path)
         .map_err(|err| io_error("open rebuild lock", &path, err))?;
     match file.try_lock_exclusive() {
-        Ok(()) => Ok(Some(RebuildLock { file, path })),
-        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Ok(true) => Ok(Some(RebuildLock { file, path })),
+        Ok(false) => Ok(None),
         Err(err) => Err(io_error("lock rebuild", &path, err)),
     }
 }
