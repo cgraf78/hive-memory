@@ -1,5 +1,5 @@
 use assert_cmd::cargo::cargo_bin_cmd;
-use fs2::FileExt;
+use fs4::fs_std::FileExt;
 use hive_memory::{hook as memory_hook, outbox, store};
 use predicates::prelude::*;
 use std::fs::{self, OpenOptions};

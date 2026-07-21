@@ -6,7 +6,7 @@
 //! reimplement memory policy in shell.
 
 use crate::{id, write};
-use fs2::FileExt;
+use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt::{self, Display};
@@ -216,8 +216,8 @@ pub fn try_refresh_lock(
         .open(&path)
         .map_err(|err| io_error("open refresh lock", &path, err))?;
     match file.try_lock_exclusive() {
-        Ok(()) => Ok(Some(RefreshLock { file, path })),
-        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Ok(true) => Ok(Some(RefreshLock { file, path })),
+        Ok(false) => Ok(None),
         Err(err) => Err(io_error("lock refresh", &path, err)),
     }
 }
@@ -264,8 +264,8 @@ pub fn try_state_lock(
         .open(&path)
         .map_err(|err| io_error("open state lock", &path, err))?;
     match file.try_lock_exclusive() {
-        Ok(()) => Ok(Some(StateLock { file, path })),
-        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Ok(true) => Ok(Some(StateLock { file, path })),
+        Ok(false) => Ok(None),
         Err(err) => Err(io_error("lock state", &path, err)),
     }
 }

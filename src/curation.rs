@@ -7,7 +7,7 @@
 
 use crate::index::IndexEntry;
 use crate::{event, id, note, store, write};
-use fs2::FileExt;
+use fs4::fs_std::FileExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
