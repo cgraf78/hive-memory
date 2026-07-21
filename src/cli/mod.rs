@@ -1,5 +1,6 @@
 //! Command-family adapters for the `hm` binary.
 
+pub(crate) mod context;
 pub(crate) mod curation;
 pub(crate) mod eval;
 pub(crate) mod projects;
