@@ -7121,6 +7121,148 @@ fn projects_alias_writes_store_alias_file() {
         .expect("aliases");
     assert!(aliases.contains("project_id = \"new-project\""));
     assert!(aliases.contains("\"old-project\""));
+
+    let manifest = store::read_manifest(&personal).expect("store manifest");
+    let identities =
+        fs::read_to_string(data.join("store-identities.toml")).expect("store identity cache");
+    assert!(identities.contains("personal"));
+    assert!(identities.contains(&manifest.store.id));
+}
+
+#[test]
+fn projects_json_error_intent_matches_existing_command_contract() {
+    let missing = temp_dir("projects-json-errors").join("missing-config.toml");
+    let config = missing.to_str().expect("utf8 config");
+    let json_commands = [
+        vec!["projects", "resolve", ".", "--json"],
+        vec!["projects", "bind", ".", "--store", "personal", "--json"],
+        vec!["projects", "unbind", ".", "--json"],
+    ];
+    for args in json_commands {
+        let output = cargo_bin_cmd!("hm")
+            .args(["--config", config])
+            .args(args)
+            .output()
+            .expect("run JSON project command");
+        assert_eq!(output.status.code(), Some(3));
+        let error: serde_json::Value =
+            serde_json::from_slice(&output.stderr).expect("structured project error");
+        assert_eq!(error["ok"], false);
+        assert_eq!(error["error"]["code"], "config_error");
+    }
+
+    let human_commands = [
+        vec!["projects", "list", "--json"],
+        vec!["projects", "show", "--json"],
+        vec!["projects", "alias", "old-project", "new-project", "--json"],
+    ];
+    for args in human_commands {
+        let output = cargo_bin_cmd!("hm")
+            .args(["--config", config])
+            .args(args)
+            .output()
+            .expect("run human-error project command");
+        assert_eq!(output.status.code(), Some(3));
+        let stderr = String::from_utf8(output.stderr).expect("UTF-8 error");
+        assert!(stderr.starts_with("Error: "));
+        assert!(serde_json::from_str::<serde_json::Value>(&stderr).is_err());
+    }
+}
+
+#[test]
+fn projects_alias_enforces_agent_write_policy_before_mutation() {
+    let dir = temp_dir("projects-alias-agent-policy");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+            state_dir = "{}"
+            cache_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+
+            [stores.work]
+            root = "{}"
+
+            [agents.codex]
+            default_store = "personal"
+            read_stores = ["personal"]
+            write_stores = ["personal"]
+            "#,
+            data.display(),
+            dir.join("state").display(),
+            dir.join("cache").display(),
+            personal.display(),
+            work.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&work, "work");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "--store",
+            "work",
+            "projects",
+            "alias",
+            "old-project",
+            "new-project",
+            "--json",
+        ])
+        .assert()
+        .code(4)
+        .stderr(predicate::str::starts_with("Error: "))
+        .stderr(predicate::str::contains(
+            "agent codex may not write store work",
+        ));
+
+    assert!(
+        !work
+            .join("memories/projects/new-project/aliases.toml")
+            .exists()
+    );
+    assert!(!data.join("store-identities.toml").exists());
+}
+
+#[test]
+fn projects_alias_requires_manifest_before_mutation() {
+    let dir = temp_dir("projects-alias-missing-manifest");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    write_data_config(&config, &data, &personal);
+    fs::create_dir_all(&personal).expect("store root");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "projects",
+            "alias",
+            "old-project",
+            "new-project",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("manifest.toml"));
+
+    assert!(
+        !personal
+            .join("memories/projects/new-project/aliases.toml")
+            .exists()
+    );
+    assert!(!data.join("store-identities.toml").exists());
 }
 
 #[test]
@@ -7249,6 +7391,68 @@ fn projects_bind_validates_active_agent_read_and_write_affinity() {
     .stderr(predicate::str::contains(
         "agent codex may not write store work",
     ));
+
+    assert!(!data.join("projects/bound-project.toml").exists());
+}
+
+#[test]
+fn projects_bind_rejects_unreadable_store_before_writing_binding() {
+    let dir = temp_dir("projects-bind-agent-read-affinity");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    let repo = dir.join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    fs::write(
+        repo.join(".hive-memory-project"),
+        "id = \"bound-project\"\n",
+    )
+    .expect("marker");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+
+            [stores.work]
+            root = "{}"
+
+            [agents.codex]
+            default_store = "personal"
+            read_stores = ["personal"]
+            write_stores = ["personal", "work"]
+            "#,
+            data.display(),
+            personal.display(),
+            work.display()
+        ),
+    )
+    .expect("write config");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "projects",
+            "bind",
+            repo.to_str().expect("utf8 repo"),
+            "--store",
+            "work",
+        ])
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains(
+            "agent codex may not read store work",
+        ));
+
+    assert!(!data.join("projects/bound-project.toml").exists());
 }
 
 /// Write an executable fake model backend that echoes `output` on stdout,
