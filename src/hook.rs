@@ -511,19 +511,37 @@ pub fn append_write_receipt(
     state_dir: &Path,
     session_id: &str,
     receipt: &WriteReceipt,
+) -> Result<(), HookStateError> {
+    append_write_receipt_with_options(
+        state_dir,
+        session_id,
+        receipt,
+        &write::AtomicWriteOptions::default(),
+    )
+}
+
+/// Append a successful write receipt with an explicit durability policy.
+pub fn append_write_receipt_with_options(
+    state_dir: &Path,
+    session_id: &str,
+    receipt: &WriteReceipt,
     options: &write::AtomicWriteOptions,
 ) -> Result<(), HookStateError> {
     let path = write_receipts_path(state_dir, session_id);
     let _lock = lock_write_receipts(state_dir, session_id)?;
-    let mut receipts = load_write_receipts_path(&path)?;
-    receipts.push(receipt.clone());
+    let existing = read_write_receipts_path(&path)?;
+    parse_write_receipts(&existing)?;
 
-    let mut contents = Vec::new();
-    for item in &receipts {
-        serde_json::to_writer(&mut contents, item)
-            .map_err(|err| HookStateError::Json(err.to_string()))?;
+    // Preserve prior bytes so an older writer cannot erase unknown fields from
+    // a newer receipt schema. A valid final record without a newline receives
+    // its separator before the new record is appended.
+    let mut contents = existing.into_bytes();
+    if !contents.is_empty() && !contents.ends_with(b"\n") {
         contents.push(b'\n');
     }
+    serde_json::to_writer(&mut contents, receipt)
+        .map_err(|err| HookStateError::Json(err.to_string()))?;
+    contents.push(b'\n');
     write::write_atomic(&path, &contents, options).map_err(|err| HookStateError::Io {
         action: "write",
         path,
@@ -542,16 +560,19 @@ pub fn load_write_receipts(
     session_id: &str,
 ) -> Result<Vec<WriteReceipt>, HookStateError> {
     let path = write_receipts_path(state_dir, session_id);
-    load_write_receipts_path(&path)
+    let contents = read_write_receipts_path(&path)?;
+    parse_write_receipts(&contents)
 }
 
-fn load_write_receipts_path(path: &Path) -> Result<Vec<WriteReceipt>, HookStateError> {
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(io_error("read", path, err)),
-    };
+fn read_write_receipts_path(path: &Path) -> Result<String, HookStateError> {
+    match fs::read_to_string(path) {
+        Ok(contents) => Ok(contents),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(err) => Err(io_error("read", path, err)),
+    }
+}
 
+fn parse_write_receipts(contents: &str) -> Result<Vec<WriteReceipt>, HookStateError> {
     contents
         .lines()
         .filter(|line| !line.trim().is_empty())
@@ -857,10 +878,51 @@ mod tests {
         let dir = temp_dir("receipts");
         let receipt = receipt("note-id");
 
-        append_write_receipt(&dir, "session-1", &receipt, &options()).expect("append receipt");
+        append_write_receipt(&dir, "session-1", &receipt).expect("append receipt");
         let receipts = load_write_receipts(&dir, "session-1").expect("load receipts");
 
         assert_eq!(receipts, vec![receipt]);
+    }
+
+    #[test]
+    fn write_receipt_append_preserves_unknown_fields() {
+        let dir = temp_dir("receipt-future-fields");
+        let path = write_receipts_path(&dir, "session-1");
+        fs::create_dir_all(path.parent().expect("receipt parent")).expect("receipt parent");
+        let existing = concat!(
+            r#"{"created_at":"2026-07-21T00:00:00Z","store":"personal","scope":"global","note_id":"old","created":true,"future":{"version":2}}"#,
+            "\n"
+        );
+        fs::write(&path, existing).expect("write future receipt");
+
+        append_write_receipt_with_options(&dir, "session-1", &receipt("new"), &options())
+            .expect("append receipt");
+
+        let contents = fs::read_to_string(&path).expect("read receipt stream");
+        assert!(contents.starts_with(existing));
+        assert!(contents.contains(r#""future":{"version":2}"#));
+        assert_eq!(
+            load_write_receipts(&dir, "session-1")
+                .expect("load receipts")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn write_receipt_append_separates_valid_unterminated_record() {
+        let dir = temp_dir("receipt-no-newline");
+        let path = write_receipts_path(&dir, "session-1");
+        fs::create_dir_all(path.parent().expect("receipt parent")).expect("receipt parent");
+        let existing = serde_json::to_string(&receipt("old")).expect("serialize receipt");
+        fs::write(&path, &existing).expect("write receipt without newline");
+
+        append_write_receipt_with_options(&dir, "session-1", &receipt("new"), &options())
+            .expect("append receipt");
+
+        let contents = fs::read_to_string(&path).expect("read receipt stream");
+        assert!(contents.starts_with(&format!("{existing}\n")));
+        assert_eq!(contents.lines().count(), 2);
     }
 
     #[test]
@@ -871,8 +933,9 @@ mod tests {
         let corrupt = b"{not-json}\n";
         fs::write(&path, corrupt).expect("write corrupt stream");
 
-        let error = append_write_receipt(&dir, "session-1", &receipt("new"), &options())
-            .expect_err("corrupt stream must fail closed");
+        let error =
+            append_write_receipt_with_options(&dir, "session-1", &receipt("new"), &options())
+                .expect_err("corrupt stream must fail closed");
 
         assert!(matches!(error, HookStateError::Json(_)));
         assert_eq!(fs::read(path).expect("read corrupt stream"), corrupt);
@@ -915,8 +978,10 @@ mod tests {
         }
 
         match mode.as_str() {
-            "write" => append_write_receipt(&dir, &session, &receipt(marker), &options())
-                .expect("append child receipt"),
+            "write" => {
+                append_write_receipt_with_options(&dir, &session, &receipt(marker), &options())
+                    .expect("append child receipt")
+            }
             "hold" => {
                 let _lock = lock_write_receipts(&dir, &session).expect("hold receipt lock");
                 fs::write(marker, b"ready").expect("write ready marker");
@@ -995,7 +1060,7 @@ mod tests {
         holder.kill().expect("kill lock holder");
         holder.wait().expect("reap lock holder");
 
-        append_write_receipt(&dir, "session-1", &receipt("after-exit"), &options())
+        append_write_receipt_with_options(&dir, "session-1", &receipt("after-exit"), &options())
             .expect("OS released receipt lock");
         assert_eq!(
             load_write_receipts(&dir, "session-1")

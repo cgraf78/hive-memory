@@ -2030,7 +2030,7 @@ fn append_session_write_receipt(
         return;
     }
 
-    let result = memory_hook::append_write_receipt(
+    let result = memory_hook::append_write_receipt_with_options(
         &config.state_dir,
         &session_id,
         &memory_hook::WriteReceipt {
