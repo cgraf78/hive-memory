@@ -54,7 +54,7 @@ file-sync (Google Drive, Dropbox, git) carries the same memory to every machine.
 Install the CLI from a checkout:
 
 ```sh
-cargo install --path .
+cargo install --path . --locked
 ```
 
 Create a minimal config at `$XDG_CONFIG_HOME/hive-memory/config.toml` when
