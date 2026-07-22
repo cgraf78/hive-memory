@@ -2043,6 +2043,7 @@ fn append_session_write_receipt(
             note_id: note_id.to_owned(),
             created: true,
         },
+        &hook_options(config),
     );
     if let Err(err) = result {
         // Receipts are ephemeral hook coordination state. The canonical memory
