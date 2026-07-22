@@ -173,8 +173,7 @@ Default config path:
 # and Rust-native via serde. JSON is reserved for structured events/metadata.
 
 default_store = "personal"
-state_dir = "${XDG_STATE_HOME:-${HOME}/.local/state}/hive-memory"
-cache_dir = "${XDG_CACHE_HOME:-${HOME}/.cache}/hive-memory"
+# Omit data_dir, state_dir, and cache_dir to use the XDG-aware defaults.
 
 host_id = "auto"      # auto = stable machine id derived by CLI
 user_id = "default"   # namespace within each memory store

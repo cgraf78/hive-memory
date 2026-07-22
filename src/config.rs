@@ -483,6 +483,12 @@ pub enum ConfigError {
     /// Default config path could not be resolved because neither an absolute
     /// `XDG_CONFIG_HOME` nor `HOME` is available.
     HomeNotSet,
+    /// A built-in local directory could not be resolved because neither its
+    /// absolute XDG root nor `HOME` is available.
+    LocalDirUnavailable {
+        /// XDG environment variable that was absent, empty, or relative.
+        xdg_env: &'static str,
+    },
     /// Required config file could not be read.
     ReadConfig {
         /// Config path that failed to read.
@@ -537,6 +543,10 @@ impl Display for ConfigError {
             Self::HomeNotSet => write!(
                 f,
                 "HOME is not set and no absolute XDG_CONFIG_HOME is available; cannot find default config path"
+            ),
+            Self::LocalDirUnavailable { xdg_env } => write!(
+                f,
+                "HOME is not set and no absolute {xdg_env} is available; cannot resolve Hive Memory's default local directory"
             ),
             Self::ReadConfig { path, message } => {
                 write!(f, "failed to read config {}: {message}", path.display())
@@ -882,24 +892,9 @@ impl Config {
         Ok(Self {
             schema_version: raw.schema_version.unwrap_or(1),
             default_store,
-            data_dir: expand_path(
-                raw.data_dir
-                    .as_deref()
-                    .unwrap_or("${XDG_DATA_HOME:-${HOME}/.local/share}/hive-memory"),
-                env,
-            )?,
-            state_dir: expand_path(
-                raw.state_dir
-                    .as_deref()
-                    .unwrap_or("${XDG_STATE_HOME:-${HOME}/.local/state}/hive-memory"),
-                env,
-            )?,
-            cache_dir: expand_path(
-                raw.cache_dir
-                    .as_deref()
-                    .unwrap_or("${XDG_CACHE_HOME:-${HOME}/.cache}/hive-memory"),
-                env,
-            )?,
+            data_dir: local_dir(raw.data_dir.as_deref(), LocalDir::Data, env)?,
+            state_dir: local_dir(raw.state_dir.as_deref(), LocalDir::State, env)?,
+            cache_dir: local_dir(raw.cache_dir.as_deref(), LocalDir::Cache, env)?,
             host_id: raw.host_id.unwrap_or_else(|| "auto".to_owned()),
             user_id: raw.user_id.unwrap_or_else(|| "default".to_owned()),
             storage: StorageConfig::from_raw(raw.storage),
@@ -1354,6 +1349,63 @@ where
     Ok(false)
 }
 
+#[derive(Debug, Clone, Copy)]
+enum LocalDir {
+    Data,
+    State,
+    Cache,
+}
+
+impl LocalDir {
+    fn xdg_env(self) -> &'static str {
+        match self {
+            Self::Data => "XDG_DATA_HOME",
+            Self::State => "XDG_STATE_HOME",
+            Self::Cache => "XDG_CACHE_HOME",
+        }
+    }
+
+    fn home_suffix(self) -> &'static str {
+        match self {
+            Self::Data => ".local/share",
+            Self::State => ".local/state",
+            Self::Cache => ".cache",
+        }
+    }
+}
+
+/// Resolve a configured local path or Hive Memory's XDG-aware built-in default.
+///
+/// Configured values intentionally retain the general path-expansion contract,
+/// including relative paths and `${...}` expressions. The stricter XDG rule is
+/// applied only to built-in defaults: XDG base directories must be absolute,
+/// while an absent, empty, or relative value falls back to `HOME`.
+fn local_dir<F>(configured: Option<&str>, kind: LocalDir, env: &F) -> Result<PathBuf, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(configured) = configured {
+        return expand_path(configured, env);
+    }
+
+    if let Some(root) = env(kind.xdg_env()).filter(|value| !value.is_empty()) {
+        let root = PathBuf::from(root);
+        if root.is_absolute() {
+            return Ok(root.join("hive-memory"));
+        }
+    }
+
+    let home =
+        env("HOME")
+            .filter(|value| !value.is_empty())
+            .ok_or(ConfigError::LocalDirUnavailable {
+                xdg_env: kind.xdg_env(),
+            })?;
+    Ok(PathBuf::from(home)
+        .join(kind.home_suffix())
+        .join("hive-memory"))
+}
+
 fn expand_path<F>(input: &str, env: &F) -> Result<PathBuf, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
@@ -1631,6 +1683,196 @@ mod tests {
             }
         );
         assert!(loaded.warnings.is_empty());
+    }
+
+    #[test]
+    fn default_local_dirs_use_absolute_xdg_roots_without_home() {
+        let loaded = LoadedConfig::from_str_with_env(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "/tmp/personal"
+            "#,
+            |name| match name {
+                "XDG_DATA_HOME" => Some("/xdg/data".to_owned()),
+                "XDG_STATE_HOME" => Some("/xdg/state".to_owned()),
+                "XDG_CACHE_HOME" => Some("/xdg/cache".to_owned()),
+                _ => None,
+            },
+        )
+        .expect("absolute XDG roots do not require HOME");
+
+        assert_eq!(
+            loaded.config.data_dir,
+            PathBuf::from("/xdg/data/hive-memory")
+        );
+        assert_eq!(
+            loaded.config.state_dir,
+            PathBuf::from("/xdg/state/hive-memory")
+        );
+        assert_eq!(
+            loaded.config.cache_dir,
+            PathBuf::from("/xdg/cache/hive-memory")
+        );
+    }
+
+    #[test]
+    fn default_local_dirs_ignore_relative_xdg_roots() {
+        let loaded = LoadedConfig::from_str_with_env(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "/tmp/personal"
+            "#,
+            |name| match name {
+                "HOME" => Some("/home/tester".to_owned()),
+                "XDG_DATA_HOME" | "XDG_STATE_HOME" | "XDG_CACHE_HOME" => {
+                    Some("relative/root".to_owned())
+                }
+                _ => None,
+            },
+        )
+        .expect("relative XDG roots fall back to HOME");
+
+        assert_eq!(
+            loaded.config.data_dir,
+            PathBuf::from("/home/tester/.local/share/hive-memory")
+        );
+        assert_eq!(
+            loaded.config.state_dir,
+            PathBuf::from("/home/tester/.local/state/hive-memory")
+        );
+        assert_eq!(
+            loaded.config.cache_dir,
+            PathBuf::from("/home/tester/.cache/hive-memory")
+        );
+    }
+
+    #[test]
+    fn default_local_dirs_ignore_empty_xdg_roots() {
+        let loaded = LoadedConfig::from_str_with_env(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "/tmp/personal"
+            "#,
+            |name| match name {
+                "HOME" => Some("/home/tester".to_owned()),
+                "XDG_DATA_HOME" | "XDG_STATE_HOME" | "XDG_CACHE_HOME" => Some(String::new()),
+                _ => None,
+            },
+        )
+        .expect("empty XDG roots fall back to HOME");
+
+        assert_eq!(
+            loaded.config.data_dir,
+            PathBuf::from("/home/tester/.local/share/hive-memory")
+        );
+        assert_eq!(
+            loaded.config.state_dir,
+            PathBuf::from("/home/tester/.local/state/hive-memory")
+        );
+        assert_eq!(
+            loaded.config.cache_dir,
+            PathBuf::from("/home/tester/.cache/hive-memory")
+        );
+    }
+
+    #[test]
+    fn default_data_dir_requires_home_without_absolute_xdg_root() {
+        let error = LoadedConfig::from_str_with_env(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "/tmp/personal"
+            "#,
+            |_| None,
+        )
+        .expect_err("missing data roots fail closed");
+
+        assert_eq!(
+            error,
+            ConfigError::LocalDirUnavailable {
+                xdg_env: "XDG_DATA_HOME"
+            }
+        );
+    }
+
+    #[test]
+    fn default_state_dir_requires_home_without_absolute_xdg_root() {
+        let error = LoadedConfig::from_str_with_env(
+            r#"
+            default_store = "personal"
+            data_dir = "/tmp/data"
+
+            [stores.personal]
+            root = "/tmp/personal"
+            "#,
+            |_| None,
+        )
+        .expect_err("missing state roots fail closed");
+
+        assert_eq!(
+            error,
+            ConfigError::LocalDirUnavailable {
+                xdg_env: "XDG_STATE_HOME"
+            }
+        );
+    }
+
+    #[test]
+    fn default_cache_dir_requires_home_without_absolute_xdg_root() {
+        let error = LoadedConfig::from_str_with_env(
+            r#"
+            default_store = "personal"
+            data_dir = "/tmp/data"
+            state_dir = "/tmp/state"
+
+            [stores.personal]
+            root = "/tmp/personal"
+            "#,
+            |_| None,
+        )
+        .expect_err("missing cache roots fail closed");
+
+        assert_eq!(
+            error,
+            ConfigError::LocalDirUnavailable {
+                xdg_env: "XDG_CACHE_HOME"
+            }
+        );
+    }
+
+    #[test]
+    fn configured_local_dirs_keep_general_path_expansion() {
+        let loaded = LoadedConfig::from_str_with_env(
+            r#"
+            default_store = "personal"
+            data_dir = "${XDG_DATA_HOME}/data"
+            state_dir = "relative/state"
+            cache_dir = "${HOME}/custom-cache"
+
+            [stores.personal]
+            root = "/tmp/personal"
+            "#,
+            |name| match name {
+                "HOME" => Some("/home/tester".to_owned()),
+                "XDG_DATA_HOME" => Some("relative/xdg".to_owned()),
+                _ => None,
+            },
+        )
+        .expect("configured local directories remain explicit");
+
+        assert_eq!(loaded.config.data_dir, PathBuf::from("relative/xdg/data"));
+        assert_eq!(loaded.config.state_dir, PathBuf::from("relative/state"));
+        assert_eq!(
+            loaded.config.cache_dir,
+            PathBuf::from("/home/tester/custom-cache")
+        );
     }
 
     #[test]
