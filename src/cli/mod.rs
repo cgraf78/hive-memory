@@ -6,4 +6,5 @@ pub(crate) mod eval;
 pub(crate) mod projects;
 pub(crate) mod search;
 pub(crate) mod stores;
+pub(crate) mod sync;
 pub(crate) mod sync_status;
