@@ -38,8 +38,16 @@ disagree, prefer this document for v1 behavior and update the docs deliberately.
 
 ### Config Schema
 
-Primary config file: `~/.config/hive-memory/config.toml`.
-Local override file: `~/.config/hive-memory/config.local.toml`.
+Config paths use this precedence:
+
+1. `--config <path>` when supplied by the CLI.
+2. `HIVE_MEMORY_CONFIG` when set, preserving its value exactly.
+3. `$XDG_CONFIG_HOME/hive-memory/config.toml` when `XDG_CONFIG_HOME` is an
+   absolute path.
+4. `$HOME/.config/hive-memory/config.toml` otherwise.
+
+The optional local override is `config.local.toml` beside the selected primary
+config, regardless of how the primary path was selected.
 
 Minimal valid config:
 
