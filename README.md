@@ -57,7 +57,9 @@ Install the CLI from a checkout:
 cargo install --path .
 ```
 
-Create a minimal config at `~/.config/hive-memory/config.toml`:
+Create a minimal config at `$XDG_CONFIG_HOME/hive-memory/config.toml` when
+`XDG_CONFIG_HOME` is absolute, or at `~/.config/hive-memory/config.toml`
+otherwise:
 
 ```toml
 default_store = "personal"
@@ -138,7 +140,7 @@ Put the store in a synced folder and point each machine's config at it. Identity
 travels with the manifest, not the path.
 
 ```toml
-# ~/.config/hive-memory/config.toml  (on every machine)
+# $XDG_CONFIG_HOME/hive-memory/config.toml or ~/.config/hive-memory/config.toml
 default_store = "personal"
 
 [stores.personal]
@@ -537,10 +539,11 @@ plus JSON event sidecars. The `generated/` tree is disposable.
 
 ## Configuration
 
-The default config path is `~/.config/hive-memory/config.toml`, with an optional
-machine-local override at `config.local.toml` beside it. `--config <path>`
-overrides the path; `HIVE_MEMORY_CONFIG` is used when `--config` is absent. A
-fuller config:
+The default config path is `$XDG_CONFIG_HOME/hive-memory/config.toml` when
+`XDG_CONFIG_HOME` is an absolute path, or `~/.config/hive-memory/config.toml`
+otherwise, with an optional machine-local override at `config.local.toml`
+beside it. `--config <path>` overrides the path; `HIVE_MEMORY_CONFIG` is used
+when `--config` is absent. A fuller config:
 
 ```toml
 schema_version = 1

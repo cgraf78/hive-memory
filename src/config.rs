@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
+use std::ffi::OsString;
 use std::fmt::{self, Display};
 use std::fs;
 use std::io;
@@ -479,7 +480,8 @@ impl Display for ConfigWarning {
 pub enum ConfigError {
     /// TOML parsing or deserialization failed.
     Parse(String),
-    /// Default config path could not be resolved because `HOME` is unset.
+    /// Default config path could not be resolved because neither an absolute
+    /// `XDG_CONFIG_HOME` nor `HOME` is available.
     HomeNotSet,
     /// Required config file could not be read.
     ReadConfig {
@@ -532,7 +534,10 @@ impl Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Parse(message) => write!(f, "failed to parse config: {message}"),
-            Self::HomeNotSet => write!(f, "HOME is not set; cannot find default config path"),
+            Self::HomeNotSet => write!(
+                f,
+                "HOME is not set and no absolute XDG_CONFIG_HOME is available; cannot find default config path"
+            ),
             Self::ReadConfig { path, message } => {
                 write!(f, "failed to read config {}: {message}", path.display())
             }
@@ -579,7 +584,7 @@ impl ConfigPaths {
     ///
     /// The local override is always `config.local.toml` beside the selected
     /// main file. That keeps custom test/config roots predictable and matches
-    /// the default `~/.config/hive-memory` layout.
+    /// the default XDG or `~/.config/hive-memory` layout.
     pub fn from_main_path(main: impl Into<PathBuf>) -> Self {
         let main = main.into();
         let local_override = main.parent().map(|parent| parent.join("config.local.toml"));
@@ -592,17 +597,34 @@ impl ConfigPaths {
     /// Resolve config paths using CLI override, env override, then defaults.
     ///
     /// `--config` should pass `explicit_main`; otherwise `HIVE_MEMORY_CONFIG`
-    /// wins over the standard `~/.config/hive-memory/config.toml` path.
+    /// wins over an absolute `XDG_CONFIG_HOME`, which in turn wins over the
+    /// standard `~/.config/hive-memory/config.toml` path. Empty or relative XDG
+    /// config roots are ignored as required by the XDG base-directory contract.
     pub fn resolve(explicit_main: Option<&Path>) -> Result<Self, ConfigError> {
+        Self::resolve_with(explicit_main, |name| std::env::var_os(name))
+    }
+
+    fn resolve_with<F>(explicit_main: Option<&Path>, env: F) -> Result<Self, ConfigError>
+    where
+        F: Fn(&str) -> Option<OsString>,
+    {
         if let Some(path) = explicit_main {
             return Ok(Self::from_main_path(path));
         }
 
-        if let Some(path) = std::env::var_os("HIVE_MEMORY_CONFIG") {
+        if let Some(path) = env("HIVE_MEMORY_CONFIG") {
             return Ok(Self::from_main_path(path));
         }
 
-        let Some(home) = std::env::var_os("HOME") else {
+        if let Some(config_home) = env("XDG_CONFIG_HOME").map(PathBuf::from)
+            && config_home.is_absolute()
+        {
+            return Ok(Self::from_main_path(
+                config_home.join("hive-memory/config.toml"),
+            ));
+        }
+
+        let Some(home) = env("HOME") else {
             return Err(ConfigError::HomeNotSet);
         };
         Ok(Self::from_main_path(
@@ -1375,6 +1397,14 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn env_vars<'a>(values: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
+        move |name| {
+            values
+                .iter()
+                .find_map(|(key, value)| (*key == name).then(|| OsString::from(*value)))
+        }
+    }
+
     fn env(name: &str) -> Option<String> {
         match name {
             "HOME" => Some("/home/tester".to_owned()),
@@ -1396,6 +1426,136 @@ mod tests {
         ));
         fs::create_dir_all(&path).expect("create temp dir");
         path
+    }
+
+    #[test]
+    fn config_paths_explicit_main_wins_over_environment() {
+        let main = PathBuf::from("relative/explicit.toml");
+        let paths = ConfigPaths::resolve_with(
+            Some(&main),
+            env_vars(&[
+                ("HIVE_MEMORY_CONFIG", "/env/config.toml"),
+                ("XDG_CONFIG_HOME", "/xdg"),
+                ("HOME", "/home/tester"),
+            ]),
+        )
+        .expect("explicit path resolves");
+
+        assert_eq!(paths.main, main);
+        assert_eq!(
+            paths.local_override,
+            Some(PathBuf::from("relative/config.local.toml"))
+        );
+    }
+
+    #[test]
+    fn config_paths_env_override_wins_over_xdg() {
+        let paths = ConfigPaths::resolve_with(
+            None,
+            env_vars(&[
+                ("HIVE_MEMORY_CONFIG", "/env/config.toml"),
+                ("XDG_CONFIG_HOME", "/xdg"),
+                ("HOME", "/home/tester"),
+            ]),
+        )
+        .expect("environment path resolves");
+
+        assert_eq!(paths.main, PathBuf::from("/env/config.toml"));
+        assert_eq!(
+            paths.local_override,
+            Some(PathBuf::from("/env/config.local.toml"))
+        );
+    }
+
+    #[test]
+    fn config_paths_preserve_empty_env_override() {
+        let paths = ConfigPaths::resolve_with(
+            None,
+            env_vars(&[
+                ("HIVE_MEMORY_CONFIG", ""),
+                ("XDG_CONFIG_HOME", "/xdg"),
+                ("HOME", "/home/tester"),
+            ]),
+        )
+        .expect("empty environment override retains existing behavior");
+
+        assert_eq!(paths.main, PathBuf::new());
+        assert_eq!(paths.local_override, None);
+    }
+
+    #[test]
+    fn config_paths_use_absolute_xdg_root() {
+        let paths = ConfigPaths::resolve_with(
+            None,
+            env_vars(&[
+                ("XDG_CONFIG_HOME", "/tmp/xdg config"),
+                ("HOME", "/home/tester"),
+            ]),
+        )
+        .expect("XDG path resolves");
+
+        assert_eq!(
+            paths.main,
+            PathBuf::from("/tmp/xdg config/hive-memory/config.toml")
+        );
+        assert_eq!(
+            paths.local_override,
+            Some(PathBuf::from(
+                "/tmp/xdg config/hive-memory/config.local.toml"
+            ))
+        );
+    }
+
+    #[test]
+    fn config_paths_use_absolute_xdg_root_without_home() {
+        let paths =
+            ConfigPaths::resolve_with(None, env_vars(&[("XDG_CONFIG_HOME", "/tmp/xdg-config")]))
+                .expect("XDG path does not require HOME");
+
+        assert_eq!(
+            paths.main,
+            PathBuf::from("/tmp/xdg-config/hive-memory/config.toml")
+        );
+    }
+
+    #[test]
+    fn config_paths_ignore_empty_xdg_root() {
+        let paths = ConfigPaths::resolve_with(
+            None,
+            env_vars(&[("XDG_CONFIG_HOME", ""), ("HOME", "/home/tester")]),
+        )
+        .expect("HOME fallback resolves");
+
+        assert_eq!(
+            paths.main,
+            PathBuf::from("/home/tester/.config/hive-memory/config.toml")
+        );
+    }
+
+    #[test]
+    fn config_paths_ignore_relative_xdg_root() {
+        let paths = ConfigPaths::resolve_with(
+            None,
+            env_vars(&[
+                ("XDG_CONFIG_HOME", "relative/config"),
+                ("HOME", "/home/tester"),
+            ]),
+        )
+        .expect("HOME fallback resolves");
+
+        assert_eq!(
+            paths.main,
+            PathBuf::from("/home/tester/.config/hive-memory/config.toml")
+        );
+    }
+
+    #[test]
+    fn config_paths_require_home_without_absolute_xdg_root() {
+        let error =
+            ConfigPaths::resolve_with(None, env_vars(&[("XDG_CONFIG_HOME", "relative/config")]))
+                .expect_err("missing default roots fail");
+
+        assert_eq!(error, ConfigError::HomeNotSet);
     }
 
     #[test]

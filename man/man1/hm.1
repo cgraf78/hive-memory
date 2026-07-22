@@ -100,8 +100,16 @@ Inspect raw inbox notes.
 Run retrieval corpus metrics and capture retrieval misses or bad hits as eval
 fixtures.
 .SH CONFIGURATION
-The default config path is
+When
+.B XDG_CONFIG_HOME
+is an absolute path, the default config path is
+.IR $XDG_CONFIG_HOME/hive-memory/config.toml .
+When it is unset, empty, or relative, the default is
 .IR ~/.config/hive-memory/config.toml .
+A path supplied with
+.B --config
+has highest precedence, followed by
+.BR HIVE_MEMORY_CONFIG .
 A minimal config selects a default store and maps store names to roots:
 .PP
 .RS
@@ -115,8 +123,14 @@ description = "Personal memory"
 .RE
 .SH FILES
 .TP
-.I ~/.config/hive-memory/config.toml
+.I $XDG_CONFIG_HOME/hive-memory/config.toml
 Default configuration file.
+.PP
+Falls back to
+.I ~/.config/hive-memory/config.toml
+when
+.B XDG_CONFIG_HOME
+is unavailable or invalid.
 .TP
 .I <store>/manifest.toml
 Store identity and metadata.
