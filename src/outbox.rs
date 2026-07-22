@@ -507,7 +507,7 @@ pub fn bind_item(input: BindInput<'_>) -> Result<BindReport, OutboxError> {
 ///
 /// A single corrupt or unwritable item must never strand the rest of the queue:
 /// the outbox exists precisely to preserve offline writes, so every recoverable
-/// per-item problem (unparseable metadata, payload I/O failure, archive write
+/// per-item problem (unparsable metadata, payload I/O failure, archive write
 /// failure) is bucketed into the item's own `FlushItemReport` and the loop keeps
 /// going. The only hard error is failing to scan the outbox root itself, because
 /// without a directory listing there is no per-item work to report against.
@@ -552,7 +552,7 @@ fn flush_item(input: &FlushInput<'_>, item_dir: &Path) -> FlushItemReport {
             // A concurrent flusher may have removed the item (and its meta.toml)
             // between the directory scan and this read. A missing meta file is
             // "already done", not a corruption to surface. Anything else
-            // (unparseable, unreadable, unsupported schema) is a per-item repair
+            // (unparsable, unreadable, unsupported schema) is a per-item repair
             // problem: bucket it as failed -- deriving id/store from the path,
             // since we have no parsed metadata -- and keep flushing the rest.
             if meta_path
@@ -1105,7 +1105,7 @@ mod tests {
     /// A concurrent flusher that already published byte-identical content must not
     /// fail the loser: `write_atomic_create_new` returns `AlreadyExists`, and the
     /// content re-check must collapse the lost race into the idempotent
-    /// already-present outcome so `perform_refresh` does not bail on `failed>0`.
+    /// already-present outcome so `cli::sync::perform` does not bail on `failed>0`.
     #[test]
     fn publish_payload_matching_existing_is_already_present_not_failed() {
         let payload = b"durable memory body";

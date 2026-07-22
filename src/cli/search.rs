@@ -191,11 +191,12 @@ fn run_search_backend(
 /// current entries when their fingerprint changed, and run a policy-filtered
 /// BM25 search. The index lives under the disposable cache dir, keyed by store.
 ///
-/// The rebuild branch takes the same cache-key `RebuildLock` that `perform_refresh`
-/// holds, so an interactive `hm search` and a concurrent `hm refresh` cannot fight
-/// over the shared cache artifact. On contention we degrade to read-only/lexical
-/// rather than block this latency-sensitive read: a stale-but-valid index searches
-/// fine, and the rebuild the other holder is running will land for the next query.
+/// The rebuild branch takes the same cache-key `RebuildLock` that
+/// `cli::sync::perform` holds, so an interactive `hm search` and a concurrent
+/// `hm refresh` cannot fight over the shared cache artifact. On contention we
+/// degrade to read-only/lexical rather than block this latency-sensitive read: a
+/// stale-but-valid index searches fine, and the rebuild the other holder is
+/// running will land for the next query.
 /// (Tantivy's own writer lock already prevents corruption; this is about honoring
 /// the documented single-writer contract and avoiding redundant rebuild scans.)
 fn tantivy_search(
