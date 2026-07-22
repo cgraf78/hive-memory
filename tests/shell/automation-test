@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Repository-owned checks for dependency automation documentation.
+
+set -uo pipefail
+
+HIVE_MEMORY_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+
+# shellcheck source=tests/shell/helpers.sh
+. "$(dirname "$0")/helpers.sh"
+
+echo "=== Automation contracts ==="
+
+_readme=$(cat "$HIVE_MEMORY_DIR/README.md")
+_assert_contains "README: source installs use the committed lockfile" \
+  'cargo install --path . --locked' "$_readme"
+
+_test_summary
