@@ -481,7 +481,7 @@ pub enum ConfigError {
     /// TOML parsing or deserialization failed.
     Parse(String),
     /// Default config path could not be resolved because neither an absolute
-    /// `XDG_CONFIG_HOME` nor `HOME` is available.
+    /// `XDG_CONFIG_HOME` nor a non-empty `HOME` is available.
     HomeNotSet,
     /// A built-in local directory could not be resolved because neither its
     /// absolute XDG root nor `HOME` is available.
@@ -542,11 +542,11 @@ impl Display for ConfigError {
             Self::Parse(message) => write!(f, "failed to parse config: {message}"),
             Self::HomeNotSet => write!(
                 f,
-                "HOME is not set and no absolute XDG_CONFIG_HOME is available; cannot find default config path"
+                "HOME is unset or empty and no absolute XDG_CONFIG_HOME is available; cannot find default config path"
             ),
             Self::LocalDirUnavailable { xdg_env } => write!(
                 f,
-                "HOME is not set and no absolute {xdg_env} is available; cannot resolve Hive Memory's default local directory"
+                "HOME is unset or empty and no absolute {xdg_env} is available; cannot resolve Hive Memory's default local directory"
             ),
             Self::ReadConfig { path, message } => {
                 write!(f, "failed to read config {}: {message}", path.display())
@@ -634,7 +634,7 @@ impl ConfigPaths {
             ));
         }
 
-        let Some(home) = env("HOME") else {
+        let Some(home) = env("HOME").filter(|value| !value.is_empty()) else {
             return Err(ConfigError::HomeNotSet);
         };
         Ok(Self::from_main_path(
@@ -1606,6 +1606,17 @@ mod tests {
         let error =
             ConfigPaths::resolve_with(None, env_vars(&[("XDG_CONFIG_HOME", "relative/config")]))
                 .expect_err("missing default roots fail");
+
+        assert_eq!(error, ConfigError::HomeNotSet);
+    }
+
+    #[test]
+    fn config_paths_require_nonempty_home_without_absolute_xdg_root() {
+        let error = ConfigPaths::resolve_with(
+            None,
+            env_vars(&[("XDG_CONFIG_HOME", "relative/config"), ("HOME", "")]),
+        )
+        .expect_err("an empty HOME cannot anchor the fallback path");
 
         assert_eq!(error, ConfigError::HomeNotSet);
     }

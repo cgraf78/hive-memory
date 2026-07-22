@@ -106,6 +106,9 @@ is an absolute path, the default config path is
 .IR $XDG_CONFIG_HOME/hive-memory/config.toml .
 When it is unset, empty, or relative, the default is
 .IR ~/.config/hive-memory/config.toml .
+This fallback requires a non-empty
+.BR HOME ;
+otherwise configuration path resolution fails.
 A path supplied with
 .B --config
 has highest precedence, followed by

@@ -59,7 +59,7 @@ cargo install --path .
 
 Create a minimal config at `$XDG_CONFIG_HOME/hive-memory/config.toml` when
 `XDG_CONFIG_HOME` is absolute, or at `~/.config/hive-memory/config.toml`
-otherwise:
+otherwise. The fallback requires a non-empty `HOME`:
 
 ```toml
 default_store = "personal"
@@ -543,7 +543,9 @@ The default config path is `$XDG_CONFIG_HOME/hive-memory/config.toml` when
 `XDG_CONFIG_HOME` is an absolute path, or `~/.config/hive-memory/config.toml`
 otherwise, with an optional machine-local override at `config.local.toml`
 beside it. `--config <path>` overrides the path; `HIVE_MEMORY_CONFIG` is used
-when `--config` is absent.
+when `--config` is absent. Hive Memory reports an error instead of constructing
+a relative config path when the fallback is required and `HOME` is unset or
+empty.
 
 When `data_dir`, `state_dir`, or `cache_dir` is omitted, Hive Memory uses the
 corresponding XDG base directory only when it is non-empty and absolute, then

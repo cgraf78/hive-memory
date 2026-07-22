@@ -44,7 +44,10 @@ Config paths use this precedence:
 2. `HIVE_MEMORY_CONFIG` when set, preserving its value exactly.
 3. `$XDG_CONFIG_HOME/hive-memory/config.toml` when `XDG_CONFIG_HOME` is an
    absolute path.
-4. `$HOME/.config/hive-memory/config.toml` otherwise.
+4. `$HOME/.config/hive-memory/config.toml` otherwise, when `HOME` is non-empty.
+
+Config path resolution MUST fail when the fallback is required and `HOME` is
+unset or empty.
 
 The optional local override is `config.local.toml` beside the selected primary
 config, regardless of how the primary path was selected.
