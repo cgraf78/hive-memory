@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt::{self, Display};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 
@@ -112,6 +111,23 @@ pub struct StateLock {
 }
 
 impl Drop for StateLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+/// Held local lock serializing one session's receipt stream rewrite.
+///
+/// Receipt publication blocks briefly rather than falling through on contention:
+/// a missed receipt can leave durable-memory intent pending indefinitely. The OS
+/// owns the lock through this open descriptor, so process exit releases ownership
+/// even though the empty lock file remains on disk.
+#[derive(Debug)]
+struct ReceiptLock {
+    file: File,
+}
+
+impl Drop for ReceiptLock {
     fn drop(&mut self) {
         let _ = self.file.unlock();
     }
@@ -235,6 +251,42 @@ pub fn state_lock_path(state_dir: &Path, session_id: &str) -> PathBuf {
         .join("locks")
         .join("hook-state")
         .join(format!("{}.lock", id::sanitize_component(session_id)))
+}
+
+/// Return the write-receipt lock path for one session.
+pub fn write_receipts_lock_path(state_dir: &Path, session_id: &str) -> PathBuf {
+    state_dir
+        .join("locks")
+        .join("write-receipts")
+        .join(format!("{}.lock", id::sanitize_component(session_id)))
+}
+
+/// Acquire the blocking per-session receipt lock.
+///
+/// Receipt writes are infrequent and the critical section only validates and
+/// atomically republishes one small JSONL file. Blocking here preserves every
+/// writer; unlike hook-state updates, proceeding unlocked is not a safe fallback.
+fn lock_write_receipts(state_dir: &Path, session_id: &str) -> Result<ReceiptLock, HookStateError> {
+    let path = write_receipts_lock_path(state_dir, session_id);
+    let Some(parent) = path.parent() else {
+        return Err(HookStateError::Io {
+            action: "create write-receipt lock parent",
+            path,
+            message: "lock path has no parent".to_owned(),
+        });
+    };
+    fs::create_dir_all(parent)
+        .map_err(|err| io_error("create write-receipt lock parent", parent, err))?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|err| io_error("open write-receipt lock", &path, err))?;
+    file.lock_exclusive()
+        .map_err(|err| io_error("lock write receipts", &path, err))?;
+    Ok(ReceiptLock { file })
 }
 
 /// Try to acquire the non-blocking per-session hook-state lock.
@@ -450,33 +502,51 @@ pub fn known_session_memory_ids(state: &HookState) -> std::collections::BTreeSet
 
 /// Append a successful write receipt for the active session.
 ///
-/// This intentionally uses append-only JSONL instead of rewriting a shared JSON
-/// array. Receipts are coordination state and can be replayed or counted; an
-/// append avoids a hot read-modify-write file at the exact boundary where
-/// multiple tools may finish close together.
+/// Serialize writers with a dedicated OS lock, then atomically replace the full
+/// JSONL stream. Plain O_APPEND cannot make serde's JSON write plus the trailing
+/// newline indivisible, and process interruption can leave a partial final line.
+/// Atomic replacement keeps the prior complete stream visible until the new
+/// complete stream is published.
 pub fn append_write_receipt(
     state_dir: &Path,
     session_id: &str,
     receipt: &WriteReceipt,
 ) -> Result<(), HookStateError> {
+    append_write_receipt_with_options(
+        state_dir,
+        session_id,
+        receipt,
+        &write::AtomicWriteOptions::default(),
+    )
+}
+
+/// Append a successful write receipt with an explicit durability policy.
+pub fn append_write_receipt_with_options(
+    state_dir: &Path,
+    session_id: &str,
+    receipt: &WriteReceipt,
+    options: &write::AtomicWriteOptions,
+) -> Result<(), HookStateError> {
     let path = write_receipts_path(state_dir, session_id);
-    let Some(parent) = path.parent() else {
-        return Err(HookStateError::Io {
-            action: "resolve parent for",
-            path,
-            message: "path has no parent".to_owned(),
-        });
-    };
-    fs::create_dir_all(parent).map_err(|err| io_error("create parent for", parent, err))?;
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|err| io_error("open", &path, err))?;
-    serde_json::to_writer(&mut file, receipt)
+    let _lock = lock_write_receipts(state_dir, session_id)?;
+    let existing = read_write_receipts_path(&path)?;
+    parse_write_receipts(&existing)?;
+
+    // Preserve prior bytes so an older writer cannot erase unknown fields from
+    // a newer receipt schema. A valid final record without a newline receives
+    // its separator before the new record is appended.
+    let mut contents = existing.into_bytes();
+    if !contents.is_empty() && !contents.ends_with(b"\n") {
+        contents.push(b'\n');
+    }
+    serde_json::to_writer(&mut contents, receipt)
         .map_err(|err| HookStateError::Json(err.to_string()))?;
-    file.write_all(b"\n")
-        .map_err(|err| io_error("write", &path, err))?;
+    contents.push(b'\n');
+    write::write_atomic(&path, &contents, options).map_err(|err| HookStateError::Io {
+        action: "write",
+        path,
+        message: err.to_string(),
+    })?;
     Ok(())
 }
 
@@ -490,12 +560,19 @@ pub fn load_write_receipts(
     session_id: &str,
 ) -> Result<Vec<WriteReceipt>, HookStateError> {
     let path = write_receipts_path(state_dir, session_id);
-    let contents = match fs::read_to_string(&path) {
-        Ok(contents) => contents,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(io_error("read", &path, err)),
-    };
+    let contents = read_write_receipts_path(&path)?;
+    parse_write_receipts(&contents)
+}
 
+fn read_write_receipts_path(path: &Path) -> Result<String, HookStateError> {
+    match fs::read_to_string(path) {
+        Ok(contents) => Ok(contents),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(err) => Err(io_error("read", path, err)),
+    }
+}
+
+fn parse_write_receipts(contents: &str) -> Result<Vec<WriteReceipt>, HookStateError> {
     contents
         .lines()
         .filter(|line| !line.trim().is_empty())
@@ -550,7 +627,9 @@ fn io_error(action: &'static str, path: &Path, err: std::io::Error) -> HookState
 mod tests {
     use super::*;
     use crate::write::FsyncPolicy;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::collections::BTreeSet;
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn temp_dir(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -572,6 +651,17 @@ mod tests {
         }
     }
 
+    fn receipt(note_id: impl Into<String>) -> WriteReceipt {
+        WriteReceipt {
+            created_at: "2026-05-16T00:00:00Z".to_owned(),
+            store: "personal".to_owned(),
+            scope: "project".to_owned(),
+            project_id: Some("project-id".to_owned()),
+            note_id: note_id.into(),
+            created: true,
+        }
+    }
+
     #[test]
     fn state_path_sanitizes_session_id() {
         let path = state_path(Path::new("/tmp/hm"), "codex/session:1");
@@ -590,6 +680,20 @@ mod tests {
             path,
             PathBuf::from("/tmp/hm/runs/codex-session-1/writes.jsonl")
         );
+    }
+
+    #[test]
+    fn write_receipts_lock_path_is_disjoint_and_sanitized() {
+        let lock = write_receipts_lock_path(Path::new("/tmp/hm"), "codex/session:1");
+        let state = state_lock_path(Path::new("/tmp/hm"), "codex/session:1");
+        let refresh = refresh_lock_path(Path::new("/tmp/hm"), "codex", "codex/session:1");
+
+        assert_eq!(
+            lock,
+            PathBuf::from("/tmp/hm/locks/write-receipts/codex-session-1.lock")
+        );
+        assert_ne!(lock, state);
+        assert_ne!(lock, refresh);
     }
 
     #[test]
@@ -772,19 +876,198 @@ mod tests {
     #[test]
     fn write_receipts_append_and_load() {
         let dir = temp_dir("receipts");
-        let receipt = WriteReceipt {
-            created_at: "2026-05-16T00:00:00Z".to_owned(),
-            store: "personal".to_owned(),
-            scope: "project".to_owned(),
-            project_id: Some("project-id".to_owned()),
-            note_id: "note-id".to_owned(),
-            created: true,
-        };
+        let receipt = receipt("note-id");
 
         append_write_receipt(&dir, "session-1", &receipt).expect("append receipt");
         let receipts = load_write_receipts(&dir, "session-1").expect("load receipts");
 
         assert_eq!(receipts, vec![receipt]);
+    }
+
+    #[test]
+    fn write_receipt_append_preserves_unknown_fields() {
+        let dir = temp_dir("receipt-future-fields");
+        let path = write_receipts_path(&dir, "session-1");
+        fs::create_dir_all(path.parent().expect("receipt parent")).expect("receipt parent");
+        let existing = concat!(
+            r#"{"created_at":"2026-07-21T00:00:00Z","store":"personal","scope":"global","note_id":"old","created":true,"future":{"version":2}}"#,
+            "\n"
+        );
+        fs::write(&path, existing).expect("write future receipt");
+
+        append_write_receipt_with_options(&dir, "session-1", &receipt("new"), &options())
+            .expect("append receipt");
+
+        let contents = fs::read_to_string(&path).expect("read receipt stream");
+        assert!(contents.starts_with(existing));
+        assert!(contents.contains(r#""future":{"version":2}"#));
+        assert_eq!(
+            load_write_receipts(&dir, "session-1")
+                .expect("load receipts")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn write_receipt_append_separates_valid_unterminated_record() {
+        let dir = temp_dir("receipt-no-newline");
+        let path = write_receipts_path(&dir, "session-1");
+        fs::create_dir_all(path.parent().expect("receipt parent")).expect("receipt parent");
+        let existing = serde_json::to_string(&receipt("old")).expect("serialize receipt");
+        fs::write(&path, &existing).expect("write receipt without newline");
+
+        append_write_receipt_with_options(&dir, "session-1", &receipt("new"), &options())
+            .expect("append receipt");
+
+        let contents = fs::read_to_string(&path).expect("read receipt stream");
+        assert!(contents.starts_with(&format!("{existing}\n")));
+        assert_eq!(contents.lines().count(), 2);
+    }
+
+    #[test]
+    fn corrupt_receipt_stream_fails_closed_without_rewriting() {
+        let dir = temp_dir("corrupt-receipts");
+        let path = write_receipts_path(&dir, "session-1");
+        fs::create_dir_all(path.parent().expect("receipt parent")).expect("receipt parent");
+        let corrupt = b"{not-json}\n";
+        fs::write(&path, corrupt).expect("write corrupt stream");
+
+        let error =
+            append_write_receipt_with_options(&dir, "session-1", &receipt("new"), &options())
+                .expect_err("corrupt stream must fail closed");
+
+        assert!(matches!(error, HookStateError::Json(_)));
+        assert_eq!(fs::read(path).expect("read corrupt stream"), corrupt);
+    }
+
+    fn receipt_child(mode: &str, dir: &Path, session: &str, start: &Path, marker: &str) -> Child {
+        Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "hook::tests::receipt_process_child",
+                "--nocapture",
+            ])
+            .env("HM_RECEIPT_CHILD_MODE", mode)
+            .env("HM_RECEIPT_STATE_DIR", dir)
+            .env("HM_RECEIPT_SESSION", session)
+            .env("HM_RECEIPT_START", start)
+            .env("HM_RECEIPT_MARKER", marker)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn receipt child")
+    }
+
+    #[test]
+    fn receipt_process_child() {
+        let Ok(mode) = std::env::var("HM_RECEIPT_CHILD_MODE") else {
+            return;
+        };
+        let dir = PathBuf::from(std::env::var("HM_RECEIPT_STATE_DIR").expect("state dir"));
+        let session = std::env::var("HM_RECEIPT_SESSION").expect("session");
+        let start = PathBuf::from(std::env::var("HM_RECEIPT_START").expect("start marker"));
+        let marker = std::env::var("HM_RECEIPT_MARKER").expect("marker");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !start.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for start marker"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        match mode.as_str() {
+            "write" => {
+                append_write_receipt_with_options(&dir, &session, &receipt(marker), &options())
+                    .expect("append child receipt")
+            }
+            "hold" => {
+                let _lock = lock_write_receipts(&dir, &session).expect("hold receipt lock");
+                fs::write(marker, b"ready").expect("write ready marker");
+                std::thread::sleep(Duration::from_secs(60));
+            }
+            other => panic!("unknown receipt child mode: {other}"),
+        }
+    }
+
+    #[test]
+    fn concurrent_process_writers_publish_complete_receipt_streams() {
+        let dir = temp_dir("concurrent-receipts");
+        let start = dir.join("start");
+        let session = "session-1";
+        let writer_count = 12;
+        let mut children = (0..writer_count)
+            .map(|index| receipt_child("write", &dir, session, &start, &format!("note-{index}")))
+            .collect::<Vec<_>>();
+        fs::write(&start, b"start").expect("publish start marker");
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut prior_count = 0;
+        loop {
+            let receipts = load_write_receipts(&dir, session).expect("reader sees complete JSONL");
+            assert!(
+                receipts.len() >= prior_count,
+                "receipt count must not regress"
+            );
+            prior_count = receipts.len();
+
+            let mut running = false;
+            for child in &mut children {
+                match child.try_wait().expect("poll receipt child") {
+                    Some(status) => assert!(status.success(), "receipt child failed: {status}"),
+                    None => running = true,
+                }
+            }
+            if !running {
+                break;
+            }
+            assert!(Instant::now() < deadline, "concurrent writers timed out");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let receipts = load_write_receipts(&dir, session).expect("load final receipts");
+        let ids = receipts
+            .iter()
+            .map(|item| item.note_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(receipts.len(), writer_count);
+        assert_eq!(ids.len(), writer_count);
+    }
+
+    #[test]
+    fn process_exit_releases_receipt_lock() {
+        let dir = temp_dir("receipt-lock-exit");
+        let start = dir.join("start");
+        let ready = dir.join("ready");
+        fs::write(&start, b"start").expect("publish start marker");
+        let mut holder = receipt_child(
+            "hold",
+            &dir,
+            "session-1",
+            &start,
+            ready.to_str().expect("utf8 ready path"),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "lock holder did not become ready"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        holder.kill().expect("kill lock holder");
+        holder.wait().expect("reap lock holder");
+
+        append_write_receipt_with_options(&dir, "session-1", &receipt("after-exit"), &options())
+            .expect("OS released receipt lock");
+        assert_eq!(
+            load_write_receipts(&dir, "session-1")
+                .expect("load receipt")
+                .len(),
+            1
+        );
     }
 
     #[test]
