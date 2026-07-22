@@ -38,8 +38,25 @@ disagree, prefer this document for v1 behavior and update the docs deliberately.
 
 ### Config Schema
 
-Primary config file: `~/.config/hive-memory/config.toml`.
-Local override file: `~/.config/hive-memory/config.local.toml`.
+Config paths use this precedence:
+
+1. `--config <path>` when supplied by the CLI.
+2. `HIVE_MEMORY_CONFIG` when set, preserving its value exactly.
+3. `$XDG_CONFIG_HOME/hive-memory/config.toml` when `XDG_CONFIG_HOME` is an
+   absolute path.
+4. `$HOME/.config/hive-memory/config.toml` otherwise, when `HOME` is non-empty.
+
+Config path resolution MUST fail when the fallback is required and `HOME` is
+unset or empty.
+
+The optional local override is `config.local.toml` beside the selected primary
+config, regardless of how the primary path was selected.
+
+For omitted `data_dir`, `state_dir`, and `cache_dir` keys, the corresponding
+XDG base-directory variable is used only when non-empty and absolute. Otherwise
+the standard `HOME`-relative directory is used. Loading MUST fail if that
+fallback is required and `HOME` is unavailable. Explicit directory values keep
+the general config path-expansion contract, including relative values.
 
 Minimal valid config:
 
@@ -56,9 +73,7 @@ Recommended full v1 shape:
 schema_version = 1
 
 default_store = "personal"
-data_dir = "${XDG_DATA_HOME:-${HOME}/.local/share}/hive-memory"
-state_dir = "${XDG_STATE_HOME:-${HOME}/.local/state}/hive-memory"
-cache_dir = "${XDG_CACHE_HOME:-${HOME}/.cache}/hive-memory"
+# Omit data_dir, state_dir, and cache_dir to use the XDG-aware defaults.
 host_id = "auto"
 user_id = "default"
 
@@ -598,10 +613,16 @@ written by the user/agent.
 V1 separates three directories along XDG conventions:
 
 ```text
-${XDG_DATA_HOME:-${HOME}/.local/share}/hive-memory/   # durable user data
-${XDG_STATE_HOME:-${HOME}/.local/state}/hive-memory/  # ephemeral state
-${XDG_CACHE_HOME:-${HOME}/.cache}/hive-memory/        # rebuildable cache
+$XDG_DATA_HOME/hive-memory/   or $HOME/.local/share/hive-memory/  # durable user data
+$XDG_STATE_HOME/hive-memory/  or $HOME/.local/state/hive-memory/  # ephemeral state
+$XDG_CACHE_HOME/hive-memory/  or $HOME/.cache/hive-memory/        # rebuildable cache
 ```
+
+For each omitted config key, its XDG root wins only when it is non-empty and
+absolute. An absent, empty, or relative XDG root falls back to `HOME`; resolution
+fails when that fallback is needed and `HOME` is unavailable. An explicitly
+configured `data_dir`, `state_dir`, or `cache_dir` retains the general config
+path-expansion contract and is not reinterpreted as an XDG default.
 
 Data dir contents (durable, treat as user memory):
 

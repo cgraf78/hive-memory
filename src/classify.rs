@@ -742,6 +742,7 @@ mod tests {
             &format!(
                 r#"
                 default_store = "personal"
+                data_dir = "{data}"
                 state_dir = "{state}"
                 cache_dir = "{cache}"
 
@@ -754,6 +755,7 @@ mod tests {
                 command = ["bash", "{fixture}"]
                 timeout_seconds = 5
                 "#,
+                data = dir.join("data").display(),
                 state = dir.join("state").display(),
                 cache = dir.join("cache").display(),
                 root = dir.join("store").display(),

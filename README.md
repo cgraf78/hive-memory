@@ -57,7 +57,9 @@ Install the CLI from a checkout:
 cargo install --path .
 ```
 
-Create a minimal config at `~/.config/hive-memory/config.toml`:
+Create a minimal config at `$XDG_CONFIG_HOME/hive-memory/config.toml` when
+`XDG_CONFIG_HOME` is absolute, or at `~/.config/hive-memory/config.toml`
+otherwise. The fallback requires a non-empty `HOME`:
 
 ```toml
 default_store = "personal"
@@ -138,7 +140,7 @@ Put the store in a synced folder and point each machine's config at it. Identity
 travels with the manifest, not the path.
 
 ```toml
-# ~/.config/hive-memory/config.toml  (on every machine)
+# $XDG_CONFIG_HOME/hive-memory/config.toml or ~/.config/hive-memory/config.toml
 default_store = "personal"
 
 [stores.personal]
@@ -537,18 +539,26 @@ plus JSON event sidecars. The `generated/` tree is disposable.
 
 ## Configuration
 
-The default config path is `~/.config/hive-memory/config.toml`, with an optional
-machine-local override at `config.local.toml` beside it. `--config <path>`
-overrides the path; `HIVE_MEMORY_CONFIG` is used when `--config` is absent. A
-fuller config:
+The default config path is `$XDG_CONFIG_HOME/hive-memory/config.toml` when
+`XDG_CONFIG_HOME` is an absolute path, or `~/.config/hive-memory/config.toml`
+otherwise, with an optional machine-local override at `config.local.toml`
+beside it. `--config <path>` overrides the path; `HIVE_MEMORY_CONFIG` is used
+when `--config` is absent. Hive Memory reports an error instead of constructing
+a relative config path when the fallback is required and `HOME` is unset or
+empty.
+
+When `data_dir`, `state_dir`, or `cache_dir` is omitted, Hive Memory uses the
+corresponding XDG base directory only when it is non-empty and absolute, then
+falls back to `$HOME/.local/share`, `$HOME/.local/state`, or `$HOME/.cache`.
+Resolution fails clearly if a fallback is needed and `HOME` is unavailable.
+Explicit directory settings retain normal config expansion and are not subject
+to this default-path validation. A fuller config:
 
 ```toml
 schema_version = 1
 
 default_store = "personal"
-data_dir  = "${XDG_DATA_HOME:-${HOME}/.local/share}/hive-memory"
-state_dir = "${XDG_STATE_HOME:-${HOME}/.local/state}/hive-memory"
-cache_dir = "${XDG_CACHE_HOME:-${HOME}/.cache}/hive-memory"
+# Omit data_dir, state_dir, and cache_dir to use the XDG-aware defaults.
 
 [stores.personal]
 root = "${HOME}/hive-memory/personal"
