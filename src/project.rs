@@ -7,7 +7,6 @@
 
 use crate::{id, write};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::error::Error;
@@ -985,7 +984,7 @@ fn slug(value: &str) -> String {
 }
 
 fn short_hash(value: &str) -> String {
-    format!("{:x}", Sha256::digest(value.as_bytes()))[..12].to_owned()
+    crate::hash::sha256_hex(value.as_bytes())[..12].to_owned()
 }
 
 #[cfg(test)]

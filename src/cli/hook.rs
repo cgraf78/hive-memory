@@ -889,7 +889,7 @@ fn prompt_recall_key(
         digest.update(b"\0");
         digest.update(id.as_bytes());
     }
-    format!("{:x}", digest.finalize())
+    hive_memory::hash::lower_hex(&digest.finalize())
 }
 
 fn prompt_recall_query(prompt: &str, path_hint: Option<&str>) -> Option<String> {
