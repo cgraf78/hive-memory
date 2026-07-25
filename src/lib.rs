@@ -16,6 +16,7 @@ pub mod doctor;
 pub mod entity;
 pub mod eval;
 pub mod event;
+pub mod hash;
 pub mod hook;
 pub mod id;
 pub mod index;

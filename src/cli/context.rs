@@ -10,7 +10,6 @@ use clap::Args;
 use hive_memory::config::Config;
 use hive_memory::{config, context as memory_context, hook as memory_hook, inject, store, write};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use time::OffsetDateTime;
 
@@ -507,10 +506,10 @@ fn write_context_cache(config: &Config, assembly: &CliContextAssembly) -> Result
 }
 
 fn context_cache_path(state_dir: &std::path::Path, key: &str) -> PathBuf {
-    let digest = Sha256::digest(key.as_bytes());
-    state_dir
-        .join("context-cache")
-        .join(format!("{digest:x}.json"))
+    state_dir.join("context-cache").join(format!(
+        "{}.json",
+        hive_memory::hash::sha256_hex(key.as_bytes())
+    ))
 }
 
 /// Load a last-success context assembly for an exact selection key.

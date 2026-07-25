@@ -10,7 +10,6 @@
 
 use crate::{config, event, note, store, write};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display};
@@ -995,7 +994,7 @@ fn path_item_report(item_dir: &Path, result: &str, message: impl Into<String>) -
 }
 
 fn sha256(contents: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(contents))
+    crate::hash::sha256_hex(contents)
 }
 
 fn io_error(action: &'static str, path: &Path, err: std::io::Error) -> OutboxError {

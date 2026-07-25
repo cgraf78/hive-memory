@@ -1289,7 +1289,7 @@ pub fn entries_fingerprint(entries: &[IndexEntry]) -> String {
             hasher.update([0u8]);
         }
     }
-    format!("{:x}", hasher.finalize())
+    crate::hash::lower_hex(&hasher.finalize())
 }
 
 /// First non-empty trimmed line of a body, bounded for display.

@@ -9,7 +9,6 @@ use crate::index::IndexEntry;
 use crate::{event, id, note, store, write};
 use fs4::fs_std::FileExt;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{self, Display};
@@ -504,7 +503,7 @@ fn unlock_target(file: File) {
 }
 
 fn hash_bytes(contents: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(contents))
+    crate::hash::sha256_hex(contents)
 }
 
 fn path_string(path: &Path) -> String {

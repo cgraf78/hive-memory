@@ -625,10 +625,7 @@ pub fn store_cache_key(store_name: &str, store_root: &Path) -> String {
     let mut hasher = Sha256::new();
     hasher.update(store_root.display().to_string().as_bytes());
     let digest = hasher.finalize();
-    let suffix = digest[..8]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let suffix = crate::hash::lower_hex(&digest[..8]);
     format!("{store_name}-{suffix}")
 }
 
