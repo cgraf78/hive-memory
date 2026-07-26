@@ -35,6 +35,7 @@ jobs:
   shell:
     uses: cgraf78/actions/.github/workflows/shell-ci.yml@a3ccc9312378c38a9d33074ea021f96ce93bfb84
     with:
+      matrix-set: full
       profiles: base,shellcheck
       # Shell-owned release behavior lives under tests/shell. Cargo integration
       # tests stay in the conventional tests/*.rs location.
