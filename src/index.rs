@@ -7,7 +7,7 @@
 
 use crate::{entity, note};
 use crate::{event, path as memory_path, write};
-use fs4::fs_std::FileExt;
+use fs4::{FileExt, TryLockError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::error::Error;
@@ -289,7 +289,7 @@ pub struct RebuildLock {
 
 impl Drop for RebuildLock {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        let _ = FileExt::unlock(&self.file);
     }
 }
 
@@ -329,10 +329,10 @@ pub fn try_rebuild_lock(
         .truncate(false)
         .open(&path)
         .map_err(|err| io_error("open rebuild lock", &path, err))?;
-    match file.try_lock_exclusive() {
-        Ok(true) => Ok(Some(RebuildLock { file, path })),
-        Ok(false) => Ok(None),
-        Err(err) => Err(io_error("lock rebuild", &path, err)),
+    match FileExt::try_lock(&file) {
+        Ok(()) => Ok(Some(RebuildLock { file, path })),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(err)) => Err(io_error("lock rebuild", &path, err)),
     }
 }
 

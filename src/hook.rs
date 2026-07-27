@@ -6,7 +6,7 @@
 //! reimplement memory policy in shell.
 
 use crate::{id, write};
-use fs4::fs_std::FileExt;
+use fs4::{FileExt, TryLockError};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt::{self, Display};
@@ -86,7 +86,7 @@ pub struct RefreshLock {
 
 impl Drop for RefreshLock {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        let _ = FileExt::unlock(&self.file);
     }
 }
 
@@ -112,7 +112,7 @@ pub struct StateLock {
 
 impl Drop for StateLock {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        let _ = FileExt::unlock(&self.file);
     }
 }
 
@@ -129,7 +129,7 @@ struct ReceiptLock {
 
 impl Drop for ReceiptLock {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        let _ = FileExt::unlock(&self.file);
     }
 }
 
@@ -231,10 +231,10 @@ pub fn try_refresh_lock(
         .truncate(false)
         .open(&path)
         .map_err(|err| io_error("open refresh lock", &path, err))?;
-    match file.try_lock_exclusive() {
-        Ok(true) => Ok(Some(RefreshLock { file, path })),
-        Ok(false) => Ok(None),
-        Err(err) => Err(io_error("lock refresh", &path, err)),
+    match FileExt::try_lock(&file) {
+        Ok(()) => Ok(Some(RefreshLock { file, path })),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(err)) => Err(io_error("lock refresh", &path, err)),
     }
 }
 
@@ -284,8 +284,7 @@ fn lock_write_receipts(state_dir: &Path, session_id: &str) -> Result<ReceiptLock
         .truncate(false)
         .open(&path)
         .map_err(|err| io_error("open write-receipt lock", &path, err))?;
-    file.lock_exclusive()
-        .map_err(|err| io_error("lock write receipts", &path, err))?;
+    FileExt::lock(&file).map_err(|err| io_error("lock write receipts", &path, err))?;
     Ok(ReceiptLock { file })
 }
 
@@ -315,10 +314,10 @@ pub fn try_state_lock(
         .truncate(false)
         .open(&path)
         .map_err(|err| io_error("open state lock", &path, err))?;
-    match file.try_lock_exclusive() {
-        Ok(true) => Ok(Some(StateLock { file, path })),
-        Ok(false) => Ok(None),
-        Err(err) => Err(io_error("lock state", &path, err)),
+    match FileExt::try_lock(&file) {
+        Ok(()) => Ok(Some(StateLock { file, path })),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(err)) => Err(io_error("lock state", &path, err)),
     }
 }
 

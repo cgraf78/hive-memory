@@ -1,5 +1,5 @@
 use assert_cmd::cargo::cargo_bin_cmd;
-use fs4::fs_std::FileExt;
+use fs4::FileExt;
 use hive_memory::{hook as memory_hook, outbox, store};
 use predicates::prelude::*;
 use std::fs::{self, OpenOptions};
@@ -5579,7 +5579,7 @@ fn refresh_hook_mode_coalesces_when_refresh_lock_is_held() {
         .truncate(false)
         .open(&lock_path)
         .expect("open lock");
-    lock.lock_exclusive().expect("hold refresh lock");
+    FileExt::lock(&lock).expect("hold refresh lock");
 
     cargo_bin_cmd!("hm")
         .env("HIVE_MEMORY_HOOK_ACTIVE", "1")
@@ -5599,7 +5599,7 @@ fn refresh_hook_mode_coalesces_when_refresh_lock_is_held() {
         .stdout(predicate::str::contains("\"coalesced\": true"));
 
     assert!(!state.join("runs/refresh-session/hook-state.json").exists());
-    lock.unlock().expect("unlock refresh lock");
+    FileExt::unlock(&lock).expect("unlock refresh lock");
 }
 
 #[test]
@@ -8564,7 +8564,7 @@ fn search_falls_back_to_lexical_when_tantivy_index_empty_and_lock_held() {
         .truncate(false)
         .open(&lock_path)
         .expect("open rebuild lock");
-    lock.lock_exclusive().expect("hold rebuild lock");
+    FileExt::lock(&lock).expect("hold rebuild lock");
 
     // The full-text index was never built, so a degraded backend must not strip
     // results: search must fall back to lexical and still find the memory.
@@ -8577,7 +8577,7 @@ fn search_falls_back_to_lexical_when_tantivy_index_empty_and_lock_held() {
         ])
         .output()
         .expect("run search");
-    lock.unlock().expect("unlock rebuild lock");
+    FileExt::unlock(&lock).expect("unlock rebuild lock");
 
     assert!(
         output.status.success(),

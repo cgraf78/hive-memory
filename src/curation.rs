@@ -7,7 +7,7 @@
 
 use crate::index::IndexEntry;
 use crate::{event, id, note, store, write};
-use fs4::fs_std::FileExt;
+use fs4::FileExt;
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -493,13 +493,12 @@ fn lock_target(path: &Path) -> Result<File, CurationError> {
         .read(true)
         .open(path)
         .map_err(|err| io_error("open promotion lock", path, err))?;
-    file.lock_exclusive()
-        .map_err(|err| io_error("lock promotion target", path, err))?;
+    FileExt::lock(&file).map_err(|err| io_error("lock promotion target", path, err))?;
     Ok(file)
 }
 
 fn unlock_target(file: File) {
-    let _ = file.unlock();
+    let _ = FileExt::unlock(&file);
 }
 
 fn hash_bytes(contents: &[u8]) -> String {
