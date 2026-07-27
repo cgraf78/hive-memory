@@ -30,7 +30,7 @@ use tantivy::collector::TopDocs;
 use tantivy::directory::MmapDirectory;
 use tantivy::query::QueryParser;
 use tantivy::schema::{Field, STORED, STRING, Schema, TEXT, Value};
-use tantivy::{Index, IndexWriter, TantivyDocument};
+use tantivy::{Index, IndexWriter, ReloadPolicy, TantivyDocument};
 
 /// Schema version for the search-document contract and Tantivy field layout.
 ///
@@ -319,7 +319,12 @@ impl SearchIndex {
 
         let reader = self
             .index
-            .reader()
+            .reader_builder()
+            // Each query builds and consumes one fresh reader. Automatic
+            // commit watching cannot make that reader fresher, and its
+            // asynchronous meta-file callback can outlive this method.
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()
             .map_err(|err| RetrievalError::Engine(err.to_string()))?;
         let searcher = reader.searcher();
 
@@ -503,11 +508,11 @@ mod tests {
                 .map(|hit| hit.id.as_str()),
             Some("a")
         );
-        // Best-effort cleanup: the assertions above are what matter, and on
-        // macOS a still-mmapped Tantivy index dir can intermittently refuse
-        // removal. The temp dir is unique per process+line, so leaving it on a
-        // rare failure is harmless.
-        let _ = std::fs::remove_dir_all(&dir);
+        // Drop every live index handle before removing its backing directory;
+        // deleting it while handles are live races Tantivy file activity.
+        drop(reopened);
+        drop(built);
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]
@@ -613,6 +618,8 @@ mod tests {
         // An in-memory or untagged index is never considered fresh.
         assert!(!SearchIndex::in_memory().expect("ram").is_fresh("fp1"));
 
+        drop(reopened);
+        drop(index);
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
@@ -641,6 +648,7 @@ mod tests {
         let hits = reopened.query("coffee", 5).expect("query");
         assert_eq!(hits.first().map(|hit| hit.id.as_str()), Some("a"));
 
+        drop(reopened);
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 }
