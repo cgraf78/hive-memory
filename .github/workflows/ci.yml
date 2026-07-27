@@ -17,7 +17,7 @@ env:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@9e0d9c7492170350e48a23b6a47c1ef9ae9fa003
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@663f83780f58f231e810d0c9eca642bbf859353b
     with:
       android-package-smoke-command: |
         scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
@@ -33,7 +33,7 @@ jobs:
           .termux-ci/hm
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@9e0d9c7492170350e48a23b6a47c1ef9ae9fa003
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@663f83780f58f231e810d0c9eca642bbf859353b
     with:
       matrix-set: full
       profiles: base,shellcheck
