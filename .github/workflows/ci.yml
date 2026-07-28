@@ -105,7 +105,9 @@ jobs:
           # benchmark enforced in CI, but calibrate the threshold to this runner
           # class instead of using the stricter local budget verbatim.
           HIVE_MEMORY_PERF_BUDGET_MULTIPLIER: 4
-        run: cargo test --release --test perf_budget -- --ignored --nocapture
+        # Serialize wall-clock samples so the budgets measure each path rather
+        # than cross-test contention between multiple 5,000-note fixtures.
+        run: cargo test --release --test perf_budget -- --ignored --nocapture --test-threads=1
 
   cloud-sync-sim:
     name: Cloud sync simulation

@@ -6,7 +6,8 @@ use hive_memory::store::{self, StoreInitOptions};
 use hive_memory::write::{AtomicWriteOptions, FsyncPolicy};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+use tempfile::TempDir;
 use time::OffsetDateTime;
 
 const SYNTHETIC_NOTES: usize = 5_000;
@@ -19,7 +20,17 @@ const SEARCH_WARM_BUDGET_MS: u128 = 300;
 const HOOK_PROMPT_BASELINE_WARM_BUDGET_MS: u128 = 300;
 const HOOK_PROMPT_RECALL_WARM_BUDGET_MS: u128 = 350;
 const HOOK_PROMPT_CACHED_OFFLINE_BUDGET_MS: u128 = 350;
+// Session-start performs the same context assembly as `hm context` plus one
+// session-state write, so it gets a small amount of headroom over that budget.
+const HOOK_SESSION_START_WARM_BUDGET_MS: u128 = 250;
 const HOOK_TOOL_COMPLETE_NO_RECEIPT_WARM_BUDGET_MS: u128 = 200;
+// A successful receipt deliberately rebuilds the local index before returning.
+// Keep that occasional hook path subsecond locally without conflating it with
+// the near-zero no-receipt path that runs after ordinary tools.
+const HOOK_TOOL_COMPLETE_RECEIPT_WARM_BUDGET_MS: u128 = 750;
+// Ten refreshes make p95 the slowest sample while keeping this filesystem-heavy
+// regression gate proportionate to the rest of the suite.
+const HOOK_REFRESH_RUNS: usize = 10;
 const SYNTHETIC_OUTBOX_ITEMS: usize = 100;
 const FLUSH_RUNS: usize = 10;
 const FLUSH_100_ITEM_BUDGET_MS: u128 = 2_000;
@@ -32,23 +43,18 @@ const PROJECT_RESOLUTION_WARM_BUDGET_MS: u128 = 300;
 const SLOW_GIT_SHIM_SLEEP_SECS: u64 = 5;
 const PERF_BUDGET_MULTIPLIER_ENV: &str = "HIVE_MEMORY_PERF_BUDGET_MULTIPLIER";
 
-fn temp_dir(name: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock after epoch")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!(
-        "hive-memory-perf-{name}-{}-{nanos}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&path).expect("create temp dir");
-    path
+fn temp_dir(name: &str) -> TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("hive-memory-perf-{name}-"))
+        .tempdir()
+        .expect("create temp dir")
 }
 
 #[test]
 #[ignore = "CI runs this explicitly because it creates a 5000-note synthetic store"]
 fn context_and_search_stay_within_warm_budget() {
     let fixture = SyntheticStore::new();
+    let fixture_path = fixture.config.parent().expect("fixture root").to_path_buf();
     fixture.refresh_index();
 
     // Include process startup in the budget: hooks and agent launchers invoke
@@ -73,6 +79,12 @@ fn context_and_search_stay_within_warm_budget() {
         search_p95 <= search_budget,
         "hm search p95 {search_p95}ms exceeded {search_budget}ms"
     );
+    drop(fixture);
+    assert!(
+        !fixture_path.exists(),
+        "synthetic store fixture was not removed: {}",
+        fixture_path.display()
+    );
 }
 
 #[test]
@@ -85,7 +97,7 @@ fn project_resolution_does_not_exec_git() {
     // If resolution still shelled out to `git`, it would hit the slow shim below
     // and blow the budget by seconds.
     let checkout = temp_dir("resolution-checkout");
-    let git_dir = checkout.join(".git");
+    let git_dir = checkout.path().join(".git");
     fs::create_dir_all(&git_dir).expect("git dir");
     fs::write(
         git_dir.join("config"),
@@ -94,17 +106,17 @@ fn project_resolution_does_not_exec_git() {
     .expect("git config");
 
     let shim_dir = temp_dir("slow-git-shim");
-    install_slow_git_shim(&shim_dir);
+    install_slow_git_shim(shim_dir.path());
     let shimmed_path = match std::env::var_os("PATH") {
         Some(existing) => {
-            let mut paths = vec![shim_dir.clone()];
+            let mut paths = vec![shim_dir.path().to_path_buf()];
             paths.extend(std::env::split_paths(&existing));
             std::env::join_paths(paths).expect("join PATH")
         }
-        None => shim_dir.clone().into_os_string(),
+        None => shim_dir.path().as_os_str().to_owned(),
     };
 
-    let checkout_str = checkout.to_str().expect("utf8 checkout").to_owned();
+    let checkout_str = checkout.path().to_str().expect("utf8 checkout").to_owned();
     let resolution_p95 = p95_ms(repeat(RUNS, || {
         hm_command(&fixture.config, ["search", "needle-4999", "--json"])
             .env("PATH", &shimmed_path)
@@ -177,9 +189,17 @@ fn flush_100_item_outbox_stays_within_budget() {
         (0..FLUSH_RUNS)
             .map(|run| {
                 let fixture = FlushFixture::new(run);
+                let fixture_path = fixture.config.parent().expect("fixture root").to_path_buf();
                 let start = Instant::now();
                 fixture.hm(["flush", "--json"]);
-                start.elapsed()
+                let elapsed = start.elapsed();
+                drop(fixture);
+                assert!(
+                    !fixture_path.exists(),
+                    "flush fixture was not removed: {}",
+                    fixture_path.display()
+                );
+                elapsed
             })
             .collect(),
     );
@@ -297,6 +317,38 @@ fn hook_prompt_submit_cached_recall_stays_fast_when_store_root_is_unavailable() 
 }
 
 #[test]
+#[ignore = "CI runs this explicitly because it measures full session-start hook latency"]
+fn hook_session_start_stays_within_warm_budget() {
+    let fixture = SyntheticStore::new();
+    fixture.refresh_index();
+
+    let session_start_p95 = p95_ms(repeat(RUNS, || {
+        hm_command(
+            &fixture.config,
+            [
+                "--as-agent",
+                "codex",
+                "hook",
+                "session-start",
+                "--project",
+                "/tmp/hive-memory-perf-project/src/main.rs",
+                "--json",
+            ],
+        )
+        .env("HIVE_MEMORY_SESSION_ID", "perf-session-start")
+        .assert()
+        .success();
+    }));
+    eprintln!("hm hook session-start warm p95: {session_start_p95}ms");
+
+    let budget = budget_ms(HOOK_SESSION_START_WARM_BUDGET_MS);
+    assert!(
+        session_start_p95 <= budget,
+        "hm hook session-start p95 {session_start_p95}ms exceeded {budget}ms"
+    );
+}
+
+#[test]
 #[ignore = "CI runs this explicitly because it measures full hook CLI latency"]
 fn hook_tool_complete_without_receipts_stays_within_warm_budget() {
     let fixture = SyntheticStore::new();
@@ -347,6 +399,93 @@ fn hook_tool_complete_without_receipts_stays_within_warm_budget() {
     );
 }
 
+#[test]
+#[ignore = "CI runs this explicitly because it measures post-write hook refresh latency"]
+fn hook_tool_complete_with_receipt_stays_within_warm_budget() {
+    let fixture = SyntheticStore::new();
+    fixture.refresh_index();
+    let session_id = "perf-tool-complete-receipt";
+
+    hm_command(
+        &fixture.config,
+        [
+            "--as-agent",
+            "codex",
+            "hook",
+            "session-start",
+            "--project",
+            "/tmp/hive-memory-perf-project/src/main.rs",
+            "--json",
+        ],
+    )
+    .env("HIVE_MEMORY_SESSION_ID", session_id)
+    .assert()
+    .success();
+
+    let tool_p95 = p95_ms(
+        (0..HOOK_REFRESH_RUNS)
+            .map(|run| {
+                let body = format!("Performance receipt fixture {run}");
+                hm_command(
+                    &fixture.config,
+                    [
+                        "--as-agent",
+                        "codex",
+                        "remember",
+                        "--scope",
+                        "global",
+                        "--text",
+                        &body,
+                        "--json",
+                    ],
+                )
+                .env("HIVE_MEMORY_SESSION_ID", session_id)
+                .assert()
+                .success();
+
+                let start = Instant::now();
+                let assert = hm_command(
+                    &fixture.config,
+                    [
+                        "--as-agent",
+                        "codex",
+                        "hook",
+                        "tool-complete",
+                        "--project",
+                        "/tmp",
+                        "--status",
+                        "0",
+                        "--json",
+                    ],
+                )
+                .env("HIVE_MEMORY_SESSION_ID", session_id)
+                .env("HIVE_MEMORY_PROJECT", "/tmp")
+                .assert()
+                .success();
+                let elapsed = start.elapsed();
+                let response: serde_json::Value =
+                    serde_json::from_slice(&assert.get_output().stdout).expect("hook JSON");
+                assert_eq!(
+                    response["refresh"]["write_receipts"], 1,
+                    "tool-complete did not consume exactly one receipt: {response}"
+                );
+                assert_eq!(
+                    response["refresh"]["refreshed"], true,
+                    "tool-complete did not refresh after the receipt: {response}"
+                );
+                elapsed
+            })
+            .collect(),
+    );
+    eprintln!("hm hook tool-complete with receipt warm p95: {tool_p95}ms");
+
+    let budget = budget_ms(HOOK_TOOL_COMPLETE_RECEIPT_WARM_BUDGET_MS);
+    assert!(
+        tool_p95 <= budget,
+        "hm hook tool-complete with receipt p95 {tool_p95}ms exceeded {budget}ms"
+    );
+}
+
 fn budget_ms(base_ms: u128) -> u128 {
     let multiplier = std::env::var(PERF_BUDGET_MULTIPLIER_ENV)
         .ok()
@@ -357,6 +496,8 @@ fn budget_ms(base_ms: u128) -> u128 {
 }
 
 struct SyntheticStore {
+    // TempDir owns cleanup; a PathBuf alone left every 5k-note fixture in /tmp.
+    _dir: TempDir,
     config: PathBuf,
     root: PathBuf,
 }
@@ -364,10 +505,10 @@ struct SyntheticStore {
 impl SyntheticStore {
     fn new() -> Self {
         let dir = temp_dir("warm-budget");
-        let config = dir.join("config.toml");
-        let root = dir.join("personal");
-        let cache = dir.join("cache");
-        let state = dir.join("state");
+        let config = dir.path().join("config.toml");
+        let root = dir.path().join("personal");
+        let cache = dir.path().join("cache");
+        let state = dir.path().join("state");
         store::init_store(&StoreInitOptions {
             name: "personal".to_owned(),
             root: root.clone(),
@@ -377,7 +518,11 @@ impl SyntheticStore {
         .expect("init synthetic store");
         write_config(&config, &root, &cache, &state);
         write_notes(&root);
-        Self { config, root }
+        Self {
+            _dir: dir,
+            config,
+            root,
+        }
     }
 
     fn refresh_index(&self) {
@@ -390,15 +535,17 @@ impl SyntheticStore {
 }
 
 struct FlushFixture {
+    // Keep cleanup ownership alongside the paths derived from this directory.
+    _dir: TempDir,
     config: PathBuf,
 }
 
 impl FlushFixture {
     fn new(run: usize) -> Self {
         let dir = temp_dir(&format!("flush-budget-{run}"));
-        let config = dir.join("config.toml");
-        let root = dir.join("personal");
-        let data = dir.join("data");
+        let config = dir.path().join("config.toml");
+        let root = dir.path().join("personal");
+        let data = dir.path().join("data");
         store::init_store(&StoreInitOptions {
             name: "personal".to_owned(),
             root: root.clone(),
@@ -418,7 +565,7 @@ impl FlushFixture {
                 format!("flush budget note {index}\n").as_bytes(),
             );
         }
-        Self { config }
+        Self { _dir: dir, config }
     }
 
     fn hm<const N: usize>(&self, args: [&str; N]) {
