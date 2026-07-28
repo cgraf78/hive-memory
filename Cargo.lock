@@ -576,6 +576,7 @@ dependencies = [
  "serde_yaml_ng",
  "sha2",
  "tantivy",
+ "tempfile",
  "time",
  "toml",
  "unicode-normalization",
