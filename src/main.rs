@@ -678,7 +678,35 @@ fn load_config(config_path: Option<&std::path::Path>) -> Result<Config> {
     for warning in &loaded.warnings {
         eprintln!("warning: {warning}");
     }
+    protect_local_support_roots(&loaded.config)?;
     Ok(loaded.config)
+}
+
+/// Keep local memory material behind an owner-only directory boundary.
+///
+/// The cache contains rendered context and a canonical-free projection, state
+/// contains session selections, and data can contain queued writes. Explicitly
+/// repair these roots instead of relying on the caller's umask so an upgrade
+/// also closes permissions on support directories created by older releases.
+fn protect_local_support_roots(config: &Config) -> Result<()> {
+    for path in [&config.data_dir, &config.state_dir, &config.cache_dir] {
+        std::fs::create_dir_all(path)?;
+        protect_local_support_root(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn protect_local_support_root(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn protect_local_support_root(_path: &std::path::Path) -> Result<()> {
+    Ok(())
 }
 
 /// Read a store manifest and remember the observed identity for offline writes.

@@ -189,6 +189,45 @@ pub fn write_receipts_path(state_dir: &Path, session_id: &str) -> PathBuf {
         .join("writes.jsonl")
 }
 
+/// Remove inactive per-session hook state older than `retention`.
+///
+/// State writes atomically replace files inside the run directory, updating its
+/// mtime. A resumed session therefore becomes current before background refresh
+/// can prune it. This removes only advisory context/receipt cursors, never
+/// canonical memory or queued outbox data.
+pub fn prune_inactive_runs(
+    state_dir: &Path,
+    retention: std::time::Duration,
+) -> Result<usize, HookStateError> {
+    let runs = state_dir.join("runs");
+    let entries = match fs::read_dir(&runs) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(io_error("read hook runs", &runs, err)),
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry.map_err(|err| io_error("read hook run entry", &runs, err))?;
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_dir()
+            || metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_none_or(|age| age <= retention)
+        {
+            continue;
+        }
+        fs::remove_dir_all(&path)
+            .map_err(|err| io_error("remove inactive hook run", &path, err))?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
 /// Return the hook refresh lock path for one agent/session pair.
 ///
 /// Agent id participates in the path because long-lived agent hosts may run
@@ -396,6 +435,28 @@ pub fn mark_memory_pending(
         |state| {
             state.memory_pending = true;
             state.pending_reason = Some(reason);
+            state.updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
+        },
+        options,
+    )
+}
+
+/// Clear durable-memory intent after a successful write receipt is observed.
+///
+/// This is separate from the refresh cursor: latency-sensitive tool hooks can
+/// acknowledge the write immediately while detached index maintenance advances
+/// `refreshed_receipts` only after it succeeds.
+pub fn mark_memory_satisfied(
+    state_dir: &Path,
+    session_id: &str,
+    options: &write::AtomicWriteOptions,
+) -> Result<HookState, HookStateError> {
+    with_state_lock(
+        state_dir,
+        session_id,
+        |state| {
+            state.memory_pending = false;
+            state.pending_reason = None;
             state.updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
         },
         options,
@@ -679,6 +740,21 @@ mod tests {
             path,
             PathBuf::from("/tmp/hm/runs/codex-session-1/writes.jsonl")
         );
+    }
+
+    #[test]
+    fn prune_inactive_runs_removes_expired_advisory_state() {
+        let dir = temp_dir("prune-inactive-runs");
+        let run = dir.join("runs/old-session");
+        fs::create_dir_all(&run).expect("create run");
+        fs::write(run.join("hook-state.json"), b"{}").expect("write state");
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert_eq!(
+            prune_inactive_runs(&dir, std::time::Duration::ZERO).expect("prune runs"),
+            1
+        );
+        assert!(!run.exists());
     }
 
     #[test]

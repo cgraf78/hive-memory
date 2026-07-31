@@ -8,7 +8,7 @@ use crate::curated::CuratedFile;
 use crate::index::IndexEntry;
 use crate::inject::{self, ClassifyInput, IncidentMarkers, InjectClass};
 use crate::{note, project, supersession, validity, visibility};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt::{self, Display};
 use std::fs;
@@ -218,7 +218,7 @@ impl From<crate::curated::CuratedError> for ContextError {
 /// wrapped as data and escaped so memory content cannot forge or terminate the
 /// boundary block that tells agents how to treat it.
 pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, ContextError> {
-    assemble_context_with_mode(input, true, true)
+    assemble_context_with_mode(input, true, true, true, true, None)
 }
 
 /// Assemble context from an already-selected candidate set.
@@ -231,13 +231,37 @@ pub fn assemble_context(input: ContextInput<'_>) -> Result<ContextOutput, Contex
 /// Search has already applied its broad cross-project policy, so this rendering
 /// pass must not narrow the selected hits back to the active project.
 pub fn assemble_selected_context(input: ContextInput<'_>) -> Result<ContextOutput, ContextError> {
-    assemble_context_with_mode(input, false, false)
+    assemble_context_with_mode(input, false, false, true, true, None)
+}
+
+/// Assemble context using only the disposable local projection.
+///
+/// The caller supplies remembered and curated entries with project aliases
+/// already normalized by index refresh. Body-less legacy entries are skipped
+/// because recovering them would require canonical-store I/O. Current source,
+/// audience, scope, project, validity, and supersession policy still applies.
+pub fn assemble_local_index_context(
+    input: ContextInput<'_>,
+    project_aliases: &BTreeMap<String, String>,
+) -> Result<ContextOutput, ContextError> {
+    assemble_context_with_mode(input, false, true, false, false, Some(project_aliases))
+}
+
+/// Render prompt-selected cached entries without canonical project metadata.
+pub fn assemble_selected_local_index_context(
+    input: ContextInput<'_>,
+    project_aliases: &BTreeMap<String, String>,
+) -> Result<ContextOutput, ContextError> {
+    assemble_context_with_mode(input, false, false, false, false, Some(project_aliases))
 }
 
 fn assemble_context_with_mode(
     input: ContextInput<'_>,
     collect_curated: bool,
     filter_project: bool,
+    resolve_project_aliases: bool,
+    read_canonical_body_fallback: bool,
+    local_project_aliases: Option<&BTreeMap<String, String>>,
 ) -> Result<ContextOutput, ContextError> {
     let header = render_header(&input);
     let mut markdown = header;
@@ -245,7 +269,15 @@ fn assemble_context_with_mode(
     let mut decisions = Vec::new();
     let mut warnings = Vec::new();
     let mut estimated_tokens = estimate_tokens(&markdown);
-    let project_ids = project_filter_ids(input.store_root, input.project_id)?;
+    let project_ids = if resolve_project_aliases {
+        project_filter_ids(input.store_root, input.project_id)?
+    } else if let (Some(project_id), Some(aliases)) = (input.project_id, local_project_aliases) {
+        Some(local_project_family_ids(project_id, aliases))
+    } else {
+        input
+            .project_id
+            .map(|project_id| BTreeSet::from([project_id.to_owned()]))
+    };
     let mut seen_bodies = BTreeSet::new();
 
     if collect_curated && curated_source_allowed(input.sources) {
@@ -284,7 +316,31 @@ fn assemble_context_with_mode(
     // Built once and reused; the Relevance strategy consults it per candidate.
     let markers = IncidentMarkers::default();
     let candidates = sorted_candidates(input.entries);
-    let project_keys = project_family_keys(input.entries, input.store_root);
+    let project_keys = if resolve_project_aliases {
+        project_family_keys(input.entries, input.store_root)
+    } else if let Some(aliases) = local_project_aliases {
+        input
+            .entries
+            .iter()
+            .filter_map(|entry| entry.project_id.as_ref())
+            .map(|project_id| {
+                (
+                    project_id.clone(),
+                    aliases
+                        .get(project_id)
+                        .cloned()
+                        .unwrap_or_else(|| project_id.clone()),
+                )
+            })
+            .collect()
+    } else {
+        input
+            .entries
+            .iter()
+            .filter_map(|entry| entry.project_id.as_ref())
+            .map(|project_id| (project_id.clone(), project_id.clone()))
+            .collect()
+    };
 
     // Supersession resolves over TWO distinct sets, kept separate on purpose:
     //
@@ -365,7 +421,7 @@ fn assemble_context_with_mode(
         // reads remain only as a fallback for body-less entries from an older
         // index schema, and a fallback failure degrades to a per-record skip —
         // one unreadable record must not strip all memory from a session.
-        let record_body = if entry.body.is_empty() {
+        let record_body = if entry.body.is_empty() && read_canonical_body_fallback {
             let note_path = input.store_root.join(&entry.note_path);
             match read_note_body(&note_path) {
                 Ok(body) => body,
@@ -378,6 +434,13 @@ fn assemble_context_with_mode(
                     continue;
                 }
             }
+        } else if entry.body.is_empty() {
+            warnings.push(ContextWarning {
+                source_path: entry.note_path.clone(),
+                message: "local index entry has no cached body".to_owned(),
+            });
+            push_decision(&mut decisions, &input, entry, "skipped", "unreadable");
+            continue;
         } else {
             entry.body.clone()
         };
@@ -444,6 +507,23 @@ fn assemble_context_with_mode(
         estimated_tokens,
         warnings,
     })
+}
+
+fn local_project_family_ids(
+    project_id: &str,
+    aliases: &BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    let family = aliases
+        .get(project_id)
+        .map(String::as_str)
+        .unwrap_or(project_id);
+    let mut ids = aliases
+        .iter()
+        .filter(|(_, candidate_family)| candidate_family.as_str() == family)
+        .map(|(id, _)| id.clone())
+        .collect::<BTreeSet<_>>();
+    ids.insert(project_id.to_owned());
+    ids
 }
 
 /// Read and parse one canonical note body for a body-less index entry.

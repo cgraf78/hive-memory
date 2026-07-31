@@ -865,8 +865,9 @@ Stable `--json` success field sets. Fields are mandatory unless explicitly noted
   "scopes", "sources", "estimated_tokens", "emitted", "stale",
   "cache_created_at", "sections" }`, where `emitted = false` means
   `--if-changed` found no context-selection change and produced no Markdown
-  body, `stale` is `true` only for last-success cache fallback,
-  `cache_created_at` is `null` for fresh context, and each section contains
+  body, `stale` is `true` for lifecycle-hook output served from either an exact
+  rendered cache or the local per-root projection, `cache_created_at` records
+  the local generation time when available, and each section contains
   `{ "id", "store", "scope", "project_id", "trust", "audience", "source_path",
   "estimated_tokens", "body" }`. `stores` is an array, but because multi-store
   reads are DEFERRED (see Read store resolution), v1 always emits exactly one
@@ -877,14 +878,17 @@ Stable `--json` success field sets. Fields are mandatory unless explicitly noted
 - `hm refresh --json`:
   `{ "indexes", "flushed", "skipped", "failed", "unbound", "pending",
   "coalesced", "write_receipts", "refreshed" }`, where
-  `refreshed = false` means no unrefreshed session writes were present and the
-  command skipped expensive work.
+  `refreshed = false` means the requested store set was not fully made current,
+  for example because another refresh held the lock or last-known-good safety
+  retained an older generation. Receipt cursors advance only when refreshed is
+  true and the refresh covered every unrefreshed receipt store.
 - `hm hook <event> --json`:
   `{ "event", "actions", "warnings", "memory_pending", "context_emitted",
   "refresh" }`, where `actions` is an ordered list of hook adapter actions such
   as `{ "kind": "inject_context", "body": "..." }`,
   `{ "kind": "remind", "body": "..." }`, or `{ "kind": "warn", "body": "..." }`.
-  `refresh` is `null` unless the event ran receipt-aware refresh.
+  `refresh` remains `null` for lifecycle events because receipt-aware index
+  maintenance runs in a detached child after the foreground response.
 - `hm stores list --json`:
   `[ { "name", "store_id", "root", "available", "default", "sensitivity",
   "readable", "writable", "default_for_agent" } ]`; the last three fields are
@@ -1084,9 +1088,10 @@ Behavior:
 - under agent policy, the resolved store means the agent's `default_store` (or an
   explicit `--store`), which must be within the agent's `read_stores`.
 - when `HIVE_MEMORY_HOOK_ACTIVE=1`, uses `defaults.hook_context_max_tokens`
-  when no explicit `--max-tokens` is provided, enables last-success cache
-  fallback, and still enforces the active agent's read policy before returning
-  either fresh or cached context.
+  when no explicit `--max-tokens` is provided, enforces the active agent's read
+  policy, and reads only owner-private local state: exact rendered cache first,
+  then the atomic per-root projection, then bounded empty output. It never
+  probes or reads the canonical store root synchronously.
 - includes active store name, sources used, and render policy in a small
   header. The header MUST also include the active agent ID (when known), resolved
   project ID, path hint, store source (`cli`, `env`, `project-binding`,
@@ -1115,14 +1120,16 @@ Behavior:
   with `---`, `+++`, or `<memory`/`</memory` to prevent source content from
   terminating the data-boundary block. Raw inbox content remains excluded unless
   `--include-inbox` is passed.
-- on successful fresh assembly, writes a last-success cache under
+- on successful interactive or local-projection assembly, writes a rendered
+  snapshot under
   `state_dir/context-cache/` keyed by agent ID, project ID, resolved stores,
   scopes, and source set. This cache is an operational fallback only; deleting it
   must not lose memory.
-- cached fallback is used only when the selected store roots are unavailable,
-  the cache is not older than `defaults.context_cache_max_age`, and every cached
-  store is still permitted by the active agent's current read policy. A privacy
-  refusal never falls back to stale context.
+- rendered snapshots are used only when they are not older than
+  `defaults.context_cache_max_age` and every cached store is still permitted by
+  the active agent's current read policy. Their identity includes the configured
+  store root so alias rebinding cannot replay another root's context. A privacy
+  refusal never falls back to local context.
 - `--if-changed` is the low-level primitive used by `hm hook` for long-lived
   sessions. It resolves the same
   agent/project/store/scope/source selection as a normal context call, compares
@@ -1347,9 +1354,11 @@ Behavior:
   applies the same recursion guards, cache fallback, and coalescing behavior
   itself. `HIVE_MEMORY_HOOK_ACTIVE=1` remains supported for hook scripts that
   call lower-level primitives directly.
-- `session-start`: resolves agent/project/store policy, emits initial context,
-  records the session context selection and emitted memory ids, and returns an
-  `inject_context` action.
+- `session-start`: resolves agent/project/store policy and emits/records initial
+  context when a local rendered snapshot or projection is available. A cold
+  local miss returns `context_emitted=false` immediately, schedules detached
+  hydration, and leaves the selection unrecorded so prompt-submit can inject the
+  hydrated context once in the same session.
 - `prompt-submit`: resolves the current project/store selection, emits context
   when the selection changed, otherwise runs bounded prompt-specific
   recall against `[defaults].search_sources`. Prompt recall keeps raw inbox
@@ -1358,13 +1367,13 @@ Behavior:
   useful context. It also runs the durable-memory intent heuristic and records
   `memory-pending` when the heuristic matches. It returns `inject_context`
   and/or `remind` actions as needed.
-- `tool-complete`: resolves the current project/store selection when the hook
-  supplies a project/path hint, emits context only when that hinted selection
-  changed, runs receipt-aware refresh after successful tool events, and clears
-  `memory-pending` when consumed write receipts prove a memory write occurred.
-  Hooks pass tool status and an optional active path; `hm` owns deciding whether
-  refresh/context actions are needed. A projectless tool completion MUST NOT
-  downgrade the session's last context selection to global/no-project context.
+- `tool-complete`: after a successful tool event, reads session write receipts,
+  clears `memory-pending` when a new receipt proves a memory write occurred,
+  returns without waiting for canonical storage, and schedules detached index
+  refresh. A single-store receipt batch targets that store; a mixed batch
+  refreshes all configured stores and advances the receipt cursor only after
+  every represented store was refreshed. Tool completion does not emit context
+  or change the session's project selection.
 - `stop`: if `memory-pending` remains, returns a reminder action. It may run
   `hm refresh --force` equivalent maintenance when configured, but it MUST NOT
   write canonical memory automatically.
@@ -1660,17 +1669,18 @@ Required hook behaviors:
   `inject_context` action into the agent's hook-provided additional context.
   This is the primary read path; the generated include files are a stable
   fallback and bootstrap surface.
-- **Project switches in long-lived sessions**: on prompt/tool boundaries where a
-  hook has a more precise active file, buffer, or tool path than the launch path,
-  pass that path to `hm hook prompt-submit` or `hm hook tool-complete`. If `hm`
-  returns an `inject_context` action, inject it as fresh additional context for
-  the new project/store selection. Project-switch detection stays inside `hm`.
+- **Project switches in long-lived sessions**: on prompt boundaries where a hook
+  has a more precise active file or buffer path than the launch path, pass that
+  path to `hm hook prompt-submit`. If `hm` returns an `inject_context` action,
+  inject it as fresh additional context for the new project/store selection.
+  Project-switch detection stays inside `hm`.
 - **UserPromptSubmit**: call `hm hook prompt-submit --text <prompt>`. `hm` owns
   the durable-memory intent heuristic, `memory-pending` state, and reminder
   action text.
 - **PostToolUse**: call `hm hook tool-complete --status <status>` after tool
-  events. `hm` owns receipt-aware refresh, context-if-changed behavior, and
-  clearing `memory-pending` when consumed receipts prove a memory write occurred.
+  events. `hm` owns immediate receipt acknowledgement, clearing
+  `memory-pending`, and detached receipt-aware index refresh. PostToolUse does
+  not inject context or wait for canonical storage.
 - **Stop**: call `hm hook stop`. If it returns a reminder action, show it. Stop
   hooks MUST NOT write new memories automatically.
 
@@ -1750,21 +1760,29 @@ v1 budget:
 - `hm context` p95 ≤ 500ms cold on the same store.
 - `hm search` p95 ≤ 300ms warm on a 5000-note store with text filter.
 - `hm flush` of a 100-item outbox p95 ≤ 2s on a local filesystem.
+- unchanged detached background refresh p95 ≤ 200ms on a 5000-note store.
 
 How v1 hits the budget:
 
-- the local triage index (cache/indexes/<store>.jsonl) is the hot-path data
-  structure. Reading 5000 jsonl lines is microseconds; matching/filtering is
-  bounded by the index, not the underlying files.
-- snippet text is read only for matched IDs, not for every note.
-- curated files are small and cacheable across invocations within a session
-  via the `state/runs/` last-run cache.
+- the per-root local projection (`cache/indexes/<store-root-key>.jsonl`) is the
+  lifecycle-hook data structure. Its atomic header carries curated bodies,
+  project aliases, and entity aliases; remembered/raw bodies remain JSONL rows.
+  Hook reads never touch the canonical store root.
+- session-start first reuses an exact rendered snapshot whose key includes the
+  configured store root. A projection hit renders locally and writes that
+  snapshot for later invocations; a local miss returns empty immediately.
+- stale or missing projections schedule a bounded, detached, index-only refresh.
+  Periodic no-write refreshes validate a fresh projection without reparsing all
+  notes; explicit and receipt-driven refreshes retain the full canonical parse.
+  No-op refreshes preserve the existing generation and rendered-cache validity.
+- prompt BM25 uses the remembered/raw corpus, while curated projection entries
+  are merged lexically without reopening canonical files.
 
 CI enforcement:
 
 - the integration test suite generates a synthetic 5000-note store under
-  `tempfile`, then benchmarks `hm context` and `hm search` 30 times each;
-  CI fails when measured p95 exceeds budget.
+  `tempfile`, then benchmarks context, search, lifecycle hooks, and unchanged
+  background refresh; CI fails when measured p95 exceeds budget.
 - `hm doctor` exposes the last-measured latencies and warns when they drift
   above budget on a real user's store.
 
@@ -1772,8 +1790,9 @@ Out-of-budget scenarios:
 
 - larger stores (>5000 notes) are post-v1; the index design extends but the
   budget does not commit numbers for them.
-- cloud-mounted roots add I/O latency that v1 does not promise to absorb;
-  doctor warns when the budget regresses on a cloud root.
+- cloud-mounted roots can delay detached hydration, but do not extend the
+  synchronous lifecycle-hook response budget. Doctor still reports slow
+  interactive canonical operations separately.
 
 ## Security and Privacy Model
 
@@ -2163,8 +2182,8 @@ Test categories per module:
   when the host integration supports env injection.
 - Dotfiles hook entry points call `hm hook <event>` and translate returned
   actions into host-specific context/warning/reminder surfaces.
-- `hm hook <event>` owns prompt memory-intent detection, `memory-pending`, context
-  selection changes, receipt-aware refresh, and refresh coalescing.
+- `hm hook <event>` owns prompt memory-intent detection, `memory-pending`, prompt
+  context selection changes, receipt-aware refresh, and refresh coalescing.
 - `hm hook session-start --json` returns an `inject_context` action with the
   same selected stores/project metadata as `hm context --json`.
 - `hm hook prompt-submit --text ... --json` records memory-pending and returns a
@@ -2175,12 +2194,12 @@ Test categories per module:
   emitted to the session.
   Repeated equivalent prompt recall returns valid JSON with
   `recall.reason = "unchanged"` and no duplicate `inject_context` action.
-- `hm hook tool-complete` emits context only when it receives a project/path hint
-  and the resolved project/store/scope/source selection changed; projectless
-  completions leave the prior context selection intact.
-- `hm hook tool-complete --status 0 --json` consumes session write receipts,
-  runs receipt-aware refresh, and clears memory-pending when receipts prove a
-  memory write occurred.
+- `hm hook tool-complete` never emits context or changes the prior project/store
+  selection; prompt-submit owns context changes for long-lived sessions.
+- `hm hook tool-complete --status 0 --json` clears memory-pending immediately
+  when a receipt proves a write, then schedules bounded detached index refresh.
+  The child advances `refreshed_receipts` only after every selected store was
+  actually refreshed; foreground tool-complete never waits on canonical I/O.
 - `hm hook tool-complete --status nonzero` does not run refresh and does not
   clear memory-pending.
 - `hm hook stop --json` returns a reminder action when memory-pending remains
@@ -2191,15 +2210,16 @@ Test categories per module:
   `agent-hook-*` scripts, not in a parallel hook stack.
 - SessionStart injects the `inject_context` action returned by
   `hm hook session-start`.
-- SessionStart uses last-success context cache only when the selected backend is
-  unavailable, the cache is within max age, and current agent policy still
-  allows every cached store.
-- Prompt/tool-boundary hooks pass the best active path hint to `hm hook
-  prompt-submit` / `hm hook tool-complete` so long-lived sessions receive fresh
-  context after moving to another project without hook-side project tracking.
-  Tool-complete hooks that intentionally omit a path stay on the cheap
-  receipt/refresh path and must not force a visible global/no-project context
-  reinjection.
+- SessionStart reads only owner-private local state: an exact rendered cache,
+  then the atomic per-root projection, then bounded empty output. Rendered-cache
+  identity includes the configured store root, max-age and active policy; legacy
+  alias-only cache keys are not replayed.
+- After an empty cold start, a successful detached hydration remains eligible
+  for one-time injection by the next prompt in the same session.
+- Prompt-boundary hooks pass the best active path hint to `hm hook
+  prompt-submit` so long-lived sessions receive fresh context after moving to
+  another project without hook-side project tracking. Tool-complete stays on
+  the cheap receipt/refresh path and never forces visible context reinjection.
 - General long-lived agent launchers do not set `HIVE_MEMORY_PROJECT_ID`; an
   explicitly pinned project ID prevents path-hint based project switching.
 - `hm hook prompt-submit` reminder action is advisory and does not write

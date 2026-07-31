@@ -11,7 +11,7 @@ use crate::retrieval::{SearchDocument, SearchIndex};
 use crate::{entity, note, project, supersession, validity, visibility};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt::{self, Display};
 use std::fs;
@@ -206,6 +206,58 @@ pub fn search_project_only(input: SearchInput<'_>) -> Result<Vec<SearchHit>, Sea
     search_with_mode(input, true)
 }
 
+/// Search only cached index bodies without consulting canonical store paths.
+///
+/// Lifecycle hooks use this when a cloud-backed store may be cold or blocked.
+/// The supplied registry and entries come from the same atomic projection, so
+/// curated files, user entity aliases, normalized project families, and current
+/// visibility/validity/scope/source policy all remain available locally.
+pub fn search_local_index(
+    input: SearchInput<'_>,
+    registry: &entity::EntityRegistry,
+    project_aliases: &BTreeMap<String, String>,
+) -> Result<Vec<SearchHit>, SearchError> {
+    let query = SearchQuery::parse(input.query, registry)?;
+    let project_ids = input
+        .project_id
+        .map(|project_id| local_project_family_ids(project_id, project_aliases));
+    let mut hits = Vec::new();
+
+    for entry in input.entries {
+        if !source_allowed(entry, input.sources, input.include_inbox)
+            || !scope_allowed(entry, input.scopes)
+            || !visibility::audience_allows(entry, input.agent_id)
+            || !validity_allows(entry, &query)
+            || entry.body.is_empty()
+        {
+            continue;
+        }
+
+        let body = Cow::Borrowed(entry.body.as_str());
+        let mut trace = score_entry(entry, &body, &query);
+        trace.project = project_boost(trace.total(), entry, project_ids.as_ref());
+        let score = trace.total();
+        if score == 0 {
+            continue;
+        }
+        hits.push(SearchHit {
+            entry: entry.clone(),
+            score,
+            trace,
+            snippet: snippet(entry, &body, &query),
+        });
+    }
+
+    finish_local_hits(
+        &mut hits,
+        &query.phrase,
+        query.temporal_intent(),
+        input.limit,
+        project_aliases,
+    );
+    Ok(hits)
+}
+
 fn search_with_mode(
     input: SearchInput<'_>,
     project_only: bool,
@@ -335,6 +387,67 @@ fn finish_hits(
     hits.truncate(limit);
 }
 
+fn finish_local_hits(
+    hits: &mut Vec<SearchHit>,
+    phrase: &str,
+    temporal_intent: Option<TemporalIntent>,
+    limit: usize,
+    project_aliases: &BTreeMap<String, String>,
+) {
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| {
+                confidence_rank(right.entry.confidence).cmp(&confidence_rank(left.entry.confidence))
+            })
+            .then_with(|| {
+                temporal_rank(temporal_intent, &right.entry.created_at)
+                    .cmp(&temporal_rank(temporal_intent, &left.entry.created_at))
+            })
+            .then_with(|| {
+                timestamp_rank(&right.entry.created_at).cmp(&timestamp_rank(&left.entry.created_at))
+            })
+            .then_with(|| left.entry.note_path.cmp(&right.entry.note_path))
+    });
+    let suppressed = suppress_superseded_hits(hits, phrase);
+    hits.retain(|hit| !suppressed.contains(&hit.entry.id));
+
+    let project_keys = hits
+        .iter()
+        .filter_map(|hit| hit.entry.project_id.as_ref())
+        .map(|project_id| {
+            (
+                project_id.clone(),
+                project_aliases
+                    .get(project_id)
+                    .cloned()
+                    .unwrap_or_else(|| project_id.clone()),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut seen = BTreeSet::new();
+    hits.retain(|hit| seen.insert(duplicate_key(&hit.entry, &hit.snippet, &project_keys)));
+    hits.truncate(limit);
+}
+
+fn local_project_family_ids(
+    project_id: &str,
+    aliases: &BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    let family = aliases
+        .get(project_id)
+        .map(String::as_str)
+        .unwrap_or(project_id);
+    let mut ids = aliases
+        .iter()
+        .filter(|(_, candidate_family)| candidate_family.as_str() == family)
+        .map(|(id, _)| id.clone())
+        .collect::<BTreeSet<_>>();
+    ids.insert(project_id.to_owned());
+    ids
+}
+
 fn suppress_superseded_hits(hits: &[SearchHit], phrase: &str) -> BTreeSet<String> {
     // Feed the FULL query-matched, audience/scope/validity-filtered hit set to
     // the shared resolver. Project filtering applies only in explicit
@@ -442,6 +555,9 @@ fn curated_source_allowed(sources: &[String]) -> bool {
 fn source_allowed(entry: &IndexEntry, sources: &[String], include_inbox: bool) -> bool {
     if sources.iter().any(|source| source == "all") {
         return true;
+    }
+    if entry.id.starts_with("curated:") {
+        return sources.iter().any(|source| source == "curated");
     }
 
     match entry.entry_kind {
@@ -1119,6 +1235,33 @@ pub fn search_indexed_project_only(
     search_indexed_with_mode(input, index, true)
 }
 
+/// Query a fresh local Tantivy index without consulting canonical store paths.
+///
+/// The supplied projection already contains curated bodies, normalized project
+/// aliases, and the entity registry, so the normal policy post-filter remains
+/// intact while lifecycle hooks avoid mounted filesystem I/O.
+pub fn search_indexed_local(
+    input: SearchInput<'_>,
+    projection_entries: &[IndexEntry],
+    index: &SearchIndex,
+    registry: &entity::EntityRegistry,
+    project_aliases: &BTreeMap<String, String>,
+) -> Result<Vec<SearchHit>, SearchError> {
+    let project_ids = input
+        .project_id
+        .map(|project_id| local_project_family_ids(project_id, project_aliases));
+    search_indexed_with_resources(
+        input,
+        index,
+        false,
+        registry,
+        project_ids,
+        false,
+        Some(project_aliases),
+        Some(projection_entries),
+    )
+}
+
 fn search_indexed_with_mode(
     input: SearchInput<'_>,
     index: &SearchIndex,
@@ -1126,8 +1269,31 @@ fn search_indexed_with_mode(
 ) -> Result<Vec<SearchHit>, SearchError> {
     let registry = entity::EntityRegistry::load_for_store(input.store_root)
         .map_err(|err| SearchError::EntityRegistry(err.to_string()))?;
-    let query = SearchQuery::parse(input.query, &registry)?;
     let project_ids = project_filter_ids(input.store_root, input.project_id)?;
+    search_indexed_with_resources(
+        input,
+        index,
+        project_only,
+        &registry,
+        project_ids,
+        true,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_indexed_with_resources(
+    input: SearchInput<'_>,
+    index: &SearchIndex,
+    project_only: bool,
+    registry: &entity::EntityRegistry,
+    project_ids: Option<BTreeSet<String>>,
+    collect_canonical_curated: bool,
+    local_project_aliases: Option<&BTreeMap<String, String>>,
+    local_projection_entries: Option<&[IndexEntry]>,
+) -> Result<Vec<SearchHit>, SearchError> {
+    let query = SearchQuery::parse(input.query, registry)?;
     let by_id: HashMap<&str, &IndexEntry> = input
         .entries
         .iter()
@@ -1154,6 +1320,9 @@ fn search_indexed_with_mode(
         let Some(entry) = by_id.get(ranked_hit.id.as_str()) else {
             continue;
         };
+        if !collect_canonical_curated && entry.id.starts_with("curated:") {
+            continue;
+        }
         if !source_allowed(entry, input.sources, input.include_inbox)
             || !scope_allowed(entry, input.scopes)
             || !project_allowed(entry, project_ids.as_ref(), project_only)
@@ -1183,6 +1352,38 @@ fn search_indexed_with_mode(
             snippet: retrieval_snippet(&body),
         });
     }
+    if !collect_canonical_curated {
+        finish_local_hits(
+            &mut indexed_hits,
+            &query.phrase,
+            query.temporal_intent(),
+            input.limit,
+            local_project_aliases.expect("local search carries project aliases"),
+        );
+        let curated_sources = vec!["curated".to_owned()];
+        let curated_hits = search_local_index(
+            SearchInput {
+                store_root: input.store_root,
+                entries: local_projection_entries
+                    .expect("local search carries complete projection entries"),
+                query: input.query,
+                scopes: input.scopes,
+                sources: &curated_sources,
+                include_inbox: false,
+                agent_id: input.agent_id,
+                project_id: input.project_id,
+                limit: input.limit,
+            },
+            registry,
+            local_project_aliases.expect("local search carries project aliases"),
+        )?;
+        return Ok(merge_ranked_sources_local(
+            vec![indexed_hits, curated_hits],
+            input.limit,
+            local_project_aliases.expect("local search carries project aliases"),
+        ));
+    }
+
     // The persistent BM25 cache indexes the JSONL note corpus. Curated Markdown
     // is intentionally read directly elsewhere because it is tiny and can be
     // scoped by the active project; merge those lexical hits here so selecting
@@ -1194,7 +1395,7 @@ fn search_indexed_with_mode(
         query.temporal_intent(),
         input.limit,
     );
-    let mut curated_hits = curated_hits(&input, &query, &registry, project_only)?;
+    let mut curated_hits = curated_hits(&input, &query, registry, project_only)?;
     finish_hits(
         &mut curated_hits,
         input.store_root,
@@ -1211,6 +1412,48 @@ fn search_indexed_with_mode(
         input.limit,
         input.store_root,
     ))
+}
+
+fn merge_ranked_sources_local(
+    mut sources: Vec<Vec<SearchHit>>,
+    limit: usize,
+    project_aliases: &BTreeMap<String, String>,
+) -> Vec<SearchHit> {
+    let project_keys = sources
+        .iter()
+        .flatten()
+        .filter_map(|hit| hit.entry.project_id.as_ref())
+        .map(|project_id| {
+            (
+                project_id.clone(),
+                project_aliases
+                    .get(project_id)
+                    .cloned()
+                    .unwrap_or_else(|| project_id.clone()),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut hits = Vec::new();
+    let mut seen = BTreeSet::new();
+    loop {
+        let mut advanced = false;
+        for source in &mut sources {
+            if source.is_empty() {
+                continue;
+            }
+            advanced = true;
+            let hit = source.remove(0);
+            if seen.insert(duplicate_key(&hit.entry, &hit.snippet, &project_keys)) {
+                hits.push(hit);
+                if hits.len() >= limit {
+                    return hits;
+                }
+            }
+        }
+        if !advanced {
+            return hits;
+        }
+    }
 }
 
 fn merge_ranked_sources(

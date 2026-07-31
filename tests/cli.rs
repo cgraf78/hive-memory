@@ -1,4 +1,3 @@
-use assert_cmd::cargo::cargo_bin_cmd;
 use fs4::FileExt;
 use hive_memory::{hook as memory_hook, outbox, store};
 use predicates::prelude::*;
@@ -6,6 +5,24 @@ use std::fs::{self, OpenOptions};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+macro_rules! cargo_bin_cmd {
+    ("hm") => {{
+        let mut command = assert_cmd::cargo::cargo_bin_cmd!("hm");
+        let thread = std::thread::current();
+        let test_name = thread.name().unwrap_or("unnamed-cli-test");
+        let sandbox = std::env::temp_dir().join(format!(
+            "hive-memory-cli-xdg-{}-{}",
+            std::process::id(),
+            hive_memory::hash::sha256_hex(test_name.as_bytes())
+        ));
+        command
+            .env("XDG_DATA_HOME", sandbox.join("data"))
+            .env("XDG_STATE_HOME", sandbox.join("state"))
+            .env("XDG_CACHE_HOME", sandbox.join("cache"));
+        command
+    }};
+}
 
 fn temp_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -94,6 +111,44 @@ fn init_store(root: &std::path::Path, name: &str) {
     ])
     .assert()
     .success();
+}
+
+fn seed_local_projection(config: &std::path::Path, text: &str) {
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            text,
+        ])
+        .assert()
+        .success();
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--force",
+        ])
+        .assert()
+        .success();
+}
+
+fn wait_for_refreshed_receipts(state_file: &std::path::Path, count: usize) -> String {
+    let expected = format!("\"refreshed_receipts\": {count}");
+    for _ in 0..100 {
+        if let Ok(state) = fs::read_to_string(state_file)
+            && state.contains(&expected)
+        {
+            return state;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "background refresh did not advance receipt cursor to {count}: {}",
+        fs::read_to_string(state_file).unwrap_or_else(|err| err.to_string())
+    );
 }
 
 fn make_file_stale(path: &std::path::Path) {
@@ -346,6 +401,42 @@ fn stores_init_json_reports_manifest_identity() {
         )))
         .stdout(predicate::str::contains("\"store_id\": \""))
         .stdout(predicate::str::contains("\"sensitivity\": \"private\""));
+}
+
+#[cfg(unix)]
+#[test]
+fn config_load_protects_local_support_root_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_dir("config-private-support-roots");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    for name in ["data", "state", "cache"] {
+        let path = dir.join(name);
+        fs::create_dir_all(&path).expect("support root");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .expect("make legacy support root permissive");
+    }
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "stores",
+            "list",
+        ])
+        .assert()
+        .success();
+
+    for name in ["data", "state", "cache"] {
+        let mode = fs::metadata(dir.join(name))
+            .expect("support root metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700, "{name} must be owner-only");
+    }
 }
 
 #[cfg(unix)]
@@ -4212,6 +4303,744 @@ fn hook_session_start_uses_hook_cache_fallback_without_env_flag() {
 }
 
 #[test]
+fn hook_session_start_uses_newer_local_index_without_revalidating_store() {
+    let dir = temp_dir("hook-session-start-local-first");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "remember",
+            "--text",
+            "Local snapshot fact from the first refresh.",
+        ])
+        .assert()
+        .success();
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "context",
+            "--path",
+            "/repo/src/main.rs",
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    // Refresh the local projection after another write. The hook must observe
+    // the newer local generation without walking canonical storage itself.
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "remember",
+            "--text",
+            "Canonical fact added after the local snapshot.",
+        ])
+        .assert()
+        .success();
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--force",
+        ])
+        .assert()
+        .success();
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", "session-local-first")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "session-start",
+            "--project",
+            "/repo/src/main.rs",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Local snapshot fact from the first refresh.",
+        ))
+        .stdout(predicate::str::contains(
+            "Canonical fact added after the local snapshot.",
+        ));
+}
+
+#[test]
+fn hook_session_start_refreshes_local_projection_after_returning() {
+    let dir = temp_dir("hook-session-start-background-refresh");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Background refresh hydrates this cold-start memory.",
+        ])
+        .assert()
+        .success();
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", "session-background-refresh-first")
+        .env("HIVE_MEMORY_BACKGROUND_REFRESH", "1")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "session-start",
+            "--project",
+            "/repo/src/main.rs",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"context_emitted\": false"));
+
+    let mut index_path = None;
+    for _ in 0..100 {
+        index_path = fs::read_dir(dir.join("cache/indexes"))
+            .ok()
+            .and_then(|mut entries| entries.next())
+            .and_then(Result::ok)
+            .map(|entry| entry.path());
+        if index_path.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let index_path = index_path.expect("background refresh did not create index");
+    let mut refreshed = false;
+    for _ in 0..100 {
+        if fs::read_to_string(&index_path).is_ok_and(|contents| {
+            contents.contains("Background refresh hydrates this cold-start memory.")
+        }) {
+            refreshed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(refreshed, "background refresh did not publish within 5s");
+    let success_stamp = dir.join("state/background-refresh").join(format!(
+        "{}.last-success",
+        hive_memory::index::store_cache_key("personal", &personal)
+    ));
+    let mut recorded_success = false;
+    for _ in 0..100 {
+        if success_stamp.is_file() {
+            recorded_success = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        recorded_success,
+        "background refresh did not record successful hydration"
+    );
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", "session-background-refresh-first")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "prompt-submit",
+            "--project",
+            "/repo/src/main.rs",
+            "--text",
+            "Continue the current task.",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"context_emitted\": true"))
+        .stdout(predicate::str::contains(
+            "Background refresh hydrates this cold-start memory.",
+        ));
+
+    cargo_bin_cmd!("hm")
+        .env(
+            "HIVE_MEMORY_SESSION_ID",
+            "session-background-refresh-second",
+        )
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "session-start",
+            "--project",
+            "/repo/src/main.rs",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Background refresh hydrates this cold-start memory.",
+        ));
+}
+
+#[test]
+fn background_refresh_lock_contention_does_not_record_success() {
+    let dir = temp_dir("background-refresh-contention");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    let lock_path = dir.join("cache/locks/index").join(format!(
+        "{}.lock",
+        hive_memory::index::store_cache_key("personal", &personal)
+    ));
+    fs::create_dir_all(lock_path.parent().expect("lock parent")).expect("lock parent");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("open rebuild lock");
+    FileExt::lock(&lock).expect("hold rebuild lock");
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_HOOK_ACTIVE", "1")
+        .env("HIVE_MEMORY_SESSION_ID", "background-contention")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--background",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"indexes\": 0"))
+        .stdout(predicate::str::contains("\"refreshed\": false"))
+        .stdout(predicate::str::contains("\"coalesced\": true"));
+    FileExt::unlock(&lock).expect("unlock rebuild lock");
+
+    assert!(
+        !dir.join("state/background-refresh")
+            .join(format!(
+                "{}.last-success",
+                hive_memory::index::store_cache_key("personal", &personal)
+            ))
+            .exists()
+    );
+}
+
+#[test]
+fn refresh_repairs_cached_store_identity_from_validated_manifest() {
+    let dir = temp_dir("refresh-store-identity");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    let manifest = store::read_manifest(&personal).expect("read personal manifest");
+    let data = dir.join("data");
+    fs::create_dir_all(&data).expect("create data dir");
+    fs::write(
+        data.join("store-identities.toml"),
+        r#"schema_version = 1
+
+[stores.personal]
+store_id = "stale-test-identity"
+seen_at = "2026-01-01T00:00:00Z"
+"#,
+    )
+    .expect("seed stale identity cache");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--store",
+            "personal",
+            "refresh",
+            "--background",
+            "--quiet",
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        outbox::cached_store_identity(&data, "personal").expect("read repaired identity"),
+        Some(manifest.store.id)
+    );
+}
+
+#[test]
+fn targeted_background_refresh_does_not_acknowledge_other_store_receipts() {
+    let dir = temp_dir("background-refresh-mixed-receipts");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    let state = dir.join("state");
+    write_config(&config, &personal, &work);
+    let config_contents = fs::read_to_string(&config).expect("read base config");
+    fs::write(
+        &config,
+        format!(
+            "{config_contents}\n[agents.codex]\ndefault_store = \"personal\"\nread_stores = [\"personal\", \"work\"]\nwrite_stores = [\"personal\", \"work\"]\n"
+        ),
+    )
+    .expect("allow test agent to access both stores");
+    init_store(&personal, "personal");
+    init_store(&work, "work");
+
+    for (store_name, text) in [
+        ("personal", "Receipt for the personal store."),
+        ("work", "Receipt for the work store."),
+    ] {
+        cargo_bin_cmd!("hm")
+            .env("HIVE_MEMORY_SESSION_ID", "mixed-store-session")
+            .args([
+                "--config",
+                config.to_str().expect("utf8 config"),
+                "--as-agent",
+                "codex",
+                "--store",
+                store_name,
+                "remember",
+                "--text",
+                text,
+            ])
+            .assert()
+            .success();
+    }
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_HOOK_ACTIVE", "1")
+        .env("HIVE_MEMORY_SESSION_ID", "mixed-store-session")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "--store",
+            "personal",
+            "refresh",
+            "--background",
+            "--quiet",
+        ])
+        .assert()
+        .success();
+    let hook_state = memory_hook::load_state(&state, "mixed-store-session")
+        .expect("load hook state after targeted refresh");
+    assert_eq!(hook_state.refreshed_receipts, 0);
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_HOOK_ACTIVE", "1")
+        .env("HIVE_MEMORY_SESSION_ID", "mixed-store-session")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "--store",
+            "personal",
+            "hook",
+            "tool-complete",
+            "--status",
+            "0",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"refresh\": null"));
+    wait_for_refreshed_receipts(&state.join("runs/mixed-store-session/hook-state.json"), 2);
+}
+
+#[test]
+fn retained_last_good_refresh_does_not_acknowledge_new_receipt() {
+    let dir = temp_dir("background-refresh-retained-index");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    let state = dir.join("state");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+
+    let old_output = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Last known good memory that must not disappear.",
+            "--json",
+        ])
+        .output()
+        .expect("write old memory");
+    assert!(old_output.status.success());
+    let old: serde_json::Value =
+        serde_json::from_slice(&old_output.stdout).expect("old memory json");
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--store",
+            "personal",
+            "refresh",
+            "--background",
+            "--quiet",
+        ])
+        .assert()
+        .success();
+    fs::remove_file(old["note_path"].as_str().expect("old note path"))
+        .expect("hide old canonical note");
+    if let Some(event_path) = old["event_path"].as_str() {
+        fs::remove_file(event_path).expect("hide old canonical event");
+    }
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", "retained-index-session")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "New memory must remain an unrefreshed receipt.",
+        ])
+        .assert()
+        .success();
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_HOOK_ACTIVE", "1")
+        .env("HIVE_MEMORY_SESSION_ID", "retained-index-session")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--store",
+            "personal",
+            "refresh",
+            "--background",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"refreshed\": false"));
+
+    let hook_state = memory_hook::load_state(&state, "retained-index-session")
+        .expect("load retained-index hook state");
+    assert_eq!(hook_state.refreshed_receipts, 0);
+}
+
+#[test]
+fn hook_session_start_reuses_project_snapshot_across_paths() {
+    let dir = temp_dir("hook-session-start-project-cache-key");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    fs::create_dir_all(personal.join("rules")).expect("create curated rules");
+    fs::write(
+        personal.join("rules/project-cache.md"),
+        "Complete curated context survives path changes.\n",
+    )
+    .expect("write curated memory");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "context",
+            "--project-id",
+            "stable-project",
+            "--path",
+            "/repo/src/first.rs",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Complete curated context survives path changes.",
+        ));
+    fs::rename(&personal, dir.join("personal-offline")).expect("move store offline");
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_HOOK_ACTIVE", "1")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "context",
+            "--project-id",
+            "stable-project",
+            "--path",
+            "/repo/src/second.rs",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("served from local cache"))
+        .stdout(predicate::str::contains("path: /repo/src/second.rs"))
+        .stdout(predicate::str::contains(
+            "Complete curated context survives path changes.",
+        ));
+
+    assert_eq!(
+        fs::read_dir(dir.join("state/context-cache"))
+            .expect("context cache dir")
+            .count(),
+        1,
+        "one stable project selection should have one rendered snapshot"
+    );
+}
+
+#[test]
+fn hook_context_cache_does_not_cross_store_root_changes() {
+    let dir = temp_dir("hook-context-cache-store-root");
+    let config = dir.join("config.toml");
+    let first = dir.join("personal-first");
+    let second = dir.join("personal-second");
+    let work = dir.join("work");
+    write_config(&config, &first, &work);
+    init_store(&first, "personal");
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Memory from the old store root must not cross configurations.",
+        ])
+        .assert()
+        .success();
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "context",
+            "--project-id",
+            "stable-project",
+        ])
+        .assert()
+        .success();
+
+    write_config(&config, &second, &work);
+    init_store(&second, "personal");
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", "store-root-change")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "hook",
+            "session-start",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains(
+                "Memory from the old store root must not cross configurations.",
+            )
+            .not(),
+        )
+        .stdout(predicate::str::contains("\"context_emitted\": false"));
+}
+
+#[test]
+fn hook_context_corrupt_rendered_cache_falls_back_to_local_projection() {
+    let dir = temp_dir("hook-context-corrupt-rendered-cache");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    seed_local_projection(
+        &config,
+        "A corrupt rendered snapshot must not hide the local projection.",
+    );
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "context",
+            "--project-id",
+            "stable-project",
+        ])
+        .assert()
+        .success();
+    let cache_path = fs::read_dir(dir.join("state/context-cache"))
+        .expect("context cache")
+        .next()
+        .expect("context cache entry")
+        .expect("context cache path")
+        .path();
+    fs::write(cache_path, b"{truncated").expect("corrupt context cache");
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", "corrupt-rendered-cache")
+        .env("HIVE_MEMORY_PROJECT_ID", "stable-project")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "session-start",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "A corrupt rendered snapshot must not hide the local projection.",
+        ));
+}
+
+#[test]
+fn hook_session_start_uses_local_index_when_exact_context_cache_is_missing() {
+    let dir = temp_dir("hook-session-start-local-index");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    fs::create_dir_all(personal.join("rules")).expect("create curated rules");
+    fs::write(
+        personal.join("rules/local-snapshot.md"),
+        "Curated memory remains available from the local projection.\n",
+    )
+    .expect("write curated memory");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "remember",
+            "--text",
+            "Local index keeps startup memory available.",
+        ])
+        .assert()
+        .success();
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--force",
+        ])
+        .assert()
+        .success();
+    fs::rename(&personal, dir.join("personal-offline")).expect("move store offline");
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", "session-local-index")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "session-start",
+            "--project",
+            "/new-repo/src/main.rs",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Local index keeps startup memory available.",
+        ))
+        .stdout(predicate::str::contains(
+            "Curated memory remains available from the local projection.",
+        ))
+        .stdout(predicate::str::contains("local index snapshot"));
+}
+
+#[test]
+fn hook_session_start_local_projection_follows_project_aliases() {
+    let dir = temp_dir("hook-session-start-local-aliases");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--project-id",
+            "old-project",
+            "--text",
+            "Renamed projects retain their local startup context.",
+        ])
+        .assert()
+        .success();
+    let aliases = personal.join("memories/projects/current-project/aliases.toml");
+    fs::create_dir_all(aliases.parent().expect("alias parent")).expect("create alias parent");
+    fs::write(
+        aliases,
+        "schema_version = 1\nproject_id = \"current-project\"\naliases = [\"old-project\"]\n",
+    )
+    .expect("write aliases");
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--force",
+        ])
+        .assert()
+        .success();
+    fs::rename(&personal, dir.join("personal-offline")).expect("move store offline");
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", "session-local-aliases")
+        .env("HIVE_MEMORY_PROJECT_ID", "current-project")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "hook",
+            "session-start",
+            "--project",
+            "/repo/src/main.rs",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Renamed projects retain their local startup context.",
+        ))
+        .stdout(predicate::str::contains("project_id=\\\"old-project\\\""));
+}
+
+#[test]
 fn context_json_explain_reports_included_and_skipped_decisions() {
     let dir = temp_dir("context-explain");
     let config = dir.join("config.toml");
@@ -4286,7 +5115,7 @@ fn context_json_explain_reports_included_and_skipped_decisions() {
 }
 
 #[test]
-fn hook_context_fails_when_store_unavailable_without_cache() {
+fn hook_context_returns_bounded_empty_result_without_local_cache() {
     let dir = temp_dir("context-no-cache");
     let config = dir.join("config.toml");
     let personal = dir.join("personal");
@@ -4306,14 +5135,10 @@ fn hook_context_fails_when_store_unavailable_without_cache() {
             "--json",
         ])
         .assert()
-        .code(5)
-        .stderr(predicate::str::contains("\"ok\": false"))
-        .stderr(predicate::str::contains(
-            "\"code\": \"backend_unavailable\"",
-        ))
-        .stderr(predicate::str::contains(
-            "store personal is unavailable and no valid context cache exists",
-        ));
+        .success()
+        .stdout(predicate::str::contains("\"stale\": true"))
+        .stdout(predicate::str::contains("\"cache_created_at\": null"))
+        .stdout(predicate::str::contains("\"sections\": []"));
 }
 
 #[test]
@@ -4328,11 +5153,13 @@ fn context_if_changed_suppresses_unchanged_session_output() {
             r#"
             default_store = "personal"
             state_dir = "{}"
+            cache_dir = "{}"
 
             [stores.personal]
             root = "{}"
             "#,
             state.display(),
+            state.join("cache").display(),
             personal.display()
         ),
     )
@@ -4415,6 +5242,7 @@ fn context_requires_include_inbox_for_raw_note() {
             r#"
             default_store = "personal"
             state_dir = "{}"
+            cache_dir = "{}"
 
             [stores.personal]
             root = "{}"
@@ -4427,6 +5255,7 @@ fn context_requires_include_inbox_for_raw_note() {
             context_strategy = "relevance"
             "#,
             dir.join("state").display(),
+            dir.join("cache").display(),
             personal.display(),
             work.display()
         ),
@@ -4751,6 +5580,7 @@ fn retag_updates_kind_and_relevance_selection() {
             r#"
             default_store = "personal"
             state_dir = "{}"
+            cache_dir = "{}"
 
             [stores.personal]
             root = "{}"
@@ -4759,6 +5589,7 @@ fn retag_updates_kind_and_relevance_selection() {
             context_strategy = "relevance"
             "#,
             state.display(),
+            state.join("cache").display(),
             personal.display()
         ),
     )
@@ -5235,12 +6066,14 @@ fn sync_status_reports_per_host_last_seen() {
                 r#"
                 default_store = "personal"
                 state_dir = "{}"
+                cache_dir = "{}"
                 host_id = "{host}"
 
                 [stores.personal]
                 root = "{}"
                 "#,
                 state.display(),
+                state.join("cache").display(),
                 personal.display()
             ),
         )
@@ -5392,6 +6225,16 @@ fn refresh_rebuilds_indexes() {
         .assert()
         .success();
 
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--force",
+        ])
+        .assert()
+        .success();
+
     let mut refresh = cargo_bin_cmd!("hm");
     refresh
         .args(["--config", config.to_str().expect("utf8 config"), "refresh"])
@@ -5441,6 +6284,49 @@ fn refresh_json_reports_maintenance_summary() {
 }
 
 #[test]
+fn refresh_prunes_context_snapshots_past_replay_policy() {
+    let dir = temp_dir("refresh-prune-context-cache");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+
+    cargo_bin_cmd!("hm")
+        .args(["--config", config.to_str().expect("utf8 config"), "context"])
+        .assert()
+        .success();
+    let cache_dir = dir.join("state/context-cache");
+    let cache_path = fs::read_dir(&cache_dir)
+        .expect("context cache")
+        .next()
+        .expect("context cache entry")
+        .expect("context cache path")
+        .path();
+    let mut entry: serde_json::Value =
+        serde_json::from_slice(&fs::read(&cache_path).expect("read context cache"))
+            .expect("parse context cache");
+    entry["created_at"] = serde_json::Value::String("2000-01-01T00:00:00Z".to_owned());
+    fs::write(
+        &cache_path,
+        serde_json::to_vec_pretty(&entry).expect("serialize context cache"),
+    )
+    .expect("age context cache");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--force",
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(fs::read_dir(cache_dir).expect("context cache").count(), 0);
+}
+
+#[test]
 fn refresh_hook_mode_skips_without_unrefreshed_receipts() {
     let dir = temp_dir("refresh-hook-no-receipts");
     let config = dir.join("config.toml");
@@ -5452,11 +6338,13 @@ fn refresh_hook_mode_skips_without_unrefreshed_receipts() {
             r#"
             default_store = "personal"
             state_dir = "{}"
+            cache_dir = "{}"
 
             [stores.personal]
             root = "{}"
             "#,
             state.display(),
+            state.join("cache").display(),
             personal.display()
         ),
     )
@@ -5492,11 +6380,13 @@ fn refresh_force_ignores_hook_receipt_skip() {
             r#"
             default_store = "personal"
             state_dir = "{}"
+            cache_dir = "{}"
 
             [stores.personal]
             root = "{}"
             "#,
             state.display(),
+            state.join("cache").display(),
             personal.display()
         ),
     )
@@ -5532,11 +6422,13 @@ fn refresh_hook_mode_consumes_unrefreshed_receipts() {
             r#"
             default_store = "personal"
             state_dir = "{}"
+            cache_dir = "{}"
 
             [stores.personal]
             root = "{}"
             "#,
             state.display(),
+            state.join("cache").display(),
             personal.display()
         ),
     )
@@ -5603,11 +6495,13 @@ fn refresh_hook_mode_coalesces_when_refresh_lock_is_held() {
             r#"
             default_store = "personal"
             state_dir = "{}"
+            cache_dir = "{}"
 
             [stores.personal]
             root = "{}"
             "#,
             state.display(),
+            state.join("cache").display(),
             personal.display()
         ),
     )
@@ -5675,6 +6569,16 @@ fn hook_session_start_emits_context_action_json() {
             "remember",
             "--text",
             "Hook context includes durable memory.",
+        ])
+        .assert()
+        .success();
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--force",
         ])
         .assert()
         .success();
@@ -5775,6 +6679,16 @@ fn hook_session_start_resolves_project_binding_from_path_hint() {
         .success()
         .stdout(predicate::str::contains("store: work"));
 
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--force",
+        ])
+        .assert()
+        .success();
+
     let mut hook = cargo_bin_cmd!("hm");
     hook.args([
         "--config",
@@ -5796,7 +6710,177 @@ fn hook_session_start_resolves_project_binding_from_path_hint() {
 }
 
 #[test]
-fn hook_session_start_human_output_is_context() {
+fn hook_prompt_project_switch_hydrates_cold_bound_store_in_same_session() {
+    let dir = temp_dir("hook-project-switch-cold-store");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    let repo = dir.join("repo");
+    fs::create_dir_all(repo.join("src")).expect("create repo");
+    fs::write(
+        repo.join(".hive-memory-project"),
+        "id = \"cold-bound-project\"\n",
+    )
+    .expect("write project marker");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            data_dir = "{}"
+            state_dir = "{}"
+            cache_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+
+            [stores.work]
+            root = "{}"
+
+            [agents.codex]
+            default_store = "personal"
+            read_stores = ["personal", "work"]
+            write_stores = ["personal", "work"]
+            "#,
+            dir.join("data").display(),
+            dir.join("state").display(),
+            dir.join("cache").display(),
+            personal.display(),
+            work.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+    init_store(&work, "work");
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "projects",
+            "bind",
+            repo.to_str().expect("utf8 repo"),
+            "--store",
+            "work",
+        ])
+        .assert()
+        .success();
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "remember",
+            "--text",
+            "Personal startup context.",
+        ])
+        .assert()
+        .success();
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--store",
+            "personal",
+            "refresh",
+            "--background",
+            "--quiet",
+        ])
+        .assert()
+        .success();
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "remember",
+            "--project",
+            repo.to_str().expect("utf8 repo"),
+            "--scope",
+            "project",
+            "--text",
+            "Cold bound-store context becomes available asynchronously.",
+        ])
+        .assert()
+        .success();
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", "cold-switch-session")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "session-start",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Personal startup context."));
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", "cold-switch-session")
+        .env("HIVE_MEMORY_BACKGROUND_REFRESH", "1")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "prompt-submit",
+            "--project",
+            repo.join("src/main.rs").to_str().expect("utf8 project"),
+            "--text",
+            "Continue in the bound project.",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"context_emitted\": false"));
+
+    let work_index = dir.join("cache/indexes").join(format!(
+        "{}.jsonl",
+        hive_memory::index::store_cache_key("work", &work)
+    ));
+    let mut hydrated = false;
+    for _ in 0..100 {
+        if fs::read_to_string(&work_index).is_ok_and(|contents| {
+            contents.contains("Cold bound-store context becomes available asynchronously.")
+        }) {
+            hydrated = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(hydrated, "prompt switch did not hydrate bound store");
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", "cold-switch-session")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "prompt-submit",
+            "--project",
+            repo.join("src/main.rs").to_str().expect("utf8 project"),
+            "--text",
+            "Continue after hydration.",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"context_emitted\": true"))
+        .stdout(predicate::str::contains(
+            "Cold bound-store context becomes available asynchronously.",
+        ));
+}
+
+#[test]
+fn hook_session_start_without_memory_has_no_context_action() {
     let dir = temp_dir("hook-session-human");
     let config = dir.join("config.toml");
     let personal = dir.join("personal");
@@ -5815,8 +6899,8 @@ fn hook_session_start_human_output_is_context() {
     ])
     .assert()
     .success()
-    .stdout(predicate::str::contains("Hive Memory Context"))
-    .stdout(predicate::str::contains("agent: codex"));
+    .stdout(predicate::str::contains("hook session-start: no actions"))
+    .stdout(predicate::str::contains("Hive Memory Context").not());
 }
 
 #[test]
@@ -5831,11 +6915,13 @@ fn hook_prompt_submit_records_memory_pending() {
             r#"
             default_store = "personal"
             state_dir = "{}"
+            cache_dir = "{}"
 
             [stores.personal]
             root = "{}"
             "#,
             state.display(),
+            state.join("cache").display(),
             personal.display()
         ),
     )
@@ -5878,11 +6964,13 @@ fn hook_stop_reminds_when_memory_pending_remains() {
             r#"
             default_store = "personal"
             state_dir = "{}"
+            cache_dir = "{}"
 
             [stores.personal]
             root = "{}"
             "#,
             state.display(),
+            state.join("cache").display(),
             personal.display()
         ),
     )
@@ -5933,11 +7021,13 @@ fn hook_prompt_submit_does_not_emit_initial_context() {
             r#"
             default_store = "personal"
             state_dir = "{}"
+            cache_dir = "{}"
 
             [stores.personal]
             root = "{}"
             "#,
             state.display(),
+            state.join("cache").display(),
             personal.display()
         ),
     )
@@ -5987,16 +7077,22 @@ fn hook_prompt_submit_emits_context_only_when_selection_changes() {
             r#"
             default_store = "personal"
             state_dir = "{}"
+            cache_dir = "{}"
 
             [stores.personal]
             root = "{}"
             "#,
             state.display(),
+            state.join("cache").display(),
             personal.display()
         ),
     )
     .expect("write config");
     init_store(&personal, "personal");
+    seed_local_projection(
+        &config,
+        "Global context keeps project selection observable.",
+    );
 
     let mut start = cargo_bin_cmd!("hm");
     start
@@ -6082,6 +7178,7 @@ fn hook_prompt_submit_recalls_relevant_search_only_project_memory_once() {
             r#"
             default_store = "personal"
             state_dir = "{}"
+            cache_dir = "{}"
 
             [stores.personal]
             root = "{}"
@@ -6093,6 +7190,7 @@ fn hook_prompt_submit_recalls_relevant_search_only_project_memory_once() {
             context_strategy = "relevance"
             "#,
             state.display(),
+            state.join("cache").display(),
             personal.display(),
             work.display()
         ),
@@ -6176,6 +7274,16 @@ fn hook_prompt_submit_recalls_relevant_search_only_project_memory_once() {
     ])
     .assert()
     .success();
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--force",
+        ])
+        .assert()
+        .success();
 
     let mut start = cargo_bin_cmd!("hm");
     let start_output = start
@@ -6457,6 +7565,7 @@ fn hook_prompt_submit_uses_search_source_defaults_for_curated_recall() {
             r#"
             default_store = "personal"
             state_dir = "{}"
+            cache_dir = "{}"
 
             [stores.personal]
             root = "{}"
@@ -6468,6 +7577,7 @@ fn hook_prompt_submit_uses_search_source_defaults_for_curated_recall() {
             context_strategy = "relevance"
             "#,
             state.display(),
+            dir.join("cache").display(),
             personal.display()
         ),
     )
@@ -6484,6 +7594,16 @@ fn hook_prompt_submit_uses_search_source_defaults_for_curated_recall() {
         "The unrelated zephyr policy must not ride along with apogee recall.\n",
     )
     .expect("unrelated curated memory");
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--force",
+        ])
+        .assert()
+        .success();
+    fs::rename(&personal, dir.join("personal-offline")).expect("move store offline");
 
     let mut prompt = cargo_bin_cmd!("hm");
     let output = prompt
@@ -6528,6 +7648,60 @@ fn hook_prompt_submit_uses_search_source_defaults_for_curated_recall() {
 }
 
 #[test]
+fn hook_prompt_submit_local_projection_uses_custom_entity_aliases() {
+    let dir = temp_dir("hook-prompt-local-entity-aliases");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    fs::write(
+        personal.join("entities.toml"),
+        "schema_version = 1\n\n[[entity]]\nid = \"runbook:deploy\"\naliases = [\"deployment launch\", \"apogee runbook\"]\n",
+    )
+    .expect("write entity registry");
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "The deployment launch procedure requires a signed manifest.",
+        ])
+        .assert()
+        .success();
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--force",
+        ])
+        .assert()
+        .success();
+    fs::rename(&personal, dir.join("personal-offline")).expect("move store offline");
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", "session-prompt-local-entity")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "prompt-submit",
+            "--text",
+            "Where is the apogee runbook?",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "The deployment launch procedure requires a signed manifest.",
+        ));
+}
+
+#[test]
 fn hook_prompt_submit_skips_recall_when_index_is_not_fresh() {
     let dir = temp_dir("hook-prompt-stale-index");
     let config = dir.join("config.toml");
@@ -6540,6 +7714,7 @@ fn hook_prompt_submit_skips_recall_when_index_is_not_fresh() {
             r#"
             default_store = "personal"
             state_dir = "{}"
+            cache_dir = "{}"
 
             [stores.personal]
             root = "{}"
@@ -6551,6 +7726,7 @@ fn hook_prompt_submit_skips_recall_when_index_is_not_fresh() {
             search_sources = ["remembered"]
             "#,
             state.display(),
+            state.join("cache").display(),
             personal.display(),
             work.display()
         ),
@@ -6587,13 +7763,13 @@ fn hook_prompt_submit_skips_recall_when_index_is_not_fresh() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"event\": \"prompt-submit\""))
-        .stdout(predicate::str::contains("\"reason\": \"index-not-fresh\""))
+        .stdout(predicate::str::contains("\"reason\": \"index-not-ready\""))
         .stdout(predicate::str::contains("\"context_emitted\": false"))
         .stdout(predicate::str::contains("\"actions\": []"));
 }
 
 #[test]
-fn hook_prompt_submit_skips_recall_when_populated_index_is_stale() {
+fn hook_prompt_submit_uses_populated_local_index_without_revalidating() {
     let dir = temp_dir("hook-prompt-populated-stale-index");
     let config = dir.join("config.toml");
     let personal = dir.join("personal");
@@ -6604,6 +7780,7 @@ fn hook_prompt_submit_skips_recall_when_populated_index_is_stale() {
             r#"
             default_store = "personal"
             state_dir = "{}"
+            cache_dir = "{}"
 
             [stores.personal]
             root = "{}"
@@ -6612,6 +7789,7 @@ fn hook_prompt_submit_skips_recall_when_populated_index_is_stale() {
             search_sources = ["remembered"]
             "#,
             state.display(),
+            state.join("cache").display(),
             personal.display()
         ),
     )
@@ -6626,7 +7804,7 @@ fn hook_prompt_submit_skips_recall_when_populated_index_is_stale() {
             "codex",
             "remember",
             "--text",
-            "Prompt-submit stale cache recall must not mention copper adapters.",
+            "Prompt-submit local cache recall should mention copper adapters.",
         ])
         .assert()
         .success();
@@ -6670,10 +7848,19 @@ fn hook_prompt_submit_skips_recall_when_populated_index_is_stale() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"event\": \"prompt-submit\""))
-        .stdout(predicate::str::contains("\"reason\": \"index-not-fresh\""))
-        .stdout(predicate::str::contains("\"context_emitted\": false"))
-        .stdout(predicate::str::contains("\"actions\": []"))
-        .stdout(predicate::str::contains("copper adapters").not());
+        .stdout(predicate::str::contains(
+            "\"reason\": \"context-selection-changed\"",
+        ))
+        .stdout(predicate::str::contains("\"context_emitted\": true"))
+        .stdout(predicate::str::contains(
+            "Prompt-submit local cache recall should mention copper adapters.",
+        ))
+        .stdout(
+            predicate::str::contains(
+                "A later remembered write invalidates the prompt recall cache.",
+            )
+            .not(),
+        );
 }
 
 #[test]
@@ -6744,7 +7931,9 @@ fn hook_prompt_submit_recalls_from_cache_when_store_root_is_unavailable() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"event\": \"prompt-submit\""))
-        .stdout(predicate::str::contains("\"reason\": \"selected\""))
+        .stdout(predicate::str::contains(
+            "\"reason\": \"context-selection-changed\"",
+        ))
         .stdout(predicate::str::contains(
             "Prompt-submit cache-only recall should prefer zirconium adapters.",
         ));
@@ -6762,16 +7951,19 @@ fn hook_tool_complete_without_project_does_not_clear_context_selection() {
             r#"
             default_store = "personal"
             state_dir = "{}"
+            cache_dir = "{}"
 
             [stores.personal]
             root = "{}"
             "#,
             state.display(),
+            state.join("cache").display(),
             personal.display()
         ),
     )
     .expect("write config");
     init_store(&personal, "personal");
+    seed_local_projection(&config, "Tool hooks preserve this startup selection.");
 
     let mut start = cargo_bin_cmd!("hm");
     start
@@ -6792,7 +7984,8 @@ fn hook_tool_complete_without_project_does_not_clear_context_selection() {
 
     let state_file = state.join("runs/session-projectless-tool/hook-state.json");
     let before = fs::read_to_string(&state_file).expect("hook state before");
-    assert!(before.contains("path=/repo-a/src/main.rs"));
+    assert!(before.contains("project_id="));
+    assert!(before.contains("path=\\n"));
 
     let mut tool = cargo_bin_cmd!("hm");
     let output = tool
@@ -6833,16 +8026,19 @@ fn hook_tool_complete_project_hint_without_receipts_does_not_refresh_context() {
             r#"
             default_store = "personal"
             state_dir = "{}"
+            cache_dir = "{}"
 
             [stores.personal]
             root = "{}"
             "#,
             state.display(),
+            state.join("cache").display(),
             personal.display()
         ),
     )
     .expect("write config");
     init_store(&personal, "personal");
+    seed_local_projection(&config, "Tool hints cannot replace this startup selection.");
 
     let mut start = cargo_bin_cmd!("hm");
     start
@@ -6905,11 +8101,13 @@ fn hook_tool_complete_clears_pending_after_session_write() {
             r#"
             default_store = "personal"
             state_dir = "{}"
+            cache_dir = "{}"
 
             [stores.personal]
             root = "{}"
             "#,
             state.display(),
+            state.join("cache").display(),
             personal.display()
         ),
     )
@@ -6962,13 +8160,12 @@ fn hook_tool_complete_clears_pending_after_session_write() {
         .success()
         .stdout(predicate::str::contains("\"event\": \"tool-complete\""))
         .stdout(predicate::str::contains("\"memory_pending\": false"))
-        .stdout(predicate::str::contains("\"write_receipts\": 1"))
-        .stdout(predicate::str::contains("\"refreshed\": true"));
+        .stdout(predicate::str::contains("\"refresh\": null"));
 
     let state_file = state.join("runs/session-3/hook-state.json");
     let state_json = fs::read_to_string(state_file).expect("hook state");
     assert!(state_json.contains("\"memory_pending\": false"));
-    assert!(state_json.contains("\"refreshed_receipts\": 1"));
+    wait_for_refreshed_receipts(&state.join("runs/session-3/hook-state.json"), 1);
 }
 
 #[test]
@@ -6983,11 +8180,13 @@ fn hook_tool_complete_receipt_allows_project_context_refresh() {
             r#"
             default_store = "personal"
             state_dir = "{}"
+            cache_dir = "{}"
 
             [stores.personal]
             root = "{}"
             "#,
             state.display(),
+            state.join("cache").display(),
             personal.display()
         ),
     )
@@ -7044,9 +8243,33 @@ fn hook_tool_complete_receipt_allows_project_context_refresh() {
         ])
         .assert()
         .success()
+        .stdout(predicate::str::contains("\"context_emitted\": false"))
+        .stdout(predicate::str::contains("\"refresh\": null"));
+    wait_for_refreshed_receipts(
+        &state.join("runs/session-receipt-context/hook-state.json"),
+        1,
+    );
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", "session-receipt-context")
+        .env("HIVE_MEMORY_PROJECT_ID", "repo-b")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "prompt-submit",
+            "--text",
+            "Continue with the release process.",
+            "--json",
+        ])
+        .assert()
+        .success()
         .stdout(predicate::str::contains("\"context_emitted\": true"))
-        .stdout(predicate::str::contains("\"kind\": \"inject_context\""))
-        .stdout(predicate::str::contains("\"write_receipts\": 1"));
+        .stdout(predicate::str::contains(
+            "This project uses release trains.",
+        ));
 }
 
 #[test]
@@ -7061,11 +8284,13 @@ fn hook_tool_complete_latest_global_receipt_does_not_reuse_older_project_context
             r#"
             default_store = "personal"
             state_dir = "{}"
+            cache_dir = "{}"
 
             [stores.personal]
             root = "{}"
             "#,
             state.display(),
+            state.join("cache").display(),
             personal.display()
         ),
     )
@@ -7142,8 +8367,12 @@ fn hook_tool_complete_latest_global_receipt_does_not_reuse_older_project_context
         .clone();
     let stdout = String::from_utf8(output).expect("utf8 stdout");
     assert!(stdout.contains("\"context_emitted\": false"));
-    assert!(stdout.contains("\"write_receipts\": 2"));
+    assert!(stdout.contains("\"refresh\": null"));
     assert!(!stdout.contains("\"kind\": \"inject_context\""));
+    wait_for_refreshed_receipts(
+        &state.join("runs/session-global-receipt/hook-state.json"),
+        2,
+    );
 }
 
 #[test]
@@ -7158,11 +8387,13 @@ fn hook_tool_complete_nonzero_status_does_not_clear_pending() {
             r#"
             default_store = "personal"
             state_dir = "{}"
+            cache_dir = "{}"
 
             [stores.personal]
             root = "{}"
             "#,
             state.display(),
+            state.join("cache").display(),
             personal.display()
         ),
     )
@@ -8604,6 +9835,20 @@ fn search_falls_back_to_lexical_when_tantivy_index_empty_and_lock_held() {
         .assert()
         .success();
 
+    // Seed the JSONL projection, then remove only the disposable Tantivy
+    // artifact. The held lock below models a concurrent full-text rebuild; the
+    // primary lexical corpus remains available for fallback.
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--force",
+        ])
+        .assert()
+        .success();
+    fs::remove_dir_all(cache.join("search/personal")).expect("remove full-text index");
+
     // Hold the cache-key rebuild lock the way a concurrent `hm refresh` would, so
     // `tantivy_search` cannot rebuild and is left facing a freshly created EMPTY
     // index. The path mirrors `index::rebuild_lock_path`.
@@ -8622,7 +9867,7 @@ fn search_falls_back_to_lexical_when_tantivy_index_empty_and_lock_held() {
         .expect("open rebuild lock");
     FileExt::lock(&lock).expect("hold rebuild lock");
 
-    // The full-text index was never built, so a degraded backend must not strip
+    // The full-text index is absent, so a degraded backend must not strip
     // results: search must fall back to lexical and still find the memory.
     let output = cargo_bin_cmd!("hm")
         .args([

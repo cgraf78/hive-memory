@@ -249,16 +249,14 @@ fn tantivy_search(
     }
 }
 
-/// Hook-safe BM25 search: query the persistent index ONLY when it is already
-/// fresh for `input.entries`. Never rebuilds — the prompt-submit hook must not
-/// pay for a full index rebuild on its latency budget. Returns `None` (so the
-/// caller falls back to lexical) when the backend is off, the index is
-/// stale/absent, or the engine errors. The index is kept fresh out of band by
-/// `hm refresh` (tool-complete) and interactive `hm search`.
-pub(crate) fn tantivy_search_if_fresh(
+/// Canonical-free hook query over an already-published local projection.
+pub(crate) fn tantivy_search_local_if_fresh(
     config: &Config,
     store_name: &str,
+    indexed_entries: &[index::IndexEntry],
     input: search::SearchInput<'_>,
+    registry: &hive_memory::entity::EntityRegistry,
+    project_aliases: &std::collections::BTreeMap<String, String>,
 ) -> Option<Vec<search::SearchHit>> {
     if !config
         .defaults
@@ -269,15 +267,28 @@ pub(crate) fn tantivy_search_if_fresh(
         return None;
     }
     let dir = config.cache_dir.join("search").join(store_name);
-    // Read-only open: never create or rebuild on the hook's hot path. A missing
-    // or stale index yields None so the caller uses lexical; refresh rebuilds it.
     let index = retrieval::SearchIndex::open_existing_in_dir(&dir)
         .ok()
         .flatten()?;
-    if !index.is_fresh(&search::entries_fingerprint(input.entries)) {
+    // The shared persistent corpus is remembered/raw JSONL only. Curated files
+    // stay in the atomic local projection and are merged lexically below. This
+    // keeps hook and interactive searches on one fingerprint instead of making
+    // each path invalidate the other's Tantivy cache.
+    if !index.is_fresh(&search::entries_fingerprint(indexed_entries)) {
         return None;
     }
-    search::search_indexed(input, &index).ok()
+    let indexed_input = search::SearchInput {
+        entries: indexed_entries,
+        ..input.clone()
+    };
+    search::search_indexed_local(
+        indexed_input,
+        input.entries,
+        &index,
+        registry,
+        project_aliases,
+    )
+    .ok()
 }
 
 /// Rebuild the store's persistent Tantivy index from `entries` when the backend
@@ -429,12 +440,6 @@ fn source_filter_includes_inbox(sources: &[String]) -> bool {
     sources
         .iter()
         .any(|source| source == "inbox" || source == "all")
-}
-
-pub(crate) fn source_filter_includes_curated(sources: &[String]) -> bool {
-    sources
-        .iter()
-        .any(|source| source == "curated" || source == "all")
 }
 
 fn search_since_cutoff(value: &str) -> Result<OffsetDateTime> {

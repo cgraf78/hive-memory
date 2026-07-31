@@ -54,6 +54,7 @@ fn classifier_verdict_flows_into_relevance_context() {
             default_store = "personal"
             state_dir = "{}"
             cache_dir = "{}"
+            data_dir = "{}"
 
             [stores.personal]
             root = "{}"
@@ -69,6 +70,7 @@ fn classifier_verdict_flows_into_relevance_context() {
             "#,
             dir.join("state").display(),
             dir.join("cache").display(),
+            dir.join("data").display(),
             store.display(),
             fake_llm.display()
         ),

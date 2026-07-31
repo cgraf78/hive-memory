@@ -7,6 +7,7 @@
 
 use crate::{id, write};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::error::Error;
@@ -647,6 +648,37 @@ pub fn related_project_ids(
         }
     }
     Ok(ids)
+}
+
+/// Build a deterministic local map from every known alias to one family key.
+///
+/// Index refresh stores this derived map in the local projection so lifecycle
+/// hooks can preserve rename continuity without reading synced alias files.
+pub fn alias_normalization_map(
+    store_root: &Path,
+) -> Result<BTreeMap<String, String>, ProjectError> {
+    let mut normalized = BTreeMap::new();
+    for directory_id in project_directories(store_root)? {
+        let Some(aliases) = load_aliases(store_root, &directory_id)? else {
+            continue;
+        };
+        let mut ids = BTreeSet::new();
+        for candidate in std::iter::once(directory_id)
+            .chain(std::iter::once(aliases.project_id))
+            .chain(aliases.aliases)
+        {
+            if is_safe_project_id(&candidate) {
+                ids.insert(candidate);
+            }
+        }
+        let Some(family_key) = ids.first().cloned() else {
+            continue;
+        };
+        for id in ids {
+            normalized.insert(id, family_key.clone());
+        }
+    }
+    Ok(normalized)
 }
 
 fn project_directories(store_root: &Path) -> Result<Vec<String>, ProjectError> {
