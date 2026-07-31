@@ -23,7 +23,18 @@ pub const VERDICT_VERSION: u32 = 1;
 const ADAPTERS: &[Adapter] = &[
     Adapter {
         label: "codex",
-        argv: &["codex", "exec", "-"],
+        // One-shot memory operations do not depend on the caller's checkout.
+        // They commonly run from $HOME, where Codex otherwise refuses to start
+        // because the directory is not a Git repository. Keep the backend
+        // explicitly read-only because it only needs to return model output.
+        argv: &[
+            "codex",
+            "exec",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "read-only",
+            "-",
+        ],
         model_flag: Some("--model"),
     },
     Adapter {
@@ -572,6 +583,32 @@ mod tests {
 
         let detected = detect(None, &[], None, Some(&path)).expect("detect");
         assert_eq!(detected.label, "codex");
+        assert_eq!(
+            detected.argv,
+            [
+                "codex",
+                "exec",
+                "--skip-git-repo-check",
+                "--sandbox",
+                "read-only",
+                "-"
+            ]
+        );
+
+        let detected = detect(None, &[], Some("fast"), Some(&path)).expect("detect with model");
+        assert_eq!(
+            detected.argv,
+            [
+                "codex",
+                "exec",
+                "--skip-git-repo-check",
+                "--sandbox",
+                "read-only",
+                "-",
+                "--model",
+                "fast"
+            ]
+        );
 
         let detected = detect(Some("claude"), &[], None, Some(&path)).expect("detect claude");
         assert_eq!(detected.label, "claude");
