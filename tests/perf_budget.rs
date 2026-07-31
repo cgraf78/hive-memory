@@ -12,11 +12,15 @@ use time::OffsetDateTime;
 
 const SYNTHETIC_NOTES: usize = 5_000;
 const RUNS: usize = 30;
+const DOCTOR_RUNS: usize = 20;
 // These are user-facing CLI budgets, not microbenchmarks. They intentionally
 // include process startup and JSON serialization because agent hooks pay those
-// costs every time they ask Hive Memory for context.
+// costs every time they ask Hive Memory for context. Full doctor is a human
+// audit, so its looser budget catches scaling regressions without imposing a
+// hook-path latency target.
 const CONTEXT_WARM_BUDGET_MS: u128 = 200;
 const SEARCH_WARM_BUDGET_MS: u128 = 300;
+const DOCTOR_WARM_BUDGET_MS: u128 = 750;
 const HOOK_PROMPT_BASELINE_WARM_BUDGET_MS: u128 = 300;
 const HOOK_PROMPT_RECALL_WARM_BUDGET_MS: u128 = 350;
 const HOOK_PROMPT_CACHED_OFFLINE_BUDGET_MS: u128 = 350;
@@ -83,6 +87,28 @@ fn context_and_search_stay_within_warm_budget() {
     assert!(
         !fixture_path.exists(),
         "synthetic store fixture was not removed: {}",
+        fixture_path.display()
+    );
+}
+
+#[test]
+#[ignore = "CI runs this explicitly because it audits a 5000-note synthetic store"]
+fn doctor_stays_within_warm_budget() {
+    let fixture = SyntheticStore::new();
+    let fixture_path = fixture.config.parent().expect("fixture root").to_path_buf();
+
+    let doctor_p95 = p95_ms(repeat(DOCTOR_RUNS, || fixture.hm(["doctor", "--json"])));
+    eprintln!("hm doctor warm p95: {doctor_p95}ms");
+
+    let budget = budget_ms(DOCTOR_WARM_BUDGET_MS);
+    assert!(
+        doctor_p95 <= budget,
+        "hm doctor p95 {doctor_p95}ms exceeded {budget}ms"
+    );
+    drop(fixture);
+    assert!(
+        !fixture_path.exists(),
+        "synthetic doctor fixture was not removed: {}",
         fixture_path.display()
     );
 }
