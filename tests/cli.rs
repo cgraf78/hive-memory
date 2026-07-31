@@ -925,6 +925,62 @@ legacy private memory
 }
 
 #[test]
+fn doctor_full_preserves_independent_malformed_note_diagnostics() {
+    let dir = temp_dir("doctor-malformed-note");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    write_data_config(&config, &data, &personal);
+    init_store(&personal, "personal");
+    let note_path = personal.join("inbox/notes/2026/05/16/malformed.md");
+    fs::create_dir_all(note_path.parent().expect("note parent")).expect("note parent");
+    fs::write(&note_path, "+++\nthis is not = valid TOML\n+++\n\nbody\n")
+        .expect("write malformed note");
+
+    let output = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "doctor",
+            "--json",
+        ])
+        .output()
+        .expect("run doctor");
+    assert!(output.status.success(), "doctor succeeds");
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse doctor report");
+    assert_eq!(report["summary"]["warnings"], 2);
+
+    let warnings: Vec<_> = report["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .filter(|check| check["status"] == "warn")
+        .collect();
+    assert_eq!(warnings.len(), 2);
+    assert_eq!(warnings[0]["id"], "store.personal.note-secrets");
+    assert!(
+        warnings[0]["message"]
+            .as_str()
+            .expect("secret message")
+            .starts_with("failed to parse note during secret scan:")
+    );
+    assert_eq!(warnings[1]["id"], "store.personal.prompt-risks");
+    assert!(
+        warnings[1]["message"]
+            .as_str()
+            .expect("prompt message")
+            .starts_with("failed to parse note during prompt-risk scan:")
+    );
+    for warning in warnings {
+        assert_eq!(
+            warning["paths"][0],
+            note_path.to_str().expect("utf8 note path")
+        );
+    }
+}
+
+#[test]
 fn doctor_warns_for_cloud_sync_conflict_files() {
     let dir = temp_dir("doctor-cloud-conflict");
     let config = dir.join("config.toml");
