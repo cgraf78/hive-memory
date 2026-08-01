@@ -145,6 +145,13 @@ pub enum HookStateError {
         /// Original error rendered for CLI diagnostics.
         message: String,
     },
+    /// Another live hook held the session state lock past the foreground budget.
+    LockTimeout {
+        /// Lock path involved in the timeout.
+        path: PathBuf,
+        /// Maximum wait before preserving hook liveness.
+        wait_ms: u64,
+    },
     /// State JSON was corrupt or could not be serialized.
     Json(String),
 }
@@ -159,6 +166,11 @@ impl Display for HookStateError {
             } => write!(
                 f,
                 "failed to {action} hook state {}: {message}",
+                path.display()
+            ),
+            Self::LockTimeout { path, wait_ms } => write!(
+                f,
+                "timed out after {wait_ms}ms waiting for hook state lock {}",
                 path.display()
             ),
             Self::Json(message) => write!(f, "invalid hook state JSON: {message}"),
@@ -375,12 +387,12 @@ pub fn try_state_lock(
 /// Run a load -> mutate -> save cycle under the per-session state lock.
 ///
 /// This is the single serialized critical section every `mark_*` routes through.
-/// Contenders briefly condition-wait on the local OS lock: proceeding unlocked
-/// can lose unrelated fields from another hook's whole-file atomic replacement.
-/// After 50 ms the update is skipped with a warning so a stuck holder cannot
-/// stall a foreground hook. The critical section contains only local state I/O,
-/// and process death releases the advisory lock. It is never nested with
-/// `RefreshLock`, so no lock-ordering deadlock is possible.
+/// Contenders condition-wait on the local OS lock: proceeding unlocked can lose
+/// unrelated fields from another hook's whole-file atomic replacement. A
+/// 500-millisecond deadline keeps foreground hooks inside their outer adapter
+/// budget; timing out is an explicit error so callers never mistake a dropped
+/// mutation for success. The critical section contains only local state I/O,
+/// and process death releases the advisory lock.
 fn with_state_lock<F>(
     state_dir: &Path,
     session_id: &str,
@@ -390,16 +402,17 @@ fn with_state_lock<F>(
 where
     F: FnOnce(&mut HookState),
 {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+    const STATE_LOCK_WAIT_MS: u64 = 500;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(STATE_LOCK_WAIT_MS);
     let _lock = loop {
         if let Some(lock) = try_state_lock(state_dir, session_id)? {
             break lock;
         }
         if std::time::Instant::now() >= deadline {
-            eprintln!(
-                "warning: hook state update skipped because another update held the session lock"
-            );
-            return load_state(state_dir, session_id);
+            return Err(HookStateError::LockTimeout {
+                path: state_lock_path(state_dir, session_id),
+                wait_ms: STATE_LOCK_WAIT_MS,
+            });
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
     };
@@ -1194,14 +1207,20 @@ mod tests {
                 ))
                 .expect("send update result");
             });
-            let skipped = rx
-                .recv_timeout(Duration::from_millis(250))
+            let error = rx
+                .recv_timeout(Duration::from_secs(3))
                 .expect("contended state update stayed latency-bounded")
-                .expect("contended state update degraded without error");
-            assert_eq!(skipped.context_key.as_deref(), Some("existing-context"));
-            assert!(skipped.prompt_recall_key.is_none());
+                .expect_err("contended state update reports an explicit timeout");
+            assert!(matches!(
+                error,
+                HookStateError::LockTimeout { wait_ms: 500, .. }
+            ));
             drop(held);
         });
+
+        let state = load_state(&dir, "session-1").expect("state remains readable");
+        assert_eq!(state.context_key.as_deref(), Some("existing-context"));
+        assert!(state.prompt_recall_key.is_none());
 
         let state = mark_prompt_recall(
             &dir,

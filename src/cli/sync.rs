@@ -141,7 +141,7 @@ pub(crate) fn run_refresh(args: RefreshArgs, context: CliContext) -> Result<()> 
     // maintenance. Periodic requests already deduplicate per store and serialize
     // on the store's rebuild lock; taking the session lock here would let a
     // personal-store refresh incorrectly swallow a distinct work-store request.
-    let _refresh_lock = if let Some(cursor) = receipt_cursor
+    let refresh_lock = if let Some(cursor) = receipt_cursor
         .as_ref()
         .filter(|cursor| cursor.unrefreshed > 0)
     {
@@ -228,6 +228,10 @@ pub(crate) fn run_refresh(args: RefreshArgs, context: CliContext) -> Result<()> 
     } else {
         false
     };
+    // Exact-row verification above establishes whether this cursor is safe to
+    // publish. Release refresh ownership before the monotonic hook-state update
+    // so no path waits for StateLock while holding RefreshLock.
+    drop(refresh_lock);
     if receipts_covered && let Some(cursor) = receipt_cursor {
         report.record_receipts(cursor.unrefreshed);
         // `hm refresh` owns only maintenance idempotency. Memory-pending debt is

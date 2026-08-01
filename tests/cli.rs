@@ -4818,45 +4818,48 @@ fn repeated_tool_hooks_do_not_respawn_the_same_receipt_refresh() {
         .expect("open other refresh lock");
     FileExt::lock(&other_lock).expect("hold other refresh lock");
 
-    let run_tool_hook = |session_id: &str| {
-        cargo_bin_cmd!("hm")
-            .env("HIVE_MEMORY_SESSION_ID", session_id)
-            .args([
-                "--config",
-                config.to_str().expect("utf8 config"),
-                "--as-agent",
-                "codex",
-                "hook",
-                "tool-complete",
-                "--status",
-                "0",
-                "--json",
-            ])
-            .assert()
-            .success();
+    let tool_hook = |session_id: &str| {
+        let mut command = cargo_bin_cmd!("hm");
+        command.env("HIVE_MEMORY_SESSION_ID", session_id).args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "hook",
+            "tool-complete",
+            "--status",
+            "0",
+            "--json",
+        ]);
+        command
     };
     let state_lock = memory_hook::try_state_lock(&state, session)
         .expect("state attempt lock")
         .expect("hold state attempt lock");
-    run_tool_hook(session);
+    tool_hook(session)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "timed out after 500ms waiting for hook state lock",
+        ));
     let attempt = memory_hook::receipt_refresh_attempt_path(&state, session);
     assert!(
         !attempt.exists(),
         "state-lock contention must suppress a racing refresh spawn"
     );
     drop(state_lock);
-    run_tool_hook(session);
+    tool_hook(session).assert().success();
     let first_modified = fs::metadata(&attempt)
         .expect("first receipt attempt marker")
         .modified()
         .expect("first marker mtime");
     std::thread::sleep(Duration::from_millis(50));
-    run_tool_hook(other_session);
+    tool_hook(other_session).assert().success();
     assert!(
         memory_hook::receipt_refresh_attempt_path(&state, other_session).is_file(),
         "the other session needs an independent receipt attempt marker"
     );
-    run_tool_hook(session);
+    tool_hook(session).assert().success();
     let second_modified = fs::metadata(&attempt)
         .expect("second receipt attempt marker")
         .modified()
@@ -4875,7 +4878,7 @@ fn repeated_tool_hooks_do_not_respawn_the_same_receipt_refresh() {
         .assert()
         .success();
     std::thread::sleep(Duration::from_millis(50));
-    run_tool_hook(session);
+    tool_hook(session).assert().success();
     let third_modified = fs::metadata(&attempt)
         .expect("third receipt attempt marker")
         .modified()
