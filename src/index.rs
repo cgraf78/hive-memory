@@ -1395,12 +1395,26 @@ fn note_paths(root: &Path) -> Result<Vec<PathBuf>, IndexError> {
 }
 
 fn collect_note_paths(root: &Path, paths: &mut Vec<PathBuf>) -> Result<(), IndexError> {
-    for entry in fs::read_dir(root).map_err(|err| io_error("read note directory", root, err))? {
-        let entry = entry.map_err(|err| io_error("read note directory", root, err))?;
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(io_error("read note directory", root, err)),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(io_error("read note directory", root, err)),
+        };
         let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .map_err(|err| io_error("read note file type", &path, err))?;
+        if write::is_atomic_temp_path(&path) {
+            continue;
+        }
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(io_error("read note file type", &path, err)),
+        };
         if file_type.is_dir() {
             collect_note_paths(&path, paths)?;
         } else if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
@@ -1474,26 +1488,49 @@ fn collect_canonical(root: &Path, scan: &mut CanonicalScan) -> Result<(), IndexE
     if !root.is_dir() {
         return Ok(());
     }
+    let metadata = match fs::metadata(root) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(io_error("read canonical directory metadata", root, err)),
+    };
     scan.dirs += 1;
-    let metadata = fs::metadata(root)
-        .map_err(|err| io_error("read canonical directory metadata", root, err))?;
     scan.latest_directory_modified_nanos =
         scan.latest_directory_modified_nanos.max(modified_nanos(
             metadata
                 .modified()
                 .map_err(|err| io_error("read canonical directory modified time", root, err))?,
         ));
-    for entry in
-        fs::read_dir(root).map_err(|err| io_error("read canonical directory", root, err))?
-    {
-        let entry = entry.map_err(|err| io_error("read canonical directory", root, err))?;
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(io_error("read canonical directory", root, err)),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(io_error("read canonical directory", root, err)),
+        };
         let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .map_err(|err| io_error("read canonical file type", &path, err))?;
+        // Atomic writers publish through this reserved temp namespace. These
+        // files are never canonical memories, and they may disappear between
+        // directory enumeration and metadata reads during a concurrent write.
+        if write::is_atomic_temp_path(&path) {
+            continue;
+        }
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(io_error("read canonical file type", &path, err)),
+        };
         if file_type.is_dir() {
             collect_canonical(&path, scan)?;
         } else if file_type.is_file() {
+            let file_metadata = match fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(io_error("read canonical file metadata", &path, err)),
+            };
             scan.files += 1;
             // Fold the file's identity (its name) into the set membership signal.
             // The name is already in hand from enumeration, so this is just a
@@ -1502,8 +1539,6 @@ fn collect_canonical(root: &Path, scan: &mut CanonicalScan) -> Result<(), IndexE
             // One extra stat per file. The dirent is already warm from
             // enumeration, so this stays cheap relative to a full note re-read,
             // and it is what lets an mtime-preserving cloud-sync arrival be seen.
-            let file_metadata = fs::metadata(&path)
-                .map_err(|err| io_error("read canonical file metadata", &path, err))?;
             scan.latest_file_modified_nanos = scan.latest_file_modified_nanos.max(modified_nanos(
                 file_metadata
                     .modified()
@@ -2460,6 +2495,43 @@ mod tests {
 
         assert_ne!(before, after, "adding a file must change the fingerprint");
         assert_eq!(after.canonical_files, before.canonical_files + 1);
+    }
+
+    #[test]
+    fn fingerprint_ignores_atomic_writer_temp_files() {
+        let dir = temp_dir("fingerprint-atomic-temp");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        let note_dir = root.join("inbox/notes/2026/05/16");
+        fs::create_dir_all(&note_dir).expect("note dir");
+        fs::write(
+            note_dir.join(".tmp.unfinished-note.md"),
+            "unfinished atomic write",
+        )
+        .expect("writer temp");
+        let rules = root.join("rules");
+        fs::create_dir_all(&rules).expect("rules dir");
+        fs::write(
+            rules.join(".tmp.unfinished-rule.md"),
+            "unfinished curated write",
+        )
+        .expect("curated writer temp");
+
+        let fingerprint = canonical_fingerprint(&root).expect("fingerprint");
+        let report = rebuild_index(RebuildIndexInput {
+            store_name: "personal",
+            store_root: &root,
+            cache_dir: &cache,
+            options: options(),
+            path_case: memory_path::PathCase::Sensitive,
+        })
+        .expect("rebuild");
+
+        assert_eq!(fingerprint.canonical_files, 0);
+        assert_eq!(fingerprint.canonical_names_combined, 0);
+        assert!(report.entries.is_empty());
+        assert!(report.projection.entries.is_empty());
+        assert!(report.warnings.is_empty());
     }
 
     /// A delete+add that nets the SAME file count, under an mtime-preserving

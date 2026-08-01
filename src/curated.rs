@@ -6,7 +6,7 @@
 //! search agree on which curated files are eligible and avoid following
 //! symlinks outside the store.
 
-use crate::project;
+use crate::{project, write};
 use std::error::Error;
 use std::fmt::{self, Display};
 use std::fs;
@@ -149,8 +149,12 @@ pub(crate) fn collect_all_report(store_root: &Path) -> CuratedCollection {
             }
         };
         let path = entry.path();
+        if write::is_atomic_temp_path(&path) {
+            continue;
+        }
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => {
                 warnings.push(read_error(path, err));
                 continue;
@@ -265,8 +269,12 @@ fn collect_tree(
             }
         };
         let path = entry.path();
+        if write::is_atomic_temp_path(&path) {
+            continue;
+        }
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => {
                 warnings.push(read_error(path, err));
                 continue;
@@ -295,6 +303,7 @@ fn collect_tree(
         {
             let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(err) => {
                     warnings.push(read_error(path, err));
                     continue;
@@ -312,6 +321,7 @@ fn collect_tree(
             }
             let body = match fs::read_to_string(&path) {
                 Ok(body) => body,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(err) => {
                     warnings.push(read_error(path, err));
                     continue;

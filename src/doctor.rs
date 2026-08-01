@@ -2196,12 +2196,7 @@ fn collect_stale_temp_files_into(
             collect_stale_temp_files_into(&path, now, paths)?;
             continue;
         }
-        if !file_type.is_file()
-            || !path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(is_atomic_temp_name)
-        {
+        if !file_type.is_file() || !write::is_atomic_temp_path(&path) {
             continue;
         }
         let metadata = entry.metadata()?;
@@ -2220,10 +2215,6 @@ fn is_quarantine_dir(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name == ".quarantine")
-}
-
-fn is_atomic_temp_name(name: &str) -> bool {
-    name.starts_with(".tmp.")
 }
 
 fn is_stale_temp_modified_at(modified: SystemTime, now: SystemTime) -> bool {
@@ -2791,10 +2782,14 @@ confidence = "medium"
 
     #[test]
     fn atomic_temp_name_matches_writer_temps() {
-        assert!(is_atomic_temp_name(".tmp.memory.md.123-456"));
-        assert!(is_atomic_temp_name(".tmp.20260517T120000Z_abc.1234"));
-        assert!(!is_atomic_temp_name("memory.tmp"));
-        assert!(!is_atomic_temp_name("tmp.memory.md"));
+        assert!(write::is_atomic_temp_path(Path::new(
+            ".tmp.memory.md.123-456"
+        )));
+        assert!(write::is_atomic_temp_path(Path::new(
+            ".tmp.20260517T120000Z_abc.1234"
+        )));
+        assert!(!write::is_atomic_temp_path(Path::new("memory.tmp")));
+        assert!(!write::is_atomic_temp_path(Path::new("tmp.memory.md")));
     }
 
     #[test]
