@@ -8,6 +8,10 @@ use anyhow::Result;
 use clap::{Args, Subcommand};
 use hive_memory::config::Config;
 use hive_memory::{hook as memory_hook, index, outbox, path as memory_path, write};
+
+/// Hard ceiling for disposable detached refresh children.
+pub(super) const BACKGROUND_REFRESH_WATCHDOG_SECS: u64 = 300;
+const INCOMPLETE_REFRESH_RETRY_SECS: u64 = 15 * 60;
 use serde::Serialize;
 
 /// Local outbox commands.
@@ -111,12 +115,14 @@ pub(crate) fn run_refresh(args: RefreshArgs, context: CliContext) -> Result<()> 
         // detached refresh bounded by terminating the disposable child; the
         // already-published local projection remains valid and atomic.
         std::thread::spawn(|| {
-            std::thread::sleep(std::time::Duration::from_secs(120));
+            std::thread::sleep(std::time::Duration::from_secs(
+                BACKGROUND_REFRESH_WATCHDOG_SECS,
+            ));
             std::process::exit(124);
         });
     }
     let config = load_config(context.config_path.as_deref())?;
-    let receipt_cursor = refresh_receipt_cursor(&config, &context)?;
+    let mut receipt_cursor = refresh_receipt_cursor(&config, &context)?;
     if let Some(cursor) = receipt_cursor.as_ref()
         && cursor.unrefreshed == 0
         && !args.background
@@ -127,29 +133,65 @@ pub(crate) fn run_refresh(args: RefreshArgs, context: CliContext) -> Result<()> 
         return Ok(());
     }
 
+    let wait_for_receipt = args.background
+        && receipt_cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.unrefreshed > 0);
     let _refresh_lock = if let Some(cursor) = receipt_cursor.as_ref() {
-        match memory_hook::try_refresh_lock(
-            &config.state_dir,
-            &cursor.agent_id,
-            &cursor.session_id,
-        )? {
-            Some(lock) => Some(lock),
-            None => {
-                let report = coalesced_refresh_report(args.force, cursor.unrefreshed);
-                emit_refresh_report(&report, &args)?;
-                return Ok(());
+        loop {
+            match memory_hook::try_refresh_lock(
+                &config.state_dir,
+                &cursor.agent_id,
+                &cursor.session_id,
+            )? {
+                Some(lock) => break Some(lock),
+                None if wait_for_receipt => {
+                    // The detached watchdog bounds this condition wait. A
+                    // receipt must not be dropped merely because the periodic
+                    // refresh from session start reached the lock first.
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                None => {
+                    let report = coalesced_refresh_report(args.force, cursor.unrefreshed);
+                    emit_refresh_report(&report, &args)?;
+                    return Ok(());
+                }
             }
         }
     } else {
         None
     };
 
+    if wait_for_receipt {
+        // The cursor observed before waiting may already have been covered by
+        // the lock holder, or newer receipts may have arrived. Re-read under
+        // refresh ownership so this child neither rebuilds redundantly nor
+        // publishes stale progress.
+        receipt_cursor = refresh_receipt_cursor(&config, &context)?;
+        if receipt_cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.unrefreshed == 0)
+        {
+            let report = skipped_refresh_report(args.force);
+            emit_refresh_report(&report, &args)?;
+            return Ok(());
+        }
+    }
+
     let use_fresh_index = args.background
         && receipt_cursor
             .as_ref()
             .is_none_or(|cursor| cursor.unrefreshed == 0);
+    // A receipt-driven child must eventually publish the generation containing
+    // that write. Periodic maintenance can still coalesce immediately.
+    let wait_for_rebuild_lock = wait_for_receipt;
     let mut report = if args.background {
-        perform_background(&config, context.store.as_deref(), use_fresh_index)?
+        perform_background(
+            &config,
+            context.store.as_deref(),
+            use_fresh_index,
+            wait_for_rebuild_lock,
+        )?
     } else {
         perform(&config, args.force)?
     };
@@ -172,10 +214,14 @@ pub(crate) fn run_refresh(args: RefreshArgs, context: CliContext) -> Result<()> 
             eprintln!("warning: background refresh success stamp skipped: {err}");
         }
     }
-    if report.refreshed
-        && let Some(cursor) = receipt_cursor
-        && cursor.covered_by(context.store.as_deref())
-    {
+    let receipts_covered = if let Some(cursor) = receipt_cursor.as_ref() {
+        cursor.unrefreshed > 0
+            && cursor.covered_by(context.store.as_deref())
+            && receipt_rows_available(&config, context.store.as_deref(), cursor)?
+    } else {
+        false
+    };
+    if receipts_covered && let Some(cursor) = receipt_cursor {
         report.record_receipts(cursor.unrefreshed);
         // `hm refresh` owns only maintenance idempotency. Memory-pending debt is
         // cleared by `hm hook tool-complete`, where the hook knows the tool
@@ -223,6 +269,7 @@ struct RefreshReceiptCursor {
     receipt_count: usize,
     unrefreshed: usize,
     unrefreshed_stores: std::collections::BTreeSet<String>,
+    unrefreshed_rows: Vec<(String, String)>,
 }
 
 impl RefreshReceiptCursor {
@@ -263,13 +310,60 @@ fn refresh_receipt_cursor(
         .iter()
         .map(|receipt| receipt.store.clone())
         .collect();
+    let unrefreshed_rows = unrefreshed_receipts
+        .iter()
+        .map(|receipt| (receipt.store.clone(), receipt.note_id.clone()))
+        .collect();
     Ok(Some(RefreshReceiptCursor {
         agent_id,
         session_id,
         receipt_count: receipts.len(),
         unrefreshed,
         unrefreshed_stores,
+        unrefreshed_rows,
     }))
+}
+
+fn receipt_rows_available(
+    config: &Config,
+    selected_store: Option<&str>,
+    cursor: &RefreshReceiptCursor,
+) -> Result<bool> {
+    let mut rows_by_store =
+        std::collections::BTreeMap::<&str, std::collections::BTreeSet<&str>>::new();
+    for (store, note_id) in &cursor.unrefreshed_rows {
+        if selected_store.is_some_and(|selected| selected != store) {
+            return Ok(false);
+        }
+        rows_by_store
+            .entry(store.as_str())
+            .or_default()
+            .insert(note_id.as_str());
+    }
+    for (store, expected_ids) in rows_by_store {
+        let Some(store_config) = config.stores.get(store) else {
+            return Ok(false);
+        };
+        let Some(report) = index::load_cached_index(&index::LoadIndexInput {
+            store_name: store,
+            store_root: &store_config.root,
+            cache_dir: &config.cache_dir,
+            options: hook_options(config),
+            path_case: memory_path::PathCase::Sensitive,
+        })?
+        else {
+            return Ok(false);
+        };
+        let available_ids = report
+            .entries
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        if !expected_ids.is_subset(&available_ids) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 pub(crate) fn run_flush(args: FlushArgs, context: CliContext) -> Result<()> {
@@ -331,10 +425,11 @@ pub(crate) fn perform(config: &Config, forced: bool) -> Result<RefreshReport> {
         anyhow::bail!("flush failed for {} item(s)", flush.failed);
     }
 
-    let indexes = refresh_indexes(config, None, false)?;
+    let index_refresh =
+        refresh_indexes(config, None, false, true, std::time::Duration::from_secs(1))?;
 
     Ok(RefreshReport {
-        indexes,
+        indexes: index_refresh.maintained,
         flushed: flush.flushed,
         skipped: flush.skipped,
         failed: flush.failed,
@@ -342,8 +437,8 @@ pub(crate) fn perform(config: &Config, forced: bool) -> Result<RefreshReport> {
         pending: flush.pending,
         forced,
         write_receipts: 0,
-        refreshed: true,
-        coalesced: false,
+        refreshed: index_refresh.eligible > 0 && index_refresh.current == index_refresh.eligible,
+        coalesced: index_refresh.coalesced > 0,
     })
 }
 
@@ -351,21 +446,23 @@ fn perform_background(
     config: &Config,
     store_name: Option<&str>,
     use_fresh_index: bool,
+    wait_for_rebuild_lock: bool,
 ) -> Result<RefreshReport> {
     if let Some(store_name) = store_name
         && !config.stores.contains_key(store_name)
     {
         anyhow::bail!("unknown store: {store_name}");
     }
-    let indexes = refresh_indexes(config, store_name, use_fresh_index)?;
-    let expected = if store_name.is_some() {
-        1
-    } else {
-        config.stores.len()
-    };
-    let refreshed = indexes == expected;
+    let index_refresh = refresh_indexes(
+        config,
+        store_name,
+        use_fresh_index,
+        wait_for_rebuild_lock,
+        std::time::Duration::from_secs(BACKGROUND_REFRESH_WATCHDOG_SECS - 1),
+    )?;
+    let refreshed = index_refresh.eligible > 0 && index_refresh.current == index_refresh.eligible;
     Ok(RefreshReport {
-        indexes,
+        indexes: index_refresh.maintained,
         flushed: 0,
         skipped: 0,
         failed: 0,
@@ -374,15 +471,24 @@ fn perform_background(
         forced: false,
         write_receipts: 0,
         refreshed,
-        coalesced: !refreshed,
+        coalesced: index_refresh.coalesced > 0,
     })
+}
+
+struct IndexRefreshReport {
+    maintained: usize,
+    current: usize,
+    eligible: usize,
+    coalesced: usize,
 }
 
 fn refresh_indexes(
     config: &Config,
     selected_store: Option<&str>,
     use_fresh_index: bool,
-) -> Result<usize> {
+    wait_for_rebuild_lock: bool,
+    rebuild_wait_budget: std::time::Duration,
+) -> Result<IndexRefreshReport> {
     // Cleanup is deliberately attached to refresh, not lifecycle-hook response
     // paths. Preserve unavailable cloud snapshots; only unusable/expired local
     // state and vanished temporary-store projections are eligible.
@@ -398,14 +504,19 @@ fn refresh_indexes(
     ) {
         eprintln!("warning: inactive hook-run cleanup skipped: {err}");
     }
-    let mut indexes = 0usize;
-    for (store_name, store_config) in &config.stores {
+    let mut maintained = 0usize;
+    let mut current_indexes = 0usize;
+    let mut eligible = 0usize;
+    let mut coalesced = 0usize;
+    let rebuild_wait_started = std::time::Instant::now();
+    'stores: for (store_name, store_config) in &config.stores {
         if selected_store.is_some_and(|selected| selected != store_name) {
             continue;
         }
         if !store_config.root.join("manifest.toml").is_file() {
             continue;
         }
+        eligible += 1;
         // A successful refresh is also a trustworthy last-seen observation for
         // offline write binding. Use the shared helper so a stale advisory
         // identity repairs itself without weakening manifest checks.
@@ -416,17 +527,28 @@ fn refresh_indexes(
         // scan the store or fight over the Tantivy writer. If another rebuild
         // already holds the lock, skip this store: that other run is producing
         // the same artifact, so this is a safe coalesce, not a dropped update.
-        let _rebuild_lock =
+        let _rebuild_lock = loop {
             match index::try_rebuild_lock(&config.cache_dir, store_name, &store_config.root)? {
-                Some(lock) => lock,
-                None => continue,
-            };
+                Some(lock) => break lock,
+                None if wait_for_rebuild_lock => {
+                    if rebuild_wait_started.elapsed() >= rebuild_wait_budget {
+                        coalesced += 1;
+                        continue 'stores;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                None => {
+                    coalesced += 1;
+                    continue 'stores;
+                }
+            }
+        };
         // Periodic background checks with no write receipts only need to prove
         // the atomic local generation still matches canonical metadata. Keep
         // explicit and receipt-driven refreshes on the full parse path so they
         // also recover content-only edits whose timestamps were preserved.
         let cached = if use_fresh_index {
-            index::load_fresh_index(&index::LoadIndexInput {
+            let report = index::load_fresh_index(&index::LoadIndexInput {
                 store_name,
                 store_root: &store_config.root,
                 cache_dir: &config.cache_dir,
@@ -437,12 +559,22 @@ fn refresh_indexes(
                 // Freshness validation does not use path-case behavior. Avoid
                 // the canonical case probe unless a rebuild is actually needed.
                 path_case: memory_path::PathCase::Sensitive,
-            })?
+            })?;
+            match report {
+                Some(report)
+                    if !report.projection.complete
+                        && mark_incomplete_retry_due(config, store_name, &store_config.root) =>
+                {
+                    None
+                }
+                report => report,
+            }
         } else {
             None
         };
         let (entries, warnings, current) = if let Some(report) = cached {
-            (report.entries, report.warnings, true)
+            let current = report.projection.complete;
+            (report.entries, report.warnings, current)
         } else {
             // We already hold the cache-key lock, so call the direct rebuild
             // API. The general lazy loader would try to acquire the same
@@ -471,12 +603,49 @@ fn refresh_indexes(
         // TODO(perf): this re-reads canonical notes that rebuild_store_index just
         // read to extract search documents; a later phase should share one
         // document-extraction pass between the JSONL and Tantivy indexes.
+        // A malformed sibling makes the generation incomplete, but every good
+        // row in the published best-available JSONL must still reach Tantivy.
+        // Keep completion status separate so callers never call it fully current.
+        super::search::refresh_tantivy_index(config, store_name, &store_config.root, &entries);
+        maintained += 1;
         if current {
-            super::search::refresh_tantivy_index(config, store_name, &store_config.root, &entries);
-            indexes += 1;
+            current_indexes += 1;
         }
     }
-    Ok(indexes)
+    Ok(IndexRefreshReport {
+        maintained,
+        current: current_indexes,
+        eligible,
+        coalesced,
+    })
+}
+
+fn mark_incomplete_retry_due(
+    config: &Config,
+    store_name: &str,
+    store_root: &std::path::Path,
+) -> bool {
+    let stamp = config.state_dir.join("background-refresh").join(format!(
+        "{}.incomplete-last-attempt",
+        index::store_cache_key(store_name, store_root)
+    ));
+    let recent = std::fs::metadata(&stamp)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age < std::time::Duration::from_secs(INCOMPLETE_REFRESH_RETRY_SECS));
+    if recent {
+        return false;
+    }
+    let Some(parent) = stamp.parent() else {
+        return true;
+    };
+    if std::fs::create_dir_all(parent).is_err()
+        || write::write_atomic(&stamp, b"", &hook_options(config)).is_err()
+    {
+        return true;
+    }
+    true
 }
 
 /// Build the successful no-op report for receipt-aware hook refresh.

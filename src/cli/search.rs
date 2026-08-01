@@ -195,8 +195,8 @@ fn run_search_backend(
 /// `cli::sync::perform` holds, so an interactive `hm search` and a concurrent
 /// `hm refresh` cannot fight over the shared cache artifact. On contention we
 /// degrade to read-only/lexical rather than block this latency-sensitive read: a
-/// stale-but-valid index searches fine, and the rebuild the other holder is
-/// running will land for the next query.
+/// a stale index can omit newly arrived memories, so contention must fall back
+/// to the current lexical corpus rather than serving the old snapshot.
 /// (Tantivy's own writer lock already prevents corruption; this is about honoring
 /// the documented single-writer contract and avoiding redundant rebuild scans.)
 fn tantivy_search(
@@ -213,11 +213,9 @@ fn tantivy_search(
     if !index.is_fresh(&fingerprint) {
         // Serialize the rebuild against refresh/other interactive rebuilds via the
         // cache-key lock. `Ok(Some(lock))` lets us rebuild while holding it;
-        // `Ok(None)` means another rebuild already holds it, and a lock I/O error
-        // means we cannot coordinate — in both of those cases skip our rebuild and
-        // search the current index read-only instead of blocking this
-        // latency-sensitive read. The lock guard must outlive the rebuild, so it
-        // is bound for the whole branch.
+        // `Ok(None)` means another rebuild already holds it. Never serve the
+        // populated-but-stale index in that case: it may silently omit current
+        // JSONL rows. Signal degradation so the caller uses lexical search.
         match index::try_rebuild_lock(&config.cache_dir, store_name, store_root) {
             Ok(Some(_rebuild_lock)) => {
                 let documents = search::search_documents(store_root, input.entries)?;
@@ -225,21 +223,12 @@ fn tantivy_search(
                     .rebuild_tagged(&documents, Some(&fingerprint))
                     .map_err(|err| search::SearchError::Retrieval(err.to_string()))?;
             }
-            // Rebuild skipped (another holder has the lock, or we cannot coordinate).
-            // `open_or_create_in_dir` will have just created an EMPTY index when none
-            // existed, so serving it now would silently return zero hits and strip
-            // results on the primary recall path. A populated-but-stale index is fine
-            // to serve (the other holder's rebuild lands for the next query), but a
-            // never-built/empty index must NOT short-circuit the lexical fallback.
-            // The manifest is written only after a successful rebuild commit, so its
-            // absence distinguishes "never built / empty" from "stale but populated".
-            _ if index.manifest().is_none() => {
+            Ok(None) => {
                 return Err(search::SearchError::Retrieval(
-                    "full-text index not yet populated and a concurrent rebuild holds the cache lock"
-                        .to_owned(),
+                    "full-text index is stale and another rebuild holds the cache lock".to_owned(),
                 ));
             }
-            _ => {}
+            Err(err) => return Err(search::SearchError::Retrieval(err.to_string())),
         }
     }
     if project_only {

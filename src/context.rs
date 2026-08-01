@@ -1040,6 +1040,37 @@ mod tests {
     }
 
     #[test]
+    fn local_index_context_keeps_curated_out_of_remembered_only_sources() {
+        let dir = temp_dir("local-curated-source-policy");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        fs::create_dir_all(root.join("memories/global")).expect("global dir");
+        fs::write(
+            root.join("memories/global/MEMORY.md"),
+            "Curated source policy fact.\n",
+        )
+        .expect("curated memory");
+        write_record(TestRecord {
+            root: &root,
+            entry_kind: note::EntryKind::Remember,
+            scope: "global",
+            body: "Remembered source policy fact.",
+            created_at: timestamp(1_778_946_153),
+            project_id: None,
+            audience: Vec::new(),
+        });
+        let entries = entries(&root, &cache);
+        let sources = ["remembered".to_owned()];
+
+        let output =
+            assemble_local_index_context(input(&root, &entries, &[], &sources), &BTreeMap::new())
+                .expect("local context");
+
+        assert!(output.markdown.contains("Remembered source policy fact."));
+        assert!(!output.markdown.contains("Curated source policy fact."));
+    }
+
+    #[test]
     fn context_follows_project_aliases_for_curated_files() {
         let dir = temp_dir("curated-alias");
         let root = dir.join("store");

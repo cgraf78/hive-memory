@@ -295,7 +295,7 @@ pub(crate) fn assemble_cli_context(
         let snapshot_label = if report.projection.complete {
             "complete local index snapshot"
         } else {
-            "legacy remembered-only local index snapshot"
+            "best-available incomplete local index snapshot"
         };
         output.markdown = format!(
             "> Hive Memory context is a {snapshot_label} from {age}; canonical refresh is asynchronous.\n\n{}",
@@ -786,9 +786,6 @@ fn index_generation(path: &std::path::Path) -> Option<u128> {
 
 /// Refresh presentation-only path metadata when a stable project cache is reused.
 fn cached_markdown_with_path(markdown: &str, path_hint: Option<&str>) -> String {
-    let Some((header, body)) = markdown.split_once("\n\n") else {
-        return markdown.to_owned();
-    };
     let path_hint = path_hint.unwrap_or("none");
     let path_hint = path_hint
         .chars()
@@ -797,10 +794,12 @@ fn cached_markdown_with_path(markdown: &str, path_hint: Option<&str>) -> String 
             _ => ch,
         })
         .collect::<String>();
-    let header = header
+    let mut replaced = false;
+    let mut rewritten = markdown
         .lines()
         .map(|line| {
-            if line.starts_with("path: ") {
+            if !replaced && line.starts_with("path: ") {
+                replaced = true;
                 format!("path: {}", path_hint.trim())
             } else {
                 line.to_owned()
@@ -808,7 +807,10 @@ fn cached_markdown_with_path(markdown: &str, path_hint: Option<&str>) -> String 
         })
         .collect::<Vec<_>>()
         .join("\n");
-    format!("{header}\n\n{body}")
+    if markdown.ends_with('\n') {
+        rewritten.push('\n');
+    }
+    rewritten
 }
 
 /// Return whether a context cache entry is still acceptable for hook fallback.
@@ -1019,4 +1021,18 @@ pub(crate) struct ContextKeyPolicy<'a> {
     pub(crate) include_inbox: bool,
     pub(crate) include_search_only: bool,
     pub(crate) strategy: &'a str,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cached_markdown_with_path;
+
+    #[test]
+    fn cached_path_rewrite_crosses_local_snapshot_banner() {
+        let markdown = "> Hive Memory context is a local snapshot.\n\nHive Memory Context\npath: /repo/src/old.rs\n\n<memory>body</memory>\n";
+        let rewritten = cached_markdown_with_path(markdown, Some("/repo/src/new.rs"));
+
+        assert!(rewritten.contains("path: /repo/src/new.rs"));
+        assert!(!rewritten.contains("path: /repo/src/old.rs"));
+    }
 }

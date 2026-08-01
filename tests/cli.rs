@@ -4156,7 +4156,7 @@ fn context_project_id_ignores_inherited_project_path() {
 }
 
 #[test]
-fn hook_context_falls_back_to_cache_on_assembly_error() {
+fn context_keeps_good_memories_when_one_curated_file_is_unreadable() {
     let dir = temp_dir("context-assembly-fallback");
     let config = dir.join("config.toml");
     let personal = dir.join("personal");
@@ -4191,14 +4191,12 @@ fn hook_context_falls_back_to_cache_on_assembly_error() {
         .assert()
         .success();
 
-    // Curated trees are read on every assembly. A file that cannot be read
-    // (mid-sync truncation, encoding damage) makes assembly fail even though
-    // the manifest is reachable — the shape the manifest-only fallback missed.
+    // Curated trees are read on every assembly. Mid-sync truncation or encoding
+    // damage in one file must not poison otherwise readable memory.
     fs::create_dir_all(personal.join("rules")).expect("create rules dir");
     fs::write(personal.join("rules/broken.md"), [0xFF, 0xFE, 0xFD]).expect("write broken rule");
 
-    // Interactive context must still surface the underlying failure.
-    cargo_bin_cmd!("hm")
+    let context_output = cargo_bin_cmd!("hm")
         .args([
             "--config",
             config.to_str().expect("utf8 config"),
@@ -4209,12 +4207,24 @@ fn hook_context_falls_back_to_cache_on_assembly_error() {
             "/repo/src/main.rs",
             "--json",
         ])
-        .assert()
-        .failure();
+        .output()
+        .expect("run interactive context");
+    assert!(context_output.status.success());
+    let context: serde_json::Value =
+        serde_json::from_slice(&context_output.stdout).expect("context json");
+    assert_eq!(context["stale"], false);
+    assert_eq!(
+        context["sections"][0]["body"],
+        "Cache fallback should preserve this memory."
+    );
+    assert!(
+        String::from_utf8_lossy(&context_output.stderr).contains("broken.md"),
+        "the skipped file must remain observable"
+    );
 
-    // Hook context degrades to the last known-good cache instead of starting
-    // the agent session with no memory at all.
-    let stale_output = cargo_bin_cmd!("hm")
+    // Hook-active assembly remains local-only and returns the same good memory
+    // from its snapshot while detached refresh handles the warning.
+    let hook_output = cargo_bin_cmd!("hm")
         .env("HIVE_MEMORY_HOOK_ACTIVE", "1")
         .args([
             "--config",
@@ -4229,15 +4239,14 @@ fn hook_context_falls_back_to_cache_on_assembly_error() {
         .output()
         .expect("run hook context");
     assert!(
-        stale_output.status.success(),
-        "hook context failed: {stale_output:?}"
+        hook_output.status.success(),
+        "hook context failed: {hook_output:?}"
     );
-    let stale_context: serde_json::Value =
-        serde_json::from_slice(&stale_output.stdout).expect("stale context json");
-    assert_eq!(stale_context["stale"], true);
-    assert!(stale_context["cache_created_at"].as_str().is_some());
+    let hook_context: serde_json::Value =
+        serde_json::from_slice(&hook_output.stdout).expect("hook context json");
+    assert_eq!(hook_context["stale"], true);
     assert_eq!(
-        stale_context["sections"][0]["body"],
+        hook_context["sections"][0]["body"],
         "Cache fallback should preserve this memory."
     );
 }
@@ -4405,7 +4414,6 @@ fn hook_session_start_refreshes_local_projection_after_returning() {
 
     cargo_bin_cmd!("hm")
         .env("HIVE_MEMORY_SESSION_ID", "session-background-refresh-first")
-        .env("HIVE_MEMORY_BACKGROUND_REFRESH", "1")
         .args([
             "--config",
             config.to_str().expect("utf8 config"),
@@ -4557,6 +4565,367 @@ fn background_refresh_lock_contention_does_not_record_success() {
 }
 
 #[test]
+fn uninitialized_store_is_not_reported_as_lock_coalescing() {
+    let dir = temp_dir("refresh-uninitialized-store");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"indexes\": 1"))
+        .stdout(predicate::str::contains("\"refreshed\": true"))
+        .stdout(predicate::str::contains("\"coalesced\": false"));
+}
+
+#[test]
+fn explicit_force_refresh_waits_briefly_for_periodic_lock_owner() {
+    let dir = temp_dir("explicit-refresh-contention");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    init_store(&work, "work");
+    let lock_path = dir.join("cache/locks/index").join(format!(
+        "{}.lock",
+        hive_memory::index::store_cache_key("personal", &personal)
+    ));
+    fs::create_dir_all(lock_path.parent().expect("lock parent")).expect("lock parent");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("open rebuild lock");
+    FileExt::lock(&lock).expect("hold rebuild lock");
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        FileExt::unlock(&lock).expect("unlock rebuild lock");
+    });
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--force",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"indexes\": 2"))
+        .stdout(predicate::str::contains("\"refreshed\": true"))
+        .stdout(predicate::str::contains("\"coalesced\": false"));
+    release.join().expect("release thread");
+}
+
+#[test]
+fn background_refresh_retries_current_but_incomplete_projection() {
+    let dir = temp_dir("background-refresh-incomplete-projection");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    let broken = personal.join("rules/broken.md");
+    fs::create_dir_all(broken.parent().expect("rules parent")).expect("rules parent");
+    fs::write(&broken, [0xff, 0xfe]).expect("broken curated memory");
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--store",
+            "personal",
+            "refresh",
+            "--force",
+            "--quiet",
+        ])
+        .assert()
+        .success();
+    let index_path = dir.join("cache/indexes").join(format!(
+        "{}.jsonl",
+        hive_memory::index::store_cache_key("personal", &personal)
+    ));
+    assert!(
+        fs::read_to_string(&index_path)
+            .expect("incomplete index")
+            .contains("\"complete\":false")
+    );
+
+    let original_mtime = fs::metadata(&broken)
+        .expect("broken metadata")
+        .modified()
+        .expect("broken mtime");
+    fs::write(&broken, "ok").expect("repair curated memory");
+    fs::File::options()
+        .write(true)
+        .open(&broken)
+        .expect("open repaired memory")
+        .set_times(fs::FileTimes::new().set_modified(original_mtime))
+        .expect("restore mtime");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--store",
+            "personal",
+            "refresh",
+            "--background",
+            "--quiet",
+        ])
+        .assert()
+        .success();
+    let repaired = fs::read_to_string(&index_path).expect("repaired index");
+    assert!(repaired.contains("\"complete\":true"));
+    assert!(repaired.contains("ok"));
+}
+
+#[test]
+fn incomplete_projection_keeps_good_rows_in_tantivy_and_throttles_repair_scans() {
+    let dir = temp_dir("incomplete-projection-tantivy");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    write_backend_strategy_config(&config, &dir, &personal, "tantivy", "relevance");
+    init_store(&personal, "personal");
+    let broken = personal.join("rules/broken.md");
+    fs::create_dir_all(broken.parent().expect("rules parent")).expect("rules parent");
+    fs::write(&broken, [0xff, 0xfe]).expect("broken curated memory");
+    let output = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "The nebulous quasar uses a copper deployment adapter.",
+            "--json",
+        ])
+        .output()
+        .expect("write good memory");
+    assert!(output.status.success());
+    let written: serde_json::Value = serde_json::from_slice(&output.stdout).expect("remember json");
+    let note_id = written["id"].as_str().expect("memory id");
+
+    for _ in 0..3 {
+        cargo_bin_cmd!("hm")
+            .args([
+                "--config",
+                config.to_str().expect("utf8 config"),
+                "refresh",
+                "--background",
+                "--json",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("\"indexes\": 1"))
+            .stdout(predicate::str::contains("\"refreshed\": false"));
+    }
+
+    let search_index = hive_memory::retrieval::SearchIndex::open_existing_in_dir(
+        &dir.join("cache/search/personal"),
+    )
+    .expect("open Tantivy index")
+    .expect("Tantivy index exists despite bad sibling");
+    assert!(
+        search_index
+            .query("nebulous quasar", 10)
+            .expect("query Tantivy")
+            .iter()
+            .any(|hit| hit.id == note_id),
+        "one bad memory suppressed a good sibling from full-text maintenance"
+    );
+    assert!(
+        dir.join("state/background-refresh")
+            .read_dir()
+            .expect("background state")
+            .any(|entry| entry
+                .expect("background state entry")
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".incomplete-last-attempt")),
+        "incomplete repair scans were not rate-limited"
+    );
+}
+
+#[test]
+fn repeated_tool_hooks_do_not_respawn_the_same_receipt_refresh() {
+    let dir = temp_dir("receipt-refresh-attempt-dedupe");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    let state = dir.join("state");
+    let session = "receipt-refresh-dedupe";
+    let other_session = "receipt-refresh-other-session";
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", session)
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "remember",
+            "--text",
+            "A pending receipt refresh must launch only once per retry window.",
+        ])
+        .assert()
+        .success();
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", other_session)
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "remember",
+            "--text",
+            "Another session must not overwrite the first session's attempt.",
+        ])
+        .assert()
+        .success();
+
+    let refresh_lock = memory_hook::refresh_lock_path(&state, "codex", session);
+    fs::create_dir_all(refresh_lock.parent().expect("lock parent")).expect("lock parent");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&refresh_lock)
+        .expect("open refresh lock");
+    FileExt::lock(&lock).expect("hold refresh lock");
+    let other_refresh_lock = memory_hook::refresh_lock_path(&state, "codex", other_session);
+    fs::create_dir_all(other_refresh_lock.parent().expect("other lock parent"))
+        .expect("other lock parent");
+    let other_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&other_refresh_lock)
+        .expect("open other refresh lock");
+    FileExt::lock(&other_lock).expect("hold other refresh lock");
+
+    let run_tool_hook = |session_id: &str| {
+        cargo_bin_cmd!("hm")
+            .env("HIVE_MEMORY_SESSION_ID", session_id)
+            .args([
+                "--config",
+                config.to_str().expect("utf8 config"),
+                "--as-agent",
+                "codex",
+                "hook",
+                "tool-complete",
+                "--status",
+                "0",
+                "--json",
+            ])
+            .assert()
+            .success();
+    };
+    let state_lock = memory_hook::try_state_lock(&state, session)
+        .expect("state attempt lock")
+        .expect("hold state attempt lock");
+    run_tool_hook(session);
+    let attempt = memory_hook::receipt_refresh_attempt_path(&state, session);
+    assert!(
+        !attempt.exists(),
+        "state-lock contention must suppress a racing refresh spawn"
+    );
+    drop(state_lock);
+    run_tool_hook(session);
+    let first_modified = fs::metadata(&attempt)
+        .expect("first receipt attempt marker")
+        .modified()
+        .expect("first marker mtime");
+    std::thread::sleep(Duration::from_millis(50));
+    run_tool_hook(other_session);
+    assert!(
+        memory_hook::receipt_refresh_attempt_path(&state, other_session).is_file(),
+        "the other session needs an independent receipt attempt marker"
+    );
+    run_tool_hook(session);
+    let second_modified = fs::metadata(&attempt)
+        .expect("second receipt attempt marker")
+        .modified()
+        .expect("second marker mtime");
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", session)
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--as-agent",
+            "codex",
+            "remember",
+            "--text",
+            "A newly advanced receipt cursor bypasses the retry window.",
+        ])
+        .assert()
+        .success();
+    std::thread::sleep(Duration::from_millis(50));
+    run_tool_hook(session);
+    let third_modified = fs::metadata(&attempt)
+        .expect("third receipt attempt marker")
+        .modified()
+        .expect("third marker mtime");
+    FileExt::unlock(&lock).expect("unlock refresh lock");
+    FileExt::unlock(&other_lock).expect("unlock other refresh lock");
+
+    let refreshed_receipts = |session_id: &str| {
+        let state_path = state.join(format!("runs/{session_id}/hook-state.json"));
+        (0..200).find_map(|_| {
+            let refreshed = fs::read_to_string(&state_path)
+                .ok()
+                .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+                .and_then(|state| state["refreshed_receipts"].as_u64());
+            if refreshed.is_some() {
+                refreshed
+            } else {
+                std::thread::sleep(Duration::from_millis(25));
+                None
+            }
+        })
+    };
+
+    assert_eq!(
+        first_modified, second_modified,
+        "the same pending receipt cursor rewrote its attempt marker and respawned"
+    );
+    assert_ne!(
+        second_modified, third_modified,
+        "a newly advanced receipt cursor did not launch immediately"
+    );
+    assert_eq!(
+        refreshed_receipts(session),
+        Some(2),
+        "the newest receipt refresh did not finish after lock contention cleared"
+    );
+    assert_eq!(
+        refreshed_receipts(other_session),
+        Some(1),
+        "the independent session refresh did not finish after contention cleared"
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        refreshed_receipts(session),
+        Some(2),
+        "an older waiter moved the receipt cursor backward"
+    );
+}
+
+#[test]
 fn refresh_repairs_cached_store_identity_from_validated_manifest() {
     let dir = temp_dir("refresh-store-identity");
     let config = dir.join("config.toml");
@@ -4680,7 +5049,7 @@ fn targeted_background_refresh_does_not_acknowledge_other_store_receipts() {
 }
 
 #[test]
-fn retained_last_good_refresh_does_not_acknowledge_new_receipt() {
+fn retained_last_good_refresh_publishes_and_acknowledges_new_good_receipt() {
     let dir = temp_dir("background-refresh-retained-index");
     let config = dir.join("config.toml");
     let personal = dir.join("personal");
@@ -4728,7 +5097,7 @@ fn retained_last_good_refresh_does_not_acknowledge_new_receipt() {
             config.to_str().expect("utf8 config"),
             "remember",
             "--text",
-            "New memory must remain an unrefreshed receipt.",
+            "New good memory must be published independently.",
         ])
         .assert()
         .success();
@@ -4746,11 +5115,110 @@ fn retained_last_good_refresh_does_not_acknowledge_new_receipt() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("\"refreshed\": false"));
+        .stdout(predicate::str::contains("\"refreshed\": false"))
+        .stdout(predicate::str::contains("\"write_receipts\": 1"));
 
     let hook_state = memory_hook::load_state(&state, "retained-index-session")
         .expect("load retained-index hook state");
+    assert_eq!(hook_state.refreshed_receipts, 1);
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "memory",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Last known good memory that must not disappear.",
+        ))
+        .stdout(predicate::str::contains(
+            "New good memory must be published independently.",
+        ));
+}
+
+#[test]
+fn malformed_receipt_row_stays_pending_while_good_siblings_remain_available() {
+    let dir = temp_dir("background-refresh-malformed-receipt");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    let state = dir.join("state");
+    let session = "malformed-receipt-session";
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "A readable sibling remains available during repair.",
+        ])
+        .assert()
+        .success();
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--quiet",
+        ])
+        .assert()
+        .success();
+
+    let output = cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", session)
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "This receipt row becomes malformed before indexing.",
+            "--json",
+        ])
+        .output()
+        .expect("write receipt memory");
+    assert!(output.status.success());
+    let written: serde_json::Value = serde_json::from_slice(&output.stdout).expect("remember json");
+    fs::write(
+        written["note_path"].as_str().expect("note path"),
+        "not front matter",
+    )
+    .expect("corrupt receipt note");
+
+    for _ in 0..2 {
+        cargo_bin_cmd!("hm")
+            .env("HIVE_MEMORY_HOOK_ACTIVE", "1")
+            .env("HIVE_MEMORY_SESSION_ID", session)
+            .args([
+                "--config",
+                config.to_str().expect("utf8 config"),
+                "refresh",
+                "--background",
+                "--json",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("\"refreshed\": false"))
+            .stdout(predicate::str::contains("\"write_receipts\": 0"));
+    }
+    let hook_state = memory_hook::load_state(&state, session).expect("load hook state");
     assert_eq!(hook_state.refreshed_receipts, 0);
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "readable sibling",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "A readable sibling remains available during repair.",
+        ));
 }
 
 #[test]
@@ -6822,7 +7290,6 @@ fn hook_prompt_project_switch_hydrates_cold_bound_store_in_same_session() {
 
     cargo_bin_cmd!("hm")
         .env("HIVE_MEMORY_SESSION_ID", "cold-switch-session")
-        .env("HIVE_MEMORY_BACKGROUND_REFRESH", "1")
         .args([
             "--config",
             config.to_str().expect("utf8 config"),
@@ -9668,6 +10135,234 @@ fn prompt_submit_hook_recalls_via_bm25_backend() {
 }
 
 #[test]
+fn hook_prompt_recall_progresses_beyond_initial_candidate_window() {
+    for backend in ["lexical", "tantivy"] {
+        let dir = temp_dir(&format!("hook-recall-window-{backend}"));
+        let personal = dir.join("personal");
+        let config = dir.join("config.toml");
+        let active_repo = dir.join("repo-alpha");
+        fs::create_dir_all(&active_repo).expect("active repo");
+        fs::write(
+            active_repo.join(".hive-memory-project"),
+            "id = \"repo-alpha\"\n",
+        )
+        .expect("project marker");
+        init_store(&personal, "personal");
+        write_backend_strategy_config(&config, &dir, &personal, backend, "relevance");
+        for item in 0..15 {
+            let project_id = ["repo-alpha", "repo-beta", "repo-gamma"][item % 3];
+            cargo_bin_cmd!("hm")
+                .args([
+                    "--config",
+                    config.to_str().expect("utf8 config"),
+                    "remember",
+                    "--scope",
+                    "project",
+                    "--project-id",
+                    project_id,
+                    "--kind",
+                    "reference",
+                    "--text",
+                    &format!("Recall window sentinel memory {item:03}."),
+                ])
+                .assert()
+                .success();
+        }
+        cargo_bin_cmd!("hm")
+            .args([
+                "--config",
+                config.to_str().expect("utf8 config"),
+                "refresh",
+                "--force",
+                "--quiet",
+            ])
+            .assert()
+            .success();
+        let session = format!("recall-window-{backend}");
+        cargo_bin_cmd!("hm")
+            .env("HIVE_MEMORY_SESSION_ID", &session)
+            .args([
+                "--config",
+                config.to_str().expect("utf8 config"),
+                "hook",
+                "session-start",
+                "--project",
+                active_repo.to_str().expect("utf8 active repo"),
+                "--json",
+            ])
+            .assert()
+            .success();
+
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..5 {
+            let output = cargo_bin_cmd!("hm")
+                .env("HIVE_MEMORY_SESSION_ID", &session)
+                .args([
+                    "--config",
+                    config.to_str().expect("utf8 config"),
+                    "hook",
+                    "prompt-submit",
+                    "--project",
+                    active_repo.to_str().expect("utf8 active repo"),
+                    "--text",
+                    "Recall window sentinel details.",
+                    "--json",
+                ])
+                .output()
+                .expect("run prompt recall");
+            assert!(output.status.success());
+            let response: serde_json::Value =
+                serde_json::from_slice(&output.stdout).expect("prompt response json");
+            for id in response["recall"]["selected_ids"]
+                .as_array()
+                .expect("selected ids")
+            {
+                seen.insert(id.as_str().expect("selected id").to_owned());
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            15,
+            "{backend} recall stopped after its initial candidate window"
+        );
+    }
+}
+
+#[test]
+fn hook_prompt_recall_strips_multiword_request_framing() {
+    let dir = temp_dir("hook-recall-request-framing");
+    let personal = dir.join("personal");
+    let config = dir.join("config.toml");
+    init_store(&personal, "personal");
+    write_backend_strategy_config(&config, &dir, &personal, "lexical", "relevance");
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--kind",
+            "reference",
+            "--text",
+            "In src/foo.rs the deployment timeout is controlled by the release watchdog.",
+        ])
+        .assert()
+        .success();
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--force",
+            "--quiet",
+        ])
+        .assert()
+        .success();
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", "recall-request-framing")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "hook",
+            "prompt-submit",
+            "--text",
+            "I need help debugging the deployment timeout.",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "In src/foo.rs the deployment timeout is controlled by the release watchdog.",
+        ));
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", "recall-code-before-framing")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "hook",
+            "prompt-submit",
+            "--text",
+            "In src/foo.rs, explain the deployment timeout.",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "In src/foo.rs the deployment timeout is controlled by the release watchdog.",
+        ));
+}
+
+#[test]
+fn unchanged_prompt_selection_still_schedules_rate_limited_revalidation() {
+    let dir = temp_dir("hook-prompt-periodic-revalidation");
+    let personal = dir.join("personal");
+    let config = dir.join("config.toml");
+    let session = "prompt-periodic-revalidation";
+    init_store(&personal, "personal");
+    write_backend_strategy_config(&config, &dir, &personal, "lexical", "relevance");
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Periodic revalidation keeps memories from other writers visible.",
+        ])
+        .assert()
+        .success();
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--quiet",
+        ])
+        .assert()
+        .success();
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", session)
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "hook",
+            "session-start",
+            "--project",
+            "/repo/src/main.rs",
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    let stamp = dir.join("state/background-refresh").join(format!(
+        "{}.last-attempt",
+        hive_memory::index::store_cache_key("personal", &personal)
+    ));
+    if stamp.exists() {
+        fs::remove_file(&stamp).expect("clear session-start refresh marker");
+    }
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", session)
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "hook",
+            "prompt-submit",
+            "--project",
+            "/repo/src/main.rs",
+            "--text",
+            "Continue the current task.",
+            "--json",
+        ])
+        .assert()
+        .success();
+    assert!(
+        stamp.is_file(),
+        "unchanged prompt selection did not request periodic revalidation"
+    );
+}
+
+#[test]
 fn prompt_submit_hook_falls_back_when_tantivy_index_absent() {
     // search_backend=tantivy but the BM25 index was never built (e.g. the user
     // enabled it before the first tantivy-aware refresh). The prompt-submit hook
@@ -9900,5 +10595,106 @@ fn search_falls_back_to_lexical_when_tantivy_index_empty_and_lock_held() {
     assert!(
         stderr.contains("full-text search backend unavailable"),
         "expected the lexical-fallback warning on stderr.\nstderr: {stderr}"
+    );
+}
+
+#[test]
+fn search_falls_back_to_lexical_when_populated_tantivy_is_stale_and_lock_held() {
+    let dir = temp_dir("search-stale-populated-fallback");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let cache = dir.join("cache");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            cache_dir = "{}"
+
+            [defaults]
+            search_backend = "tantivy"
+
+            [stores.personal]
+            root = "{}"
+            "#,
+            cache.display(),
+            personal.display()
+        ),
+    )
+    .expect("write config");
+    init_store(&personal, "personal");
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "The copper baseline populates the full-text index.",
+        ])
+        .assert()
+        .success();
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--force",
+        ])
+        .assert()
+        .success();
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "The zirconium procedure arrived after the full-text snapshot.",
+        ])
+        .assert()
+        .success();
+    hive_memory::index::rebuild_index(hive_memory::index::RebuildIndexInput {
+        store_name: "personal",
+        store_root: &personal,
+        cache_dir: &cache,
+        options: hive_memory::write::AtomicWriteOptions::default(),
+        path_case: hive_memory::path::PathCase::Sensitive,
+    })
+    .expect("refresh JSONL without rebuilding Tantivy");
+
+    let lock_path = cache.join("locks/index").join(format!(
+        "{}.lock",
+        hive_memory::index::store_cache_key("personal", &personal)
+    ));
+    fs::create_dir_all(lock_path.parent().expect("lock parent")).expect("lock parent");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("open rebuild lock");
+    FileExt::lock(&lock).expect("hold rebuild lock");
+
+    let output = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "zirconium",
+        ])
+        .output()
+        .expect("run search");
+    FileExt::unlock(&lock).expect("unlock rebuild lock");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(
+        stdout.contains("zirconium"),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("full-text search backend unavailable"),
+        "stale full-text fallback must be visible: {stderr}"
     );
 }

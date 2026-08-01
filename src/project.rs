@@ -657,7 +657,7 @@ pub fn related_project_ids(
 pub fn alias_normalization_map(
     store_root: &Path,
 ) -> Result<BTreeMap<String, String>, ProjectError> {
-    let mut normalized = BTreeMap::new();
+    let mut families: Vec<BTreeSet<String>> = Vec::new();
     for directory_id in project_directories(store_root)? {
         let Some(aliases) = load_aliases(store_root, &directory_id)? else {
             continue;
@@ -671,9 +671,26 @@ pub fn alias_normalization_map(
                 ids.insert(candidate);
             }
         }
-        let Some(family_key) = ids.first().cloned() else {
+        if ids.is_empty() {
             continue;
-        };
+        }
+        // Alias files can overlap across successive renames. Merge connected
+        // components instead of letting filesystem iteration order decide which
+        // family key wins for the shared id.
+        let mut index = 0;
+        while index < families.len() {
+            if ids.is_disjoint(&families[index]) {
+                index += 1;
+                continue;
+            }
+            ids.extend(families.remove(index));
+            index = 0;
+        }
+        families.push(ids);
+    }
+    let mut normalized = BTreeMap::new();
+    for ids in families {
+        let family_key = ids.first().expect("nonempty family").clone();
         for id in ids {
             normalized.insert(id, family_key.clone());
         }
@@ -1472,6 +1489,27 @@ mod tests {
             first.remote_url.as_deref(),
             Some("git@github.com:cgraf78/hive-memory.git")
         );
+    }
+
+    #[test]
+    fn alias_normalization_merges_overlapping_families() {
+        let root = temp_dir("alias-family-closure");
+        for (directory, aliases) in [("a", "c"), ("b", "c")] {
+            let project = root.join("memories/projects").join(directory);
+            fs::create_dir_all(&project).expect("project dir");
+            fs::write(
+                project.join("aliases.toml"),
+                format!(
+                    "schema_version = 1\nproject_id = \"{directory}\"\naliases = [\"{aliases}\"]\n"
+                ),
+            )
+            .expect("aliases");
+        }
+
+        let normalized = alias_normalization_map(&root).expect("normalization map");
+        assert_eq!(normalized.get("a").map(String::as_str), Some("a"));
+        assert_eq!(normalized.get("b").map(String::as_str), Some("a"));
+        assert_eq!(normalized.get("c").map(String::as_str), Some("a"));
     }
 
     #[test]

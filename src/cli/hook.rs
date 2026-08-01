@@ -202,7 +202,7 @@ fn run_session_start(args: HookContextArgs, mut context: CliContext) -> Result<(
     };
     emit_hook_response(&response, args.json)?;
     if schedule_refresh {
-        maybe_spawn_background_refresh(&config, &context, refresh_target, false);
+        maybe_spawn_background_refresh(&config, &context, refresh_target, None);
     }
 
     Ok(())
@@ -210,9 +210,10 @@ fn run_session_start(args: HookContextArgs, mut context: CliContext) -> Result<(
 
 /// Refresh the local projection after returning stale-while-revalidate data.
 ///
-/// Agentguard opts into this path. The child is detached, rate-limited to one
-/// attempt per minute, and self-terminates if a cloud filesystem call wedges,
-/// so canonical freshness can never extend the synchronous hook latency.
+/// Lifecycle hooks use this path automatically so a long-lived session sees
+/// other writers without paying canonical I/O in the foreground. The child is
+/// detached, periodic attempts are rate-limited, and a repeated receipt cursor
+/// is suppressed through the watchdog window. A new cursor launches immediately.
 #[derive(Debug)]
 enum BackgroundRefreshTarget {
     One(String),
@@ -223,11 +224,8 @@ fn maybe_spawn_background_refresh(
     config: &Config,
     context: &CliContext,
     target: BackgroundRefreshTarget,
-    force: bool,
+    receipt_request: Option<(&str, usize)>,
 ) {
-    if !force && std::env::var("HIVE_MEMORY_BACKGROUND_REFRESH").as_deref() != Ok("1") {
-        return;
-    }
     let refresh_key = match &target {
         BackgroundRefreshTarget::One(store_name) => config
             .stores
@@ -236,24 +234,47 @@ fn maybe_spawn_background_refresh(
             .unwrap_or_else(|| "all-stores".to_owned()),
         BackgroundRefreshTarget::All => "all-stores".to_owned(),
     };
-    let stamp = config
-        .state_dir
-        .join("background-refresh")
-        .join(format!("{refresh_key}.last-attempt"));
-    if !force
-        && std::fs::metadata(&stamp)
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .and_then(|modified| modified.elapsed().ok())
-            .is_some_and(|age| age < std::time::Duration::from_secs(60))
-    {
+    // The same lock used for session-state read-modify-write also serializes
+    // receipt attempt publication. Contention is a duplicate or a nearby state
+    // update, so fail soft and let a later hook retry rather than spawning.
+    let _receipt_lock = if let Some((session_id, _)) = receipt_request {
+        match memory_hook::try_state_lock(&config.state_dir, session_id) {
+            Ok(Some(lock)) => Some(lock),
+            _ => return,
+        }
+    } else {
+        None
+    };
+    let (stamp, retry_after, attempt_body) = match receipt_request {
+        Some((session_id, cursor)) => (
+            memory_hook::receipt_refresh_attempt_path(&config.state_dir, session_id),
+            std::time::Duration::from_secs(super::sync::BACKGROUND_REFRESH_WATCHDOG_SECS),
+            cursor.to_string().into_bytes(),
+        ),
+        None => (
+            config
+                .state_dir
+                .join("background-refresh")
+                .join(format!("{refresh_key}.last-attempt")),
+            std::time::Duration::from_secs(60),
+            Vec::new(),
+        ),
+    };
+    let recent_attempt = std::fs::metadata(&stamp)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age < retry_after);
+    let same_request = receipt_request.is_none()
+        || std::fs::read(&stamp).is_ok_and(|contents| contents == attempt_body);
+    if recent_attempt && same_request {
         return;
     }
     let Some(parent) = stamp.parent() else {
         return;
     };
     if std::fs::create_dir_all(parent).is_err()
-        || write::write_atomic(&stamp, b"", &hook_options(config)).is_err()
+        || write::write_atomic(&stamp, &attempt_body, &hook_options(config)).is_err()
     {
         return;
     }
@@ -308,7 +329,8 @@ fn run_prompt_submit(args: HookPromptSubmitArgs, context: CliContext) -> Result<
     // Validate the same read policy used by possible context refresh below.
     // Prompt hooks should fail inside `hm` when project affinity is outside
     // agent policy, not leave shell adapters to discover that later.
-    validate_hook_context_read_policy(&config, &context, path_hint.as_deref())?;
+    let periodic_refresh_store =
+        validate_hook_context_read_policy(&config, &context, path_hint.as_deref())?;
     let mut context_emitted = false;
     let (context_action, refresh_store) = hook_context_action_if_changed(
         &config,
@@ -364,14 +386,12 @@ fn run_prompt_submit(args: HookPromptSubmitArgs, context: CliContext) -> Result<
         recall,
     };
     emit_hook_response(&response, args.json)?;
-    if let Some(store) = refresh_store {
-        maybe_spawn_background_refresh(
-            &config,
-            &context,
-            BackgroundRefreshTarget::One(store),
-            false,
-        );
-    }
+    maybe_spawn_background_refresh(
+        &config,
+        &context,
+        BackgroundRefreshTarget::One(refresh_store.unwrap_or(periodic_refresh_store)),
+        None,
+    );
 
     Ok(())
 }
@@ -395,6 +415,7 @@ fn run_tool_complete(args: HookToolCompleteArgs, context: CliContext) -> Result<
     };
     let context_emitted = false;
     let mut refresh_target = None;
+    let mut refresh_request = None;
 
     if args.status == 0
         && let Some(session_id) = session_id.as_deref()
@@ -414,6 +435,7 @@ fn run_tool_complete(args: HookToolCompleteArgs, context: CliContext) -> Result<
             } else {
                 BackgroundRefreshTarget::All
             });
+            refresh_request = Some((session_id, receipts.len()));
             state = memory_hook::mark_memory_satisfied(
                 &config.state_dir,
                 session_id,
@@ -435,7 +457,7 @@ fn run_tool_complete(args: HookToolCompleteArgs, context: CliContext) -> Result<
     };
     emit_hook_response(&response, args.json)?;
     if let Some(target) = refresh_target {
-        maybe_spawn_background_refresh(&config, &context, target, true);
+        maybe_spawn_background_refresh(&config, &context, target, refresh_request);
     }
 
     Ok(())
@@ -751,6 +773,8 @@ fn hook_prompt_recall_action(
     };
     let entries = cached_report.projection.entries.as_slice();
     let include_inbox = super::search::search_include_inbox(false, sources);
+    let state = memory_hook::load_state(&config.state_dir, session_id)?;
+    let known_ids = memory_hook::known_session_memory_ids(&state);
     let search_input = search::SearchInput {
         store_root: &store_config.root,
         entries,
@@ -760,7 +784,10 @@ fn hook_prompt_recall_action(
         include_inbox,
         agent_id: agent_id.as_deref(),
         project_id: project_id.as_deref(),
-        limit: 10,
+        // Search beyond memories already emitted in this session. Applying the
+        // old fixed cap before session dedupe permanently hid rank 11+ after the
+        // first few prompts even though those memories remained eligible.
+        limit: known_ids.len().saturating_add(3).max(10),
     };
     // Prefer BM25 recall when the persistent index is already fresh; this is
     // where the prompt hook gains paraphrase/multi-session recall. Fall back to
@@ -791,8 +818,6 @@ fn hook_prompt_recall_action(
         },
     };
 
-    let state = memory_hook::load_state(&config.state_dir, session_id)?;
-    let known_ids = memory_hook::known_session_memory_ids(&state);
     let selected_entries = hits
         .iter()
         .filter(|hit| !known_ids.contains(&hit.entry.id))
@@ -912,6 +937,9 @@ fn prompt_recall_query(prompt: &str, path_hint: Option<&str>) -> Option<String> 
         if is_prompt_stopword(&token) {
             continue;
         }
+        if is_task_intent_term(&token) {
+            continue;
+        }
         if is_code_prompt_term(&token) {
             push_unique(&mut code_terms, token);
         } else if token.len() >= 4 {
@@ -932,7 +960,13 @@ fn prompt_recall_query(prompt: &str, path_hint: Option<&str>) -> Option<String> 
     }
 
     let terms = if !code_terms.is_empty() {
-        code_terms.into_iter().take(3).collect::<Vec<_>>()
+        let mut terms = code_terms.into_iter().take(3).collect::<Vec<_>>();
+        terms.extend(
+            plain_terms
+                .into_iter()
+                .take(4usize.saturating_sub(terms.len())),
+        );
+        terms
     } else {
         plain_terms.into_iter().take(2).collect::<Vec<_>>()
     };
@@ -953,6 +987,42 @@ fn is_code_prompt_term(token: &str) -> bool {
         || token.contains('/')
         || token.contains('.')
         || token.contains('<')
+}
+
+fn is_task_intent_term(token: &str) -> bool {
+    matches!(
+        token,
+        "analyze"
+            | "analyse"
+            | "check"
+            | "debug"
+            | "debugging"
+            | "describe"
+            | "explain"
+            | "find"
+            | "fix"
+            | "fixing"
+            | "help"
+            | "inspect"
+            | "investigate"
+            | "look"
+            | "looking"
+            | "make"
+            | "making"
+            | "need"
+            | "review"
+            | "show"
+            | "summarise"
+            | "summarize"
+            | "tell"
+            | "take"
+            | "try"
+            | "trying"
+            | "understand"
+            | "use"
+            | "using"
+            | "want"
+    )
 }
 
 fn is_prompt_stopword(token: &str) -> bool {
@@ -1037,18 +1107,18 @@ fn validate_hook_context_read_policy(
     config: &Config,
     context: &CliContext,
     path_hint: Option<&str>,
-) -> Result<()> {
+) -> Result<String> {
     let agent_id = resolve_agent_id(context.as_agent.clone());
     let project_id = resolve_project_id(None, path_hint)?;
     let project_binding = project_binding_store(config, project_id.as_deref())?;
-    resolve_store(
+    Ok(resolve_store(
         config,
         context.store.as_deref(),
         project_binding.as_deref(),
         agent_id.as_deref(),
         StoreAccess::Read,
-    )?;
-    Ok(())
+    )?
+    .name)
 }
 
 fn memory_intent_reminder() -> &'static str {
@@ -1072,6 +1142,40 @@ mod tests {
             )
             .as_deref(),
             Some("grafhome cedar")
+        );
+    }
+
+    #[test]
+    fn prompt_recall_query_skips_leading_task_intent() {
+        assert_eq!(
+            prompt_recall_query("Help analyze the deployment timeout.", None).as_deref(),
+            Some("deployment timeout")
+        );
+        assert_eq!(
+            prompt_recall_query("Find the deployment timeout.", None).as_deref(),
+            Some("deployment timeout")
+        );
+        assert_eq!(
+            prompt_recall_query("Explain the deployment timeout.", None).as_deref(),
+            Some("deployment timeout")
+        );
+        assert_eq!(
+            prompt_recall_query("In src/foo.rs, explain the deployment timeout.", None).as_deref(),
+            Some("src/foo.rs deployment timeout")
+        );
+        assert_eq!(
+            prompt_recall_query("I need help debugging the deployment timeout.", None).as_deref(),
+            Some("deployment timeout")
+        );
+        assert_eq!(
+            prompt_recall_query("I'm trying to understand the deployment timeout.", None)
+                .as_deref(),
+            Some("deployment timeout")
+        );
+        assert_eq!(
+            prompt_recall_query("Can you take a look into the deployment timeout.", None)
+                .as_deref(),
+            Some("deployment timeout")
         );
     }
 }

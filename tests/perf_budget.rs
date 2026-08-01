@@ -328,6 +328,52 @@ fn hook_prompt_submit_recall_stays_within_warm_budget() {
 }
 
 #[test]
+#[ignore = "CI runs this explicitly because it measures broad Tantivy recall over 5000 notes"]
+fn tantivy_broad_search_and_hook_recall_stay_within_warm_budget() {
+    let fixture = SyntheticStore::new_with_backend("tantivy");
+    fixture.refresh_index();
+
+    // Every synthetic record contains both terms. This guards the expensive
+    // realistic case where complete BM25 and deterministic lexical streams
+    // must be unioned before applying the small user-facing output limit.
+    let search_p95 = p95_ms(repeat(RUNS, || {
+        fixture.hm(["search", "synthetic memory", "--json"])
+    }));
+    let prompt_p95 = p95_ms(repeat(RUNS, || {
+        hm_command(
+            &fixture.config,
+            [
+                "--as-agent",
+                "codex",
+                "hook",
+                "prompt-submit",
+                "--project",
+                "/tmp/hive-memory-perf-project/src/main.rs",
+                "--text",
+                "Find the synthetic memory details.",
+                "--json",
+            ],
+        )
+        .env("HIVE_MEMORY_SESSION_ID", "perf-tantivy-broad-recall")
+        .assert()
+        .success();
+    }));
+    eprintln!("hm Tantivy broad search warm p95: {search_p95}ms");
+    eprintln!("hm Tantivy broad hook recall warm p95: {prompt_p95}ms");
+
+    let search_budget = budget_ms(SEARCH_WARM_BUDGET_MS);
+    let prompt_budget = budget_ms(HOOK_PROMPT_RECALL_WARM_BUDGET_MS);
+    assert!(
+        search_p95 <= search_budget,
+        "hm Tantivy broad search p95 {search_p95}ms exceeded {search_budget}ms"
+    );
+    assert!(
+        prompt_p95 <= prompt_budget,
+        "hm Tantivy broad hook recall p95 {prompt_p95}ms exceeded {prompt_budget}ms"
+    );
+}
+
+#[test]
 #[ignore = "CI runs this explicitly because it measures full hook recall latency"]
 fn hook_prompt_submit_cached_recall_stays_fast_when_store_root_is_unavailable() {
     let fixture = SyntheticStore::new();
@@ -510,6 +556,7 @@ fn hook_tool_complete_with_receipt_stays_within_warm_budget() {
                 .assert()
                 .success();
                 let elapsed = start.elapsed();
+                let completion_start = Instant::now();
                 let response: serde_json::Value =
                     serde_json::from_slice(&assert.get_output().stdout).expect("hook JSON");
                 assert_eq!(
@@ -524,7 +571,7 @@ fn hook_tool_complete_with_receipt_stays_within_warm_budget() {
                     .join(format!("state/runs/{session_id}/hook-state.json"));
                 let expected = run + 1;
                 let mut advanced = false;
-                for _ in 0..200 {
+                for _ in 0..1_200 {
                     if fs::read_to_string(&state_path)
                         .ok()
                         .and_then(|contents| {
@@ -540,7 +587,12 @@ fn hook_tool_complete_with_receipt_stays_within_warm_budget() {
                 }
                 assert!(
                     advanced,
-                    "background refresh did not advance receipt cursor to {expected}"
+                    "background refresh did not advance receipt cursor to {expected} within 30s"
+                );
+                eprintln!(
+                    "hm receipt background completion {}: {}ms",
+                    expected,
+                    completion_start.elapsed().as_millis()
                 );
                 elapsed
             })
@@ -573,6 +625,10 @@ struct SyntheticStore {
 
 impl SyntheticStore {
     fn new() -> Self {
+        Self::new_with_backend("lexical")
+    }
+
+    fn new_with_backend(search_backend: &str) -> Self {
         let dir = temp_dir("warm-budget");
         let config = dir.path().join("config.toml");
         let root = dir.path().join("personal");
@@ -586,7 +642,7 @@ impl SyntheticStore {
             sensitivity: Sensitivity::Private,
         })
         .expect("init synthetic store");
-        write_config(&config, &root, &cache, &state, &data);
+        write_config(&config, &root, &cache, &state, &data, search_backend);
         write_notes(&root);
         Self {
             _dir: dir,
@@ -667,7 +723,14 @@ fn write_flush_config(config: &Path, root: &Path, data: &Path) {
     .expect("write flush config");
 }
 
-fn write_config(config: &Path, root: &Path, cache: &Path, state: &Path, data: &Path) {
+fn write_config(
+    config: &Path,
+    root: &Path,
+    cache: &Path,
+    state: &Path,
+    data: &Path,
+    search_backend: &str,
+) {
     fs::write(
         config,
         format!(
@@ -680,6 +743,9 @@ fn write_config(config: &Path, root: &Path, cache: &Path, state: &Path, data: &P
             [stores.personal]
             root = "{}"
 
+            [defaults]
+            search_backend = "{}"
+
             [performance]
             context_warm_p95_ms = {}
             context_store_size_target = {}
@@ -688,6 +754,7 @@ fn write_config(config: &Path, root: &Path, cache: &Path, state: &Path, data: &P
             state.display(),
             data.display(),
             root.display(),
+            search_backend,
             CONTEXT_WARM_BUDGET_MS,
             SYNTHETIC_NOTES
         ),

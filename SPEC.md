@@ -1767,7 +1767,13 @@ How v1 hits the budget:
 - the per-root local projection (`cache/indexes/<store-root-key>.jsonl`) is the
   lifecycle-hook data structure. Its atomic header carries curated bodies,
   project aliases, and entity aliases; remembered/raw bodies remain JSONL rows.
-  Hook reads never touch the canonical store root.
+  Hook reads never touch the canonical store root. The header authenticates the
+  row count and content digest so damaged rows cannot be silently accepted as a
+  complete generation.
+- rebuilds publish every readable memory even when one record is malformed or
+  oversized. Such omissions produce warnings and set the projection's
+  `complete` flag to false rather than poisoning the rest of the corpus or
+  silently claiming completeness.
 - session-start first reuses an exact rendered snapshot whose key includes the
   configured store root. A projection hit renders locally and writes that
   snapshot for later invocations; a local miss returns empty immediately.
@@ -1775,8 +1781,15 @@ How v1 hits the budget:
   Periodic no-write refreshes validate a fresh projection without reparsing all
   notes; explicit and receipt-driven refreshes retain the full canonical parse.
   No-op refreshes preserve the existing generation and rendered-cache validity.
-- prompt BM25 uses the remembered/raw corpus, while curated projection entries
-  are merged lexically without reopening canonical files.
+  Receipt-triggered attempts are keyed by session and receipt cursor: repeated
+  tool hooks cannot spawn duplicate children during the 300-second watchdog
+  window, while a newly advanced cursor launches immediately.
+- prompt BM25 uses the remembered/raw corpus and is unioned with the complete
+  deterministic lexical/alias stream, including curated projection entries,
+  without reopening canonical files. Candidate generation remains broad across
+  projects; active-project identity changes ranking only unless project-only
+  mode was explicitly requested. Policy, supersession, session deduplication,
+  and the small injected-output limit are applied after candidate generation.
 
 CI enforcement:
 

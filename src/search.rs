@@ -1352,64 +1352,60 @@ fn search_indexed_with_resources(
             snippet: retrieval_snippet(&body),
         });
     }
+    let requested_limit = input.limit;
     if !collect_canonical_curated {
         finish_local_hits(
             &mut indexed_hits,
             &query.phrase,
             query.temporal_intent(),
-            input.limit,
+            usize::MAX,
             local_project_aliases.expect("local search carries project aliases"),
         );
-        let curated_sources = vec!["curated".to_owned()];
-        let curated_hits = search_local_index(
+        let lexical_hits = search_local_index(
             SearchInput {
                 store_root: input.store_root,
-                entries: local_projection_entries
-                    .expect("local search carries complete projection entries"),
+                entries: local_projection_entries.expect("local search carries projection entries"),
                 query: input.query,
                 scopes: input.scopes,
-                sources: &curated_sources,
-                include_inbox: false,
+                sources: input.sources,
+                include_inbox: input.include_inbox,
                 agent_id: input.agent_id,
                 project_id: input.project_id,
-                limit: input.limit,
+                limit: usize::MAX,
             },
             registry,
             local_project_aliases.expect("local search carries project aliases"),
         )?;
         return Ok(merge_ranked_sources_local(
-            vec![indexed_hits, curated_hits],
-            input.limit,
+            vec![indexed_hits, lexical_hits],
+            requested_limit,
             local_project_aliases.expect("local search carries project aliases"),
         ));
     }
 
-    // The persistent BM25 cache indexes the JSONL note corpus. Curated Markdown
-    // is intentionally read directly elsewhere because it is tiny and can be
-    // scoped by the active project; merge those lexical hits here so selecting
-    // the Tantivy backend never silently drops configured curated sources.
+    // Tantivy raises semantic recall, but it must complement rather than replace
+    // deterministic lexical/entity matching. Retain each complete ranked stream
+    // until the final merge so duplicate BM25 hits cannot crowd a lexical-only
+    // match beyond an intermediate output window.
     finish_hits(
         &mut indexed_hits,
         input.store_root,
         &query.phrase,
         query.temporal_intent(),
-        input.limit,
+        usize::MAX,
     );
-    let mut curated_hits = curated_hits(&input, &query, registry, project_only)?;
-    finish_hits(
-        &mut curated_hits,
-        input.store_root,
-        &query.phrase,
-        query.temporal_intent(),
-        input.limit,
-    );
-    // BM25 scores and lexical scores are meaningful only inside their own
-    // source streams. Interleave per-source rankings instead of globally sorting
-    // incompatible scores, so a configured source cannot be crowded out by a
-    // different backend's scale.
+    let lexical_input = SearchInput {
+        limit: usize::MAX,
+        ..input.clone()
+    };
+    let lexical_hits = if project_only {
+        search_project_only(lexical_input)?
+    } else {
+        search(lexical_input)?
+    };
     Ok(merge_ranked_sources(
-        vec![indexed_hits, curated_hits],
-        input.limit,
+        vec![indexed_hits, lexical_hits],
+        requested_limit,
         input.store_root,
     ))
 }
@@ -1434,7 +1430,8 @@ fn merge_ranked_sources_local(
         })
         .collect::<HashMap<_, _>>();
     let mut hits = Vec::new();
-    let mut seen = BTreeSet::new();
+    let mut seen_ids = BTreeSet::new();
+    let mut seen_content = BTreeSet::new();
     loop {
         let mut advanced = false;
         for source in &mut sources {
@@ -1443,7 +1440,8 @@ fn merge_ranked_sources_local(
             }
             advanced = true;
             let hit = source.remove(0);
-            if seen.insert(duplicate_key(&hit.entry, &hit.snippet, &project_keys)) {
+            let duplicate = duplicate_key(&hit.entry, &hit.snippet, &project_keys);
+            if seen_ids.insert(hit.entry.id.clone()) && seen_content.insert(duplicate) {
                 hits.push(hit);
                 if hits.len() >= limit {
                     return hits;
@@ -1729,6 +1727,10 @@ mod tests {
     }
 
     fn entries(root: &Path, cache: &Path) -> Vec<IndexEntry> {
+        index_report(root, cache).entries
+    }
+
+    fn index_report(root: &Path, cache: &Path) -> index::RebuildIndexReport {
         index::rebuild_index(index::RebuildIndexInput {
             store_name: "personal",
             store_root: root,
@@ -1737,7 +1739,6 @@ mod tests {
             path_case: crate::path::PathCase::Sensitive,
         })
         .expect("rebuild index")
-        .entries
     }
 
     fn hit_bodies(hits: &[SearchHit]) -> Vec<String> {
@@ -1834,6 +1835,44 @@ mod tests {
 
         assert_eq!(lexical.len(), 1);
         assert_eq!(indexed.len(), 1);
+    }
+
+    #[test]
+    fn local_merge_deduplicates_bodyless_legacy_entry_by_id() {
+        let dir = temp_dir("local-bodyless-cross-source-duplicate");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "A long legacy memory can produce different lexical and indexed snippets.",
+            timestamp(1_778_946_153),
+            Vec::new(),
+        );
+        let entries = entries(&root, &cache);
+        let mut indexed_hit = search(indexed_input(
+            &root,
+            &entries,
+            "legacy memory",
+            &[],
+            None,
+            None,
+        ))
+        .expect("search")
+        .remove(0);
+        indexed_hit.entry.body.clear();
+        indexed_hit.snippet = "A long legacy memory".to_owned();
+        let mut lexical_hit = indexed_hit.clone();
+        lexical_hit.snippet = "legacy memory can produce different lexical".to_owned();
+
+        let merged = merge_ranked_sources_local(
+            vec![vec![indexed_hit], vec![lexical_hit]],
+            20,
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(merged.len(), 1);
     }
 
     #[test]
@@ -1937,7 +1976,8 @@ mod tests {
             "Policy evaluation compares Cedar and Rego.",
             "proj-alpha",
         );
-        let entries = entries(&root, &cache);
+        let report = index_report(&root, &cache);
+        let entries = report.entries;
         let index = build_index(&root, &entries);
 
         let mut input = indexed_input(&root, &entries, "Cedar Rego", &[], None, Some("proj-alpha"));
@@ -1949,6 +1989,176 @@ mod tests {
         assert!(hits[0].trace.retrieval > 0);
         assert!(hits[0].trace.project > 0);
         assert_eq!(hits[0].trace.total(), hits[0].score);
+
+        let mut local_input =
+            indexed_input(&root, &entries, "Cedar Rego", &[], None, Some("proj-alpha"));
+        local_input.limit = 1;
+        let local = search_indexed_local(
+            local_input,
+            &report.projection.entries,
+            &index,
+            &report.projection.entity_registry,
+            &report.projection.project_aliases,
+        )
+        .expect("local indexed search");
+        assert_eq!(local[0].entry.project_id.as_deref(), Some("proj-alpha"));
+    }
+
+    #[test]
+    fn warm_local_search_preserves_full_canonical_candidate_set() {
+        let dir = temp_dir("local-full-corpus");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        fs::create_dir_all(root.join("rules")).expect("rules dir");
+        fs::write(
+            root.join("rules/full-corpus.md"),
+            "Warm corpus sentinel curated memory.\n",
+        )
+        .expect("curated memory");
+        for item in 0..64 {
+            write_record(
+                &root,
+                note::EntryKind::Remember,
+                "global",
+                &format!("Warm corpus sentinel remembered memory {item:03}."),
+                timestamp(1_778_946_153 + i64::from(item)),
+                Vec::new(),
+            );
+        }
+
+        let report = index_report(&root, &cache);
+        assert_eq!(report.entries.len(), 64);
+        assert_eq!(report.projection.entries.len(), 65);
+        let sources = ["curated".to_owned(), "remembered".to_owned()];
+        let canonical_input = SearchInput {
+            store_root: &root,
+            entries: &report.entries,
+            query: "warm corpus sentinel",
+            scopes: &[],
+            sources: &sources,
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 128,
+        };
+        let local_input = SearchInput {
+            entries: &report.projection.entries,
+            ..canonical_input.clone()
+        };
+
+        let canonical_lexical = search(canonical_input.clone()).expect("canonical lexical");
+        let local_lexical = search_local_index(
+            local_input,
+            &report.projection.entity_registry,
+            &report.projection.project_aliases,
+        )
+        .expect("local lexical");
+        assert_eq!(hit_ids(&canonical_lexical), hit_ids(&local_lexical));
+        assert_eq!(local_lexical.len(), 65);
+
+        let index = build_index(&root, &report.entries);
+        let canonical_indexed =
+            search_indexed(canonical_input.clone(), &index).expect("canonical indexed");
+        let local_indexed = search_indexed_local(
+            canonical_input,
+            &report.projection.entries,
+            &index,
+            &report.projection.entity_registry,
+            &report.projection.project_aliases,
+        )
+        .expect("local indexed");
+        assert_eq!(hit_ids(&canonical_indexed), hit_ids(&local_indexed));
+        assert_eq!(local_indexed.len(), 65);
+    }
+
+    #[test]
+    fn local_indexed_search_respects_remembered_only_source_policy() {
+        let dir = temp_dir("local-remembered-only");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        fs::create_dir_all(root.join("rules")).expect("rules dir");
+        fs::write(
+            root.join("rules/curated-only.md"),
+            "Curated-only zirconium guidance.\n",
+        )
+        .expect("curated memory");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "Remembered copper guidance.",
+            timestamp(1_778_946_153),
+            Vec::new(),
+        );
+        let report = index_report(&root, &cache);
+        let index = build_index(&root, &report.entries);
+        let sources = ["remembered".to_owned()];
+        let hits = search_indexed_local(
+            SearchInput {
+                store_root: &root,
+                entries: &report.entries,
+                query: "zirconium",
+                scopes: &[],
+                sources: &sources,
+                include_inbox: false,
+                agent_id: None,
+                project_id: None,
+                limit: 20,
+            },
+            &report.projection.entries,
+            &index,
+            &report.projection.entity_registry,
+            &report.projection.project_aliases,
+        )
+        .expect("local indexed search");
+
+        assert!(
+            hits.is_empty(),
+            "curated source bypassed remembered-only policy"
+        );
+    }
+
+    #[test]
+    fn indexed_search_unions_lexical_alias_recall() {
+        let dir = temp_dir("indexed-lexical-alias-union");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "Follow AGENTS.md instructions for every repository.",
+            timestamp(1_778_946_153),
+            Vec::new(),
+        );
+        let report = index_report(&root, &cache);
+        let index = build_index(&root, &report.entries);
+        let input = indexed_input(&root, &report.entries, "guidelines", &[], None, None);
+
+        let canonical = search_indexed(input.clone(), &index).expect("canonical indexed search");
+        let local = search_indexed_local(
+            input,
+            &report.projection.entries,
+            &index,
+            &report.projection.entity_registry,
+            &report.projection.project_aliases,
+        )
+        .expect("local indexed search");
+
+        assert_eq!(
+            canonical.len(),
+            1,
+            "BM25 must not suppress lexical alias recall"
+        );
+        assert_eq!(
+            local.len(),
+            1,
+            "local BM25 must preserve lexical alias recall"
+        );
+    }
+
+    fn hit_ids(hits: &[SearchHit]) -> BTreeSet<&str> {
+        hits.iter().map(|hit| hit.entry.id.as_str()).collect()
     }
 
     #[test]
