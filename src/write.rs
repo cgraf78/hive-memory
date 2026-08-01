@@ -18,6 +18,13 @@ enum PublishMode {
     CreateNew,
 }
 
+/// Whether `path` belongs to the reserved atomic-writer temporary namespace.
+pub(crate) fn is_atomic_temp_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(".tmp."))
+}
+
 /// Durability policy for an atomic write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FsyncPolicy {

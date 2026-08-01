@@ -104,109 +104,25 @@ fn load_cached_store_index(
         store_root: &store_config.root,
         cache_dir: &config.cache_dir,
         options,
-        path_case: memory_path::resolve_case(&config.storage.case_sensitive, &store_config.root),
-    })?)
-}
-
-fn load_fresh_store_index(
-    config: &Config,
-    store_name: &str,
-) -> Result<Option<index::LoadIndexReport>> {
-    let store_config = &config.stores[store_name];
-    let options = write::AtomicWriteOptions {
-        fsync: config.storage.fsync.into(),
-        ..write::AtomicWriteOptions::default()
-    };
-    Ok(index::load_fresh_index(&index::LoadIndexInput {
-        store_name,
-        store_root: &store_config.root,
-        cache_dir: &config.cache_dir,
-        options,
-        path_case: memory_path::resolve_case(&config.storage.case_sensitive, &store_config.root),
+        // Cache-only reads do not serialize paths; probing auto case behavior
+        // here would touch the canonical mount on the hook hot path.
+        path_case: memory_path::PathCase::Sensitive,
     })?)
 }
 
 enum PromptRecallIndex {
     Indexed(index::LoadIndexReport),
-    CuratedOnly,
     Skip(&'static str),
 }
 
-fn load_prompt_recall_index(
-    config: &Config,
-    store_name: &str,
-    curated_allowed: bool,
-) -> Result<PromptRecallIndex> {
-    let store_config = &config.stores[store_name];
-    match load_fresh_store_index(config, store_name) {
-        Ok(Some(report)) => Ok(PromptRecallIndex::Indexed(report)),
-        Ok(None) if !store_config.root.is_dir() => {
-            match load_cached_store_index(config, store_name) {
-                Ok(Some(report)) => {
-                    // `load_fresh_index` intentionally reports missing canonical
-                    // roots as cache misses, not errors. The hook policy still
-                    // distinguishes that offline case from a reachable stale cache:
-                    // cache-only remembered recall is useful when the store root is
-                    // unavailable, but stale indexed recall must not fire when the
-                    // store can be inspected.
-                    eprintln!(
-                        "warning: prompt recall using cache-only indexed recall because store root is unavailable: {}",
-                        store_config.root.display()
-                    );
-                    Ok(PromptRecallIndex::Indexed(report))
-                }
-                Ok(None) if curated_allowed => Ok(PromptRecallIndex::CuratedOnly),
-                Ok(None) => Ok(PromptRecallIndex::Skip("index-not-fresh")),
-                Err(err) if curated_allowed => {
-                    eprintln!(
-                        "warning: prompt recall using curated-only search because indexed cache fallback is unavailable: {err}"
-                    );
-                    Ok(PromptRecallIndex::CuratedOnly)
-                }
-                Err(err) => {
-                    eprintln!("warning: prompt recall skipped: {err}");
-                    Ok(PromptRecallIndex::Skip("index-unavailable"))
-                }
-            }
-        }
-        Ok(None) if curated_allowed => Ok(PromptRecallIndex::CuratedOnly),
-        Ok(None) => Ok(PromptRecallIndex::Skip("index-not-fresh")),
-        Err(err) => match load_cached_store_index(config, store_name) {
-            Ok(Some(report)) => {
-                // Freshness checks touch the canonical store root. When a
-                // cloud/offline store is temporarily unavailable, prefer a
-                // local cache-only recall over dropping remembered context
-                // entirely; reachable-but-stale stores take the `Ok(None)` path
-                // above and cannot serve stale indexed hits.
-                eprintln!(
-                    "warning: prompt recall using cache-only indexed recall because freshness check failed: {err}"
-                );
-                Ok(PromptRecallIndex::Indexed(report))
-            }
-            Ok(None) if curated_allowed => {
-                eprintln!(
-                    "warning: prompt recall using curated-only search because indexed recall is unavailable: {err}"
-                );
-                Ok(PromptRecallIndex::CuratedOnly)
-            }
-            Ok(None) => {
-                eprintln!("warning: prompt recall skipped: {err}");
-                Ok(PromptRecallIndex::Skip("index-unavailable"))
-            }
-            Err(cache_err) if curated_allowed => {
-                eprintln!(
-                    "warning: prompt recall using curated-only search because indexed recall is unavailable: {err}; cache fallback failed: {cache_err}"
-                );
-                Ok(PromptRecallIndex::CuratedOnly)
-            }
-            Err(cache_err) => {
-                eprintln!(
-                    "warning: prompt recall skipped: {err}; cache fallback failed: {cache_err}"
-                );
-                Ok(PromptRecallIndex::Skip("index-unavailable"))
-            }
-        },
+fn load_prompt_recall_index(config: &Config, store_name: &str) -> Result<PromptRecallIndex> {
+    if let Some(report) = load_cached_store_index(config, store_name)? {
+        // Prompt hooks are latency-sensitive. Once a complete local projection
+        // exists, use it without first proving freshness against a cloud mount;
+        // refresh is deliberately outside the synchronous response path.
+        return Ok(PromptRecallIndex::Indexed(report));
     }
+    Ok(PromptRecallIndex::Skip("index-not-ready"))
 }
 
 pub(crate) fn run(command: HookCommand, context: CliContext) -> Result<()> {
@@ -246,7 +162,15 @@ fn run_session_start(args: HookContextArgs, mut context: CliContext) -> Result<(
             path_hint: path_hint.clone(),
         },
     )?;
-    if let Some(session_id) = hook_session_id(&mut warnings) {
+    let schedule_refresh = assembly.stale;
+    let context_emitted = !assembly.stale || !assembly.output.sections.is_empty();
+    let refresh_target = assembly
+        .stores
+        .first()
+        .cloned()
+        .map(BackgroundRefreshTarget::One)
+        .unwrap_or(BackgroundRefreshTarget::All);
+    if context_emitted && let Some(session_id) = hook_session_id(&mut warnings) {
         memory_hook::mark_startup_context(
             &config.state_dir,
             &session_id,
@@ -261,18 +185,129 @@ fn run_session_start(args: HookContextArgs, mut context: CliContext) -> Result<(
         )?;
     }
 
+    let actions = if context_emitted {
+        vec![HookAction::new("inject_context", assembly.output.markdown)]
+    } else {
+        Vec::new()
+    };
+
     let response = HookResponse {
         event: "session-start",
-        actions: vec![HookAction::new("inject_context", assembly.output.markdown)],
+        actions,
         warnings,
         memory_pending: false,
-        context_emitted: true,
+        context_emitted,
         refresh: None,
         recall: None,
     };
     emit_hook_response(&response, args.json)?;
+    if schedule_refresh {
+        maybe_spawn_background_refresh(&config, &context, refresh_target, None);
+    }
 
     Ok(())
+}
+
+/// Refresh the local projection after returning stale-while-revalidate data.
+///
+/// Lifecycle hooks use this path automatically so a long-lived session sees
+/// other writers without paying canonical I/O in the foreground. The child is
+/// detached, periodic attempts are rate-limited, and a repeated receipt cursor
+/// is suppressed through the watchdog window. A new cursor launches immediately.
+#[derive(Debug)]
+enum BackgroundRefreshTarget {
+    One(String),
+    All,
+}
+
+fn maybe_spawn_background_refresh(
+    config: &Config,
+    context: &CliContext,
+    target: BackgroundRefreshTarget,
+    receipt_request: Option<(&str, usize)>,
+) {
+    let refresh_key = match &target {
+        BackgroundRefreshTarget::One(store_name) => config
+            .stores
+            .get(store_name)
+            .map(|store| index::store_cache_key(store_name, &store.root))
+            .unwrap_or_else(|| "all-stores".to_owned()),
+        BackgroundRefreshTarget::All => "all-stores".to_owned(),
+    };
+    // The same lock used for session-state read-modify-write also serializes
+    // receipt attempt publication. Contention is a duplicate or a nearby state
+    // update, so fail soft and let a later hook retry rather than spawning.
+    let _receipt_lock = if let Some((session_id, _)) = receipt_request {
+        match memory_hook::try_state_lock(&config.state_dir, session_id) {
+            Ok(Some(lock)) => Some(lock),
+            _ => return,
+        }
+    } else {
+        None
+    };
+    let (stamp, retry_after, attempt_body) = match receipt_request {
+        Some((session_id, cursor)) => (
+            memory_hook::receipt_refresh_attempt_path(&config.state_dir, session_id),
+            std::time::Duration::from_secs(super::sync::BACKGROUND_REFRESH_WATCHDOG_SECS),
+            cursor.to_string().into_bytes(),
+        ),
+        None => (
+            config
+                .state_dir
+                .join("background-refresh")
+                .join(format!("{refresh_key}.last-attempt")),
+            std::time::Duration::from_secs(60),
+            Vec::new(),
+        ),
+    };
+    let recent_attempt = std::fs::metadata(&stamp)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age < retry_after);
+    let same_request = receipt_request.is_none()
+        || std::fs::read(&stamp).is_ok_and(|contents| contents == attempt_body);
+    if recent_attempt && same_request {
+        return;
+    }
+    let Some(parent) = stamp.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err()
+        || write::write_atomic(&stamp, &attempt_body, &hook_options(config)).is_err()
+    {
+        return;
+    }
+
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut command = std::process::Command::new(exe);
+    if let Some(config_path) = &context.config_path {
+        command.arg("--config").arg(config_path);
+    }
+    if let BackgroundRefreshTarget::One(store) = &target {
+        command.arg("--store").arg(store);
+    }
+    if let Some(agent) = &context.as_agent {
+        command.arg("--as-agent").arg(agent);
+    }
+    command
+        .arg("refresh")
+        .arg("--quiet")
+        .arg("--background")
+        .env("HIVE_MEMORY_HOOK_ACTIVE", "1")
+        .env_remove("HIVE_MEMORY_BACKGROUND_REFRESH")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    if command.spawn().is_err() {
+        let _ = std::fs::remove_file(stamp);
+    }
 }
 
 /// Record explicit durable-memory intent from a prompt.
@@ -294,15 +329,17 @@ fn run_prompt_submit(args: HookPromptSubmitArgs, context: CliContext) -> Result<
     // Validate the same read policy used by possible context refresh below.
     // Prompt hooks should fail inside `hm` when project affinity is outside
     // agent policy, not leave shell adapters to discover that later.
-    validate_hook_context_read_policy(&config, &context, path_hint.as_deref())?;
+    let periodic_refresh_store =
+        validate_hook_context_read_policy(&config, &context, path_hint.as_deref())?;
     let mut context_emitted = false;
-    if let Some(action) = hook_context_action_if_changed(
+    let (context_action, refresh_store) = hook_context_action_if_changed(
         &config,
         &context,
         path_hint.as_deref(),
         session_id.as_deref(),
-        false,
-    )? {
+        true,
+    )?;
+    if let Some(action) = context_action {
         context_emitted = true;
         actions.push(action);
     }
@@ -349,6 +386,12 @@ fn run_prompt_submit(args: HookPromptSubmitArgs, context: CliContext) -> Result<
         recall,
     };
     emit_hook_response(&response, args.json)?;
+    maybe_spawn_background_refresh(
+        &config,
+        &context,
+        BackgroundRefreshTarget::One(refresh_store.unwrap_or(periodic_refresh_store)),
+        None,
+    );
 
     Ok(())
 }
@@ -361,8 +404,8 @@ fn run_prompt_submit(args: HookPromptSubmitArgs, context: CliContext) -> Result<
 fn run_tool_complete(args: HookToolCompleteArgs, context: CliContext) -> Result<()> {
     let config = load_config(context.config_path.as_deref())?;
     let mut warnings = Vec::new();
-    let mut actions = Vec::new();
-    let mut refresh = None;
+    let actions = Vec::new();
+    let refresh = None;
 
     let session_id = hook_session_id(&mut warnings);
     let mut memory_pending = if let Some(session_id) = session_id.as_deref() {
@@ -370,7 +413,9 @@ fn run_tool_complete(args: HookToolCompleteArgs, context: CliContext) -> Result<
     } else {
         false
     };
-    let mut context_emitted = false;
+    let context_emitted = false;
+    let mut refresh_target = None;
+    let mut refresh_request = None;
 
     if args.status == 0
         && let Some(session_id) = session_id.as_deref()
@@ -380,43 +425,22 @@ fn run_tool_complete(args: HookToolCompleteArgs, context: CliContext) -> Result<
         let unrefreshed_receipts = receipts.len().saturating_sub(state.refreshed_receipts);
 
         if unrefreshed_receipts > 0 {
-            let receipt_project_id = receipts
+            let stores = receipts
                 .iter()
                 .skip(state.refreshed_receipts)
-                .last()
-                .and_then(|receipt| receipt.project_id.clone())
-                .filter(|project_id| !project_id.trim().is_empty());
-
-            let mut report = super::sync::perform(&config, false)?;
-            report.record_receipts(unrefreshed_receipts);
-            refresh = Some(report);
-
-            state = memory_hook::mark_receipts_refreshed(
+                .map(|receipt| receipt.store.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            refresh_target = Some(if stores.len() == 1 {
+                BackgroundRefreshTarget::One(stores.first().expect("one receipt store").to_string())
+            } else {
+                BackgroundRefreshTarget::All
+            });
+            refresh_request = Some((session_id, receipts.len()));
+            state = memory_hook::mark_memory_satisfied(
                 &config.state_dir,
                 session_id,
-                receipts.len(),
-                true,
                 &hook_options(&config),
             )?;
-
-            // Tool completion is a high-frequency hook. Ignore process cwd or
-            // payload cwd here; in home-launched multi-project sessions those
-            // hints are often stale. A successful memory write receipt carries
-            // the project id that was actually written, so use that as the
-            // only project-aware context-refresh signal.
-            if let Some(project_id) = receipt_project_id
-                && let Some(action) = hook_context_action_if_changed_for_project(
-                    &config,
-                    &context,
-                    Some(project_id),
-                    None,
-                    Some(session_id),
-                    false,
-                )?
-            {
-                context_emitted = true;
-                actions.push(action);
-            }
         }
 
         memory_pending = state.memory_pending;
@@ -432,6 +456,9 @@ fn run_tool_complete(args: HookToolCompleteArgs, context: CliContext) -> Result<
         recall: None,
     };
     emit_hook_response(&response, args.json)?;
+    if let Some(target) = refresh_target {
+        maybe_spawn_background_refresh(&config, &context, target, refresh_request);
+    }
 
     Ok(())
 }
@@ -625,7 +652,7 @@ fn hook_context_action_if_changed(
     path_hint: Option<&str>,
     session_id: Option<&str>,
     emit_initial: bool,
-) -> Result<Option<HookAction>> {
+) -> Result<(Option<HookAction>, Option<String>)> {
     hook_context_action_if_changed_for_project(
         config,
         context,
@@ -643,9 +670,9 @@ fn hook_context_action_if_changed_for_project(
     path_hint: Option<&str>,
     session_id: Option<&str>,
     emit_initial: bool,
-) -> Result<Option<HookAction>> {
+) -> Result<(Option<HookAction>, Option<String>)> {
     let Some(session_id) = session_id else {
-        return Ok(None);
+        return Ok((None, None));
     };
 
     // Long-lived agents can move between projects while the process stays
@@ -653,16 +680,16 @@ fn hook_context_action_if_changed_for_project(
     // so hooks can reinject when path/project/store policy changes.
     let context_key = hook_context_key_for_project(config, context, project_id.clone(), path_hint)?;
     let state = memory_hook::load_state(&config.state_dir, session_id)?;
-    // SessionStart owns initial context injection. Prompt/tool hooks should only
+    // SessionStart owns initial context injection. Prompt hooks should only
     // reinject after an existing session selection changes; otherwise hook
     // runners that fire SessionStart and PromptSubmit close together can show
     // duplicate "Hive Memory Context" blocks before either process observes the
     // other's freshly written state.
     if state.context_key.is_none() && !emit_initial {
-        return Ok(None);
+        return Ok((None, None));
     }
     if state.context_key.as_deref() == Some(context_key.as_str()) {
-        return Ok(None);
+        return Ok((None, None));
     }
 
     let assembly = super::context::assemble_cli_context(
@@ -679,6 +706,13 @@ fn hook_context_action_if_changed_for_project(
             path_hint: path_hint.map(str::to_owned),
         },
     )?;
+    let refresh_store = assembly
+        .stale
+        .then(|| assembly.stores.first().cloned())
+        .flatten();
+    if assembly.stale && assembly.output.sections.is_empty() {
+        return Ok((None, refresh_store));
+    }
     let section_ids = assembly
         .output
         .sections
@@ -693,10 +727,10 @@ fn hook_context_action_if_changed_for_project(
         &hook_options(config),
     )?;
 
-    Ok(Some(HookAction::new(
-        "inject_context",
-        assembly.output.markdown,
-    )))
+    Ok((
+        Some(HookAction::new("inject_context", assembly.output.markdown)),
+        refresh_store,
+    ))
 }
 
 fn hook_prompt_recall_action(
@@ -729,67 +763,61 @@ fn hook_prompt_recall_action(
     // Prompt recall is an automatic `hm search`, so it follows the same source
     // defaults. Raw inbox material remains opt-in through that policy.
     let sources = &config.defaults.search_sources;
-    let curated_allowed = super::search::source_filter_includes_curated(sources);
-    let cached_report = match load_prompt_recall_index(config, &store_name, curated_allowed)? {
-        PromptRecallIndex::Indexed(report) => Some(report),
-        PromptRecallIndex::CuratedOnly => None,
+    let cached_report = match load_prompt_recall_index(config, &store_name)? {
+        PromptRecallIndex::Indexed(report) => report,
         PromptRecallIndex::Skip(reason) => {
             let mut recall = HookRecallReport::skipped(reason);
             recall.retrieval_ms = started.elapsed().as_millis();
             return Ok((None, recall));
         }
     };
-    let empty_entries = Vec::new();
-    let entries = cached_report
-        .as_ref()
-        .map(|report| report.entries.as_slice())
-        .unwrap_or_else(|| empty_entries.as_slice());
-    let curated_only_sources;
-    let search_sources = if cached_report.is_some() {
-        sources.as_slice()
-    } else {
-        // When the note index is stale/missing, remembered/raw recall would be
-        // incomplete. Curated Markdown is read directly, so keep that part of
-        // the configured recall surface available without pretending the JSONL
-        // note corpus was searched.
-        curated_only_sources = vec!["curated".to_owned()];
-        curated_only_sources.as_slice()
-    };
-    let include_inbox = super::search::search_include_inbox(false, search_sources);
+    let entries = cached_report.projection.entries.as_slice();
+    let include_inbox = super::search::search_include_inbox(false, sources);
+    let state = memory_hook::load_state(&config.state_dir, session_id)?;
+    let known_ids = memory_hook::known_session_memory_ids(&state);
     let search_input = search::SearchInput {
         store_root: &store_config.root,
         entries,
         query: &query,
         scopes: &config.defaults.search_scopes,
-        sources: search_sources,
+        sources,
         include_inbox,
         agent_id: agent_id.as_deref(),
         project_id: project_id.as_deref(),
-        limit: 10,
+        // Search beyond memories already emitted in this session. Applying the
+        // old fixed cap before session dedupe permanently hid rank 11+ after the
+        // first few prompts even though those memories remained eligible.
+        limit: known_ids.len().saturating_add(3).max(10),
     };
     // Prefer BM25 recall when the persistent index is already fresh; this is
     // where the prompt hook gains paraphrase/multi-session recall. Fall back to
     // the lexical scan when the index is stale/absent so the hook never pays for
     // a rebuild on its latency budget (refresh/tool-complete keeps it fresh).
-    let hits =
-        match super::search::tantivy_search_if_fresh(config, &store_name, search_input.clone()) {
-            Some(hits) => hits,
-            None => match search::search(search_input) {
-                Ok(hits) => hits,
-                Err(search::SearchError::EmptyQuery) => {
-                    return Ok((None, HookRecallReport::skipped("budget-empty")));
-                }
-                Err(err) => {
-                    let mut recall = HookRecallReport::skipped("index-unavailable");
-                    recall.retrieval_ms = started.elapsed().as_millis();
-                    eprintln!("warning: prompt recall skipped: {err}");
-                    return Ok((None, recall));
-                }
-            },
-        };
+    let registry = &cached_report.projection.entity_registry;
+    let project_aliases = &cached_report.projection.project_aliases;
+    let hits = match super::search::tantivy_search_local_if_fresh(
+        config,
+        &store_name,
+        &cached_report.entries,
+        search_input.clone(),
+        registry,
+        project_aliases,
+    ) {
+        Some(hits) => hits,
+        None => match search::search_local_index(search_input, registry, project_aliases) {
+            Ok(hits) => hits,
+            Err(search::SearchError::EmptyQuery) => {
+                return Ok((None, HookRecallReport::skipped("budget-empty")));
+            }
+            Err(err) => {
+                let mut recall = HookRecallReport::skipped("index-unavailable");
+                recall.retrieval_ms = started.elapsed().as_millis();
+                eprintln!("warning: local prompt recall skipped: {err}");
+                return Ok((None, recall));
+            }
+        },
+    };
 
-    let state = memory_hook::load_state(&config.state_dir, session_id)?;
-    let known_ids = memory_hook::known_session_memory_ids(&state);
     let selected_entries = hits
         .iter()
         .filter(|hit| !known_ids.contains(&hit.entry.id))
@@ -829,12 +857,12 @@ fn hook_prompt_recall_action(
     }
 
     let max_tokens = usize::try_from(config.defaults.hook_context_max_tokens)?.clamp(200, 1_200);
-    let output = memory_context::assemble_selected_context(memory_context::ContextInput {
+    let context_input = memory_context::ContextInput {
         store_name: store_name.as_str(),
         store_root: &store_config.root,
         entries: &selected_entries,
         scopes: &config.defaults.search_scopes,
-        sources: search_sources,
+        sources,
         include_inbox,
         include_search_only: true,
         agent_id: agent_id.as_deref(),
@@ -843,7 +871,11 @@ fn hook_prompt_recall_action(
         max_tokens,
         inject_strategy: inject::Strategy::from_config(&config.defaults.context_strategy),
         explain: false,
-    })?;
+    };
+    let output = memory_context::assemble_selected_local_index_context(
+        context_input,
+        &cached_report.projection.project_aliases,
+    )?;
     if output.sections.is_empty() {
         recall.reason = "below-threshold";
         recall.selected_count = 0;
@@ -905,6 +937,9 @@ fn prompt_recall_query(prompt: &str, path_hint: Option<&str>) -> Option<String> 
         if is_prompt_stopword(&token) {
             continue;
         }
+        if is_task_intent_term(&token) {
+            continue;
+        }
         if is_code_prompt_term(&token) {
             push_unique(&mut code_terms, token);
         } else if token.len() >= 4 {
@@ -925,7 +960,13 @@ fn prompt_recall_query(prompt: &str, path_hint: Option<&str>) -> Option<String> 
     }
 
     let terms = if !code_terms.is_empty() {
-        code_terms.into_iter().take(3).collect::<Vec<_>>()
+        let mut terms = code_terms.into_iter().take(3).collect::<Vec<_>>();
+        terms.extend(
+            plain_terms
+                .into_iter()
+                .take(4usize.saturating_sub(terms.len())),
+        );
+        terms
     } else {
         plain_terms.into_iter().take(2).collect::<Vec<_>>()
     };
@@ -946,6 +987,42 @@ fn is_code_prompt_term(token: &str) -> bool {
         || token.contains('/')
         || token.contains('.')
         || token.contains('<')
+}
+
+fn is_task_intent_term(token: &str) -> bool {
+    matches!(
+        token,
+        "analyze"
+            | "analyse"
+            | "check"
+            | "debug"
+            | "debugging"
+            | "describe"
+            | "explain"
+            | "find"
+            | "fix"
+            | "fixing"
+            | "help"
+            | "inspect"
+            | "investigate"
+            | "look"
+            | "looking"
+            | "make"
+            | "making"
+            | "need"
+            | "review"
+            | "show"
+            | "summarise"
+            | "summarize"
+            | "tell"
+            | "take"
+            | "try"
+            | "trying"
+            | "understand"
+            | "use"
+            | "using"
+            | "want"
+    )
 }
 
 fn is_prompt_stopword(token: &str) -> bool {
@@ -1004,9 +1081,11 @@ fn hook_context_key_for_project(
         StoreAccess::Read,
     )?;
 
+    let store = &config.stores[resolved_store.name.as_str()];
+    let store_key = index::store_cache_key(&resolved_store.name, &store.root);
     Ok(super::context::context_selection_key(
         &agent_label,
-        &[resolved_store.name],
+        &[store_key],
         project_id.as_deref(),
         path_hint,
         &config.defaults.search_scopes,
@@ -1021,25 +1100,25 @@ fn hook_context_key_for_project(
 
 /// Validate read-side hook policy without assembling or emitting context.
 ///
-/// Prompt/tool hooks call this before doing auxiliary work so policy failures
-/// are reported by `hm` consistently, while the shell hook remains a thin event
+/// Prompt hooks call this before doing auxiliary work so policy failures are
+/// reported by `hm` consistently, while the shell hook remains a thin event
 /// adapter with no duplicate store-affinity logic.
 fn validate_hook_context_read_policy(
     config: &Config,
     context: &CliContext,
     path_hint: Option<&str>,
-) -> Result<()> {
+) -> Result<String> {
     let agent_id = resolve_agent_id(context.as_agent.clone());
     let project_id = resolve_project_id(None, path_hint)?;
     let project_binding = project_binding_store(config, project_id.as_deref())?;
-    resolve_store(
+    Ok(resolve_store(
         config,
         context.store.as_deref(),
         project_binding.as_deref(),
         agent_id.as_deref(),
         StoreAccess::Read,
-    )?;
-    Ok(())
+    )?
+    .name)
 }
 
 fn memory_intent_reminder() -> &'static str {
@@ -1063,6 +1142,40 @@ mod tests {
             )
             .as_deref(),
             Some("grafhome cedar")
+        );
+    }
+
+    #[test]
+    fn prompt_recall_query_skips_leading_task_intent() {
+        assert_eq!(
+            prompt_recall_query("Help analyze the deployment timeout.", None).as_deref(),
+            Some("deployment timeout")
+        );
+        assert_eq!(
+            prompt_recall_query("Find the deployment timeout.", None).as_deref(),
+            Some("deployment timeout")
+        );
+        assert_eq!(
+            prompt_recall_query("Explain the deployment timeout.", None).as_deref(),
+            Some("deployment timeout")
+        );
+        assert_eq!(
+            prompt_recall_query("In src/foo.rs, explain the deployment timeout.", None).as_deref(),
+            Some("src/foo.rs deployment timeout")
+        );
+        assert_eq!(
+            prompt_recall_query("I need help debugging the deployment timeout.", None).as_deref(),
+            Some("deployment timeout")
+        );
+        assert_eq!(
+            prompt_recall_query("I'm trying to understand the deployment timeout.", None)
+                .as_deref(),
+            Some("deployment timeout")
+        );
+        assert_eq!(
+            prompt_recall_query("Can you take a look into the deployment timeout.", None)
+                .as_deref(),
+            Some("deployment timeout")
         );
     }
 }

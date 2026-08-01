@@ -18,7 +18,7 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use tempfile::TempDir;
 use time::OffsetDateTime;
 
 #[derive(Debug, Deserialize)]
@@ -59,6 +59,8 @@ struct ContextCase {
 }
 
 struct Materialized {
+    _root_dir: TempDir,
+    _cache_dir: TempDir,
     root: PathBuf,
     entries: Vec<IndexEntry>,
 }
@@ -152,7 +154,8 @@ fn load_corpus() -> Corpus {
 }
 
 fn materialize(corpus: &Corpus) -> Materialized {
-    let root = temp_dir("retrieval-eval").join("personal");
+    let root_dir = temp_dir("retrieval-eval");
+    let root = root_dir.path().join("personal");
     fs::create_dir_all(&root).expect("create store root");
     let manifest = StoreManifest::with_identity(
         "personal",
@@ -198,11 +201,11 @@ fn materialize(corpus: &Corpus) -> Materialized {
         .expect("write eval record");
     }
 
-    let cache = temp_dir("retrieval-eval-cache");
+    let cache_dir = temp_dir("retrieval-eval-cache");
     let report = index::rebuild_index(RebuildIndexInput {
         store_name: "personal",
         store_root: &root,
-        cache_dir: &cache,
+        cache_dir: cache_dir.path(),
         options,
         path_case: PathCase::Sensitive,
     })
@@ -214,6 +217,8 @@ fn materialize(corpus: &Corpus) -> Materialized {
     );
 
     Materialized {
+        _root_dir: root_dir,
+        _cache_dir: cache_dir,
         root,
         entries: report.entries,
     }
@@ -251,15 +256,11 @@ fn assert_excludes(case: &str, subjects: &BTreeSet<String>, forbidden: &[String]
     }
 }
 
-fn temp_dir(name: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock after epoch")
-        .as_nanos();
-    let path =
-        std::env::temp_dir().join(format!("hive-memory-{name}-{}-{nanos}", std::process::id()));
-    fs::create_dir_all(&path).expect("create temp dir");
-    path
+fn temp_dir(name: &str) -> TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("hive-memory-{name}-"))
+        .tempdir()
+        .expect("create temp dir")
 }
 
 fn entry_kind(value: &str) -> EntryKind {

@@ -12,18 +12,18 @@ use std::fmt::{self, Display};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Canonical entity id extracted from memory text or a recall query.
 pub type EntityId = String;
 
 /// User-editable entity alias registry.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntityRegistry {
     entities: Vec<EntityDef>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct EntityDef {
     id: String,
     aliases: Vec<String>,

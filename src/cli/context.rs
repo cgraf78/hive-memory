@@ -1,17 +1,22 @@
 //! Context CLI assembly, cache, output models, and selection identity.
 
 use crate::{
-    BackendUnavailable, CliContext, StoreAccess, context_session_id, hook_active, hook_options,
-    load_config, project_binding_store, rebuild_store_index, resolve_agent_id, resolve_project_id,
+    CliContext, StoreAccess, context_session_id, hook_active, hook_options, load_config,
+    project_binding_store, rebuild_store_index, resolve_agent_id, resolve_project_id,
     resolve_store,
 };
 use anyhow::Result;
 use clap::Args;
 use hive_memory::config::Config;
-use hive_memory::{config, context as memory_context, hook as memory_hook, inject, store, write};
+use hive_memory::{
+    config, context as memory_context, hook as memory_hook, index, inject, path as memory_path,
+    write,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use time::OffsetDateTime;
+
+const MAX_CONTEXT_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Arguments for `hm context`.
 #[derive(Debug, Args)]
@@ -85,7 +90,7 @@ pub(crate) fn run(args: ContextArgs, context: CliContext) -> Result<()> {
     if args.if_changed
         && let Some(session_id) = context_session_id()
     {
-        let context_key = context_selection_key_from_assembly(&assembly);
+        let context_key = context_selection_key_from_assembly(&config, &assembly);
         let state = memory_hook::load_state(&config.state_dir, &session_id)?;
         if state.context_key.as_deref() == Some(context_key.as_str()) {
             if args.json {
@@ -141,7 +146,7 @@ pub(crate) struct CliContextAssembly {
     agent_id: Option<String>,
     project_id: Option<String>,
     project_hint: Option<String>,
-    stores: Vec<String>,
+    pub(crate) stores: Vec<String>,
     store_source: String,
     scopes: Vec<String>,
     sources: Vec<String>,
@@ -151,7 +156,7 @@ pub(crate) struct CliContextAssembly {
     include_search_only: bool,
     /// Resolved selection strategy label, part of the cache key.
     strategy: String,
-    stale: bool,
+    pub(crate) stale: bool,
     cache_created_at: Option<String>,
 }
 
@@ -209,9 +214,10 @@ pub(crate) fn assemble_cli_context(
     let store_source = resolved_store.source.to_string();
     let store_config = &config.stores[resolved_store.name.as_str()];
     let stores = vec![store_name.clone()];
+    let store_keys = vec![index::store_cache_key(&store_name, &store_config.root)];
     let context_key = context_selection_key(
         agent_id.as_deref().unwrap_or("unknown"),
-        &stores,
+        &store_keys,
         project_id.as_deref(),
         path_hint.as_deref(),
         &scopes,
@@ -222,44 +228,155 @@ pub(crate) fn assemble_cli_context(
             strategy: &strategy_label,
         },
     );
+    let cached_index_path =
+        index::scoped_index_path(&config.cache_dir, &store_name, &store_config.root);
     let hook_active = hook_active(context);
     if hook_active
-        && let Err(store::StoreError::Io { .. }) = store::read_manifest(&store_config.root)
+        && let Some(assembly) = load_context_cache(
+            config,
+            &context_key,
+            store_source.clone(),
+            path_hint.as_deref(),
+            &cached_index_path,
+        )?
     {
-        // Hook context runs at agent startup/prompt boundaries, where failing
-        // hard on an offline cloud/mount path is worse than using the last
-        // known-good context. Outside hook mode, interactive commands should
-        // rebuild normally and surface the underlying store read failure.
-        if let Some(assembly) = load_context_cache(config, &context_key, store_source.clone())? {
-            return Ok(assembly);
-        }
-        return Err(BackendUnavailable {
-            message: format!(
-                "store {} is unavailable and no valid context cache exists",
-                resolved_store.name
-            ),
-        }
-        .into());
+        // Lifecycle hooks have a hard latency budget. A canonical store can be
+        // a reachable but cold cloud mount, so even a freshness stat may block
+        // past that budget. Serve the complete policy-scoped local snapshot;
+        // canonical refresh belongs outside the synchronous hook path.
+        return Ok(assembly);
     }
-    let max_tokens = selection.max_tokens.unwrap_or_else(|| {
-        // Hooks run on latency-sensitive agent boundaries, so they use the
-        // configured hook budget unless the caller has explicitly provided a
-        // tighter or broader limit. Interactive `hm context` keeps the larger
-        // v1 default for inspection and manual debugging.
-        if hook_active {
+    if hook_active
+        && let Some(report) = index::load_cached_index(&index::LoadIndexInput {
+            store_name: &store_name,
+            store_root: &store_config.root,
+            cache_dir: &config.cache_dir,
+            options: write::AtomicWriteOptions {
+                fsync: config.storage.fsync.into(),
+                ..write::AtomicWriteOptions::default()
+            },
+            // Cache-only loads never serialize paths, so path_case is unused.
+            // Avoid resolve_case: auto mode probes the canonical mount.
+            path_case: memory_path::PathCase::Sensitive,
+        })?
+    {
+        let max_tokens = selection.max_tokens.unwrap_or_else(|| {
             usize::try_from(config.defaults.hook_context_max_tokens)
                 .expect("hook context token budget fits usize")
+        });
+        let mut output = memory_context::assemble_local_index_context(
+            memory_context::ContextInput {
+                store_name: store_name.as_str(),
+                store_root: &store_config.root,
+                entries: &report.projection.entries,
+                scopes: &scopes,
+                sources: &sources,
+                include_inbox,
+                include_search_only,
+                agent_id: agent_id.as_deref(),
+                project_id: project_id.as_deref(),
+                path_hint: path_hint.as_deref(),
+                max_tokens,
+                inject_strategy,
+                explain: selection.explain,
+            },
+            &report.projection.project_aliases,
+        )?;
+        let cache_created_at = std::fs::metadata(&report.path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .map(OffsetDateTime::from)
+            .and_then(|created_at| {
+                created_at
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .ok()
+            });
+        let age = cache_created_at.as_deref().unwrap_or("unknown time");
+        let snapshot_label = if report.projection.complete {
+            "complete local index snapshot"
         } else {
-            4000
+            "best-available incomplete local index snapshot"
+        };
+        output.markdown = format!(
+            "> Hive Memory context is a {snapshot_label} from {age}; canonical refresh is asynchronous.\n\n{}",
+            output.markdown
+        );
+        let assembly = CliContextAssembly {
+            output,
+            agent_id,
+            project_id,
+            project_hint: path_hint,
+            stores,
+            store_source,
+            scopes,
+            sources,
+            include_inbox,
+            include_search_only,
+            strategy: strategy_label,
+            stale: true,
+            cache_created_at,
+        };
+        if let Err(err) = write_context_cache(config, &assembly) {
+            eprintln!("warning: failed to write local context cache: {err}");
         }
-    });
+        return Ok(assembly);
+    }
+    if hook_active {
+        // Lifecycle hooks must never bootstrap from canonical storage. A cold
+        // or corrupt local cache returns a bounded empty view immediately;
+        // the caller schedules detached projection hydration after responding.
+        let aliases = std::collections::BTreeMap::new();
+        let mut output = memory_context::assemble_local_index_context(
+            memory_context::ContextInput {
+                store_name: store_name.as_str(),
+                store_root: &store_config.root,
+                entries: &[],
+                scopes: &scopes,
+                sources: &sources,
+                include_inbox,
+                include_search_only,
+                agent_id: agent_id.as_deref(),
+                project_id: project_id.as_deref(),
+                path_hint: path_hint.as_deref(),
+                max_tokens: selection.max_tokens.unwrap_or_else(|| {
+                    usize::try_from(config.defaults.hook_context_max_tokens)
+                        .expect("hook context token budget fits usize")
+                }),
+                inject_strategy,
+                explain: selection.explain,
+            },
+            &aliases,
+        )?;
+        output.markdown = format!(
+            "> Hive Memory has no local projection yet; canonical hydration is asynchronous.\n\n{}",
+            output.markdown
+        );
+        return Ok(CliContextAssembly {
+            output,
+            agent_id,
+            project_id,
+            project_hint: path_hint,
+            stores,
+            store_source,
+            scopes,
+            sources,
+            include_inbox,
+            include_search_only,
+            strategy: strategy_label,
+            stale: true,
+            cache_created_at: None,
+        });
+    }
+    // Hook mode returned above. Interactive `hm context` keeps the larger v1
+    // default for inspection and manual debugging.
+    let max_tokens = selection.max_tokens.unwrap_or(4000);
 
-    // Fresh assembly can still fail past the manifest check: the index rebuild
-    // or a curated/canonical read can hit a mid-sync file on a cloud-backed
-    // root. In hook mode those failures degrade to the last known-good cache,
-    // exactly like an unreachable store; interactive commands surface the
-    // underlying error so the store gets fixed instead of papered over.
-    let fresh = rebuild_store_index(config, &resolved_store.name).and_then(|report| {
+    // Interactive canonical reads require a reachable, valid store. This also
+    // prevents an unavailable root from being mistaken for a legitimate empty
+    // store and replacing the last local projection.
+    crate::read_store_manifest(config, &resolved_store.name, store_config)?;
+
+    let output = rebuild_store_index(config, &resolved_store.name).and_then(|report| {
         memory_context::assemble_context(memory_context::ContextInput {
             store_name: store_name.as_str(),
             store_root: &store_config.root,
@@ -276,20 +393,7 @@ pub(crate) fn assemble_cli_context(
             explain: selection.explain,
         })
         .map_err(anyhow::Error::from)
-    });
-    let output = match fresh {
-        Ok(output) => output,
-        Err(err) => {
-            if hook_active
-                && let Some(assembly) =
-                    load_context_cache(config, &context_key, store_source.clone())?
-            {
-                eprintln!("warning: hook context degraded to cached fallback: {err}");
-                return Ok(assembly);
-            }
-            return Err(err);
-        }
-    };
+    })?;
     // Per-record degradations are non-fatal by design; surface them on stderr
     // so sync damage is visible without stripping memory from the session.
     for warning in &output.warnings {
@@ -393,6 +497,9 @@ struct ContextCacheEntry {
     schema_version: u32,
     /// RFC3339 write time used for max-age policy.
     created_at: String,
+    /// Local index generation rendered into this snapshot.
+    #[serde(default)]
+    index_generation: Option<u128>,
     /// Full context selection key that produced this entry.
     key: String,
     /// Exact Markdown injected during the successful fresh assembly.
@@ -453,13 +560,25 @@ fn write_context_cache(config: &Config, assembly: &CliContextAssembly) -> Result
     // memory source. Keep the full rendered Markdown plus section metadata so a
     // later stale response can preserve the same data-boundary labeling without
     // touching the store root.
-    let key = context_selection_key_from_assembly(assembly);
+    let key = context_selection_key_from_assembly(config, assembly);
     let path = context_cache_path(&config.state_dir, &key);
+    let index_generation = assembly
+        .stores
+        .first()
+        .and_then(|store_name| config.stores.get(store_name))
+        .and_then(|store| {
+            index_generation(&index::scoped_index_path(
+                &config.cache_dir,
+                assembly.stores.first().expect("selected store exists"),
+                &store.root,
+            ))
+        });
     let entry = ContextCacheEntry {
         schema_version: 1,
         created_at: OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .expect("RFC3339 formatting should not fail"),
+        index_generation,
         key,
         markdown: assembly.output.markdown.clone(),
         agent_id: assembly.agent_id.clone(),
@@ -512,6 +631,41 @@ fn context_cache_path(state_dir: &std::path::Path, key: &str) -> PathBuf {
     ))
 }
 
+/// Remove context snapshots that policy would no longer allow hooks to replay.
+///
+/// This runs only during explicit/background refresh, never on a hook response
+/// path. Malformed entries are also disposable because they cannot be loaded.
+pub(crate) fn prune_expired_context_cache(config: &Config) -> Result<usize> {
+    let dir = config.state_dir.join("context-cache");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err.into()),
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let reusable = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|contents| serde_json::from_str::<ContextCacheEntry>(&contents).ok())
+            .is_some_and(|entry| {
+                context_cache_is_fresh(&entry.created_at, &config.defaults.context_cache_max_age)
+            });
+        if !reusable {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err.into()),
+            }
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 /// Load a last-success context assembly for an exact selection key.
 ///
 /// This is intentionally stricter than a generic "last context" cache. Hook
@@ -522,16 +676,35 @@ fn load_context_cache(
     config: &Config,
     key: &str,
     store_source: String,
+    path_hint: Option<&str>,
+    cached_index_path: &std::path::Path,
 ) -> Result<Option<CliContextAssembly>> {
     let path = context_cache_path(&config.state_dir, key);
+    if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() > MAX_CONTEXT_CACHE_BYTES) {
+        return Ok(None);
+    }
     let contents = match std::fs::read_to_string(&path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err.into()),
+        Err(_) => return Ok(None),
     };
-    let entry: ContextCacheEntry = serde_json::from_str(&contents)?;
+    let Ok(entry) = serde_json::from_str::<ContextCacheEntry>(&contents) else {
+        return Ok(None);
+    };
     if entry.schema_version != 1 || entry.key != key {
         return Ok(None);
+    }
+    if let Some(current_generation) = index_generation(cached_index_path) {
+        let cache_covers_generation = entry.index_generation.map_or_else(
+            || {
+                index_generation(&path)
+                    .is_some_and(|cache_generation| cache_generation >= current_generation)
+            },
+            |cached_generation| cached_generation == current_generation,
+        );
+        if !cache_covers_generation {
+            return Ok(None);
+        }
     }
     // Cache fallback happens only after store resolution has enforced the
     // current agent policy. Matching the full context key keeps stale data tied
@@ -541,11 +714,12 @@ fn load_context_cache(
         return Ok(None);
     }
 
+    let cached_markdown = cached_markdown_with_path(&entry.markdown, path_hint);
     let markdown = format!(
-        "> Hive Memory context is stale offline cache from {}; stores: {}.\n\n{}",
+        "> Hive Memory context is served from local cache from {}; stores: {}.\n\n{}",
         entry.created_at,
         entry.stores.join(","),
-        entry.markdown
+        cached_markdown
     );
     let sections = entry
         .sections
@@ -585,7 +759,7 @@ fn load_context_cache(
         },
         agent_id: entry.agent_id,
         project_id: entry.project_id,
-        project_hint: entry.project_hint,
+        project_hint: path_hint.map(str::to_owned).or(entry.project_hint),
         stores: entry.stores,
         store_source,
         scopes: entry.scopes,
@@ -598,6 +772,45 @@ fn load_context_cache(
         stale: true,
         cache_created_at: Some(entry.created_at),
     }))
+}
+
+fn index_generation(path: &std::path::Path) -> Option<u128> {
+    std::fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_nanos())
+}
+
+/// Refresh presentation-only path metadata when a stable project cache is reused.
+fn cached_markdown_with_path(markdown: &str, path_hint: Option<&str>) -> String {
+    let path_hint = path_hint.unwrap_or("none");
+    let path_hint = path_hint
+        .chars()
+        .map(|ch| match ch {
+            '\r' | '\n' | '\t' => ' ',
+            _ => ch,
+        })
+        .collect::<String>();
+    let mut replaced = false;
+    let mut rewritten = markdown
+        .lines()
+        .map(|line| {
+            if !replaced && line.starts_with("path: ") {
+                replaced = true;
+                format!("path: {}", path_hint.trim())
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if markdown.ends_with('\n') {
+        rewritten.push('\n');
+    }
+    rewritten
 }
 
 /// Return whether a context cache entry is still acceptable for hook fallback.
@@ -718,16 +931,26 @@ fn context_json_suppressed(
     }
 }
 
-fn context_selection_key_from_assembly(assembly: &CliContextAssembly) -> String {
+fn context_selection_key_from_assembly(config: &Config, assembly: &CliContextAssembly) -> String {
     let agent_id = assembly.agent_id.as_deref().unwrap_or("unknown");
     let policy = ContextKeyPolicy {
         include_inbox: assembly.include_inbox,
         include_search_only: assembly.include_search_only,
         strategy: &assembly.strategy,
     };
+    let store_keys = assembly
+        .stores
+        .iter()
+        .filter_map(|store_name| {
+            config
+                .stores
+                .get(store_name)
+                .map(|store| index::store_cache_key(store_name, &store.root))
+        })
+        .collect::<Vec<_>>();
     context_selection_key(
         agent_id,
-        &assembly.stores,
+        &store_keys,
         assembly.project_id.as_deref(),
         assembly.project_hint.as_deref(),
         &assembly.scopes,
@@ -755,6 +978,35 @@ pub(crate) fn context_selection_key(
         include_search_only,
         strategy,
     } = policy;
+    // Once a stable project id exists, the literal file/cwd hint changes only
+    // presentation. Keeping it in the identity creates one cache file per
+    // editor buffer and prevents same-project reuse during a store outage.
+    let path_hint = project_id.is_none().then_some(path_hint).flatten();
+    format_context_selection_key(
+        agent_id,
+        stores,
+        project_id,
+        path_hint,
+        scopes,
+        sources,
+        include_inbox,
+        include_search_only,
+        strategy,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_context_selection_key(
+    agent_id: &str,
+    stores: &[String],
+    project_id: Option<&str>,
+    path_hint: Option<&str>,
+    scopes: &[String],
+    sources: &[String],
+    include_inbox: bool,
+    include_search_only: bool,
+    strategy: &str,
+) -> String {
     format!(
         "agent={agent_id}\nstores={}\nproject_id={}\npath={}\nscopes={}\nsources={}\ninclude_inbox={include_inbox}\ninclude_search_only={include_search_only}\nstrategy={strategy}",
         stores.join(","),
@@ -769,4 +1021,18 @@ pub(crate) struct ContextKeyPolicy<'a> {
     pub(crate) include_inbox: bool,
     pub(crate) include_search_only: bool,
     pub(crate) strategy: &'a str,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cached_markdown_with_path;
+
+    #[test]
+    fn cached_path_rewrite_crosses_local_snapshot_banner() {
+        let markdown = "> Hive Memory context is a local snapshot.\n\nHive Memory Context\npath: /repo/src/old.rs\n\n<memory>body</memory>\n";
+        let rewritten = cached_markdown_with_path(markdown, Some("/repo/src/new.rs"));
+
+        assert!(rewritten.contains("path: /repo/src/new.rs"));
+        assert!(!rewritten.contains("path: /repo/src/old.rs"));
+    }
 }

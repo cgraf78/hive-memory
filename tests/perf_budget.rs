@@ -28,10 +28,13 @@ const HOOK_PROMPT_CACHED_OFFLINE_BUDGET_MS: u128 = 350;
 // session-state write, so it gets a small amount of headroom over that budget.
 const HOOK_SESSION_START_WARM_BUDGET_MS: u128 = 250;
 const HOOK_TOOL_COMPLETE_NO_RECEIPT_WARM_BUDGET_MS: u128 = 200;
-// A successful receipt deliberately rebuilds the local index before returning.
-// Keep that occasional hook path subsecond locally without conflating it with
-// the near-zero no-receipt path that runs after ordinary tools.
-const HOOK_TOOL_COMPLETE_RECEIPT_WARM_BUDGET_MS: u128 = 750;
+// Receipt maintenance is detached; foreground latency should remain comparable
+// to the no-receipt path even when the child must rebuild 5,000 notes.
+const HOOK_TOOL_COMPLETE_RECEIPT_WARM_BUDGET_MS: u128 = 200;
+// Periodic refresh with no new write receipts validates the local projection
+// instead of reparsing every canonical note. The pre-optimization 5k-note path
+// was about 300ms on the reference host, so this budget catches that regression.
+const BACKGROUND_REFRESH_UNCHANGED_BUDGET_MS: u128 = 200;
 // Ten refreshes make p95 the slowest sample while keeping this filesystem-heavy
 // regression gate proportionate to the rest of the suite.
 const HOOK_REFRESH_RUNS: usize = 10;
@@ -88,6 +91,24 @@ fn context_and_search_stay_within_warm_budget() {
         !fixture_path.exists(),
         "synthetic store fixture was not removed: {}",
         fixture_path.display()
+    );
+}
+
+#[test]
+#[ignore = "CI runs this explicitly because it creates a 5000-note synthetic store"]
+fn unchanged_background_refresh_stays_within_warm_budget() {
+    let fixture = SyntheticStore::new();
+    fixture.refresh_index();
+
+    let refresh_p95 = p95_ms(repeat(HOOK_REFRESH_RUNS, || {
+        fixture.hm(["refresh", "--background", "--quiet"])
+    }));
+    eprintln!("hm unchanged background refresh p95: {refresh_p95}ms");
+
+    let budget = budget_ms(BACKGROUND_REFRESH_UNCHANGED_BUDGET_MS);
+    assert!(
+        refresh_p95 <= budget,
+        "hm unchanged background refresh p95 {refresh_p95}ms exceeded {budget}ms"
     );
 }
 
@@ -307,6 +328,52 @@ fn hook_prompt_submit_recall_stays_within_warm_budget() {
 }
 
 #[test]
+#[ignore = "CI runs this explicitly because it measures broad Tantivy recall over 5000 notes"]
+fn tantivy_broad_search_and_hook_recall_stay_within_warm_budget() {
+    let fixture = SyntheticStore::new_with_backend("tantivy");
+    fixture.refresh_index();
+
+    // Every synthetic record contains both terms. This guards the expensive
+    // realistic case where complete BM25 and deterministic lexical streams
+    // must be unioned before applying the small user-facing output limit.
+    let search_p95 = p95_ms(repeat(RUNS, || {
+        fixture.hm(["search", "synthetic memory", "--json"])
+    }));
+    let prompt_p95 = p95_ms(repeat(RUNS, || {
+        hm_command(
+            &fixture.config,
+            [
+                "--as-agent",
+                "codex",
+                "hook",
+                "prompt-submit",
+                "--project",
+                "/tmp/hive-memory-perf-project/src/main.rs",
+                "--text",
+                "Find the synthetic memory details.",
+                "--json",
+            ],
+        )
+        .env("HIVE_MEMORY_SESSION_ID", "perf-tantivy-broad-recall")
+        .assert()
+        .success();
+    }));
+    eprintln!("hm Tantivy broad search warm p95: {search_p95}ms");
+    eprintln!("hm Tantivy broad hook recall warm p95: {prompt_p95}ms");
+
+    let search_budget = budget_ms(SEARCH_WARM_BUDGET_MS);
+    let prompt_budget = budget_ms(HOOK_PROMPT_RECALL_WARM_BUDGET_MS);
+    assert!(
+        search_p95 <= search_budget,
+        "hm Tantivy broad search p95 {search_p95}ms exceeded {search_budget}ms"
+    );
+    assert!(
+        prompt_p95 <= prompt_budget,
+        "hm Tantivy broad hook recall p95 {prompt_p95}ms exceeded {prompt_budget}ms"
+    );
+}
+
+#[test]
 #[ignore = "CI runs this explicitly because it measures full hook recall latency"]
 fn hook_prompt_submit_cached_recall_stays_fast_when_store_root_is_unavailable() {
     let fixture = SyntheticStore::new();
@@ -489,15 +556,43 @@ fn hook_tool_complete_with_receipt_stays_within_warm_budget() {
                 .assert()
                 .success();
                 let elapsed = start.elapsed();
+                let completion_start = Instant::now();
                 let response: serde_json::Value =
                     serde_json::from_slice(&assert.get_output().stdout).expect("hook JSON");
                 assert_eq!(
-                    response["refresh"]["write_receipts"], 1,
-                    "tool-complete did not consume exactly one receipt: {response}"
+                    response["refresh"],
+                    serde_json::Value::Null,
+                    "tool-complete performed synchronous maintenance: {response}"
                 );
-                assert_eq!(
-                    response["refresh"]["refreshed"], true,
-                    "tool-complete did not refresh after the receipt: {response}"
+                let state_path = fixture
+                    .config
+                    .parent()
+                    .expect("fixture parent")
+                    .join(format!("state/runs/{session_id}/hook-state.json"));
+                let expected = run + 1;
+                let mut advanced = false;
+                for _ in 0..1_200 {
+                    if fs::read_to_string(&state_path)
+                        .ok()
+                        .and_then(|contents| {
+                            serde_json::from_str::<serde_json::Value>(&contents).ok()
+                        })
+                        .and_then(|state| state["refreshed_receipts"].as_u64())
+                        == Some(expected as u64)
+                    {
+                        advanced = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                assert!(
+                    advanced,
+                    "background refresh did not advance receipt cursor to {expected} within 30s"
+                );
+                eprintln!(
+                    "hm receipt background completion {}: {}ms",
+                    expected,
+                    completion_start.elapsed().as_millis()
                 );
                 elapsed
             })
@@ -530,11 +625,16 @@ struct SyntheticStore {
 
 impl SyntheticStore {
     fn new() -> Self {
+        Self::new_with_backend("lexical")
+    }
+
+    fn new_with_backend(search_backend: &str) -> Self {
         let dir = temp_dir("warm-budget");
         let config = dir.path().join("config.toml");
         let root = dir.path().join("personal");
         let cache = dir.path().join("cache");
         let state = dir.path().join("state");
+        let data = dir.path().join("data");
         store::init_store(&StoreInitOptions {
             name: "personal".to_owned(),
             root: root.clone(),
@@ -542,7 +642,7 @@ impl SyntheticStore {
             sensitivity: Sensitivity::Private,
         })
         .expect("init synthetic store");
-        write_config(&config, &root, &cache, &state);
+        write_config(&config, &root, &cache, &state, &data, search_backend);
         write_notes(&root);
         Self {
             _dir: dir,
@@ -623,7 +723,14 @@ fn write_flush_config(config: &Path, root: &Path, data: &Path) {
     .expect("write flush config");
 }
 
-fn write_config(config: &Path, root: &Path, cache: &Path, state: &Path) {
+fn write_config(
+    config: &Path,
+    root: &Path,
+    cache: &Path,
+    state: &Path,
+    data: &Path,
+    search_backend: &str,
+) {
     fs::write(
         config,
         format!(
@@ -631,9 +738,13 @@ fn write_config(config: &Path, root: &Path, cache: &Path, state: &Path) {
             default_store = "personal"
             cache_dir = "{}"
             state_dir = "{}"
+            data_dir = "{}"
 
             [stores.personal]
             root = "{}"
+
+            [defaults]
+            search_backend = "{}"
 
             [performance]
             context_warm_p95_ms = {}
@@ -641,7 +752,9 @@ fn write_config(config: &Path, root: &Path, cache: &Path, state: &Path) {
             "#,
             cache.display(),
             state.display(),
+            data.display(),
             root.display(),
+            search_backend,
             CONTEXT_WARM_BUDGET_MS,
             SYNTHETIC_NOTES
         ),

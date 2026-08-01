@@ -145,6 +145,13 @@ pub enum HookStateError {
         /// Original error rendered for CLI diagnostics.
         message: String,
     },
+    /// Another live hook held the session state lock past the foreground budget.
+    LockTimeout {
+        /// Lock path involved in the timeout.
+        path: PathBuf,
+        /// Maximum wait before preserving hook liveness.
+        wait_ms: u64,
+    },
     /// State JSON was corrupt or could not be serialized.
     Json(String),
 }
@@ -159,6 +166,11 @@ impl Display for HookStateError {
             } => write!(
                 f,
                 "failed to {action} hook state {}: {message}",
+                path.display()
+            ),
+            Self::LockTimeout { path, wait_ms } => write!(
+                f,
+                "timed out after {wait_ms}ms waiting for hook state lock {}",
                 path.display()
             ),
             Self::Json(message) => write!(f, "invalid hook state JSON: {message}"),
@@ -187,6 +199,57 @@ pub fn write_receipts_path(state_dir: &Path, session_id: &str) -> PathBuf {
         .join("runs")
         .join(id::sanitize_component(session_id))
         .join("writes.jsonl")
+}
+
+/// Return the detached-refresh attempt marker for one agent session.
+///
+/// Keeping the marker beside session state prevents independent sessions from
+/// overwriting each other's receipt cursors, and inactive-run pruning removes
+/// it with the rest of the advisory session data.
+pub fn receipt_refresh_attempt_path(state_dir: &Path, session_id: &str) -> PathBuf {
+    state_dir
+        .join("runs")
+        .join(id::sanitize_component(session_id))
+        .join("receipt-refresh-attempt")
+}
+
+/// Remove inactive per-session hook state older than `retention`.
+///
+/// State writes atomically replace files inside the run directory, updating its
+/// mtime. A resumed session therefore becomes current before background refresh
+/// can prune it. This removes only advisory context/receipt cursors, never
+/// canonical memory or queued outbox data.
+pub fn prune_inactive_runs(
+    state_dir: &Path,
+    retention: std::time::Duration,
+) -> Result<usize, HookStateError> {
+    let runs = state_dir.join("runs");
+    let entries = match fs::read_dir(&runs) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(io_error("read hook runs", &runs, err)),
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry.map_err(|err| io_error("read hook run entry", &runs, err))?;
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_dir()
+            || metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_none_or(|age| age <= retention)
+        {
+            continue;
+        }
+        fs::remove_dir_all(&path)
+            .map_err(|err| io_error("remove inactive hook run", &path, err))?;
+        removed += 1;
+    }
+    Ok(removed)
 }
 
 /// Return the hook refresh lock path for one agent/session pair.
@@ -291,9 +354,9 @@ fn lock_write_receipts(state_dir: &Path, session_id: &str) -> Result<ReceiptLock
 /// Try to acquire the non-blocking per-session hook-state lock.
 ///
 /// Returning `Ok(None)` means another hook is mid read-modify-write for this
-/// session; callers degrade to a best-effort unlocked update rather than failing,
-/// because hooks must never hard-fail on lock contention. Only genuine I/O
-/// errors (which mean local coordination state cannot be trusted) are surfaced.
+/// session. Callers choose either a nonblocking skip for advisory work or a
+/// condition wait for lossless state updates. Only genuine I/O errors (which
+/// mean local coordination state cannot be trusted) are surfaced.
 pub fn try_state_lock(
     state_dir: &Path,
     session_id: &str,
@@ -324,12 +387,12 @@ pub fn try_state_lock(
 /// Run a load -> mutate -> save cycle under the per-session state lock.
 ///
 /// This is the single serialized critical section every `mark_*` routes through.
-/// Lock acquisition is best-effort: on contention (`Ok(None)`) the closure still
-/// runs unlocked so the hook never hard-fails, accepting the original racy
-/// behavior only in the rare window where two hooks for one session overlap. The
-/// lock is held for the whole load+mutate+save and released by `StateLock`'s
-/// `Drop` when this function returns. It is never nested with `RefreshLock`, so
-/// no lock-ordering deadlock is possible.
+/// Contenders condition-wait on the local OS lock: proceeding unlocked can lose
+/// unrelated fields from another hook's whole-file atomic replacement. A
+/// 500-millisecond deadline keeps foreground hooks inside their outer adapter
+/// budget; timing out is an explicit error so callers never mistake a dropped
+/// mutation for success. The critical section contains only local state I/O,
+/// and process death releases the advisory lock.
 fn with_state_lock<F>(
     state_dir: &Path,
     session_id: &str,
@@ -339,9 +402,20 @@ fn with_state_lock<F>(
 where
     F: FnOnce(&mut HookState),
 {
-    // Best-effort: contention degrades to an unlocked update, a hard I/O error
-    // (corrupt local coordination state) still propagates.
-    let _lock = try_state_lock(state_dir, session_id)?;
+    const STATE_LOCK_WAIT_MS: u64 = 500;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(STATE_LOCK_WAIT_MS);
+    let _lock = loop {
+        if let Some(lock) = try_state_lock(state_dir, session_id)? {
+            break lock;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(HookStateError::LockTimeout {
+                path: state_lock_path(state_dir, session_id),
+                wait_ms: STATE_LOCK_WAIT_MS,
+            });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
     let mut state = load_state(state_dir, session_id)?;
     mutate(&mut state);
     save_state(state_dir, session_id, &state, options)?;
@@ -402,6 +476,28 @@ pub fn mark_memory_pending(
     )
 }
 
+/// Clear durable-memory intent after a successful write receipt is observed.
+///
+/// This is separate from the refresh cursor: latency-sensitive tool hooks can
+/// acknowledge the write immediately while detached index maintenance advances
+/// `refreshed_receipts` only after it succeeds.
+pub fn mark_memory_satisfied(
+    state_dir: &Path,
+    session_id: &str,
+    options: &write::AtomicWriteOptions,
+) -> Result<HookState, HookStateError> {
+    with_state_lock(
+        state_dir,
+        session_id,
+        |state| {
+            state.memory_pending = false;
+            state.pending_reason = None;
+            state.updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
+        },
+        options,
+    )
+}
+
 /// Record that refresh/tool-complete consumed receipts through `receipt_count`.
 pub fn mark_receipts_refreshed(
     state_dir: &Path,
@@ -414,7 +510,9 @@ pub fn mark_receipts_refreshed(
         state_dir,
         session_id,
         |state| {
-            state.refreshed_receipts = receipt_count;
+            // Detached refresh children can finish out of launch order. Never
+            // let an older child move the durable cursor backward.
+            state.refreshed_receipts = state.refreshed_receipts.max(receipt_count);
             if clear_memory_pending {
                 state.memory_pending = false;
                 state.pending_reason = None;
@@ -682,6 +780,31 @@ mod tests {
     }
 
     #[test]
+    fn receipt_refresh_attempt_path_is_session_scoped_and_sanitized() {
+        let path = receipt_refresh_attempt_path(Path::new("/tmp/hm"), "codex/session:1");
+
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/hm/runs/codex-session-1/receipt-refresh-attempt")
+        );
+    }
+
+    #[test]
+    fn prune_inactive_runs_removes_expired_advisory_state() {
+        let dir = temp_dir("prune-inactive-runs");
+        let run = dir.join("runs/old-session");
+        fs::create_dir_all(&run).expect("create run");
+        fs::write(run.join("hook-state.json"), b"{}").expect("write state");
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert_eq!(
+            prune_inactive_runs(&dir, std::time::Duration::ZERO).expect("prune runs"),
+            1
+        );
+        assert!(!run.exists());
+    }
+
+    #[test]
     fn write_receipts_lock_path_is_disjoint_and_sanitized() {
         let lock = write_receipts_lock_path(Path::new("/tmp/hm"), "codex/session:1");
         let state = state_lock_path(Path::new("/tmp/hm"), "codex/session:1");
@@ -758,87 +881,57 @@ mod tests {
         assert!(third.is_some());
     }
 
-    /// Acquire the per-session state lock, spinning until the holder releases.
-    ///
-    /// `try_state_lock` is non-blocking by design (hooks must not stall), so the
-    /// concurrency test drives a blocking acquire itself to exercise true
-    /// serialization rather than the best-effort fall-through path.
-    fn block_state_lock(dir: &Path, session: &str) -> StateLock {
-        loop {
-            if let Some(lock) = try_state_lock(dir, session).expect("state lock") {
-                return lock;
-            }
-            std::thread::yield_now();
-        }
-    }
-
     #[test]
     fn serialized_concurrent_marks_preserve_both_field_updates() {
         // Two distinct hook events mutate different fields of the same session's
         // state at nearly the same time. Before serialization the second
-        // whole-file replace could clobber the first writer's field; holding the
-        // per-session lock across each load -> mutate -> save makes the updates
-        // compose. Each thread takes the lock (mirroring how the production hook
-        // serializes the critical section) and runs a `mark_*` under it.
+        // whole-file replace could clobber the first writer's field. Exercise
+        // the production mark API directly: it owns the per-session lock across
+        // each load -> mutate -> save cycle, so the updates must compose.
         let dir = temp_dir("concurrent-marks");
-        let session = "session-1";
+        for iteration in 0..50 {
+            let session = format!("session-{iteration}");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
 
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-
-        let pending_dir = dir.clone();
-        let pending_barrier = std::sync::Arc::clone(&barrier);
-        let pending = std::thread::spawn(move || {
-            pending_barrier.wait();
-            for _ in 0..50 {
-                let _lock = block_state_lock(&pending_dir, session);
-                mark_memory_pending(&pending_dir, session, "intent", &options())
+            let pending_dir = dir.clone();
+            let pending_session = session.clone();
+            let pending_barrier = std::sync::Arc::clone(&barrier);
+            let pending = std::thread::spawn(move || {
+                pending_barrier.wait();
+                mark_memory_pending(&pending_dir, &pending_session, "intent", &options())
                     .expect("mark pending");
-            }
-        });
+            });
 
-        let startup_dir = dir.clone();
-        let startup_barrier = std::sync::Arc::clone(&barrier);
-        let startup = std::thread::spawn(move || {
-            startup_barrier.wait();
-            for _ in 0..50 {
-                let _lock = block_state_lock(&startup_dir, session);
+            let startup_dir = dir.clone();
+            let startup_session = session.clone();
+            let startup_barrier = std::sync::Arc::clone(&barrier);
+            let startup = std::thread::spawn(move || {
+                startup_barrier.wait();
                 mark_startup_context(
                     &startup_dir,
-                    session,
+                    &startup_session,
                     "agent=codex|store=personal",
                     vec!["mem-a".to_owned(), "mem-b".to_owned()],
                     &options(),
                 )
                 .expect("mark startup");
-            }
-        });
+            });
 
-        pending.join().expect("pending thread");
-        startup.join().expect("startup thread");
-
-        let loaded = load_state(&dir, session).expect("load state");
-
-        // Both mutations survive: the pending flag from one writer and the
-        // startup context/memory ids from the other.
-        assert!(
-            loaded.memory_pending,
-            "memory_pending must survive concurrent startup-context writes"
-        );
-        assert_eq!(
-            loaded.pending_reason.as_deref(),
-            Some("intent"),
-            "pending reason must survive"
-        );
-        assert_eq!(
-            loaded.context_key.as_deref(),
-            Some("agent=codex|store=personal"),
-            "startup context key must survive concurrent pending writes"
-        );
-        assert_eq!(
-            loaded.startup_memory_ids,
-            vec!["mem-a".to_owned(), "mem-b".to_owned()],
-            "startup memory ids must survive"
-        );
+            pending.join().expect("pending thread");
+            startup.join().expect("startup thread");
+            let loaded = load_state(&dir, &session).expect("load state");
+            assert!(loaded.memory_pending, "iteration {iteration}: pending lost");
+            assert_eq!(loaded.pending_reason.as_deref(), Some("intent"));
+            assert_eq!(
+                loaded.context_key.as_deref(),
+                Some("agent=codex|store=personal"),
+                "iteration {iteration}: startup context lost"
+            );
+            assert_eq!(
+                loaded.startup_memory_ids,
+                vec!["mem-a".to_owned(), "mem-b".to_owned()]
+            );
+        }
     }
 
     #[test]
@@ -1079,6 +1172,67 @@ mod tests {
 
         assert!(!state.memory_pending);
         assert_eq!(state.refreshed_receipts, 2);
+    }
+
+    #[test]
+    fn refreshed_receipt_count_is_monotonic_across_out_of_order_workers() {
+        let dir = temp_dir("receipt-count-monotonic");
+        mark_receipts_refreshed(&dir, "session-1", 2, false, &options())
+            .expect("newer worker completes");
+
+        let state = mark_receipts_refreshed(&dir, "session-1", 1, false, &options())
+            .expect("older worker completes later");
+
+        assert_eq!(state.refreshed_receipts, 2);
+    }
+
+    #[test]
+    fn state_updates_bound_lock_wait_without_overwriting_unrelated_fields() {
+        let dir = temp_dir("state-update-contention");
+        mark_context_key(&dir, "session-1", "existing-context", &options())
+            .expect("seed context state");
+        let held = try_state_lock(&dir, "session-1")
+            .expect("state lock")
+            .expect("hold state lock");
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                tx.send(mark_prompt_recall(
+                    &dir,
+                    "session-1",
+                    "new-recall",
+                    vec!["memory-1".to_owned()],
+                    &options(),
+                ))
+                .expect("send update result");
+            });
+            let error = rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("contended state update stayed latency-bounded")
+                .expect_err("contended state update reports an explicit timeout");
+            assert!(matches!(
+                error,
+                HookStateError::LockTimeout { wait_ms: 500, .. }
+            ));
+            drop(held);
+        });
+
+        let state = load_state(&dir, "session-1").expect("state remains readable");
+        assert_eq!(state.context_key.as_deref(), Some("existing-context"));
+        assert!(state.prompt_recall_key.is_none());
+
+        let state = mark_prompt_recall(
+            &dir,
+            "session-1",
+            "new-recall",
+            vec!["memory-1".to_owned()],
+            &options(),
+        )
+        .expect("retry state update after unlock");
+        assert_eq!(state.context_key.as_deref(), Some("existing-context"));
+        assert_eq!(state.prompt_recall_key.as_deref(), Some("new-recall"));
+        assert_eq!(state.prompt_recall_memory_ids, ["memory-1"]);
     }
 
     #[test]

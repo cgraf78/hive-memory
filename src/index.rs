@@ -5,14 +5,16 @@
 //! bodies. If it is deleted or stale, it can always be rebuilt from notes and
 //! paired JSON events in the store root.
 
-use crate::{entity, note};
+use crate::{curated, entity, note, project};
 use crate::{event, path as memory_path, write};
 use fs4::{FileExt, TryLockError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display};
 use std::fs::{self, File, OpenOptions};
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
@@ -24,8 +26,12 @@ use time::OffsetDateTime;
 // Bumped to 10 when the fingerprint added an order-independent XOR of per-file
 // name hashes, so a delete+add netting the same file count under an
 // mtime-preserving cloud sync still invalidates the cache. Schema-9 caches are
-// treated as stale and rebuilt cleanly on first read.
-const INDEX_FINGERPRINT_SCHEMA_VERSION: u32 = 10;
+// treated as stale and rebuilt cleanly on first read. Bumped to 11 when the
+// atomic header gained curated records, project aliases, and entity aliases for
+// canonical-free lifecycle hook reads. Bumped to 12 when the header began
+// authenticating the entry-row count, row content, and header-resident local
+// projection so damage cannot be silently accepted as a complete generation.
+const INDEX_FINGERPRINT_SCHEMA_VERSION: u32 = 12;
 
 /// Format version for the embedded index header line.
 ///
@@ -149,8 +155,18 @@ pub struct RebuildIndexReport {
     pub path: PathBuf,
     /// Entries written to the index.
     pub entries: Vec<IndexEntry>,
+    /// Best-available local hook projection, including curated records.
+    pub projection: LocalIndexProjection,
     /// Non-fatal parse warnings.
     pub warnings: Vec<IndexWarning>,
+    /// Whether this rebuild published a new cache generation.
+    pub published: bool,
+    /// Whether the returned generation represents the current canonical view.
+    ///
+    /// This remains true for an unchanged no-op rebuild and false when safety
+    /// checks retain a previous generation after observing an unstable or
+    /// regressing canonical snapshot.
+    pub current: bool,
 }
 
 /// Result of loading or rebuilding one store index.
@@ -160,10 +176,25 @@ pub struct LoadIndexReport {
     pub path: PathBuf,
     /// Entries read from or written to the index.
     pub entries: Vec<IndexEntry>,
+    /// Best-available local hook projection, including curated records.
+    pub projection: LocalIndexProjection,
     /// Non-fatal parse warnings from a rebuild.
     pub warnings: Vec<IndexWarning>,
     /// Whether the canonical store was parsed to refresh the cache.
     pub rebuilt: bool,
+}
+
+/// Canonical-free read model consumed by latency-sensitive lifecycle hooks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalIndexProjection {
+    /// Whether every observed eligible record was represented without warning.
+    pub complete: bool,
+    /// Remembered/raw and curated entries with project aliases normalized.
+    pub entries: Vec<IndexEntry>,
+    /// Every known project id mapped to a deterministic alias-family key.
+    pub project_aliases: BTreeMap<String, String>,
+    /// Built-in plus store-defined entity aliases used for prompt recall.
+    pub entity_registry: entity::EntityRegistry,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,6 +244,18 @@ struct IndexHeader {
     hm_index_format: u32,
     /// Freshness fingerprint this index was built against.
     fingerprint: IndexFingerprint,
+    /// Number of JSONL entry rows published after this header.
+    #[serde(default)]
+    entry_count: usize,
+    /// SHA-256 of the deterministically serialized entry rows.
+    #[serde(default)]
+    entries_sha256: String,
+    /// SHA-256 of the serialized header-resident local projection.
+    #[serde(default)]
+    projection_sha256: String,
+    /// Canonical-free hook read model published with the index generation.
+    #[serde(default)]
+    projection: Option<LocalIndexProjection>,
 }
 
 /// Non-fatal index rebuild warning.
@@ -247,6 +290,8 @@ pub enum IndexError {
     },
     /// Entity registry could not be loaded.
     EntityRegistry(String),
+    /// Curated or project-alias projection could not be built.
+    Projection(String),
 }
 
 impl Display for IndexError {
@@ -262,6 +307,7 @@ impl Display for IndexError {
                 write!(f, "invalid note timestamp in {}: {value}", path.display())
             }
             Self::EntityRegistry(message) => write!(f, "{message}"),
+            Self::Projection(message) => write!(f, "{message}"),
         }
     }
 }
@@ -304,9 +350,8 @@ fn rebuild_lock_path(cache_dir: &Path, store_name: &str, store_root: &Path) -> P
 /// Try to acquire the non-blocking rebuild lock for one store cache key.
 ///
 /// `Ok(None)` means another rebuild is already running on this host for the same
-/// cache artifact; callers fall back gracefully (re-check freshness, then
-/// rebuild lock-free) rather than block a latency-sensitive read. Any other I/O
-/// error surfaces so the caller knows local coordination state is untrustworthy.
+/// cache artifact. Any other I/O error surfaces so the caller knows local
+/// coordination state is untrustworthy.
 pub fn try_rebuild_lock(
     cache_dir: &Path,
     store_name: &str,
@@ -322,18 +367,44 @@ pub fn try_rebuild_lock(
     };
     fs::create_dir_all(parent)
         .map_err(|err| io_error("create rebuild lock parent", parent, err))?;
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-        .map_err(|err| io_error("open rebuild lock", &path, err))?;
-    match FileExt::try_lock(&file) {
-        Ok(()) => Ok(Some(RebuildLock { file, path })),
-        Err(TryLockError::WouldBlock) => Ok(None),
-        Err(TryLockError::Error(err)) => Err(io_error("lock rebuild", &path, err)),
+    for _ in 0..4 {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|err| io_error("open rebuild lock", &path, err))?;
+        match FileExt::try_lock(&file) {
+            Ok(()) => match lock_path_matches_file(&file, &path) {
+                Ok(true) => return Ok(Some(RebuildLock { file, path })),
+                Ok(false) => continue,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(io_error("verify rebuild lock", &path, err)),
+            },
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Error(err)) => {
+                return Err(io_error("lock rebuild", &path, err));
+            }
+        }
     }
+    Err(IndexError::Projection(
+        "rebuild lock path changed repeatedly during acquisition".to_owned(),
+    ))
+}
+
+#[cfg(unix)]
+fn lock_path_matches_file(file: &File, path: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let open = file.metadata()?;
+    let current = fs::metadata(path)?;
+    Ok(open.dev() == current.dev() && open.ino() == current.ino())
+}
+
+#[cfg(not(unix))]
+fn lock_path_matches_file(_file: &File, _path: &Path) -> std::io::Result<bool> {
+    Ok(true)
 }
 
 /// Read a fresh index when possible, otherwise rebuild it from canonical files.
@@ -347,25 +418,43 @@ pub fn try_rebuild_lock(
 ///
 /// Concurrent rebuilds of the same store are serialized by a cache-key-scoped
 /// advisory lock so two sessions cannot redundantly scan the store or fight over
-/// the Tantivy writer. If the lock is already held, another rebuild just ran, so
-/// we re-check freshness once before falling back to a lock-free rebuild (the
-/// atomic header publish keeps that safe).
+/// the Tantivy writer. Interactive contenders condition-wait for the current
+/// owner, then consume its fresh publication or take ownership themselves.
 pub fn load_or_rebuild_index(input: LoadIndexInput<'_>) -> Result<LoadIndexReport, IndexError> {
     if let Some(report) = load_fresh_index(&input)? {
         return Ok(report);
     }
 
-    let _lock = match try_rebuild_lock(input.cache_dir, input.store_name, input.store_root)? {
-        Some(lock) => Some(lock),
-        None => {
-            // Another rebuild is in flight. It may have just published a fresh
-            // index; re-check before doing redundant work.
-            if let Some(report) = load_fresh_index(&input)? {
-                return Ok(report);
+    let started = std::time::Instant::now();
+    let mut contended = false;
+    let _lock = loop {
+        match try_rebuild_lock(input.cache_dir, input.store_name, input.store_root)? {
+            Some(lock) => break Some(lock),
+            None => {
+                contended = true;
+                if started.elapsed() >= std::time::Duration::from_secs(1) {
+                    if let Some(mut report) = load_cached_index(&input)? {
+                        report.warnings.push(IndexWarning {
+                            path: report.path.clone(),
+                            message: "served the previous local generation after waiting one second for an index rebuild"
+                                .to_owned(),
+                        });
+                        return Ok(report);
+                    }
+                    return Err(IndexError::Projection(
+                        "index rebuild did not publish within one second".to_owned(),
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            None
         }
     };
+    // The previous owner may have published while we waited. Validate once
+    // after acquiring the cheap local lock; never repeatedly rescan a cloud
+    // tree inside the contention loop.
+    if contended && let Some(report) = load_fresh_index(&input)? {
+        return Ok(report);
+    }
 
     let report = rebuild_index(RebuildIndexInput {
         store_name: input.store_name,
@@ -377,8 +466,9 @@ pub fn load_or_rebuild_index(input: LoadIndexInput<'_>) -> Result<LoadIndexRepor
     Ok(LoadIndexReport {
         path: report.path,
         entries: report.entries,
+        projection: report.projection,
         warnings: report.warnings,
-        rebuilt: true,
+        rebuilt: report.published,
     })
 }
 
@@ -395,13 +485,18 @@ pub fn load_fresh_index(input: &LoadIndexInput<'_>) -> Result<Option<LoadIndexRe
     // to a different rebuild's data. A missing/old-format header, a stale
     // fingerprint, an oversized file, or any read/parse error is a cache miss
     // (rebuild), never a hard error on this latency-sensitive boundary.
-    if let Ok(Some((cached, entries))) = read_index_with_fingerprint(&path)
-        && cached == current
+    if let Ok((Some(header), entries)) = read_index_inner(&path)
+        && header.fingerprint == current
+        && header_generation_valid(&header, &entries)
     {
+        let projection =
+            hydrate_local_projection(header.projection.expect("checked projection"), &entries);
+        let warnings = incomplete_projection_warnings(&path, &projection);
         return Ok(Some(LoadIndexReport {
             path,
             entries,
-            warnings: Vec::new(),
+            projection,
+            warnings,
             rebuilt: false,
         }));
     }
@@ -409,12 +504,11 @@ pub fn load_fresh_index(input: &LoadIndexInput<'_>) -> Result<Option<LoadIndexRe
     Ok(None)
 }
 
-/// Read a locally cached index without touching the canonical store root.
+/// Read a locally cached hook projection without touching the canonical root.
 ///
-/// This is intentionally weaker than [`load_fresh_index`]. It exists for the
-/// offline prompt-submit fallback after a freshness check fails because the
-/// canonical store cannot be inspected. Normal indexed recall must try the
-/// fresh path first so a reachable-but-stale cache cannot inject old memory.
+/// This is intentionally weaker than [`load_fresh_index`]: lifecycle hooks use
+/// it for stale-while-revalidate reads, while an out-of-band refresh updates the
+/// atomic projection for later invocations.
 pub fn load_cached_index(
     input: &LoadIndexInput<'_>,
 ) -> Result<Option<LoadIndexReport>, IndexError> {
@@ -425,21 +519,52 @@ pub fn load_cached_index(
     // header (missing, old-format, oversized, or corrupt) is simply a cache miss
     // that callers turn into a rebuild. Per-line corruption inside the body is
     // already tolerated by `read_index_with_fingerprint` (skip-and-warn).
-    let Ok(Some((cached, entries))) = read_index_with_fingerprint(&path) else {
+    let Ok((Some(header), entries)) = read_index_inner(&path) else {
         return Ok(None);
     };
-    if cached.schema_version != INDEX_FINGERPRINT_SCHEMA_VERSION
-        || cached.store_root != input.store_root.display().to_string()
-    {
+    if header.fingerprint.store_root != input.store_root.display().to_string() {
         return Ok(None);
     }
+    let projection = match header.fingerprint.schema_version {
+        INDEX_FINGERPRINT_SCHEMA_VERSION if header_generation_valid(&header, &entries) => {
+            header.projection.expect("validated projection")
+        }
+        // Schema 10 already carries full remembered bodies. Serve that
+        // degraded local view while detached hydration publishes a verifiable
+        // current generation; it can never qualify as fresh above.
+        10 => LocalIndexProjection {
+            complete: false,
+            entries: Vec::new(),
+            project_aliases: BTreeMap::new(),
+            entity_registry: entity::EntityRegistry::builtin(),
+        },
+        _ => return Ok(None),
+    };
+    let projection = hydrate_local_projection(projection, &entries);
+    let warnings = incomplete_projection_warnings(&path, &projection);
 
     Ok(Some(LoadIndexReport {
         path,
         entries,
-        warnings: Vec::new(),
+        projection,
+        warnings,
         rebuilt: false,
     }))
+}
+
+fn incomplete_projection_warnings(
+    path: &Path,
+    projection: &LocalIndexProjection,
+) -> Vec<IndexWarning> {
+    if projection.complete {
+        Vec::new()
+    } else {
+        vec![IndexWarning {
+            path: path.to_path_buf(),
+            message: "using a best-available incomplete local index snapshot; background refresh will retry omitted canonical records"
+                .to_owned(),
+        }]
+    }
 }
 
 /// Rebuild one store's JSONL triage index from canonical inbox files.
@@ -449,6 +574,24 @@ pub fn load_cached_index(
 /// when it parses cleanly; malformed events warn and fall back to note metadata
 /// so one bad sidecar does not make the whole index unusable.
 pub fn rebuild_index(input: RebuildIndexInput<'_>) -> Result<RebuildIndexReport, IndexError> {
+    rebuild_index_with_policy(input)
+}
+
+fn rebuild_index_with_policy(
+    input: RebuildIndexInput<'_>,
+) -> Result<RebuildIndexReport, IndexError> {
+    let path = scoped_index_path(input.cache_dir, input.store_name, input.store_root);
+    let previous = read_index_inner(&path)
+        .ok()
+        .and_then(|(header, entries)| header.map(|header| (header, entries)))
+        .and_then(|(header, entries)| {
+            if header.fingerprint.store_root != input.store_root.display().to_string() {
+                return None;
+            }
+            previous_local_projection(&header, &entries)
+                .map(|projection| (header, entries, projection))
+        });
+    let fingerprint_before = canonical_fingerprint(input.store_root)?;
     let mut entries = Vec::new();
     let mut warnings = Vec::new();
     let registry = entity::EntityRegistry::load_for_store(input.store_root)
@@ -458,14 +601,13 @@ pub fn rebuild_index(input: RebuildIndexInput<'_>) -> Result<RebuildIndexReport,
         let relative_note_path = relative_path(input.store_root, &note_path, input.path_case);
         let contents = match fs::read_to_string(&note_path) {
             Ok(contents) => contents,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Err(err) => {
                 warnings.push(IndexWarning {
                     path: note_path,
-                    message: "note disappeared during index rebuild".to_owned(),
+                    message: format!("read note: {err}"),
                 });
                 continue;
             }
-            Err(err) => return Err(io_error("read note", &note_path, err)),
         };
         let parsed = match note::parse_note(&contents) {
             Ok(note) => note,
@@ -495,25 +637,423 @@ pub fn rebuild_index(input: RebuildIndexInput<'_>) -> Result<RebuildIndexReport,
             &registry,
         ));
     }
+    let mut snapshot_restored = false;
+    if let Some((previous_header, previous_entries, _)) = previous.as_ref() {
+        let restored = merge_regressed_snapshot(previous_entries, &mut entries);
+        if restored > 0 {
+            snapshot_restored = true;
+            warnings.push(IndexWarning {
+                path: input.store_root.to_path_buf(),
+                message: format!(
+                    "retained {restored} last-known-good entr{} while publishing other readable memories; canonical view observed {} files/{} parsed entries versus {} previous entries",
+                    if restored == 1 { "y" } else { "ies" },
+                    previous_header.fingerprint.canonical_files,
+                    entries.len(),
+                    previous_entries.len()
+                ),
+            });
+        }
+    }
+    let (mut projection, projection_warnings) =
+        build_local_projection(input.store_root, &entries, &registry)?;
+    if !projection_warnings.is_empty()
+        && let Some((_, _, previous_projection)) = previous.as_ref()
+    {
+        restore_warned_curated_entries(
+            input.store_root,
+            &projection_warnings,
+            previous_projection,
+            &mut projection,
+        );
+    }
+    warnings.extend(projection_warnings);
+    projection.complete &= warnings.is_empty();
 
-    let path = scoped_index_path(input.cache_dir, input.store_name, input.store_root);
     // Compute the fingerprint BEFORE serializing so it is published in the same
     // atomic rename as the entries it describes. This closes the two-file race:
     // a reader can no longer see a fresh fingerprint paired with stale/partial
     // data, because there is exactly one file and one rename.
     let fingerprint = canonical_fingerprint(input.store_root)?;
-    let jsonl = render_jsonl(&fingerprint, &entries)?;
+    if fingerprint_before != fingerprint {
+        if let Some((_, previous_entries, previous_projection)) = previous.as_ref() {
+            warnings.push(IndexWarning {
+                path: input.store_root.to_path_buf(),
+                message: "retained last known good index: canonical view changed during rebuild"
+                    .to_owned(),
+            });
+            return Ok(RebuildIndexReport {
+                path,
+                entries: previous_entries.clone(),
+                projection: previous_projection.clone(),
+                warnings,
+                published: false,
+                current: false,
+            });
+        }
+        return Err(IndexError::Projection(
+            "canonical view changed during index rebuild; retry refresh".to_owned(),
+        ));
+    }
+    if let Some((previous_header, previous_entries, previous_projection)) = previous.as_ref()
+        && previous_header.fingerprint == fingerprint
+        && previous_entries == &entries
+        && previous_projection == &projection
+    {
+        let current = projection.complete && !snapshot_restored;
+        return Ok(RebuildIndexReport {
+            path,
+            entries,
+            projection,
+            warnings,
+            published: false,
+            current,
+        });
+    }
+    let jsonl = render_jsonl(&fingerprint, &projection, &entries)?;
+    if jsonl.len() as u64 > MAX_CACHED_INDEX_BYTES {
+        return Err(IndexError::Projection(format!(
+            "rendered index is {} bytes, over the {MAX_CACHED_INDEX_BYTES}-byte cache cap",
+            jsonl.len()
+        )));
+    }
     write::write_atomic(&path, jsonl.as_bytes(), &input.options).map_err(|err| IndexError::Io {
         action: "write index",
         path: path.clone(),
         message: err.to_string(),
     })?;
 
+    let current = projection.complete && !snapshot_restored;
     Ok(RebuildIndexReport {
         path,
         entries,
+        projection,
         warnings,
+        published: true,
+        current,
     })
+}
+
+/// Remove projections for vanished stores rooted in the OS temporary directory.
+///
+/// Cloud-backed roots are deliberately retained when unavailable: that local
+/// snapshot is exactly what lifecycle hooks need during an outage. Temporary
+/// stores are test/evaluation fixtures and cannot return after their root has
+/// been deleted, so retaining those disposable indexes only leaks cache space.
+pub fn prune_orphaned_temporary_indexes(cache_dir: &Path) -> Result<usize, IndexError> {
+    let indexes = cache_dir.join("indexes");
+    let entries = match fs::read_dir(&indexes) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            prune_unreferenced_index_locks(cache_dir, &indexes)?;
+            return Ok(0);
+        }
+        Err(err) => return Err(io_error("read index cache", &indexes, err)),
+    };
+    let temp_root = std::env::temp_dir();
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry.map_err(|err| io_error("read index cache entry", &indexes, err))?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(file) = File::open(&path) else {
+            continue;
+        };
+        let mut header = String::new();
+        if std::io::BufReader::new(file)
+            .read_line(&mut header)
+            .is_err()
+        {
+            continue;
+        }
+        let Some(store_root) = serde_json::from_str::<serde_json::Value>(&header)
+            .ok()
+            .and_then(|value| {
+                value
+                    .pointer("/fingerprint/store_root")
+                    .and_then(serde_json::Value::as_str)
+                    .map(PathBuf::from)
+            })
+        else {
+            continue;
+        };
+        if store_root.starts_with(&temp_root) && !store_root.exists() {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(io_error("remove orphaned index", &path, err)),
+            }
+            removed += 1;
+        }
+    }
+    let entries = fs::read_dir(&indexes)
+        .map_err(|err| io_error("read legacy fingerprint cache", &indexes, err))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| io_error("read fingerprint cache entry", &indexes, err))?;
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(_key) = file_name.strip_suffix(".fingerprint.json") else {
+            continue;
+        };
+        let Some(store_root) = fs::read_to_string(&path)
+            .ok()
+            .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+            .and_then(|value| {
+                value
+                    .get("store_root")
+                    .and_then(serde_json::Value::as_str)
+                    .map(PathBuf::from)
+            })
+        else {
+            continue;
+        };
+        if store_root.starts_with(&temp_root) && !store_root.exists() {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(io_error("remove legacy fingerprint", &path, err)),
+            }
+            removed += 1;
+        }
+    }
+    prune_unreferenced_index_locks(cache_dir, &indexes)?;
+    Ok(removed)
+}
+
+/// Remove zero-content coordination files after their cache artifacts vanish.
+///
+/// Lock files intentionally outlive processes, but a long-running test-heavy
+/// host can otherwise accumulate one inode per disposable store forever. Never
+/// unlink a referenced or actively held lock: deleting a live locked inode would
+/// let a second process create a new path and bypass the original lock.
+fn prune_unreferenced_index_locks(cache_dir: &Path, indexes: &Path) -> Result<(), IndexError> {
+    let locks = cache_dir.join("locks/index");
+    let entries = match fs::read_dir(&locks) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(io_error("read index locks", &locks, err)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|err| io_error("read index lock entry", &locks, err))?;
+        let path = entry.path();
+        let Some(key) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".lock"))
+        else {
+            continue;
+        };
+        if indexes.join(format!("{key}.jsonl")).exists()
+            || indexes.join(format!("{key}.fingerprint.json")).exists()
+        {
+            continue;
+        }
+        let file = match OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(io_error("open orphaned index lock", &path, err)),
+        };
+        match FileExt::try_lock(&file) {
+            Ok(()) => {
+                let path_matches = match lock_path_matches_file(&file, &path) {
+                    Ok(matches) => matches,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(err) => return Err(io_error("verify orphaned index lock", &path, err)),
+                };
+                if !path_matches
+                    || indexes.join(format!("{key}.jsonl")).exists()
+                    || indexes.join(format!("{key}.fingerprint.json")).exists()
+                {
+                    continue;
+                }
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(io_error("remove orphaned index lock", &path, err)),
+                }
+            }
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Error(err)) => {
+                return Err(io_error("lock orphaned index", &path, err));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reject lost append-only canonical history before it replaces a complete cache.
+///
+/// Hive's canonical note/event log is append-only during normal operation.
+/// Missing prior IDs or event pairings therefore indicates a partial mount view.
+/// Curated rules, project aliases, and entity aliases remain intentionally
+/// editable; their stable additions, changes, and removals must propagate after
+/// the before/after fingerprint check proves one consistent observation.
+fn merge_regressed_snapshot(
+    previous_entries: &[IndexEntry],
+    candidate_entries: &mut Vec<IndexEntry>,
+) -> usize {
+    let mut positions = candidate_entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| (entry.id.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    let mut restored = 0;
+    for previous in previous_entries {
+        match positions.get(&previous.id).copied() {
+            Some(index)
+                if previous.event_path.is_some()
+                    && candidate_entries[index].event_path.is_none() =>
+            {
+                candidate_entries[index] = previous.clone();
+                restored += 1;
+            }
+            Some(_) => {}
+            None => {
+                positions.insert(previous.id.clone(), candidate_entries.len());
+                candidate_entries.push(previous.clone());
+                restored += 1;
+            }
+        }
+    }
+    candidate_entries.sort_by(|left, right| {
+        left.note_path
+            .cmp(&right.note_path)
+            .then(left.id.cmp(&right.id))
+    });
+    restored
+}
+
+fn build_local_projection(
+    store_root: &Path,
+    entries: &[IndexEntry],
+    registry: &entity::EntityRegistry,
+) -> Result<(LocalIndexProjection, Vec<IndexWarning>), IndexError> {
+    let project_aliases = project::alias_normalization_map(store_root)
+        .map_err(|err| IndexError::Projection(err.to_string()))?;
+    let curated = curated::collect_all_report(store_root);
+    let warnings = curated
+        .warnings
+        .iter()
+        .map(|warning| IndexWarning {
+            path: warning.path().to_path_buf(),
+            message: warning.to_string(),
+        })
+        .collect::<Vec<_>>();
+    let projection = LocalIndexProjection {
+        complete: warnings.is_empty(),
+        entries: curated
+            .files
+            .into_iter()
+            .map(|file| curated_index_entry(file, registry))
+            .collect(),
+        project_aliases,
+        entity_registry: registry.clone(),
+    };
+    Ok((hydrate_local_projection(projection, entries), warnings))
+}
+
+fn hydrate_local_projection(
+    mut projection: LocalIndexProjection,
+    entries: &[IndexEntry],
+) -> LocalIndexProjection {
+    let curated = std::mem::take(&mut projection.entries);
+    projection.entries = entries.to_vec();
+    projection.entries.extend(curated);
+    projection
+}
+
+fn previous_local_projection(
+    header: &IndexHeader,
+    entries: &[IndexEntry],
+) -> Option<LocalIndexProjection> {
+    match header.fingerprint.schema_version {
+        INDEX_FINGERPRINT_SCHEMA_VERSION if header_generation_valid(header, entries) => {
+            Some(hydrate_local_projection(
+                header.projection.clone().expect("validated projection"),
+                entries,
+            ))
+        }
+        10 => Some(LocalIndexProjection {
+            complete: false,
+            entries: entries.to_vec(),
+            project_aliases: BTreeMap::new(),
+            entity_registry: entity::EntityRegistry::builtin(),
+        }),
+        _ => None,
+    }
+}
+
+fn restore_warned_curated_entries(
+    store_root: &Path,
+    warnings: &[IndexWarning],
+    previous: &LocalIndexProjection,
+    projection: &mut LocalIndexProjection,
+) {
+    let mut present = projection
+        .entries
+        .iter()
+        .map(|entry| entry.id.clone())
+        .collect::<BTreeSet<_>>();
+    for entry in &previous.entries {
+        if !entry.id.starts_with("curated:")
+            || present.contains(&entry.id)
+            || !warnings
+                .iter()
+                .any(|warning| warning_covers_curated_entry(store_root, warning, entry))
+        {
+            continue;
+        }
+        present.insert(entry.id.clone());
+        projection.entries.push(entry.clone());
+    }
+    projection.entries.sort_by(|left, right| {
+        left.note_path
+            .cmp(&right.note_path)
+            .then(left.id.cmp(&right.id))
+    });
+}
+
+fn warning_covers_curated_entry(
+    store_root: &Path,
+    warning: &IndexWarning,
+    entry: &IndexEntry,
+) -> bool {
+    warning
+        .path
+        .strip_prefix(store_root)
+        .is_ok_and(|relative| Path::new(&entry.note_path).starts_with(relative))
+}
+
+fn curated_index_entry(
+    curated: curated::CuratedFile,
+    registry: &entity::EntityRegistry,
+) -> IndexEntry {
+    IndexEntry {
+        id: curated.id,
+        store_id: String::new(),
+        entry_kind: note::EntryKind::Remember,
+        scope: curated.scope,
+        project_id: curated.project_id,
+        audience: Vec::new(),
+        tags: Vec::new(),
+        subject: None,
+        confidence: note::Confidence::High,
+        valid_from: None,
+        valid_to: None,
+        supersedes: Vec::new(),
+        kind: None,
+        entities: entity::extract_with_registry(&curated.body, registry),
+        classified: None,
+        agent_id: "human".to_owned(),
+        host_id: String::new(),
+        created_at: String::new(),
+        body: curated.body,
+        note_path: curated.relative_path,
+        event_path: None,
+    }
 }
 
 /// Read an existing JSONL index file, returning only its entries.
@@ -536,6 +1076,7 @@ pub fn read_index(path: &Path) -> Result<Vec<IndexEntry>, IndexError> {
 /// lets freshness checks treat a legacy index as stale and rebuild it without
 /// panicking. Genuine I/O failures (including the size cap) still surface as
 /// errors so the caller can decide; on the hot path that decision is a miss.
+#[cfg(test)]
 fn read_index_with_fingerprint(
     path: &Path,
 ) -> Result<Option<(IndexFingerprint, Vec<IndexEntry>)>, IndexError> {
@@ -786,12 +1327,21 @@ fn entry_entities(
 
 fn render_jsonl(
     fingerprint: &IndexFingerprint,
+    projection: &LocalIndexProjection,
     entries: &[IndexEntry],
 ) -> Result<String, IndexError> {
     let mut output = String::new();
+    let mut stored_projection = projection.clone();
+    stored_projection
+        .entries
+        .retain(|entry| entry.id.starts_with("curated:"));
     let header = IndexHeader {
         hm_index_format: INDEX_HEADER_FORMAT_VERSION,
         fingerprint: fingerprint.clone(),
+        entry_count: entries.len(),
+        entries_sha256: index_entries_sha256(entries)?,
+        projection_sha256: index_projection_sha256(&stored_projection)?,
+        projection: Some(stored_projection),
     };
     let header_line =
         serde_json::to_string(&header).map_err(|err| IndexError::Json(err.to_string()))?;
@@ -805,6 +1355,35 @@ fn render_jsonl(
     Ok(output)
 }
 
+fn header_entries_valid(header: &IndexHeader, entries: &[IndexEntry]) -> bool {
+    header.entry_count == entries.len()
+        && index_entries_sha256(entries).is_ok_and(|digest| digest == header.entries_sha256)
+}
+
+fn header_generation_valid(header: &IndexHeader, entries: &[IndexEntry]) -> bool {
+    header.fingerprint.schema_version == INDEX_FINGERPRINT_SCHEMA_VERSION
+        && header_entries_valid(header, entries)
+        && header.projection.as_ref().is_some_and(|projection| {
+            index_projection_sha256(projection)
+                .is_ok_and(|digest| digest == header.projection_sha256)
+        })
+}
+
+fn index_projection_sha256(projection: &LocalIndexProjection) -> Result<String, IndexError> {
+    let bytes = serde_json::to_vec(projection).map_err(|err| IndexError::Json(err.to_string()))?;
+    Ok(crate::hash::lower_hex(&Sha256::digest(bytes)))
+}
+
+fn index_entries_sha256(entries: &[IndexEntry]) -> Result<String, IndexError> {
+    let mut digest = Sha256::new();
+    for entry in entries {
+        let line = serde_json::to_vec(entry).map_err(|err| IndexError::Json(err.to_string()))?;
+        digest.update(line);
+        digest.update(b"\n");
+    }
+    Ok(crate::hash::lower_hex(&digest.finalize()))
+}
+
 fn note_paths(root: &Path) -> Result<Vec<PathBuf>, IndexError> {
     let mut paths = Vec::new();
     if !root.is_dir() {
@@ -816,12 +1395,26 @@ fn note_paths(root: &Path) -> Result<Vec<PathBuf>, IndexError> {
 }
 
 fn collect_note_paths(root: &Path, paths: &mut Vec<PathBuf>) -> Result<(), IndexError> {
-    for entry in fs::read_dir(root).map_err(|err| io_error("read note directory", root, err))? {
-        let entry = entry.map_err(|err| io_error("read note directory", root, err))?;
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(io_error("read note directory", root, err)),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(io_error("read note directory", root, err)),
+        };
         let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .map_err(|err| io_error("read note file type", &path, err))?;
+        if write::is_atomic_temp_path(&path) {
+            continue;
+        }
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(io_error("read note file type", &path, err)),
+        };
         if file_type.is_dir() {
             collect_note_paths(&path, paths)?;
         } else if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
@@ -857,6 +1450,9 @@ fn canonical_fingerprint(store_root: &Path) -> Result<IndexFingerprint, IndexErr
     let mut scan = CanonicalScan::default();
     collect_canonical(&store_root.join("inbox/notes"), &mut scan)?;
     collect_canonical(&store_root.join("inbox/events"), &mut scan)?;
+    collect_canonical(&store_root.join("rules"), &mut scan)?;
+    collect_canonical(&store_root.join("people"), &mut scan)?;
+    collect_canonical(&store_root.join("memories"), &mut scan)?;
     Ok(IndexFingerprint {
         // v8: entity extraction includes deterministic quoted/proper-name
         // phrase links in addition to built-in aliases and the store registry.
@@ -865,6 +1461,8 @@ fn canonical_fingerprint(store_root: &Path) -> Result<IndexFingerprint, IndexErr
         // v10: folds an order-independent XOR of per-file name hashes so a
         // delete+add netting the same count under an mtime-preserving sync still
         // invalidates the cache (file-SET membership, not just file count).
+        // v11: publishes curated records, project aliases, and entity aliases
+        // in the atomic local projection used by lifecycle hooks.
         schema_version: INDEX_FINGERPRINT_SCHEMA_VERSION,
         store_root: store_root.display().to_string(),
         canonical_dirs: scan.dirs,
@@ -890,26 +1488,49 @@ fn collect_canonical(root: &Path, scan: &mut CanonicalScan) -> Result<(), IndexE
     if !root.is_dir() {
         return Ok(());
     }
+    let metadata = match fs::metadata(root) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(io_error("read canonical directory metadata", root, err)),
+    };
     scan.dirs += 1;
-    let metadata = fs::metadata(root)
-        .map_err(|err| io_error("read canonical directory metadata", root, err))?;
     scan.latest_directory_modified_nanos =
         scan.latest_directory_modified_nanos.max(modified_nanos(
             metadata
                 .modified()
                 .map_err(|err| io_error("read canonical directory modified time", root, err))?,
         ));
-    for entry in
-        fs::read_dir(root).map_err(|err| io_error("read canonical directory", root, err))?
-    {
-        let entry = entry.map_err(|err| io_error("read canonical directory", root, err))?;
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(io_error("read canonical directory", root, err)),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(io_error("read canonical directory", root, err)),
+        };
         let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .map_err(|err| io_error("read canonical file type", &path, err))?;
+        // Atomic writers publish through this reserved temp namespace. These
+        // files are never canonical memories, and they may disappear between
+        // directory enumeration and metadata reads during a concurrent write.
+        if write::is_atomic_temp_path(&path) {
+            continue;
+        }
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(io_error("read canonical file type", &path, err)),
+        };
         if file_type.is_dir() {
             collect_canonical(&path, scan)?;
         } else if file_type.is_file() {
+            let file_metadata = match fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(io_error("read canonical file metadata", &path, err)),
+            };
             scan.files += 1;
             // Fold the file's identity (its name) into the set membership signal.
             // The name is already in hand from enumeration, so this is just a
@@ -918,8 +1539,6 @@ fn collect_canonical(root: &Path, scan: &mut CanonicalScan) -> Result<(), IndexE
             // One extra stat per file. The dirent is already warm from
             // enumeration, so this stays cheap relative to a full note re-read,
             // and it is what lets an mtime-preserving cloud-sync arrival be seen.
-            let file_metadata = fs::metadata(&path)
-                .map_err(|err| io_error("read canonical file metadata", &path, err))?;
             scan.latest_file_modified_nanos = scan.latest_file_modified_nanos.max(modified_nanos(
                 file_metadata
                     .modified()
@@ -1199,6 +1818,91 @@ mod tests {
     }
 
     #[test]
+    fn load_or_rebuild_merges_last_good_rows_with_new_good_siblings() {
+        let dir = temp_dir("load-regressing-view");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(&root, true);
+        let hidden = write_record(&root, true);
+        let first = load_or_rebuild_index(LoadIndexInput {
+            store_name: "personal",
+            store_root: &root,
+            cache_dir: &cache,
+            options: options(),
+            path_case: memory_path::PathCase::Sensitive,
+        })
+        .expect("first load");
+        assert_eq!(first.entries.len(), 2);
+
+        // A cloud mount can temporarily expose a valid but incomplete directory
+        // view. That must not replace the complete local projection.
+        fs::remove_file(&hidden.note_path).expect("hide note from canonical view");
+        fs::remove_file(hidden.event_path.as_ref().expect("paired event"))
+            .expect("hide event from canonical view");
+        let replacement = write_record(&root, true);
+        let second = load_or_rebuild_index(LoadIndexInput {
+            store_name: "personal",
+            store_root: &root,
+            cache_dir: &cache,
+            options: options(),
+            path_case: memory_path::PathCase::Sensitive,
+        })
+        .expect("second load");
+
+        assert!(second.rebuilt, "best-available union must be published");
+        assert_eq!(second.entries.len(), 3);
+        assert_eq!(read_index(&second.path).expect("merged index").len(), 3);
+        assert!(second.entries.iter().any(|entry| entry.id == hidden.id));
+        assert!(
+            second
+                .entries
+                .iter()
+                .any(|entry| entry.id == replacement.id),
+            "a missing old row must not hide a new readable sibling"
+        );
+        assert!(!second.projection.complete);
+        assert!(
+            second
+                .warnings
+                .iter()
+                .any(|warning| warning.message.contains("last-known-good")),
+            "retention must be visible to callers"
+        );
+    }
+
+    #[test]
+    fn load_or_rebuild_propagates_intentional_curated_removal() {
+        let dir = temp_dir("load-curated-removal");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(&root, true);
+        let curated = root.join("rules/temporary.md");
+        fs::create_dir_all(curated.parent().expect("rules parent")).expect("create rules");
+        fs::write(&curated, "Temporary curated guidance.\n").expect("write curated");
+        let first =
+            load_or_rebuild_index(load_input("personal", &root, &cache)).expect("first load");
+        assert!(
+            first
+                .projection
+                .entries
+                .iter()
+                .any(|entry| entry.id == "curated:rules/temporary.md")
+        );
+
+        fs::remove_file(curated).expect("remove curated");
+        let second =
+            load_or_rebuild_index(load_input("personal", &root, &cache)).expect("second load");
+        assert!(second.rebuilt);
+        assert!(
+            !second
+                .projection
+                .entries
+                .iter()
+                .any(|entry| entry.id == "curated:rules/temporary.md")
+        );
+    }
+
+    #[test]
     fn load_or_rebuild_repairs_corrupt_cached_index() {
         let dir = temp_dir("load-corrupt");
         let root = dir.join("store");
@@ -1263,6 +1967,83 @@ mod tests {
 
         assert!(report.entries.is_empty());
         assert_eq!(report.warnings.len(), 1);
+        assert!(
+            !report.projection.complete,
+            "an omitted raw note must keep the best available projection but mark it incomplete"
+        );
+    }
+
+    #[test]
+    fn malformed_existing_note_cannot_hide_new_good_sibling() {
+        let dir = temp_dir("bad-existing-note-good-sibling");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        let first = write_record(&root, true);
+        let seeded = rebuild_index(RebuildIndexInput {
+            store_name: "personal",
+            store_root: &root,
+            cache_dir: &cache,
+            options: options(),
+            path_case: memory_path::PathCase::Sensitive,
+        })
+        .expect("seed index");
+        let first_id = seeded.entries[0].id.clone();
+        fs::write(&first.note_path, "not front matter").expect("corrupt existing note");
+        let second = write_record(&root, true);
+
+        let report = rebuild_index(RebuildIndexInput {
+            store_name: "personal",
+            store_root: &root,
+            cache_dir: &cache,
+            options: options(),
+            path_case: memory_path::PathCase::Sensitive,
+        })
+        .expect("publish best available siblings");
+
+        assert!(!report.projection.complete);
+        assert!(report.entries.iter().any(|entry| entry.id == first_id));
+        assert!(report.entries.iter().any(|entry| {
+            entry.note_path
+                == relative_path(&root, &second.note_path, memory_path::PathCase::Sensitive)
+        }));
+        assert_eq!(report.entries.len(), 2);
+        let retry = rebuild_index(RebuildIndexInput {
+            store_name: "personal",
+            store_root: &root,
+            cache_dir: &cache,
+            options: options(),
+            path_case: memory_path::PathCase::Sensitive,
+        })
+        .expect("retry incomplete generation");
+        assert!(!retry.current);
+        assert!(!retry.published);
+    }
+
+    #[test]
+    fn unreadable_utf8_note_cannot_poison_good_sibling() {
+        let dir = temp_dir("invalid-utf8-good-sibling");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        let good = write_record(&root, true);
+        let bad = root.join("inbox/notes/2026/05/16/invalid-utf8.md");
+        fs::write(&bad, [0xff, 0xfe]).expect("invalid UTF-8 note");
+
+        let report = rebuild_index(RebuildIndexInput {
+            store_name: "personal",
+            store_root: &root,
+            cache_dir: &cache,
+            options: options(),
+            path_case: memory_path::PathCase::Sensitive,
+        })
+        .expect("publish readable sibling");
+
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(
+            report.entries[0].note_path,
+            relative_path(&root, &good.note_path, memory_path::PathCase::Sensitive)
+        );
+        assert!(!report.projection.complete);
+        assert!(report.warnings.iter().any(|warning| warning.path == bad));
     }
 
     fn load_input<'a>(store_name: &'a str, root: &'a Path, cache: &'a Path) -> LoadIndexInput<'a> {
@@ -1302,6 +2083,290 @@ mod tests {
             .expect("load cached must not error on a torn line");
         let loaded = loaded.expect("header still valid, cache reused");
         assert_eq!(loaded.entries.len(), 1);
+    }
+
+    #[test]
+    fn corrupted_real_row_invalidates_warm_projection_and_rebuilds() {
+        let dir = temp_dir("corrupt-real-row");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(&root, true);
+        write_record(&root, true);
+        let initial = rebuild_index(RebuildIndexInput {
+            store_name: "personal",
+            store_root: &root,
+            cache_dir: &cache,
+            options: options(),
+            path_case: memory_path::PathCase::Sensitive,
+        })
+        .expect("seed index");
+        assert_eq!(initial.entries.len(), 2);
+        let contents = fs::read_to_string(&initial.path).expect("read index");
+        let mut lines = contents.lines().map(str::to_owned).collect::<Vec<_>>();
+        lines[1] = "{malformed-row".to_owned();
+        fs::write(&initial.path, format!("{}\n", lines.join("\n"))).expect("corrupt row");
+
+        let input = load_input("personal", &root, &cache);
+        assert!(
+            load_cached_index(&input).expect("cached read").is_none(),
+            "a partial projection must not be presented as complete"
+        );
+        assert!(
+            load_fresh_index(&input).expect("fresh read").is_none(),
+            "canonical fingerprint alone must not bless a damaged index"
+        );
+        let repaired = load_or_rebuild_index(input).expect("repair damaged index");
+        assert_eq!(repaired.entries.len(), 2);
+        assert!(repaired.rebuilt);
+    }
+
+    #[test]
+    fn rebuild_publishes_good_memories_and_marks_curated_omissions() {
+        let dir = temp_dir("partial-curated-projection");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        let project = root.join("memories/projects/example");
+        fs::create_dir_all(&project).expect("project dir");
+        fs::write(project.join("good.md"), "Good project memory.\n").expect("good memory");
+        fs::write(project.join("broken.md"), [0xff, 0xfe]).expect("broken memory");
+        write_record(&root, true);
+
+        let report = rebuild_index(RebuildIndexInput {
+            store_name: "personal",
+            store_root: &root,
+            cache_dir: &cache,
+            options: options(),
+            path_case: memory_path::PathCase::Sensitive,
+        })
+        .expect("publish best available projection");
+
+        assert!(!report.projection.complete);
+        assert_eq!(report.projection.entries.len(), 2);
+        assert!(
+            report
+                .projection
+                .entries
+                .iter()
+                .any(|entry| entry.body == "Good project memory.\n")
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.path.ends_with("broken.md"))
+        );
+    }
+
+    #[test]
+    fn rebuild_retains_last_good_curated_memory_beside_new_good_records() {
+        let dir = temp_dir("retain-curated-on-warning");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        let curated = root.join("rules/good.md");
+        fs::create_dir_all(curated.parent().expect("rules dir")).expect("rules dir");
+        fs::write(&curated, "Last known good curated memory.\n").expect("curated memory");
+        write_record(&root, true);
+        let first = rebuild_index(RebuildIndexInput {
+            store_name: "personal",
+            store_root: &root,
+            cache_dir: &cache,
+            options: options(),
+            path_case: memory_path::PathCase::Sensitive,
+        })
+        .expect("seed complete projection");
+        assert!(first.projection.complete);
+
+        fs::write(&curated, [0xff, 0xfe]).expect("damage curated memory");
+        write_record(&root, true);
+        let rebuilt = rebuild_index(RebuildIndexInput {
+            store_name: "personal",
+            store_root: &root,
+            cache_dir: &cache,
+            options: options(),
+            path_case: memory_path::PathCase::Sensitive,
+        })
+        .expect("publish best available projection");
+
+        assert!(!rebuilt.projection.complete);
+        assert_eq!(
+            rebuilt.entries.len(),
+            2,
+            "new good records must not be delayed"
+        );
+        assert!(
+            rebuilt
+                .projection
+                .entries
+                .iter()
+                .any(|entry| entry.body == "Last known good curated memory.\n"),
+            "one damaged curated file must not erase its last known good body"
+        );
+        let current = load_fresh_index(&load_input("personal", &root, &cache))
+            .expect("fresh check")
+            .expect("interactive reads should reuse best available current data");
+        assert!(!current.projection.complete);
+        assert!(
+            load_cached_index(&load_input("personal", &root, &cache))
+                .expect("cached check")
+                .is_some(),
+            "hooks must still receive the best available incomplete projection"
+        );
+    }
+
+    #[test]
+    fn projection_digest_rejects_valid_json_curated_mutation() {
+        let dir = temp_dir("projection-digest");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        fs::create_dir_all(root.join("rules")).expect("rules dir");
+        fs::write(
+            root.join("rules/good.md"),
+            "Authenticated curated memory.\n",
+        )
+        .expect("curated memory");
+        write_record(&root, true);
+        let report = rebuild_index(RebuildIndexInput {
+            store_name: "personal",
+            store_root: &root,
+            cache_dir: &cache,
+            options: options(),
+            path_case: memory_path::PathCase::Sensitive,
+        })
+        .expect("seed index");
+        let contents = fs::read_to_string(&report.path).expect("read index");
+        let mut lines = contents.lines().map(str::to_owned).collect::<Vec<_>>();
+        let mut header: serde_json::Value = serde_json::from_str(&lines[0]).expect("header json");
+        header["projection"]["entries"] = serde_json::json!([]);
+        lines[0] = serde_json::to_string(&header).expect("mutated header");
+        fs::write(&report.path, format!("{}\n", lines.join("\n"))).expect("mutate projection");
+
+        assert!(
+            load_cached_index(&load_input("personal", &root, &cache))
+                .expect("cached read")
+                .is_none(),
+            "valid JSON must not bypass projection integrity"
+        );
+    }
+
+    #[test]
+    fn missing_projection_is_rebuilt_without_panicking() {
+        let dir = temp_dir("missing-projection-repair");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(&root, true);
+        let report = rebuild_index(RebuildIndexInput {
+            store_name: "personal",
+            store_root: &root,
+            cache_dir: &cache,
+            options: options(),
+            path_case: memory_path::PathCase::Sensitive,
+        })
+        .expect("seed index");
+        let contents = fs::read_to_string(&report.path).expect("read index");
+        let mut lines = contents.lines().map(str::to_owned).collect::<Vec<_>>();
+        let mut header: serde_json::Value = serde_json::from_str(&lines[0]).expect("header json");
+        header
+            .as_object_mut()
+            .expect("header object")
+            .remove("projection");
+        lines[0] = serde_json::to_string(&header).expect("mutated header");
+        fs::write(&report.path, format!("{}\n", lines.join("\n"))).expect("drop projection");
+
+        let repaired = load_or_rebuild_index(load_input("personal", &root, &cache))
+            .expect("repair missing projection");
+        assert_eq!(repaired.entries.len(), 1);
+        assert!(repaired.rebuilt);
+        assert!(repaired.projection.complete);
+    }
+
+    #[test]
+    fn schema_ten_rows_remain_the_upgrade_regression_baseline() {
+        let dir = temp_dir("schema-ten-regression-baseline");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        let first = write_record(&root, true);
+        let second = write_record(&root, true);
+        let report = rebuild_index(RebuildIndexInput {
+            store_name: "personal",
+            store_root: &root,
+            cache_dir: &cache,
+            options: options(),
+            path_case: memory_path::PathCase::Sensitive,
+        })
+        .expect("seed index");
+        let contents = fs::read_to_string(&report.path).expect("read index");
+        let mut lines = contents.lines().map(str::to_owned).collect::<Vec<_>>();
+        let mut header: serde_json::Value = serde_json::from_str(&lines[0]).expect("header json");
+        header["fingerprint"]["schema_version"] = serde_json::json!(10);
+        header
+            .as_object_mut()
+            .expect("header object")
+            .remove("projection");
+        header
+            .as_object_mut()
+            .expect("header object")
+            .remove("projection_sha256");
+        lines[0] = serde_json::to_string(&header).expect("legacy header");
+        fs::write(&report.path, format!("{}\n", lines.join("\n"))).expect("write legacy cache");
+
+        fs::remove_file(&second.note_path).expect("hide second note");
+        fs::remove_file(second.event_path.expect("second event")).expect("hide second event");
+        let rebuilt = rebuild_index(RebuildIndexInput {
+            store_name: "personal",
+            store_root: &root,
+            cache_dir: &cache,
+            options: options(),
+            path_case: memory_path::PathCase::Sensitive,
+        })
+        .expect("retain legacy baseline");
+
+        assert_eq!(rebuilt.entries.len(), 2);
+        assert!(!rebuilt.current);
+        assert!(
+            rebuilt.published,
+            "schema-12 best-available union is published"
+        );
+        assert!(rebuilt.entries.iter().any(|entry| entry.id == first.id));
+        assert!(rebuilt.entries.iter().any(|entry| entry.id == second.id));
+    }
+
+    #[test]
+    fn load_cached_index_bootstraps_unverifiable_schema_ten_rows() {
+        let dir = temp_dir("cached-schema-ten");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(&root, true);
+        let report = rebuild_index(RebuildIndexInput {
+            store_name: "personal",
+            store_root: &root,
+            cache_dir: &cache,
+            options: options(),
+            path_case: memory_path::PathCase::Sensitive,
+        })
+        .expect("rebuild");
+        let contents = fs::read_to_string(&report.path).expect("read index");
+        let mut lines = contents.lines();
+        let mut header: serde_json::Value =
+            serde_json::from_str(lines.next().expect("header")).expect("parse header");
+        header["fingerprint"]["schema_version"] = serde_json::Value::from(10);
+        header
+            .as_object_mut()
+            .expect("header object")
+            .remove("projection");
+        let mut schema_ten = serde_json::to_string(&header).expect("serialize header");
+        schema_ten.push('\n');
+        for line in lines {
+            schema_ten.push_str(line);
+            schema_ten.push('\n');
+        }
+        fs::write(&report.path, schema_ten).expect("write schema ten cache");
+
+        let loaded = load_cached_index(&load_input("personal", &root, &cache))
+            .expect("load cache")
+            .expect("legacy rows remain available while hydration runs");
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.projection.entries, loaded.entries);
+        assert!(!loaded.projection.complete);
     }
 
     /// `read_index` skips one malformed body line and returns the rest rather
@@ -1432,6 +2497,43 @@ mod tests {
         assert_eq!(after.canonical_files, before.canonical_files + 1);
     }
 
+    #[test]
+    fn fingerprint_ignores_atomic_writer_temp_files() {
+        let dir = temp_dir("fingerprint-atomic-temp");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        let note_dir = root.join("inbox/notes/2026/05/16");
+        fs::create_dir_all(&note_dir).expect("note dir");
+        fs::write(
+            note_dir.join(".tmp.unfinished-note.md"),
+            "unfinished atomic write",
+        )
+        .expect("writer temp");
+        let rules = root.join("rules");
+        fs::create_dir_all(&rules).expect("rules dir");
+        fs::write(
+            rules.join(".tmp.unfinished-rule.md"),
+            "unfinished curated write",
+        )
+        .expect("curated writer temp");
+
+        let fingerprint = canonical_fingerprint(&root).expect("fingerprint");
+        let report = rebuild_index(RebuildIndexInput {
+            store_name: "personal",
+            store_root: &root,
+            cache_dir: &cache,
+            options: options(),
+            path_case: memory_path::PathCase::Sensitive,
+        })
+        .expect("rebuild");
+
+        assert_eq!(fingerprint.canonical_files, 0);
+        assert_eq!(fingerprint.canonical_names_combined, 0);
+        assert!(report.entries.is_empty());
+        assert!(report.projection.entries.is_empty());
+        assert!(report.warnings.is_empty());
+    }
+
     /// A delete+add that nets the SAME file count, under an mtime-preserving
     /// cloud-sync arrival where the added file's mtime is <= the prior newest,
     /// leaves dir count, file count, and newest mtime all unchanged. Only the
@@ -1512,6 +2614,214 @@ mod tests {
             ..base.clone()
         };
         assert_ne!(base, one_more_file);
+    }
+
+    #[test]
+    fn prune_removes_only_vanished_temporary_store_index() {
+        let dir = temp_dir("prune-temp-index");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(&root, true);
+        let report = rebuild_index(RebuildIndexInput {
+            store_name: "personal",
+            store_root: &root,
+            cache_dir: &cache,
+            options: options(),
+            path_case: memory_path::PathCase::Sensitive,
+        })
+        .expect("build temporary index");
+        fs::remove_dir_all(&root).expect("remove temporary store");
+
+        assert_eq!(
+            prune_orphaned_temporary_indexes(&cache).expect("prune indexes"),
+            1
+        );
+        assert!(!report.path.exists());
+    }
+
+    #[test]
+    fn prune_removes_legacy_temp_fingerprint_and_matching_lock() {
+        let dir = temp_dir("prune-legacy-fingerprint");
+        let root = dir.join("vanished-store");
+        let cache = dir.join("cache");
+        let key = store_cache_key("personal", &root);
+        let fingerprint = cache
+            .join("indexes")
+            .join(format!("{key}.fingerprint.json"));
+        let lock = cache.join("locks/index").join(format!("{key}.lock"));
+        fs::create_dir_all(fingerprint.parent().expect("fingerprint parent"))
+            .expect("fingerprint parent");
+        fs::create_dir_all(lock.parent().expect("lock parent")).expect("lock parent");
+        fs::write(
+            &fingerprint,
+            format!(
+                r#"{{"schema_version":8,"store_root":"{}"}}"#,
+                root.display()
+            ),
+        )
+        .expect("legacy fingerprint");
+        fs::write(&lock, b"").expect("legacy lock");
+
+        assert_eq!(
+            prune_orphaned_temporary_indexes(&cache).expect("prune legacy artifacts"),
+            1
+        );
+        assert!(!fingerprint.exists());
+        assert!(!lock.exists());
+    }
+
+    #[test]
+    fn prune_removes_unreferenced_unlocked_index_lock() {
+        let dir = temp_dir("prune-orphan-lock");
+        let cache = dir.join("cache");
+        let indexes = cache.join("indexes");
+        let lock = cache.join("locks/index/orphan.lock");
+        fs::create_dir_all(&indexes).expect("indexes dir");
+        fs::create_dir_all(lock.parent().expect("lock parent")).expect("lock parent");
+        fs::write(&lock, b"").expect("orphan lock");
+
+        assert_eq!(
+            prune_orphaned_temporary_indexes(&cache).expect("prune orphan lock"),
+            0
+        );
+        assert!(!lock.exists());
+    }
+
+    #[test]
+    fn prune_preserves_unreferenced_contended_index_lock() {
+        let dir = temp_dir("prune-live-lock");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        fs::create_dir_all(cache.join("indexes")).expect("indexes dir");
+        let held = try_rebuild_lock(&cache, "personal", &root)
+            .expect("take lock")
+            .expect("lock available");
+
+        prune_orphaned_temporary_indexes(&cache).expect("prune around live lock");
+        assert!(held.path.exists());
+    }
+
+    #[test]
+    fn prune_preserves_held_lock_after_vanished_temp_index_is_removed() {
+        let dir = temp_dir("prune-vanished-held-lock");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(&root, true);
+        let report = rebuild_index(RebuildIndexInput {
+            store_name: "personal",
+            store_root: &root,
+            cache_dir: &cache,
+            options: options(),
+            path_case: memory_path::PathCase::Sensitive,
+        })
+        .expect("build temporary index");
+        let held = try_rebuild_lock(&cache, "personal", &root)
+            .expect("take matching lock")
+            .expect("lock available");
+        fs::remove_dir_all(&root).expect("remove temporary store");
+
+        assert_eq!(
+            prune_orphaned_temporary_indexes(&cache).expect("prune vanished index"),
+            1
+        );
+        assert!(!report.path.exists());
+        assert!(held.path.exists(), "active matching lock must survive");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_identity_detects_path_replacement() {
+        let dir = temp_dir("lock-path-replacement");
+        let path = dir.join("index.lock");
+        fs::write(&path, b"").expect("lock file");
+        let open = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open original lock");
+        assert!(lock_path_matches_file(&open, &path).expect("match original"));
+
+        fs::remove_file(&path).expect("unlink original");
+        fs::write(&path, b"").expect("replace lock path");
+        assert!(!lock_path_matches_file(&open, &path).expect("detect replacement"));
+    }
+
+    #[test]
+    fn contended_interactive_rebuild_waits_for_fresh_generation() {
+        let dir = temp_dir("lock-serve-cache");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(&root, true);
+        let first =
+            load_or_rebuild_index(load_input("personal", &root, &cache)).expect("seed index");
+        write_record(&root, true);
+        let lock = try_rebuild_lock(&cache, "personal", &root)
+            .expect("take lock")
+            .expect("lock available");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(lock);
+        });
+
+        let contended = load_or_rebuild_index(load_input("personal", &root, &cache))
+            .expect("wait then rebuild current generation");
+        release.join().expect("release rebuild lock");
+
+        assert!(contended.rebuilt);
+        assert_eq!(contended.entries.len(), first.entries.len() + 1);
+    }
+
+    #[test]
+    fn contended_interactive_rebuild_has_bounded_stale_fallback() {
+        let dir = temp_dir("lock-bounded-stale-fallback");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(&root, true);
+        let first =
+            load_or_rebuild_index(load_input("personal", &root, &cache)).expect("seed index");
+        write_record(&root, true);
+        let lock = try_rebuild_lock(&cache, "personal", &root)
+            .expect("take lock")
+            .expect("lock available");
+
+        let started = std::time::Instant::now();
+        let contended = load_or_rebuild_index(load_input("personal", &root, &cache))
+            .expect("serve explicit stale fallback");
+        let elapsed = started.elapsed();
+        drop(lock);
+
+        assert!(elapsed >= std::time::Duration::from_secs(1));
+        assert!(elapsed < std::time::Duration::from_secs(3));
+        assert_eq!(contended.entries, first.entries);
+        assert!(contended.warnings.iter().any(|warning| {
+            warning
+                .message
+                .contains("previous local generation after waiting one second")
+        }));
+    }
+
+    #[test]
+    fn direct_rebuild_does_not_republish_identical_generation() {
+        let dir = temp_dir("rebuild-identical");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(&root, true);
+        let input = || RebuildIndexInput {
+            store_name: "personal",
+            store_root: &root,
+            cache_dir: &cache,
+            options: options(),
+            path_case: memory_path::PathCase::Sensitive,
+        };
+        let first = rebuild_index(input()).expect("first rebuild");
+        let second = rebuild_index(input()).expect("identical rebuild");
+
+        assert!(first.published);
+        assert!(first.current);
+        assert!(!second.published);
+        assert!(second.current);
+        assert_eq!(first.entries, second.entries);
+        assert_eq!(first.projection, second.projection);
     }
 
     /// Two threads racing `load_or_rebuild_index` against the same cache key must

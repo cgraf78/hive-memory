@@ -195,8 +195,8 @@ fn run_search_backend(
 /// `cli::sync::perform` holds, so an interactive `hm search` and a concurrent
 /// `hm refresh` cannot fight over the shared cache artifact. On contention we
 /// degrade to read-only/lexical rather than block this latency-sensitive read: a
-/// stale-but-valid index searches fine, and the rebuild the other holder is
-/// running will land for the next query.
+/// a stale index can omit newly arrived memories, so contention must fall back
+/// to the current lexical corpus rather than serving the old snapshot.
 /// (Tantivy's own writer lock already prevents corruption; this is about honoring
 /// the documented single-writer contract and avoiding redundant rebuild scans.)
 fn tantivy_search(
@@ -213,11 +213,9 @@ fn tantivy_search(
     if !index.is_fresh(&fingerprint) {
         // Serialize the rebuild against refresh/other interactive rebuilds via the
         // cache-key lock. `Ok(Some(lock))` lets us rebuild while holding it;
-        // `Ok(None)` means another rebuild already holds it, and a lock I/O error
-        // means we cannot coordinate — in both of those cases skip our rebuild and
-        // search the current index read-only instead of blocking this
-        // latency-sensitive read. The lock guard must outlive the rebuild, so it
-        // is bound for the whole branch.
+        // `Ok(None)` means another rebuild already holds it. Never serve the
+        // populated-but-stale index in that case: it may silently omit current
+        // JSONL rows. Signal degradation so the caller uses lexical search.
         match index::try_rebuild_lock(&config.cache_dir, store_name, store_root) {
             Ok(Some(_rebuild_lock)) => {
                 let documents = search::search_documents(store_root, input.entries)?;
@@ -225,21 +223,12 @@ fn tantivy_search(
                     .rebuild_tagged(&documents, Some(&fingerprint))
                     .map_err(|err| search::SearchError::Retrieval(err.to_string()))?;
             }
-            // Rebuild skipped (another holder has the lock, or we cannot coordinate).
-            // `open_or_create_in_dir` will have just created an EMPTY index when none
-            // existed, so serving it now would silently return zero hits and strip
-            // results on the primary recall path. A populated-but-stale index is fine
-            // to serve (the other holder's rebuild lands for the next query), but a
-            // never-built/empty index must NOT short-circuit the lexical fallback.
-            // The manifest is written only after a successful rebuild commit, so its
-            // absence distinguishes "never built / empty" from "stale but populated".
-            _ if index.manifest().is_none() => {
+            Ok(None) => {
                 return Err(search::SearchError::Retrieval(
-                    "full-text index not yet populated and a concurrent rebuild holds the cache lock"
-                        .to_owned(),
+                    "full-text index is stale and another rebuild holds the cache lock".to_owned(),
                 ));
             }
-            _ => {}
+            Err(err) => return Err(search::SearchError::Retrieval(err.to_string())),
         }
     }
     if project_only {
@@ -249,16 +238,14 @@ fn tantivy_search(
     }
 }
 
-/// Hook-safe BM25 search: query the persistent index ONLY when it is already
-/// fresh for `input.entries`. Never rebuilds — the prompt-submit hook must not
-/// pay for a full index rebuild on its latency budget. Returns `None` (so the
-/// caller falls back to lexical) when the backend is off, the index is
-/// stale/absent, or the engine errors. The index is kept fresh out of band by
-/// `hm refresh` (tool-complete) and interactive `hm search`.
-pub(crate) fn tantivy_search_if_fresh(
+/// Canonical-free hook query over an already-published local projection.
+pub(crate) fn tantivy_search_local_if_fresh(
     config: &Config,
     store_name: &str,
+    indexed_entries: &[index::IndexEntry],
     input: search::SearchInput<'_>,
+    registry: &hive_memory::entity::EntityRegistry,
+    project_aliases: &std::collections::BTreeMap<String, String>,
 ) -> Option<Vec<search::SearchHit>> {
     if !config
         .defaults
@@ -269,15 +256,28 @@ pub(crate) fn tantivy_search_if_fresh(
         return None;
     }
     let dir = config.cache_dir.join("search").join(store_name);
-    // Read-only open: never create or rebuild on the hook's hot path. A missing
-    // or stale index yields None so the caller uses lexical; refresh rebuilds it.
     let index = retrieval::SearchIndex::open_existing_in_dir(&dir)
         .ok()
         .flatten()?;
-    if !index.is_fresh(&search::entries_fingerprint(input.entries)) {
+    // The shared persistent corpus is remembered/raw JSONL only. Curated files
+    // stay in the atomic local projection and are merged lexically below. This
+    // keeps hook and interactive searches on one fingerprint instead of making
+    // each path invalidate the other's Tantivy cache.
+    if !index.is_fresh(&search::entries_fingerprint(indexed_entries)) {
         return None;
     }
-    search::search_indexed(input, &index).ok()
+    let indexed_input = search::SearchInput {
+        entries: indexed_entries,
+        ..input.clone()
+    };
+    search::search_indexed_local(
+        indexed_input,
+        input.entries,
+        &index,
+        registry,
+        project_aliases,
+    )
+    .ok()
 }
 
 /// Rebuild the store's persistent Tantivy index from `entries` when the backend
@@ -429,12 +429,6 @@ fn source_filter_includes_inbox(sources: &[String]) -> bool {
     sources
         .iter()
         .any(|source| source == "inbox" || source == "all")
-}
-
-pub(crate) fn source_filter_includes_curated(sources: &[String]) -> bool {
-    sources
-        .iter()
-        .any(|source| source == "curated" || source == "all")
 }
 
 fn search_since_cutoff(value: &str) -> Result<OffsetDateTime> {

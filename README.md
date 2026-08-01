@@ -253,7 +253,7 @@ Hive Memory ships two candidate-generation backends, selected by
 | Backend | Value | Default | What it is |
 | --- | --- | --- | --- |
 | Lexical | `"lexical"` | ✅ | Deterministic, stable text scan. Phrase matches weighted above term matches; ties broken by confidence, temporal intent, then recency. |
-| Tantivy BM25 | `"tantivy"` | opt-in | Local **BM25** full-text index for higher recall (subject/tags field-boosted). |
+| Tantivy BM25 | `"tantivy"` | opt-in | Local **BM25** full-text index for higher recall (subject/tags field-boosted), unioned with deterministic lexical and alias matches. |
 
 ```toml
 [defaults]
@@ -263,9 +263,10 @@ search_backend = "tantivy"
 This is **full-text / BM25 lexical** search — there is no embedding, semantic, or
 vector search. Retrieval ranking is not yet tuned; an unrecognized
 `search_backend` value degrades to lexical rather than failing. In both backends
-the index returns ranked ids only; store, scope, audience, and validity policy
-are applied as mandatory post-filters. Project identity is a ranking signal
-unless `--project-only` requests a hard project filter. The index is a recall
+candidate generation considers the complete eligible corpus before the final
+output limit; store, scope, audience, validity, supersession, and deduplication
+remain mandatory post-filters. Project identity is a ranking signal unless
+`--project-only` requests a hard project filter. The index is a recall
 optimization, never a security boundary.
 
 Inspect scoring with `hm search --explain`, and measure ranking changes against
