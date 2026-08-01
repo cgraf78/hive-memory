@@ -377,7 +377,7 @@ pub fn try_state_lock(
 /// This is the single serialized critical section every `mark_*` routes through.
 /// Contenders briefly condition-wait on the local OS lock: proceeding unlocked
 /// can lose unrelated fields from another hook's whole-file atomic replacement.
-/// After 25 ms the update is skipped with a warning so a stuck holder cannot
+/// After 50 ms the update is skipped with a warning so a stuck holder cannot
 /// stall a foreground hook. The critical section contains only local state I/O,
 /// and process death releases the advisory lock. It is never nested with
 /// `RefreshLock`, so no lock-ordering deadlock is possible.
@@ -390,7 +390,7 @@ fn with_state_lock<F>(
 where
     F: FnOnce(&mut HookState),
 {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(25);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
     let _lock = loop {
         if let Some(lock) = try_state_lock(state_dir, session_id)? {
             break lock;
@@ -876,62 +876,49 @@ mod tests {
         // the production mark API directly: it owns the per-session lock across
         // each load -> mutate -> save cycle, so the updates must compose.
         let dir = temp_dir("concurrent-marks");
-        let session = "session-1";
+        for iteration in 0..50 {
+            let session = format!("session-{iteration}");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
 
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-
-        let pending_dir = dir.clone();
-        let pending_barrier = std::sync::Arc::clone(&barrier);
-        let pending = std::thread::spawn(move || {
-            pending_barrier.wait();
-            for _ in 0..50 {
-                mark_memory_pending(&pending_dir, session, "intent", &options())
+            let pending_dir = dir.clone();
+            let pending_session = session.clone();
+            let pending_barrier = std::sync::Arc::clone(&barrier);
+            let pending = std::thread::spawn(move || {
+                pending_barrier.wait();
+                mark_memory_pending(&pending_dir, &pending_session, "intent", &options())
                     .expect("mark pending");
-            }
-        });
+            });
 
-        let startup_dir = dir.clone();
-        let startup_barrier = std::sync::Arc::clone(&barrier);
-        let startup = std::thread::spawn(move || {
-            startup_barrier.wait();
-            for _ in 0..50 {
+            let startup_dir = dir.clone();
+            let startup_session = session.clone();
+            let startup_barrier = std::sync::Arc::clone(&barrier);
+            let startup = std::thread::spawn(move || {
+                startup_barrier.wait();
                 mark_startup_context(
                     &startup_dir,
-                    session,
+                    &startup_session,
                     "agent=codex|store=personal",
                     vec!["mem-a".to_owned(), "mem-b".to_owned()],
                     &options(),
                 )
                 .expect("mark startup");
-            }
-        });
+            });
 
-        pending.join().expect("pending thread");
-        startup.join().expect("startup thread");
-
-        let loaded = load_state(&dir, session).expect("load state");
-
-        // Both mutations survive: the pending flag from one writer and the
-        // startup context/memory ids from the other.
-        assert!(
-            loaded.memory_pending,
-            "memory_pending must survive concurrent startup-context writes"
-        );
-        assert_eq!(
-            loaded.pending_reason.as_deref(),
-            Some("intent"),
-            "pending reason must survive"
-        );
-        assert_eq!(
-            loaded.context_key.as_deref(),
-            Some("agent=codex|store=personal"),
-            "startup context key must survive concurrent pending writes"
-        );
-        assert_eq!(
-            loaded.startup_memory_ids,
-            vec!["mem-a".to_owned(), "mem-b".to_owned()],
-            "startup memory ids must survive"
-        );
+            pending.join().expect("pending thread");
+            startup.join().expect("startup thread");
+            let loaded = load_state(&dir, &session).expect("load state");
+            assert!(loaded.memory_pending, "iteration {iteration}: pending lost");
+            assert_eq!(loaded.pending_reason.as_deref(), Some("intent"));
+            assert_eq!(
+                loaded.context_key.as_deref(),
+                Some("agent=codex|store=personal"),
+                "iteration {iteration}: startup context lost"
+            );
+            assert_eq!(
+                loaded.startup_memory_ids,
+                vec!["mem-a".to_owned(), "mem-b".to_owned()]
+            );
+        }
     }
 
     #[test]
