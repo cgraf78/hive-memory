@@ -10410,6 +10410,18 @@ fn prompt_submit_hook_falls_back_when_tantivy_index_absent() {
         "lexical refresh must not build the tantivy index"
     );
 
+    // Prompt hooks now schedule a detached refresh after responding. Suppress
+    // that worker with the same recent-attempt stamp used in production so this
+    // test isolates the foreground guarantee: lexical fallback itself must not
+    // build Tantivy on the latency-sensitive prompt path.
+    let refresh_stamp = dir.join("state/background-refresh").join(format!(
+        "{}.last-attempt",
+        hive_memory::index::store_cache_key("personal", &personal)
+    ));
+    fs::create_dir_all(refresh_stamp.parent().expect("refresh stamp parent"))
+        .expect("refresh stamp parent");
+    fs::write(&refresh_stamp, b"").expect("recent refresh attempt");
+
     // Prompt-submit under the tantivy backend: index absent -> lexical fallback.
     let out = run_prompt_submit_hook(&tantivy_cfg, "bravo audit bucket");
     assert!(
