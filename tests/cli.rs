@@ -7021,6 +7021,48 @@ fn refresh_hook_mode_coalesces_when_refresh_lock_is_held() {
 }
 
 #[test]
+fn background_refresh_without_receipts_does_not_coalesce_on_session_lock() {
+    let dir = temp_dir("background-refresh-independent-store");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&work, "work");
+
+    let lock_path = memory_hook::refresh_lock_path(&dir.join("state"), "codex", "refresh-session");
+    fs::create_dir_all(lock_path.parent().expect("lock parent")).expect("lock parent");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("open lock");
+    FileExt::lock(&lock).expect("hold receipt refresh lock");
+
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_HOOK_ACTIVE", "1")
+        .env("HIVE_MEMORY_SESSION_ID", "refresh-session")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "--store",
+            "work",
+            "--as-agent",
+            "codex",
+            "refresh",
+            "--background",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"indexes\": 1"))
+        .stdout(predicate::str::contains("\"refreshed\": true"))
+        .stdout(predicate::str::contains("\"coalesced\": false"));
+    FileExt::unlock(&lock).expect("unlock receipt refresh lock");
+}
+
+#[test]
 fn hook_session_start_emits_context_action_json() {
     let dir = temp_dir("hook-session-start");
     let config = dir.join("config.toml");

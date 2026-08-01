@@ -137,7 +137,14 @@ pub(crate) fn run_refresh(args: RefreshArgs, context: CliContext) -> Result<()> 
         && receipt_cursor
             .as_ref()
             .is_some_and(|cursor| cursor.unrefreshed > 0);
-    let _refresh_lock = if let Some(cursor) = receipt_cursor.as_ref() {
+    // The session lock protects receipt cursor consumption, not ordinary cache
+    // maintenance. Periodic requests already deduplicate per store and serialize
+    // on the store's rebuild lock; taking the session lock here would let a
+    // personal-store refresh incorrectly swallow a distinct work-store request.
+    let _refresh_lock = if let Some(cursor) = receipt_cursor
+        .as_ref()
+        .filter(|cursor| cursor.unrefreshed > 0)
+    {
         loop {
             match memory_hook::try_refresh_lock(
                 &config.state_dir,
