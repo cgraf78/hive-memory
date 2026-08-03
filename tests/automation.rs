@@ -171,7 +171,7 @@ fn comments_do_not_satisfy_a_missing_command() {
 
 #[test]
 fn a_missing_schedule_trigger_is_rejected() {
-    let yaml = valid_workflow().replace("  schedule:\n    - cron: \"0 7 * * *\"\n", "");
+    let yaml = valid_workflow().replace("  schedule:\n    - cron: \"17 8 * * *\"\n", "");
     assert!(validate_workflow(&yaml).is_err());
 }
 

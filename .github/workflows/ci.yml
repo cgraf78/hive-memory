@@ -6,7 +6,7 @@ on:
     branches:
       - main
   schedule:
-    - cron: "0 7 * * *"
+    - cron: "17 8 * * *"
   workflow_dispatch:
 
 permissions:
@@ -17,7 +17,7 @@ env:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@d0648a98a1585710edb5d1393af84e48025bcaa7
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@8eaac8e384ae89e9c1aaf675dd23689cfe73fa7c
     with:
       android-package-smoke-command: |
         scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
@@ -33,7 +33,7 @@ jobs:
           .termux-ci/hm
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@6258122bd79dc9296b5d529c33fc3aad8f4d5796
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@8eaac8e384ae89e9c1aaf675dd23689cfe73fa7c
     with:
       matrix-set: full
       profiles: base
