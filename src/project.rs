@@ -279,14 +279,6 @@ fn discover(start_dir: &Path) -> Result<Discovered, ProjectError> {
     })
 }
 
-/// Clear the process-wide discovery cache. Test-only.
-#[cfg(test)]
-fn clear_discovery_cache() {
-    if let Ok(mut guard) = DISCOVERY_CACHE.lock() {
-        *guard = None;
-    }
-}
-
 /// Normalize a git origin URL so protocol/auth changes preserve project id.
 pub fn normalize_remote_url(input: &str) -> String {
     let mut value = input.trim().trim_end_matches('/').to_owned();
@@ -1453,7 +1445,6 @@ mod tests {
 
     #[test]
     fn resolve_uses_parsed_git_origin_for_id() {
-        clear_discovery_cache();
         let root = temp_dir("resolve-git-id");
         write_git_config(&root, "git@github.com:cgraf78/hive-memory.git");
 
@@ -1473,7 +1464,6 @@ mod tests {
 
     #[test]
     fn discovery_cache_returns_same_result_without_rewalking() {
-        clear_discovery_cache();
         let root = temp_dir("resolve-cache");
         write_git_config(&root, "git@github.com:cgraf78/hive-memory.git");
         let start = starting_dir(&absolutize_hint(&root).expect("absolutize"));
@@ -1514,7 +1504,6 @@ mod tests {
 
     #[test]
     fn resolve_falls_back_to_path_identity_without_marker_or_vcs() {
-        clear_discovery_cache();
         // A bare directory with no `.hive-memory-project` marker and none of the
         // VCS sentinels in `VCS_MARKERS` exercises the final identity rung: the
         // path fallback that `resolve_project` reaches only after marker and
@@ -1560,7 +1549,6 @@ mod tests {
 
     #[test]
     fn discovery_cache_isolates_distinct_start_dirs() {
-        clear_discovery_cache();
         // Two unrelated repos with different origins. The cache is keyed per
         // start dir, so each must retain its OWN discovered identity; a bug that
         // collapsed all keys into one slot would let B's resolution return A's
