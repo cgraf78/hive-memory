@@ -4429,19 +4429,11 @@ fn hook_session_start_refreshes_local_projection_after_returning() {
         .success()
         .stdout(predicate::str::contains("\"context_emitted\": false"));
 
-    let mut index_path = None;
-    for _ in 0..100 {
-        index_path = fs::read_dir(dir.join("cache/indexes"))
-            .ok()
-            .and_then(|mut entries| entries.next())
-            .and_then(Result::ok)
-            .map(|entry| entry.path());
-        if index_path.is_some() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let index_path = index_path.expect("background refresh did not create index");
+    // Poll the known final path. Atomic publication briefly exposes a .tmp file
+    // in the same directory, so read_dir().next() can select a path that the
+    // writer removes during rename and never observe the completed index.
+    let index_path =
+        hive_memory::index::scoped_index_path(&dir.join("cache"), "personal", &personal);
     let mut refreshed = false;
     for _ in 0..100 {
         if fs::read_to_string(&index_path).is_ok_and(|contents| {
@@ -4463,7 +4455,7 @@ fn hook_session_start_refreshes_local_projection_after_returning() {
             recorded_success = true;
             break;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(50));
     }
     assert!(
         recorded_success,
