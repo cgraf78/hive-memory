@@ -27,7 +27,7 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use tempfile::TempDir;
 use time::OffsetDateTime;
 
 // ---------------------------------------------------------------------------
@@ -103,17 +103,13 @@ fn load_labels() -> Labels {
 // Store materialization
 // ---------------------------------------------------------------------------
 
-fn temp_dir(name: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock after epoch")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!(
-        "hm-inject-eval-{name}-{}-{nanos}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&path).expect("create temp dir");
-    path
+// Eval tests run in parallel, so the root must be created atomically rather
+// than derived from a wall-clock timestamp that concurrent tests can share.
+fn temp_dir(name: &str) -> TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("hm-inject-eval-{name}-"))
+        .tempdir()
+        .expect("create temp dir")
 }
 
 fn manifest() -> StoreManifest {
@@ -334,15 +330,16 @@ fn recall(tp: usize, fn_: usize) -> f64 {
 fn evaluate(strategy: InjectStrategy) -> (Vec<(String, Score)>, Score) {
     let corpus = load_corpus();
     let labels = load_labels();
-    let root = temp_dir("store");
-    let entries = materialize(&corpus, &root);
+    let root_dir = temp_dir("store");
+    let root = root_dir.path();
+    let entries = materialize(&corpus, root);
 
     let mut per_context = Vec::new();
     let mut total = Score::default();
     println!("\ninjection eval — strategy={strategy:?}");
     for ctx in &labels.context {
         let project = (!ctx.project_id.is_empty()).then_some(ctx.project_id.as_str());
-        let injected = inject(strategy, &root, &entries, project);
+        let injected = inject(strategy, root, &entries, project);
         let score = score_context(&injected, ctx);
         println!(
             "  {:<20} precision={:.3} recall={:.3}  tp={} fp={} fn={} hi-fn={} tokens={} wasted={}",
@@ -376,8 +373,6 @@ fn evaluate(strategy: InjectStrategy) -> (Vec<(String, Score)>, Score) {
         total.injected_tokens,
         total.wasted_tokens,
     );
-
-    let _ = fs::remove_dir_all(&root);
     (per_context, total)
 }
 
