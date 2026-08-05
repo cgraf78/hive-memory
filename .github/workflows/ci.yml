@@ -17,12 +17,20 @@ env:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@fb1777c6f248ece2ed02c8cb6d82533d011d3218
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@a2dd8390ddd0b410d5a82822296036387247cc4c
     with:
       android-package-smoke-command: |
         scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
         scripts/smoke-release.sh "$ASSET_PLATFORM"
       doc-command: RUSTDOCFLAGS='-D missing-docs' cargo doc --no-deps
+      # Release archives are the fleet bootstrap contract, so regular CI should
+      # exercise the same Linux musl label that tagged releases publish instead
+      # of waiting until a tag push discovers drift. `shdeps` and `grafhome-ca`
+      # already gate on this; Hive Memory only covered the Android artifact.
+      package-smoke-musl-target: x86_64-unknown-linux-musl
+      package-smoke-command: |
+        scripts/package-release.sh x86_64-unknown-linux-musl linux-x86_64-musl
+        scripts/smoke-release.sh linux-x86_64-musl
       termux-command: scripts/termux-ci.sh
       termux-host-command: |
         target_dir="$RUNNER_TEMP/hive-memory-termux-target"
