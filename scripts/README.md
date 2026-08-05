@@ -5,16 +5,27 @@ Runtime behavior belongs in the Rust crate under `src/`.
 
 ## Release
 
-- `release-version.sh` computes the release version from repo state.
-- `release-tag.sh` creates or validates the tag used for a release.
-- `package-release.sh` builds release artifacts.
-- `smoke-release.sh` validates a packaged release.
-- `release.sh` composes the local release flow.
+`release-lib.sh`, `release-version.sh`, `release-tag.sh`, `package-release.sh`,
+`smoke-release.sh`, and `release.sh` are **vendored verbatim** from
+`cgraf78/actions` (`release-scripts/`), which is shared with `shdeps` and
+`grafhome-ca`. Do not edit them here: the `Vendored release scripts` CI job
+fails on any divergence.
+
+To change shared behavior, edit it in `cgraf78/actions`, then bump the pinned
+SHA in `.github/workflows/ci.yml` and run `release-scripts/sync.sh` from an
+`actions` checkout in the same commit.
+
+Repo-owned pieces:
+
+- `release.conf` declares the env namespace, archive naming, and the payload
+  Hive Memory ships.
+- `release-smoke-hook.sh` holds the runtime assertions that need to execute the
+  packaged `hm`. It is skipped for cross-built `android-*` archives.
 
 Keep scripts deterministic and friendly to CI. If a script needs a generated
 artifact, make the artifact path explicit and avoid depending on untracked local
-state. Release archive shape changes should be covered by
-`tests/shell/release-scripts-test`.
+state. Payload changes should be covered by `tests/shell/release-scripts-test`;
+the shared scripts are covered by `test/release-scripts-test` in `actions`.
 
 ## Public Evals
 
