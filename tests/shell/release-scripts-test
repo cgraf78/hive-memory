@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC1091
-# Focused coverage for release helper scripts. These are shell-owned contracts,
-# so they stay in a shell suite.
+# Hive Memory-specific release coverage.
+#
+# The release scripts themselves are vendored from cgraf78/actions and covered
+# by that repo's test/release-scripts-test: identity resolution, packaging,
+# smoke validation, and local tag cutting all live there. Re-asserting them here
+# would recreate the triplicated coverage this consolidation removed.
+#
+# What stays is what only this repo can know: that release.conf declares the
+# payload Hive Memory actually ships, that the smoke hook works, and that the
+# workflows wire the shared release contract the way this project needs.
 
 set -uo pipefail
 
@@ -12,253 +20,98 @@ HIVE_MEMORY_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 
 echo "=== Release scripts ==="
 
-_release_tag=$(
-  cd "$HIVE_MEMORY_DIR" || exit 1
-  env HIVE_MEMORY_BUILD_COMMIT=abcdef123456 HIVE_MEMORY_BUILD_TIMESTAMP=20990203-040506 \
-    GITHUB_REF_TYPE=branch GITHUB_REF_NAME=feature scripts/release-tag.sh
-)
-_assert_eq "release tag: branch ref uses generated identity" \
-  "20990203-040506-abcdef12" "$_release_tag"
+# shellcheck source=../../scripts/release.conf
+. "$HIVE_MEMORY_DIR/scripts/release.conf"
 
-_release_tag=$(
-  cd "$HIVE_MEMORY_DIR" || exit 1
-  env HIVE_MEMORY_BUILD_COMMIT=abcdef123456 GITHUB_REF_TYPE=tag \
-    GITHUB_REF_NAME=20990203-040506-abcdef12 scripts/release-tag.sh
-)
-_assert_eq "release tag: version tag ref is preserved" \
-  "20990203-040506-abcdef12" "$_release_tag"
+_assert_eq "release config: uses the Hive Memory env namespace" \
+  "HIVE_MEMORY" "$RELEASE_ENV_PREFIX"
+# The repo is hive-memory but the CLI and its archives are named hm. Getting
+# this backwards would rename every published asset.
+_assert_eq "release config: publishes hm-prefixed archives" "hm" "$RELEASE_ASSET_NAME"
+_assert_eq "release config: builds the hm binary" "hm" "$RELEASE_BINARY"
+_assert_eq "release config: keys install metadata off the repo slug" \
+  "hive-memory" "$RELEASE_SLUG"
 
-_release_tag=$(
-  cd "$HIVE_MEMORY_DIR" || exit 1
-  env HIVE_MEMORY_BUILD_COMMIT=abcdef123456 \
-    HIVE_MEMORY_BUILD_VERSION=20990204-050607-abcdef12 \
-    GITHUB_REF_TYPE=branch GITHUB_REF_NAME=feature scripts/release-tag.sh
-)
-_assert_eq "release tag: explicit build version wins" \
-  "20990204-050607-abcdef12" "$_release_tag"
+# A declared entry that no longer exists fails the release on a runner rather
+# than here, which is a slow way to discover a rename.
+for _entry in "${RELEASE_PAYLOAD_FILES[@]}"; do
+  if [[ -f "$HIVE_MEMORY_DIR/$_entry" ]]; then
+    _pass "release config: declared payload exists: $_entry"
+  else
+    _fail "release config: declared payload exists: $_entry"
+  fi
+done
+
+# The man page is the one payload entry that is easy to move without noticing,
+# because nothing else in the build references its path.
+_declared() {
+  local needle=$1 entry
+  for entry in "${RELEASE_PAYLOAD_FILES[@]}"; do
+    [[ "$entry" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+while IFS= read -r _tracked; do
+  if _declared "$_tracked"; then
+    _pass "release config: ships tracked man page: $_tracked"
+  else
+    _fail "release config: ships tracked man page: $_tracked"
+  fi
+done < <(git -C "$HIVE_MEMORY_DIR" ls-files -- 'man/man1/*.1')
+
+# --- Smoke hook -------------------------------------------------------------
+
+# shellcheck source=../../scripts/release-smoke-hook.sh
+. "$HIVE_MEMORY_DIR/scripts/release-smoke-hook.sh"
+
+if declare -F release_smoke_check >/dev/null; then
+  _pass "smoke hook: defines release_smoke_check"
+else
+  _fail "smoke hook: defines release_smoke_check"
+fi
+
+# The hook builds a throwaway store and config. A hook that leaves those behind
+# would slowly fill a release runner's temp space across matrix rows. Point the
+# hook at a private TMPDIR so the count is exact rather than racing whatever
+# else is using the system temp directory.
+_hook_fake=$(mktemp -d)
+_hook_tmp=$(mktemp -d)
+cat >"$_hook_fake/hm" <<'HM'
+#!/usr/bin/env bash
+exit 0
+HM
+chmod +x "$_hook_fake/hm"
+(TMPDIR="$_hook_tmp" release_smoke_check "$_hook_fake" linux-x86_64-musl) >/dev/null 2>&1
+_hook_left=$(find "$_hook_tmp" -mindepth 1 -maxdepth 1 | wc -l)
+rm -rf "$_hook_fake" "$_hook_tmp"
+_assert_eq "smoke hook: cleans up its store and config fixtures" "0" "$_hook_left"
+
+# A failing binary must fail the smoke test rather than being swallowed.
+_hook_fail=$(mktemp -d)
+cat >"$_hook_fail/hm" <<'HM'
+#!/usr/bin/env bash
+exit 3
+HM
+chmod +x "$_hook_fail/hm"
+rc=0
+release_smoke_check "$_hook_fail" linux-x86_64-musl >/dev/null 2>&1 || rc=$?
+rm -rf "$_hook_fail"
+if [[ "$rc" -ne 0 ]]; then
+  _pass "smoke hook: propagates a failing binary"
+else
+  _fail "smoke hook: propagates a failing binary"
+fi
+
+# --- Workflow contract ------------------------------------------------------
 
 _release_workflow=$(cat "$HIVE_MEMORY_DIR/.github/workflows/release.yml")
 _assert_contains "release workflow: uses exact reusable tag command" \
   'tag-command: scripts/release-tag.sh' "$_release_workflow"
 
-if [[ -f "$HIVE_MEMORY_DIR/man/man1/hm.1" ]]; then
-  _pass "manpage: hm.1 exists"
-else
-  _fail "manpage: hm.1 exists"
-fi
-_hm_manpage=$(cat "$HIVE_MEMORY_DIR/man/man1/hm.1")
-_assert_contains "manpage: documents hm command" "hm \\-" "$_hm_manpage"
-_assert_contains "manpage: documents hook command" ".B hook" "$_hm_manpage"
-
-rc=0
-(
-  cd "$HIVE_MEMORY_DIR" || exit 1
-  scripts/package-release.sh x86_64-unknown-linux-musl >/dev/null 2>&1
-) || rc=$?
-_assert_exit "package release: requires public asset label" 2 "$rc"
-
-rc=0
-(
-  cd "$HIVE_MEMORY_DIR" || exit 1
-  scripts/package-release.sh x86_64-unknown-linux-musl x86_64-unknown-linux-musl \
-    >/dev/null 2>&1
-) || rc=$?
-_assert_exit "package release: rejects Rust target label" 2 "$rc"
-
-rc=0
-(
-  cd "$HIVE_MEMORY_DIR" || exit 1
-  scripts/smoke-release.sh x86_64-unknown-linux-musl >/dev/null 2>&1
-) || rc=$?
-_assert_exit "smoke release: rejects Rust target label" 2 "$rc"
-
-_android_smoke=$(_tmpdir)
-mkdir -p "$_android_smoke/scripts" "$_android_smoke/dist" \
-  "$_android_smoke/stage/man/man1"
-cp "$HIVE_MEMORY_DIR/scripts/smoke-release.sh" "$_android_smoke/scripts/smoke-release.sh"
-cat >"$_android_smoke/scripts/release-tag.sh" <<'SH'
-#!/usr/bin/env bash
-printf 'unused\n'
-SH
-chmod +x "$_android_smoke/scripts/release-tag.sh"
-printf '#!/system/bin/sh\n' >"$_android_smoke/stage/hm"
-chmod +x "$_android_smoke/stage/hm"
-printf '.TH HM 1\n' >"$_android_smoke/stage/man/man1/hm.1"
-_android_tag=20990207-080910-abcdef12
-printf '%s\n' "$_android_tag" >"$_android_smoke/dist/.hive-memory-release-version"
-tar -C "$_android_smoke/stage" -czf \
-  "$_android_smoke/dist/hm-${_android_tag}-android-aarch64.tar.gz" .
-_android_bin=$(_mock_bin)
-cat >"$_android_bin/readelf" <<'SH'
-#!/usr/bin/env bash
-printf '%s\n' "$1" >>"$ANDROID_READELF_LOG"
-case "$1" in
-  -h) printf '  Machine:                           AArch64\n' ;;
-  -l) printf '      [Requesting program interpreter: /system/bin/linker64]\n' ;;
-  *) exit 2 ;;
-esac
-SH
-chmod +x "$_android_bin/readelf"
-rc=0
-(
-  cd "$_android_smoke" || exit 1
-  ANDROID_READELF_LOG="$_android_smoke/readelf.log" \
-    PATH="$_android_bin:$PATH" scripts/smoke-release.sh android-aarch64
-) || rc=$?
-_assert_exit "smoke release: validates cross-built Android archive" 0 "$rc"
-_android_readelf=$(cat "$_android_smoke/readelf.log")
-_assert_contains "smoke release: checks Android ELF architecture" "-h" "$_android_readelf"
-_assert_contains "smoke release: checks Android Bionic loader" "-l" "$_android_readelf"
-
-_release_script_origin=$(_tmpdir)/release-origin.git
-_release_script_repo=$(_tmpdir)/release-repo
-git init --bare "$_release_script_origin" >/dev/null 2>&1
-git init -b main "$_release_script_repo" >/dev/null 2>&1
-git -C "$_release_script_repo" config user.email "test@test.com"
-git -C "$_release_script_repo" config user.name "Test"
-mkdir -p "$_release_script_repo/scripts"
-cp "$HIVE_MEMORY_DIR/scripts/release.sh" "$_release_script_repo/scripts/release.sh"
-cp "$HIVE_MEMORY_DIR/scripts/release-tag.sh" "$_release_script_repo/scripts/release-tag.sh"
-cp "$HIVE_MEMORY_DIR/scripts/release-version.sh" "$_release_script_repo/scripts/release-version.sh"
-chmod +x "$_release_script_repo/scripts/"*.sh
-git -C "$_release_script_repo" add scripts >/dev/null 2>&1
-GIT_AUTHOR_DATE="2099-02-05T06:07:08Z" \
-  GIT_COMMITTER_DATE="2099-02-05T06:07:08Z" \
-  git -C "$_release_script_repo" commit -m init >/dev/null 2>&1
-git -C "$_release_script_repo" remote add origin "$_release_script_origin"
-git -C "$_release_script_repo" push origin main >/dev/null 2>&1
-_release_script_commit=$(git -C "$_release_script_repo" rev-parse HEAD)
-_release_script_tag="20990205-060708-${_release_script_commit:0:8}"
-git -C "$_release_script_repo" update-ref -d refs/remotes/origin/main
-
-_release_tag=$(
-  cd "$_release_script_repo" || exit 1
-  env HIVE_MEMORY_BUILD_COMMIT="$_release_script_commit" scripts/release-tag.sh
-)
-_assert_eq "release tag: default timestamp uses commit time" \
-  "$_release_script_tag" "$_release_tag"
-
-_release_script_output=$(
-  cd "$_release_script_repo" || exit 1
-  env HIVE_MEMORY_BUILD_VERSION=20000101-010101-deadbeef \
-    HIVE_MEMORY_BUILD_COMMIT=deadbeef12345678 \
-    HIVE_MEMORY_BUILD_TIMESTAMP=20000101-010101 \
-    GITHUB_REF_TYPE=tag \
-    GITHUB_REF_NAME=20000101-010101-deadbeef \
-    GITHUB_REF=refs/tags/20000101-010101-deadbeef \
-    GITHUB_SHA=deadbeef12345678 \
-    scripts/release.sh --push --dry-run
-)
-_assert_contains "release script dry-run: ignores ambient build env" \
-  "release: tag $_release_script_tag" "$_release_script_output"
-_assert_contains "release script dry-run: prints push plan" \
-  "would push main and refs/tags/$_release_script_tag to origin" \
-  "$_release_script_output"
-if git -C "$_release_script_repo" rev-parse -q --verify refs/remotes/origin/main >/dev/null; then
-  _pass "release script dry-run: recreates missing remote-tracking branch"
-else
-  _fail "release script dry-run: recreates missing remote-tracking branch"
-fi
-if git -C "$_release_script_repo" rev-parse -q --verify "refs/tags/$_release_script_tag" >/dev/null; then
-  _fail "release script dry-run: does not create local tag"
-else
-  _pass "release script dry-run: does not create local tag"
-fi
-
-_release_script_output=$(
-  cd "$_release_script_repo" || exit 1
-  scripts/release.sh --push
-)
-_assert_contains "release script push: creates tag" \
-  "release: created tag $_release_script_tag" "$_release_script_output"
-_assert_contains "release script push: pushes tag" \
-  "release: pushed tag $_release_script_tag" "$_release_script_output"
-if git ls-remote --exit-code --tags "$_release_script_origin" "refs/tags/$_release_script_tag" >/dev/null 2>&1; then
-  _pass "release script push: remote tag exists"
-else
-  _fail "release script push: remote tag exists"
-fi
-
-rc=0
-_release_script_error=$(
-  cd "$_release_script_repo" || exit 1
-  scripts/release.sh --push 2>&1
-) || rc=$?
-_assert_exit "release script duplicate: exits 1" 1 "$rc"
-_assert_contains "release script duplicate: rejects existing remote tag" \
-  "origin already has tag $_release_script_tag" "$_release_script_error"
-
-git -C "$_release_script_repo" tag -d "$_release_script_tag" >/dev/null 2>&1
-git -C "$_release_script_repo" push --quiet origin ":refs/tags/$_release_script_tag"
-
-_release_script_output=$(
-  cd "$_release_script_repo" || exit 1
-  scripts/release.sh
-)
-_assert_contains "release script local-only: creates tag" \
-  "release: created tag $_release_script_tag" "$_release_script_output"
-_assert_contains "release script local-only: explains unpublished tag" \
-  "tag $_release_script_tag is local only" "$_release_script_output"
-if git ls-remote --exit-code --tags "$_release_script_origin" "refs/tags/$_release_script_tag" >/dev/null 2>&1; then
-  _fail "release script local-only: remote tag absent"
-else
-  _pass "release script local-only: remote tag absent"
-fi
-
-_release_script_output=$(
-  cd "$_release_script_repo" || exit 1
-  scripts/release.sh --push
-)
-_assert_contains "release script existing local tag: reuses tag at HEAD" \
-  "local tag $_release_script_tag already exists at HEAD" "$_release_script_output"
-_assert_contains "release script existing local tag: pushes tag" \
-  "release: pushed tag $_release_script_tag" "$_release_script_output"
-
-git -C "$_release_script_repo" tag -d "$_release_script_tag" >/dev/null 2>&1
-git -C "$_release_script_repo" push --quiet origin ":refs/tags/$_release_script_tag"
-git -C "$_release_script_repo" tag -a "$_release_script_tag" -m annotated
-rc=0
-_release_script_error=$(
-  cd "$_release_script_repo" || exit 1
-  scripts/release.sh --push 2>&1
-) || rc=$?
-_assert_exit "release script annotated local tag: exits 1" 1 "$rc"
-_assert_contains "release script annotated local tag: rejected" \
-  "release tags must be lightweight" "$_release_script_error"
-git -C "$_release_script_repo" tag -d "$_release_script_tag" >/dev/null 2>&1
-
-git -C "$_release_script_repo" checkout -b feature >/dev/null 2>&1
-rc=0
-_release_script_error=$(
-  cd "$_release_script_repo" || exit 1
-  env HIVE_MEMORY_BUILD_COMMIT="$_release_script_commit" \
-    HIVE_MEMORY_BUILD_TIMESTAMP=20990206-070809 \
-    scripts/release.sh --dry-run 2>&1
-) || rc=$?
-_assert_exit "release script branch guard: exits 1" 1 "$rc"
-_assert_contains "release script branch guard: requires main" \
-  "release: run from main" "$_release_script_error"
-
-git -C "$_release_script_repo" checkout main >/dev/null 2>&1
-_release_script_gh_bin=$(_mock_bin)
-cat >"$_release_script_gh_bin/gh" <<'SH'
-#!/usr/bin/env bash
-if [[ "${1:-}" == "release" && "${2:-}" == "view" ]]; then
-  exit 0
-fi
-exit 1
-SH
-chmod +x "$_release_script_gh_bin/gh"
-rc=0
-_release_script_error=$(
-  cd "$_release_script_repo" || exit 1
-  PATH="$_release_script_gh_bin:$PATH" \
-    HIVE_MEMORY_BUILD_COMMIT="$_release_script_commit" \
-    HIVE_MEMORY_BUILD_TIMESTAMP=20990206-070809 \
-    scripts/release.sh --dry-run 2>&1
-) || rc=$?
-_assert_exit "release script GitHub release guard: exits 1" 1 "$rc"
-_assert_contains "release script GitHub release guard: rejects existing release" \
-  "GitHub release $_release_script_tag already exists" "$_release_script_error"
+# Vendored copies are only equivalent to a single source while CI enforces it.
+_ci_workflow=$(cat "$HIVE_MEMORY_DIR/.github/workflows/ci.yml")
+_assert_contains "ci workflow: verifies the vendored release scripts" \
+  "verify-release-scripts" "$_ci_workflow"
 
 _test_summary
