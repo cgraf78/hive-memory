@@ -53,7 +53,7 @@ jobs:
         tests/shell/automation-test
 
   release-scripts:
-    name: Vendored release scripts
+    name: Release script sync
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
