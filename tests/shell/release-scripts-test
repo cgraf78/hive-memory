@@ -83,9 +83,11 @@ exit 0
 HM
 chmod +x "$_hook_fake/hm"
 (TMPDIR="$_hook_tmp" release_smoke_check "$_hook_fake" linux-x86_64-musl) >/dev/null 2>&1
-_hook_left=$(find "$_hook_tmp" -mindepth 1 -maxdepth 1 | wc -l)
+# Emptiness rather than a count: BSD `wc -l` pads its output with leading
+# whitespace, so a numeric string comparison fails on macOS runners.
+_hook_left=$(ls -A "$_hook_tmp")
 rm -rf "$_hook_fake" "$_hook_tmp"
-_assert_eq "smoke hook: cleans up its store and config fixtures" "0" "$_hook_left"
+_assert_eq "smoke hook: cleans up its store and config fixtures" "" "$_hook_left"
 
 # A failing binary must fail the smoke test rather than being swallowed.
 _hook_fail=$(mktemp -d)
