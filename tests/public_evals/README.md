@@ -17,7 +17,7 @@ Run the retrieval-only eval:
 
 ```console
 HIVE_MEMORY_LONGMEMEVAL_S_JSON=target/public-evals/longmemeval_s_cleaned.json \
-  cargo test --test public_longmemeval -- --ignored --nocapture
+  cargo test --locked --test public_longmemeval -- --ignored --nocapture
 ```
 
 The adapter ingests unique haystack sessions as remembered records, restricts

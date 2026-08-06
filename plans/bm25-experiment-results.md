@@ -24,7 +24,7 @@ Reproduce:
 scripts/download-longmemeval-fixture
 HIVE_MEMORY_LONGMEMEVAL_S_JSON=target/public-evals/longmemeval_s_cleaned.json \
   HIVE_MEMORY_LONGMEMEVAL_RETRIEVER=bm25 \
-  cargo test --test public_longmemeval -- --ignored --nocapture
+  cargo test --locked --test public_longmemeval -- --ignored --nocapture
 ```
 
 ## Result (100-case smoke, session ingest)

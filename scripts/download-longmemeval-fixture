@@ -49,5 +49,5 @@ downloaded: $output
 Run the eval with:
 
   HIVE_MEMORY_LONGMEMEVAL_S_JSON="$output" \\
-    cargo test --test public_longmemeval -- --ignored --nocapture
+    cargo test --locked --test public_longmemeval -- --ignored --nocapture
 EOF

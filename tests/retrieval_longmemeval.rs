@@ -12,7 +12,7 @@
 //! ```console
 //! scripts/download-longmemeval-fixture
 //! HIVE_MEMORY_LONGMEMEVAL_S_JSON=target/public-evals/longmemeval_s_cleaned.json \
-//!   cargo test --test retrieval_longmemeval -- --ignored --nocapture
+//!   cargo test --locked --test retrieval_longmemeval -- --ignored --nocapture
 //! ```
 
 use std::collections::BTreeSet;
