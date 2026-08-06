@@ -8,7 +8,7 @@ Runtime behavior belongs in the Rust crate under `src/`.
 `release-lib.sh`, `release-version.sh`, `release-tag.sh`, `package-release.sh`,
 `smoke-release.sh`, and `release.sh` are **vendored verbatim** from
 `cgraf78/actions` (`release-scripts/`), which is shared with `shdeps` and
-`grafhome-ca`. Do not edit them here: the `Release script sync` CI job verifies
+`grafhome-ca`. Do not edit them here: the `cgraf78/actions sync` CI job verifies
 that the action lock, every literal `cgraf78/actions` ref, and the vendored
 scripts all describe one reviewed actions commit.
 
