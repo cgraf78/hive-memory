@@ -19,7 +19,7 @@ env:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@f301fa80f9eef8082332a83a74153eb0d3e1e8d4
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@0c8c5f1c615fd61b48cc7d5de5225ca491665d80
     with:
       android-package-smoke-command: |
         scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
@@ -47,7 +47,7 @@ jobs:
           .termux-ci/hm
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@f301fa80f9eef8082332a83a74153eb0d3e1e8d4
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@0c8c5f1c615fd61b48cc7d5de5225ca491665d80
     with:
       matrix-set: full
       profiles: base
@@ -58,20 +58,21 @@ jobs:
         tests/shell/release-scripts-test
         tests/shell/automation-test
 
-  release-scripts:
-    name: Release script sync
+  actions-sync:
+    name: cgraf78/actions sync
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # GitHub requires literal action refs in workflow YAML, so the lock and
-      # generated refs cannot be expressed through a normal variable. This one
-      # verifier checks those literals and the vendored release files together,
-      # preventing either half of the shared CI snapshot from drifting alone.
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@f301fa80f9eef8082332a83a74153eb0d3e1e8d4
+      # GitHub resolves literal `uses:` refs before a job can read repository
+      # files, so `.github/cgraf78-actions.lock` cannot be interpolated. This
+      # gate verifies every unavoidable action literal and all vendored release
+      # scripts still match that single reviewed dependency decision.
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@0c8c5f1c615fd61b48cc7d5de5225ca491665d80
 
   source-install:
     name: Locked source install
