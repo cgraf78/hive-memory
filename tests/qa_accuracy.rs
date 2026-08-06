@@ -14,7 +14,7 @@
 //! ```console
 //! HIVE_MEMORY_LONGMEMEVAL_S_JSON=target/public-evals/longmemeval_s_cleaned.json \
 //!   HIVE_MEMORY_QA_BACKEND="claude -p" \
-//!   cargo test --test qa_accuracy -- --ignored --nocapture
+//!   cargo test --locked --test qa_accuracy -- --ignored --nocapture
 //! ```
 
 use std::collections::BTreeSet;

@@ -24,7 +24,7 @@
 //!
 //! ```console
 //! HIVE_MEMORY_RECONCILE_BACKEND="claude -p" \
-//!   cargo test --test autocapture_eval -- --ignored --nocapture
+//!   cargo test --locked --test autocapture_eval -- --ignored --nocapture
 //! ```
 //!
 //! Caveat for nested-CLI backends (`claude -p`, `codex`, `gemini`): these are

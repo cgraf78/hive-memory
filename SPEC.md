@@ -1959,8 +1959,8 @@ glibc baseline.
 Recommended jobs:
 
 - `fmt`: `cargo fmt --check`.
-- `clippy`: `cargo clippy --all-targets -- -D warnings`.
-- `test`: `cargo test` on Linux/macOS.
+- `clippy`: `cargo clippy --locked --all-targets --all-features -- -D warnings`.
+- `test`: `cargo test --locked` on Linux/macOS.
 - `integration`: CLI tests with temp stores on Linux, including the
   performance-budget benchmark suite.
 - `cloud-sync-sim`: integration tests using the cloud-sync simulation harness
@@ -1969,8 +1969,15 @@ Recommended jobs:
 - `release-build`: build target archives for release tags.
 - `smoke-install`: on native CI targets, download the release archive and run
   `hm --version` plus `hm doctor` against a temp config. On Android, hosted
-  Linux CI verifies the AArch64 ELF and Bionic interpreter; a real Termux launch
-  remains a post-release smoke check.
+  Linux CI builds and structurally checks the published AArch64 archive, while
+  CI runs the official Termux APK in an x86_64 Android emulator and executes a
+  separately cross-built x86_64 binary there. The architectures differ because
+  the emulator is x86_64 while actual release consumers are AArch64; both
+  checks are required, but only the AArch64 archive is published.
+
+All dependency-resolving Cargo commands use `--locked`. That makes the
+committed `Cargo.lock`, rather than the current registry state, the dependency
+graph under test and keeps local reproduction equivalent to CI.
 
 Initial release target matrix:
 

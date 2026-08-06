@@ -73,7 +73,6 @@ work and no machine re-judges what another already judged.
 - Modify: `src/event.rs` (field on `MemoryEvent` + its observation input)
 - Modify: `src/index.rs` (field on `IndexEntry`, populate in `entry_from_note`, bump schema)
 - Modify: `src/memory.rs` (pass-through `None` on fresh writes)
-
 - [ ] **Step 1: Write failing round-trip tests in `src/note.rs`**
 
 Add to the existing `#[cfg(test)] mod tests` in `src/note.rs`:
@@ -230,6 +229,7 @@ git commit -m 'Add classification provenance to persisted records'
 **Files:**
 
 - Modify: `src/memory.rs:198-286` (`RetagRecordInput`, `retag_record`)
+
 - Modify: `src/main.rs:2816` (`run_retag`)
 
 - [ ] **Step 1: Write failing test in `src/memory.rs` tests**
@@ -416,7 +416,6 @@ Run: `cargo test --locked config::tests::classifier -- --nocapture`
 Expected: FAIL — no `classifier` field on `Config`.
 
 - [ ] **Step 3: Implement**
-
 - Add `"classifier"` to the top-level keys array (`src/config.rs:25-32`).
 - Add `const CLASSIFIER_KEYS: &[&str] = &["mode", "backend", "command", "model", "batch_limit", "min_interval", "timeout_seconds", "apply_confidence"];`
 - Add `classifier: RawClassifierConfig` to `RawConfig` and `RawConfig::default`.
@@ -532,7 +531,6 @@ git commit -m 'Add [classifier] config section'
 - Create: `src/llm.rs`
 - Modify: `src/lib.rs` (add `pub mod llm;`)
 - Create: `tests/fixtures/fake-llm` (executable shell script)
-
 - [ ] **Step 1: Create the fake backend fixture**
 
 `tests/fixtures/fake-llm` (then `chmod +x`):
@@ -1007,6 +1005,7 @@ git commit -m 'Add LLM backend detection and structured invocation'
 **Files:**
 
 - Create: `src/classify.rs`
+
 - Modify: `src/lib.rs` (add `pub mod classify;`)
 
 - [ ] **Step 1: Write failing unit tests for the pure policy pieces**
@@ -1202,6 +1201,7 @@ git commit -m 'Add bounded background classification worker'
 **Files:**
 
 - Modify: `src/main.rs` (Command variant, args struct, runner)
+
 - Modify: `tests/cli.rs`
 
 - [ ] **Step 1: Write failing CLI test in `tests/cli.rs`**
@@ -1286,6 +1286,7 @@ git commit -m 'Add `hm classify` command'
 **Files:**
 
 - Modify: `src/main.rs` (`run_hook_stop`, ~line 3495)
+
 - Modify: `src/classify.rs` (spawn-decision helper)
 
 - [ ] **Step 1: Write failing test for the spawn decision**
@@ -1371,7 +1372,7 @@ if classify::should_spawn(
 - [ ] **Step 3: Verify hook latency is untouched**
 
 Run: `cargo test --locked`
-Run: `HIVE_MEMORY_PERF_BUDGET_MULTIPLIER=4 cargo test --release --test perf_budget -- --ignored --nocapture`
+Run: `HIVE_MEMORY_PERF_BUDGET_MULTIPLIER=4 cargo test --release --locked --test perf_budget -- --ignored --nocapture`
 Expected: PASS — the perf budget suite is the regression gate for invariant #2.
 
 - [ ] **Step 4: Commit**
@@ -1413,11 +1414,12 @@ git commit -m 'Report classifier status in doctor'
 **Files:**
 
 - Create: `tests/classify_eval.rs`
+
 - Modify: `README.md`, `SPEC.md`, `src/README.md`
 
 - [ ] **Step 1: Plumbing eval (CI-runnable)** — `tests/classify_eval.rs`: build a temp store, write the legacy shapes from `tests/fixtures/inject_corpus.toml` that PR #21 targeted (stale PR status, incident postmortem, durable preference, project fact), run the worker with the fake backend returning the labeled kind per record (drive `FAKE_LLM_KIND` per-invocation via a wrapper script that reads a body→kind map file), then assert `hm context` injects exactly the expected ids. This proves verdicts flow end-to-end into injection without any injection-code change.
 
-- [ ] **Step 2: Real-model eval (manual, `--ignored`)** — same harness but with `llm::detect(None, &[], None, None)`; `#[ignore]` plus a skip-if-no-backend guard, so `cargo test --test classify_eval -- --ignored` measures real-model agreement against the labeled corpus locally, never in CI.
+- [ ] **Step 2: Real-model eval (manual, `--ignored`)** — same harness but with `llm::detect(None, &[], None, None)`; `#[ignore]` plus a skip-if-no-backend guard, so `cargo test --locked --test classify_eval -- --ignored` measures real-model agreement against the labeled corpus locally, never in CI.
 
 - [ ] **Step 3: Docs** — README: new "Automatic LLM classification" section (what it does, that default `mode = "off"` disables hook-spawned classification, that `mode = "auto"` runs only when a detected backend is also a configured `[agents]` entry, cost bounds via `batch_limit`/`min_interval`, how to opt into another installed CLI with `mode = "on"` or explicit `backend =`, how to turn off, `hm classify --pending --json` for a no-LLM queue preview, and `hm classify --dry-run --json` to judge without persisting). SPEC.md: the `classified` front-matter field and verdict-version semantics. `src/README.md`: add `llm.rs` and `classify.rs` lines to module ownership.
 
@@ -1426,10 +1428,10 @@ git commit -m 'Report classifier status in doctor'
 ```bash
 cargo fmt --check
 cargo test --locked
-cargo clippy --locked --all-targets -- -D warnings
+cargo clippy --locked --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS='-D missing-docs' cargo doc --locked --no-deps
 tests/shell/release-scripts-test
-HIVE_MEMORY_PERF_BUDGET_MULTIPLIER=4 cargo test --release --test perf_budget -- --ignored --nocapture
+HIVE_MEMORY_PERF_BUDGET_MULTIPLIER=4 cargo test --release --locked --test perf_budget -- --ignored --nocapture
 ```
 
 Expected: all PASS.

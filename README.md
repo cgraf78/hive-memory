@@ -507,7 +507,7 @@ guarantees. Real-world conditions shift them:
 integration test, which builds a 5000-note synthetic store and prints each `p95`:
 
 ```sh
-cargo test --release --test perf_budget -- --ignored --nocapture
+cargo test --release --locked --test perf_budget -- --ignored --nocapture
 ```
 
 ---
@@ -637,15 +637,17 @@ formats, or hook contracts are tracked in [SPEC.md](SPEC.md).
 
 ```sh
 cargo fmt --check
-cargo test
-cargo clippy --all-targets --all-features -- -D warnings
-RUSTDOCFLAGS='-D missing-docs' cargo doc --no-deps
+cargo test --locked
+cargo clippy --locked --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS='-D missing-docs' cargo doc --locked --no-deps
 ```
 
-CI runs these through the shared `cgraf78/actions` Rust workflow. The library
-crate uses `#![deny(missing_docs)]`. If a change affects public behavior, update
-[SPEC.md](SPEC.md); if it changes design rationale or non-goals, update
-[PLAN.md](PLAN.md).
+CI runs these through the shared `cgraf78/actions` Rust workflow. The locked
+commands make local reproduction use the same dependency graph CI reviewed,
+rather than allowing an incidental registry update to change the result. The
+library crate uses `#![deny(missing_docs)]`. If a change affects public
+behavior, update [SPEC.md](SPEC.md); if it changes design rationale or
+non-goals, update [PLAN.md](PLAN.md).
 
 ## Release
 

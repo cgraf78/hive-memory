@@ -6,6 +6,8 @@ on:
     branches:
       - main
   schedule:
+    # Stagger sibling repositories so their full matrices and advisory audits
+    # do not compete for the same hosted-runner capacity at the top of the hour.
     - cron: "17 8 * * *"
   workflow_dispatch:
 
@@ -17,21 +19,25 @@ env:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@a2dd8390ddd0b410d5a82822296036387247cc4c
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@f301fa80f9eef8082332a83a74153eb0d3e1e8d4
     with:
       android-package-smoke-command: |
         scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
         scripts/smoke-release.sh "$ASSET_PLATFORM"
-      doc-command: RUSTDOCFLAGS='-D missing-docs' cargo doc --no-deps
       # Release archives are the fleet bootstrap contract, so regular CI should
       # exercise the same Linux musl label that tagged releases publish instead
       # of waiting until a tag push discovers drift. `shdeps` and `grafhome-ca`
       # already gate on this; Hive Memory only covered the Android artifact.
+      # Hive's dependency graph is pure Rust, so the shared default adds only
+      # the target and deliberately skips the optional host musl linker.
       package-smoke-musl-target: x86_64-unknown-linux-musl
       package-smoke-command: |
-        scripts/package-release.sh x86_64-unknown-linux-musl linux-x86_64-musl
+        scripts/package-release.sh "$RUST_TARGET" linux-x86_64-musl
         scripts/smoke-release.sh linux-x86_64-musl
       termux-command: scripts/termux-ci.sh
+      # CI runs the official Termux APK in an x86_64 Android emulator, so this
+      # host build exists only for that runtime. Tagged releases deliberately
+      # publish AArch64 Android instead, matching real phones and tablets.
       termux-host-command: |
         target_dir="$RUNNER_TEMP/hive-memory-termux-target"
         cargo build --release --locked --target "$RUST_TARGET" --target-dir "$target_dir"
@@ -41,7 +47,7 @@ jobs:
           .termux-ci/hm
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@fb1777c6f248ece2ed02c8cb6d82533d011d3218
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@f301fa80f9eef8082332a83a74153eb0d3e1e8d4
     with:
       matrix-set: full
       profiles: base
@@ -54,19 +60,18 @@ jobs:
 
   release-scripts:
     name: Release script sync
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # scripts/release-*.sh are vendored from cgraf78/actions. Catching drift
-      # on every pull request is what keeps the vendored copy equivalent to a
-      # single source rather than a fork that happens to look similar.
-      - uses: cgraf78/actions/.github/actions/verify-release-scripts@816817518ed623a59b6ffdd87949b23d15d73fa2
-        with:
-          scripts-dir: scripts
+      # GitHub requires literal action refs in workflow YAML, so the lock and
+      # generated refs cannot be expressed through a normal variable. This one
+      # verifier checks those literals and the vendored release files together,
+      # preventing either half of the shared CI snapshot from drifting alone.
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@f301fa80f9eef8082332a83a74153eb0d3e1e8d4
 
   source-install:
     name: Locked source install
@@ -86,27 +91,6 @@ jobs:
       - name: Smoke installed binary
         run: |
           "$RUNNER_TEMP/hive-memory-install/bin/hm" --version
-
-  rustsec:
-    name: RustSec advisory audit
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-
-      # crates.io release versions are immutable. Pinning the tool keeps the
-      # gate reproducible while its advisory database still refreshes.
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --version 0.22.2 --locked
-
-      - name: Audit the committed dependency graph
-        run: cargo audit --file Cargo.lock
 
   performance-budget:
     name: Performance budget
@@ -132,7 +116,7 @@ jobs:
           HIVE_MEMORY_PERF_BUDGET_MULTIPLIER: 4
         # Serialize wall-clock samples so the budgets measure each path rather
         # than cross-test contention between multiple 5,000-note fixtures.
-        run: cargo test --release --test perf_budget -- --ignored --nocapture --test-threads=1
+        run: cargo test --release --locked --test perf_budget -- --ignored --nocapture --test-threads=1
 
   cloud-sync-sim:
     name: Cloud sync simulation
@@ -149,4 +133,4 @@ jobs:
       # Simulate the file-level behaviors cloud drives tend to produce around
       # agent writes: independent files merging, conflict copies, and renames.
       - name: Run cloud sync simulation
-        run: cargo test --test cloud_sync_sim -- --ignored --nocapture
+        run: cargo test --locked --test cloud_sync_sim -- --ignored --nocapture

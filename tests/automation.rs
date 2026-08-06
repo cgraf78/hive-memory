@@ -5,10 +5,30 @@ use std::collections::HashMap;
 const LOCKED_INSTALL: &str =
     "cargo install --path . --locked --root \"$RUNNER_TEMP/hive-memory-install\"";
 const INSTALLED_SMOKE: &str = "\"$RUNNER_TEMP/hive-memory-install/bin/hm\" --version";
-const AUDITOR_INSTALL: &str = "cargo install cargo-audit --version 0.22.2 --locked";
-const LOCKFILE_AUDIT: &str = "cargo audit --file Cargo.lock";
-const RUSTSEC_CONDITION: &str =
-    "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'";
+const LOCKED_PERFORMANCE_BUDGET: &str =
+    "cargo test --release --locked --test perf_budget -- --ignored --nocapture --test-threads=1";
+const LOCKED_CLOUD_SYNC_SIM: &str =
+    "cargo test --locked --test cloud_sync_sim -- --ignored --nocapture";
+const PACKAGE_SMOKE: &str = "scripts/package-release.sh \"$RUST_TARGET\" linux-x86_64-musl\n\
+scripts/smoke-release.sh linux-x86_64-musl";
+const SHARED_RUST_WORKFLOW: &str = "cgraf78/actions/.github/workflows/rust-ci.yml@";
+// These inputs encode fleet policy in the reusable workflow. Hive only owns
+// product-specific setup, packaging, and runtime commands; repeating a shared
+// default here would create a second place for that policy to drift. The musl
+// tools switch is the Hive-specific exception: its graph is pure Rust, so
+// enabling that shared opt-in would add an unused apt/network dependency.
+const FORBIDDEN_RUST_INPUTS: &[&str] = &[
+    "rust-toolchain",
+    "msrv-toolchain",
+    "msrv-command",
+    "test-command",
+    "fmt-command",
+    "clippy-command",
+    "build-command",
+    "doc-command",
+    "audit-command",
+    "package-smoke-install-musl-tools",
+];
 
 #[derive(Deserialize)]
 struct Dependabot {
@@ -38,6 +58,9 @@ struct Workflow {
 struct Job {
     #[serde(rename = "if")]
     condition: Option<Value>,
+    uses: Option<String>,
+    #[serde(rename = "with")]
+    inputs: Option<Mapping>,
     #[serde(default)]
     steps: Vec<Step>,
 }
@@ -86,12 +109,51 @@ fn validate_workflow(yaml: &str) -> Result<(), String> {
     require_unconditional_step(source_install, LOCKED_INSTALL)?;
     require_unconditional_step(source_install, INSTALLED_SMOKE)?;
 
-    let rustsec = workflow.jobs.get("rustsec").ok_or("missing rustsec job")?;
-    if rustsec.condition.as_ref().and_then(Value::as_str) != Some(RUSTSEC_CONDITION) {
-        return Err("rustsec job has the wrong condition".into());
+    let rust = workflow.jobs.get("rust").ok_or("missing shared rust job")?;
+    if !rust
+        .uses
+        .as_deref()
+        .is_some_and(|uses| uses.starts_with(SHARED_RUST_WORKFLOW))
+    {
+        return Err("rust job must use the shared cgraf78/actions workflow".into());
     }
-    require_unconditional_step(rustsec, AUDITOR_INSTALL)?;
-    require_unconditional_step(rustsec, LOCKFILE_AUDIT)
+    let inputs = rust
+        .inputs
+        .as_ref()
+        .ok_or("shared rust job must define its product inputs")?;
+    for input in FORBIDDEN_RUST_INPUTS {
+        if mapping_value(inputs, input).is_some() {
+            return Err(format!(
+                "rust job must inherit shared {input} policy without an override"
+            ));
+        }
+    }
+    if mapping_value(inputs, "package-smoke-musl-target").and_then(Value::as_str)
+        != Some("x86_64-unknown-linux-musl")
+    {
+        return Err("package smoke must declare its shared Rust target".into());
+    }
+    let package_smoke = mapping_value(inputs, "package-smoke-command")
+        .and_then(Value::as_str)
+        .ok_or("missing package-smoke-command")?;
+    if package_smoke.trim() != PACKAGE_SMOKE {
+        return Err("package smoke must build and smoke the prepared Rust target".into());
+    }
+    if workflow.jobs.contains_key("rustsec") {
+        return Err("RustSec must be provided by the shared rust workflow".into());
+    }
+
+    let performance_budget = workflow
+        .jobs
+        .get("performance-budget")
+        .ok_or("missing performance-budget job")?;
+    require_unconditional_step(performance_budget, LOCKED_PERFORMANCE_BUDGET)?;
+
+    let cloud_sync_sim = workflow
+        .jobs
+        .get("cloud-sync-sim")
+        .ok_or("missing cloud-sync-sim job")?;
+    require_unconditional_step(cloud_sync_sim, LOCKED_CLOUD_SYNC_SIM)
 }
 
 fn require_triggers(document: &Value) -> Result<(), String> {
@@ -163,15 +225,17 @@ updates:
 #[test]
 fn comments_do_not_satisfy_a_missing_command() {
     let yaml = valid_workflow().replace(
-        &format!("        run: {LOCKFILE_AUDIT}"),
-        &format!("        run: echo skipped\n      # run: {LOCKFILE_AUDIT}"),
+        &format!("        run: {LOCKED_CLOUD_SYNC_SIM}"),
+        &format!("        run: echo skipped\n      # run: {LOCKED_CLOUD_SYNC_SIM}"),
     );
     assert!(validate_workflow(&yaml).is_err());
 }
 
 #[test]
 fn a_missing_schedule_trigger_is_rejected() {
-    let yaml = valid_workflow().replace("  schedule:\n    - cron: \"17 8 * * *\"\n", "");
+    // Rename the key instead of matching the whole block so explanatory cron
+    // comments can evolve without turning this mutation test into a no-op.
+    let yaml = valid_workflow().replacen("  schedule:\n", "  not_schedule:\n", 1);
     assert!(validate_workflow(&yaml).is_err());
 }
 
@@ -197,28 +261,67 @@ fn a_condition_on_the_source_install_job_is_rejected() {
 #[test]
 fn misplaced_commands_do_not_satisfy_a_job_step() {
     let yaml = valid_workflow().replace(
-        &format!("        run: {LOCKFILE_AUDIT}"),
+        &format!("        run: {LOCKED_PERFORMANCE_BUDGET}"),
         &format!(
-            "        env:\n          DEAD_COMMAND: {LOCKFILE_AUDIT}\n        run: echo skipped"
+            "        env:\n          DEAD_COMMAND: {LOCKED_PERFORMANCE_BUDGET}\n        run: echo skipped"
         ),
     );
     assert!(validate_workflow(&yaml).is_err());
 }
 
 #[test]
-fn a_false_job_condition_is_rejected_even_when_the_expected_condition_is_commented() {
+fn a_standalone_rustsec_job_is_rejected() {
     let yaml = valid_workflow().replace(
-        &format!("    if: {RUSTSEC_CONDITION}"),
-        &format!("    # if: {RUSTSEC_CONDITION}\n    if: false"),
+        "  source-install:\n",
+        "  rustsec:\n    runs-on: ubuntu-24.04\n\n  source-install:\n",
     );
     assert!(validate_workflow(&yaml).is_err());
 }
 
 #[test]
-fn a_condition_on_a_required_step_is_rejected() {
+fn shared_rust_policy_overrides_are_rejected() {
+    for (input, value) in [
+        ("rust-toolchain", "nightly"),
+        ("msrv-toolchain", "1.88"),
+        ("msrv-command", "cargo check"),
+        ("test-command", "cargo test"),
+        ("fmt-command", "true"),
+        ("clippy-command", "cargo clippy"),
+        ("build-command", "cargo build"),
+        ("doc-command", "cargo doc --no-deps"),
+        ("audit-command", r#""""#),
+        ("package-smoke-install-musl-tools", "true"),
+    ] {
+        let yaml = valid_workflow().replacen(
+            "    with:\n",
+            &format!("    with:\n      {input}: {value}\n"),
+            1,
+        );
+        assert!(
+            validate_workflow(&yaml).is_err(),
+            "{input} override unexpectedly passed"
+        );
+    }
+}
+
+#[test]
+fn missing_or_drifted_product_inputs_are_rejected() {
+    let missing_inputs = valid_workflow().replacen("    with:\n", "    not_with:\n", 1);
+    assert!(validate_workflow(&missing_inputs).is_err());
+
+    let repeated_target = valid_workflow().replace("\"$RUST_TARGET\"", "x86_64-unknown-linux-musl");
+    assert!(validate_workflow(&repeated_target).is_err());
+
+    let missing_smoke =
+        valid_workflow().replace("        scripts/smoke-release.sh linux-x86_64-musl\n", "");
+    assert!(validate_workflow(&missing_smoke).is_err());
+}
+
+#[test]
+fn an_unlocked_product_test_is_rejected() {
     let yaml = valid_workflow().replace(
-        &format!("        run: {LOCKFILE_AUDIT}"),
-        &format!("        if: false\n        run: {LOCKFILE_AUDIT}"),
+        LOCKED_CLOUD_SYNC_SIM,
+        "cargo test --test cloud_sync_sim -- --ignored --nocapture",
     );
     assert!(validate_workflow(&yaml).is_err());
 }

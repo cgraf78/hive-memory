@@ -180,7 +180,7 @@ Suggested budget classes:
 - **optional semantic/entity sidecars:** cache-miss and provider-failure paths
   must stay within lexical-only budgets by skipping optional signals.
 
-CI should continue running `cargo test --release --test perf_budget -- --ignored
+CI should continue running `cargo test --release --locked --test perf_budget -- --ignored
 --nocapture` as a separate job with `HIVE_MEMORY_PERF_BUDGET_MULTIPLIER` for
 shared runners. Add new ignored perf tests there rather than to the default
 unit-test suite.
@@ -1000,13 +1000,13 @@ until these pass against the fully implemented system.
 
   ```sh
   HIVE_MEMORY_PERF_BUDGET_MULTIPLIER=4 \
-    cargo test --release --test perf_budget -- --ignored --nocapture
+    cargo test --release --locked --test perf_budget -- --ignored --nocapture
   ```
 
 - [ ] Run cloud sync simulation after schema/cache changes:
 
   ```sh
-  cargo test --test cloud_sync_sim -- --ignored --nocapture
+  cargo test --locked --test cloud_sync_sim -- --ignored --nocapture
   ```
 
 - [ ] Run a manual local hook smoke test from a real repo.

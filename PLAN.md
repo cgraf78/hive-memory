@@ -129,6 +129,9 @@ avoid requiring the install host to provide the same or newer glibc as the build
 runner. Archive names use installer-facing platform labels instead of raw Rust
 target triples.
 Termux and other aarch64 Android environments use the Android/Bionic artifact.
+CI also runs the official Termux APK in CI's x86_64 Android emulator. That build
+is runtime coverage only: releases remain AArch64 because that is the
+architecture of the phones and tablets the artifact is meant to serve.
 
 ## Implementation Language
 
@@ -155,8 +158,9 @@ Planned Rust stack:
 - plain text/front-matter handling initially; add Markdown parsing only when needed
 - simple text search first; `rusqlite`/SQLite FTS later for local indexing
 - `assert_cmd`, `predicates`, `tempfile` for CLI tests
-- Rust edition 2024 unless target constraints require 2021; document MSRV before
-  first release
+- Rust edition 2024 on the current stable toolchain. The project does not claim
+  a fixed MSRV today; adding one should follow a concrete consumer need so CI
+  does not advertise a compatibility promise the project has not chosen.
 - Prefer `cargo-dist` for release archives/checksums unless it blocks target needs
 
 Keep the architecture modular but not framework-heavy: storage, writer, index,

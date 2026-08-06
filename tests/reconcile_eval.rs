@@ -13,7 +13,7 @@
 //!
 //! ```console
 //! HIVE_MEMORY_RECONCILE_BACKEND="claude -p" \
-//!   cargo test --test reconcile_eval -- --ignored --nocapture
+//!   cargo test --locked --test reconcile_eval -- --ignored --nocapture
 //! ```
 
 use std::path::{Path, PathBuf};

@@ -111,9 +111,11 @@ _release_workflow=$(cat "$HIVE_MEMORY_DIR/.github/workflows/release.yml")
 _assert_contains "release workflow: uses exact reusable tag command" \
   'tag-command: scripts/release-tag.sh' "$_release_workflow"
 
-# Vendored copies are only equivalent to a single source while CI enforces it.
+# The broader consumer verifier keeps the action pin and all generated files in
+# one contract; checking its exact action name prevents a silent fallback to
+# the older release-script-only check.
 _ci_workflow=$(cat "$HIVE_MEMORY_DIR/.github/workflows/ci.yml")
-_assert_contains "ci workflow: verifies the vendored release scripts" \
-  "verify-release-scripts" "$_ci_workflow"
+_assert_contains "ci workflow: verifies the complete shared CI snapshot" \
+  "cgraf78/actions/.github/actions/verify-consumer-sync@" "$_ci_workflow"
 
 _test_summary

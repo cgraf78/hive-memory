@@ -145,7 +145,7 @@ struct LabeledCase {
 /// verdict for re-review:
 ///
 /// ```sh
-/// cargo test --test classify_eval -- --ignored --nocapture
+/// cargo test --locked --test classify_eval -- --ignored --nocapture
 /// ```
 #[test]
 #[ignore = "invokes a real LLM backend from PATH; run manually before bumping VERDICT_VERSION"]
