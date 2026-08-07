@@ -19,7 +19,7 @@ env:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@ce882e815cadd89f06a0a05fcfece953b22619b8
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@023a7d521187d9a1dc281a4b2beddbf03845d689
     with:
       android-package-smoke-command: |
         scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
@@ -47,7 +47,7 @@ jobs:
           .termux-ci/hm
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@ce882e815cadd89f06a0a05fcfece953b22619b8
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@023a7d521187d9a1dc281a4b2beddbf03845d689
     with:
       matrix-set: full
       profiles: base
@@ -72,7 +72,7 @@ jobs:
       # files, so `.github/cgraf78-actions.lock` cannot be interpolated. This
       # gate verifies every unavoidable action literal and all vendored release
       # scripts still match that single reviewed dependency decision.
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@ce882e815cadd89f06a0a05fcfece953b22619b8
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@023a7d521187d9a1dc281a4b2beddbf03845d689
 
   source-install:
     name: Locked source install
