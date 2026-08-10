@@ -2044,6 +2044,29 @@ mod tests {
     }
 
     #[test]
+    fn checked_in_config_examples_form_one_valid_layered_configuration() {
+        let loaded = LoadedConfig::from_toml_layers_with_env(
+            include_str!("../examples/config.toml"),
+            Some(include_str!("../examples/config.local.toml")),
+            env,
+        )
+        .expect("checked-in examples load");
+
+        assert!(loaded.warnings.is_empty());
+        assert_eq!(loaded.config.default_store, "personal");
+        assert_eq!(loaded.config.host_id, "example-host");
+        assert_eq!(
+            loaded.config.stores["personal"].root,
+            PathBuf::from("/home/tester/.local/share/hive-memory/personal")
+        );
+        assert_eq!(
+            loaded.config.stores["reference"].root,
+            PathBuf::from("/home/tester/hive-memory/reference")
+        );
+        assert_eq!(loaded.config.classifier.mode, "off");
+    }
+
+    #[test]
     fn file_loader_ignores_missing_local_override() {
         let dir = temp_dir("missing-local");
         let main = dir.join("config.toml");

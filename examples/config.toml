@@ -1,0 +1,38 @@
+# Durable, shareable Hive Memory policy. Copy to
+# ${XDG_CONFIG_HOME:-$HOME/.config}/hive-memory/config.toml.
+schema_version = 1
+default_store = "personal"
+
+[stores.personal]
+root = "${HOME}/hive-memory/personal"
+description = "Private personal memory"
+sensitivity = "private"
+
+# A second store demonstrates that configuration owns storage policy while
+# each command or agent still selects among explicitly allowed stores.
+[stores.reference]
+root = "${HOME}/hive-memory/reference"
+description = "Shareable reference memory"
+sensitivity = "public"
+
+[defaults]
+write_scope = "global"
+search_scopes = ["global", "project"]
+search_sources = ["curated", "remembered"]
+context_sources = ["curated", "remembered"]
+search_backend = "lexical"
+context_strategy = "adaptive"
+hook_context_max_tokens = 4000
+
+[privacy]
+secret_refuses_cloud_roots = true
+allow_secret_writes = false
+allow_hook_secret_writes = false
+
+[offline]
+enabled = true
+
+# Classification is deliberately opt-in. A reusable example should not send
+# stored content to an agent or model merely because its CLI is installed.
+[classifier]
+mode = "off"

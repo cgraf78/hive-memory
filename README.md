@@ -69,6 +69,9 @@ root = "${HOME}/hive-memory/personal"
 description = "Personal memory"
 ```
 
+A fuller, tested configuration—including the optional machine-local layer and
+a stable project marker—is available under [`examples/`](examples/README.md).
+
 Initialize the store, write a memory, recall it:
 
 ```sh
@@ -586,6 +589,10 @@ enabled = true
 [classifier]
 mode = "off"
 ```
+
+The checked-in [`examples/config.toml`](examples/config.toml) and
+[`examples/config.local.toml`](examples/config.local.toml) are loaded together
+by the test suite, so the copyable configuration cannot drift from the parser.
 
 Store `sensitivity` is `public`, `internal`, `private`, or `secret` — a policy
 class, not encryption. Secret stores are refused under common cloud-sync roots by
