@@ -1256,6 +1256,28 @@ mod tests {
     }
 
     #[test]
+    fn checked_in_project_marker_resolves_through_the_real_walker() {
+        let root = temp_dir("example-marker");
+        let nested = root.join("src/nested");
+        fs::create_dir_all(&nested).expect("nested");
+        fs::write(
+            root.join(".hive-memory-project"),
+            include_str!("../examples/.hive-memory-project"),
+        )
+        .expect("write example marker");
+
+        let resolved = resolve_project(ResolveProjectInput {
+            hint: nested,
+            explicit_project_id: None,
+            env_project_id: None,
+        })
+        .expect("resolve checked-in marker");
+
+        assert_eq!(resolved.project_id, "example-project");
+        assert_eq!(resolved.source, ProjectIdSource::Marker);
+    }
+
+    #[test]
     fn explicit_id_wins_but_keeps_resolved_root() {
         let root = temp_dir("explicit");
         fs::write(root.join(".hive-memory-project"), "id = \"marker-id\"\n").expect("marker");

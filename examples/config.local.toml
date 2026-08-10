@@ -1,0 +1,6 @@
+# Optional machine-local overrides. Keep this file outside a shared config
+# repository when it contains real host identity or machine-specific paths.
+host_id = "example-host"
+
+[stores.personal]
+root = "${HOME}/.local/share/hive-memory/personal"

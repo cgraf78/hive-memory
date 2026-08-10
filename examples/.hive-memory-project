@@ -1,0 +1,3 @@
+# Copy to a project root when VCS remote identity is unavailable or should not
+# define memory ownership. Use the same stable id in every checkout.
+id = "example-project"
