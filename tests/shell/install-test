@@ -2,10 +2,11 @@
 # Hive Memory's consumer-side contract for the generated release installer.
 #
 # Generic download and archive hardening belongs to cgraf78/actions. This test
-# deliberately exercises a schema-faithful synthetic local archive so failures
-# can target Hive's binary path, manual page, metadata name, and complete payload
-# without rebuilding Rust. The package-smoke CI job separately feeds the exact
-# archive emitted by package-release.sh through this generated installer.
+# uses schema-faithful synthetic archives so failures can target Hive's binary
+# path, manual page, metadata name, complete payload, and advertised download
+# modes without rebuilding Rust or fetching release assets. The package-smoke CI
+# job separately feeds the exact archive emitted by package-release.sh through
+# this generated installer.
 
 set -uo pipefail
 
@@ -25,11 +26,30 @@ _sha256_file() {
   fi
 }
 
-# Keep this consumer contract deterministic across the shared Linux, macOS,
-# and Termux shell matrix. Platform-selection behavior belongs to the generated
-# installer's provider suite, which separately exercises every published
-# platform. This fixture instead proves Hive's exact archive schema and payload,
-# so it pins a synthetic Linux host and clears Termux's ambient Android marker.
+# Preserve the actual runner identity and prefix before the portable archive
+# fixture pins uname below. The canonical Termux prefix identifies that matrix
+# row independently of the Android classifier inputs it is meant to verify.
+host_path=$PATH
+host_prefix=${PREFIX:-}
+host_uname=$(command -v uname)
+host_uname_s=$("$host_uname" -s 2>/dev/null || true)
+host_uname_m=$("$host_uname" -m 2>/dev/null || true)
+host_uname_o=$("$host_uname" -o 2>/dev/null || true)
+host_android_root=${ANDROID_ROOT:-}
+host_has_android_signal=0
+if [[ "$host_uname_o" == Android || -n "$host_android_root" ]]; then
+  host_has_android_signal=1
+fi
+host_is_android=0
+if [[ "$host_uname_s" == Linux && "$host_has_android_signal" -eq 1 ]]; then
+  host_is_android=1
+fi
+
+# Keep the main archive contract deterministic across the shared Linux, macOS,
+# and Termux shell matrix. This fixture proves Hive's exact archive schema and
+# payload, so it pins a synthetic Linux host and clears Termux's ambient Android
+# marker. Targeted download cases below bind the consumer to Android composition;
+# the generated installer's provider suite owns the exhaustive platform matrix.
 uname_bin=$(mktemp -d)
 CLEANUP_DIRS+=("$uname_bin")
 cat >"$uname_bin/uname" <<'EOF'
@@ -48,7 +68,7 @@ export PATH ANDROID_ROOT
 
 _make_archive() {
   local workspace=$1 version=$2 marker=$3
-  local platform=linux-x86_64-musl
+  local platform=${4:-linux-x86_64-musl}
   local archive="$workspace/hm-${version}-${platform}.tar.gz"
   local payload="$workspace/payload-$marker"
   local commit_suffix=${version##*-}
@@ -78,6 +98,100 @@ EOF
   printf '%s\n' "$archive"
 }
 
+_make_curl_stub() {
+  local directory=$1
+  mkdir -p "$directory"
+  cat >"$directory/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+output=
+write_format=
+url=
+fs_sl_count=0
+proto_count=0
+proto_redir_count=0
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -fsSL)
+      fs_sl_count=$((fs_sl_count + 1))
+      shift
+      ;;
+    --proto)
+      [[ $# -ge 2 && $2 == '=https' ]] || exit 64
+      proto_count=$((proto_count + 1))
+      shift 2
+      ;;
+    --proto-redir)
+      [[ $# -ge 2 && $2 == '=https' ]] || exit 64
+      proto_redir_count=$((proto_redir_count + 1))
+      shift 2
+      ;;
+    -o)
+      [[ $# -ge 2 ]] || exit 64
+      output=$2
+      shift 2
+      ;;
+    -w)
+      [[ $# -ge 2 ]] || exit 64
+      write_format=$2
+      shift 2
+      ;;
+    -*)
+      printf 'unexpected curl option: %s\n' "$1" >&2
+      exit 64
+      ;;
+    *)
+      [[ -z "$url" ]] || {
+        printf 'multiple curl URLs are not supported\n' >&2
+        exit 64
+      }
+      url=$1
+      shift
+      ;;
+  esac
+done
+
+[[ "$fs_sl_count" -eq 1 && "$proto_count" -eq 1 &&
+  "$proto_redir_count" -eq 1 ]] || exit 64
+[[ -n "$url" ]] || {
+  printf 'curl URL is missing\n' >&2
+  exit 64
+}
+printf '%s\n' "$url" >>"$INSTALL_TEST_CURL_LOG"
+
+case $url in
+  "$INSTALL_TEST_LATEST_URL")
+    [[ "$output" == /dev/null && "$write_format" == '%{url_effective}' ]] ||
+      exit 64
+    printf '%s' "$INSTALL_TEST_TAG_URL"
+    ;;
+  "$INSTALL_TEST_CHECKSUM_URL")
+    [[ -n "$output" && -z "$write_format" ]] || exit 64
+    cp "$INSTALL_TEST_CHECKSUM" "$output"
+    ;;
+  "$INSTALL_TEST_ARCHIVE_URL")
+    [[ -n "$output" && -z "$write_format" ]] || exit 64
+    cp "$INSTALL_TEST_ARCHIVE" "$output"
+    ;;
+  *)
+    printf 'unexpected curl URL: %s\n' "$url" >&2
+    exit 64
+    ;;
+esac
+EOF
+  chmod 0755 "$directory/curl"
+}
+
+_assert_curl_stub_rejects() {
+  local description=$1
+  shift
+  local curl_rc=0
+
+  "$@" >/dev/null 2>&1 || curl_rc=$?
+  _assert_exit "$description" 64 "$curl_rc"
+}
+
 if [[ -x "$HIVE_MEMORY_DIR/install.sh" ]]; then
   _pass "installer: generated entry point exists and is executable"
 else
@@ -102,12 +216,15 @@ HOME="$home" XDG_DATA_HOME="$data_home" \
   --archive "$archive_v1" --checksum "$archive_v1.sha256" || rc=$?
 _assert_exit "installer: installs a valid local release archive" 0 "$rc"
 
+installed_rc=0
 installed_output=$(
   XDG_CONFIG_HOME="$workspace/config" \
     XDG_STATE_HOME="$workspace/state" \
     XDG_CACHE_HOME="$workspace/cache" \
     "$bin_dir/hm"
-)
+) || installed_rc=$?
+_assert_exit "installer: installed public command exits successfully" \
+  0 "$installed_rc"
 _assert_eq "installer: public command executes installed release" \
   "first" "$installed_output"
 
@@ -149,8 +266,11 @@ HOME="$home" XDG_DATA_HOME="$data_home" \
   "$HIVE_MEMORY_DIR/install.sh" \
   --archive "$archive_v2" --checksum "$archive_v2.sha256" || rc=$?
 _assert_exit "installer: activates a validated update" 0 "$rc"
+updated_rc=0
+updated_output=$("$bin_dir/hm") || updated_rc=$?
+_assert_exit "installer: updated public command exits successfully" 0 "$updated_rc"
 _assert_eq "installer: updated command uses the new release" \
-  "second" "$("$bin_dir/hm")"
+  "second" "$updated_output"
 
 # A failed update must leave the last complete version active. Use a checksum
 # failure here because it occurs before the archive can be trusted or staged.
@@ -165,8 +285,12 @@ if [[ "$rc" -ne 0 ]]; then
 else
   _fail "installer: rejects a corrupt checksum"
 fi
+preserved_rc=0
+preserved_output=$("$bin_dir/hm") || preserved_rc=$?
+_assert_exit "installer: preserved public command exits successfully" \
+  0 "$preserved_rc"
 _assert_eq "installer: failed update preserves prior command" \
-  "second" "$("$bin_dir/hm")"
+  "second" "$preserved_output"
 
 # Standalone installation must coexist safely with package managers such as
 # Shdeps. An unowned command path is never evidence that this installer owns it.
@@ -192,6 +316,215 @@ if [[ ! -e "$collision_data/cgraf78/hive-memory" ]]; then
   _pass "installer: command collision publishes no partial install"
 else
   _fail "installer: command collision publishes no partial install"
+fi
+
+# Exercise the README's no-argument path without reaching GitHub. The curl stub
+# accepts only the generated installer's exact latest-redirect, checksum, and
+# archive requests, then serves this repository's schema-faithful fixture.
+latest_root="$workspace/latest-download"
+latest_home="$latest_root/home"
+latest_data="$latest_root/data"
+latest_curl_bin="$latest_root/fake-bin"
+latest_curl_log="$latest_root/curl.log"
+latest_version=20260810-120002-cafebabe
+mkdir -p "$latest_home"
+latest_archive=$(_make_archive "$latest_root" "$latest_version" latest)
+_make_curl_stub "$latest_curl_bin"
+latest_archive_name=$(basename "$latest_archive")
+latest_url=https://github.com/cgraf78/hive-memory/releases/latest
+latest_tag_url=https://github.com/cgraf78/hive-memory/releases/tag/$latest_version
+latest_download_base=https://github.com/cgraf78/hive-memory/releases/download/$latest_version
+curl_stub_env=(
+  "INSTALL_TEST_CURL_LOG=/dev/null"
+  "INSTALL_TEST_LATEST_URL=$latest_url"
+  "INSTALL_TEST_TAG_URL=$latest_tag_url"
+  "INSTALL_TEST_CHECKSUM_URL=$latest_download_base/$latest_archive_name.sha256"
+  "INSTALL_TEST_ARCHIVE_URL=$latest_download_base/$latest_archive_name"
+  "INSTALL_TEST_CHECKSUM=$latest_archive.sha256"
+  "INSTALL_TEST_ARCHIVE=$latest_archive"
+)
+_assert_curl_stub_rejects "installer fixture: curl requires -fsSL" \
+  env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
+  --proto '=https' --proto-redir '=https' \
+  -o /dev/null -w '%{url_effective}' "$latest_url"
+_assert_curl_stub_rejects "installer fixture: curl rejects duplicate -fsSL" \
+  env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
+  -fsSL -fsSL --proto '=https' --proto-redir '=https' \
+  -o /dev/null -w '%{url_effective}' "$latest_url"
+_assert_curl_stub_rejects "installer fixture: curl requires --proto" \
+  env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
+  -fsSL --proto-redir '=https' \
+  -o /dev/null -w '%{url_effective}' "$latest_url"
+_assert_curl_stub_rejects "installer fixture: curl rejects duplicate --proto" \
+  env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
+  -fsSL --proto '=https' --proto '=https' --proto-redir '=https' \
+  -o /dev/null -w '%{url_effective}' "$latest_url"
+_assert_curl_stub_rejects "installer fixture: curl rejects weakened --proto" \
+  env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
+  -fsSL --proto '=http' --proto-redir '=https' \
+  -o /dev/null -w '%{url_effective}' "$latest_url"
+_assert_curl_stub_rejects "installer fixture: curl requires --proto-redir" \
+  env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
+  -fsSL --proto '=https' \
+  -o /dev/null -w '%{url_effective}' "$latest_url"
+_assert_curl_stub_rejects "installer fixture: curl rejects duplicate --proto-redir" \
+  env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
+  -fsSL --proto '=https' --proto-redir '=https' --proto-redir '=https' \
+  -o /dev/null -w '%{url_effective}' "$latest_url"
+_assert_curl_stub_rejects "installer fixture: curl rejects weakened --proto-redir" \
+  env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
+  -fsSL --proto '=https' --proto-redir '=all' \
+  -o /dev/null -w '%{url_effective}' "$latest_url"
+rc=0
+PATH="$latest_curl_bin:$PATH" \
+  HOME="$latest_home" XDG_DATA_HOME="$latest_data" \
+  INSTALL_TEST_CURL_LOG="$latest_curl_log" \
+  INSTALL_TEST_LATEST_URL="$latest_url" \
+  INSTALL_TEST_TAG_URL="$latest_tag_url" \
+  INSTALL_TEST_CHECKSUM_URL="$latest_download_base/$latest_archive_name.sha256" \
+  INSTALL_TEST_ARCHIVE_URL="$latest_download_base/$latest_archive_name" \
+  INSTALL_TEST_CHECKSUM="$latest_archive.sha256" \
+  INSTALL_TEST_ARCHIVE="$latest_archive" \
+  "$HIVE_MEMORY_DIR/install.sh" || rc=$?
+_assert_exit "installer: no-argument install resolves and installs latest" 0 "$rc"
+latest_requests=$(printf '%s\n%s\n%s' \
+  "$latest_url" \
+  "$latest_download_base/$latest_archive_name.sha256" \
+  "$latest_download_base/$latest_archive_name")
+_assert_eq "installer: no-argument install requests the exact latest assets" \
+  "$latest_requests" "$(cat "$latest_curl_log")"
+latest_command_rc=0
+latest_command_output=$("$latest_home/.local/bin/hm") || latest_command_rc=$?
+_assert_exit "installer: latest public command exits successfully" \
+  0 "$latest_command_rc"
+_assert_eq "installer: latest public command executes downloaded release" \
+  latest "$latest_command_output"
+
+# Exercise --version and Android destination policy with a published-platform
+# fixture. The host is synthetic here so every conventional matrix row covers
+# the same Android/AArch64 branch; the real Termux row is checked separately.
+android_root="$workspace/android-version"
+android_home="$android_root/home"
+android_data="$android_root/data"
+android_prefix="$android_root/prefix"
+android_uname_bin="$android_root/uname-bin"
+android_curl_bin="$android_root/fake-bin"
+android_curl_log="$android_root/curl.log"
+android_version=20260810-120003-acde1234
+mkdir -p "$android_home" "$android_uname_bin"
+android_archive=$(_make_archive \
+  "$android_root" "$android_version" android android-aarch64)
+_make_curl_stub "$android_curl_bin"
+cat >"$android_uname_bin/uname" <<'EOF'
+#!/usr/bin/env bash
+case ${1:-} in
+  -s) printf '%s\n' Linux ;;
+  -m) printf '%s\n' aarch64 ;;
+  -o) printf '%s\n' Android ;;
+  *) exit 2 ;;
+esac
+EOF
+chmod 0755 "$android_uname_bin/uname"
+android_archive_name=$(basename "$android_archive")
+android_latest_url=https://github.com/cgraf78/hive-memory/releases/latest
+android_tag_url=https://github.com/cgraf78/hive-memory/releases/tag/$android_version
+android_download_base=https://github.com/cgraf78/hive-memory/releases/download/$android_version
+rc=0
+PATH="$android_curl_bin:$android_uname_bin:$host_path" \
+  HOME="$android_home" XDG_DATA_HOME="$android_data" \
+  ANDROID_ROOT=/system PREFIX="$android_prefix" \
+  INSTALL_TEST_CURL_LOG="$android_curl_log" \
+  INSTALL_TEST_LATEST_URL="$android_latest_url" \
+  INSTALL_TEST_TAG_URL="$android_tag_url" \
+  INSTALL_TEST_CHECKSUM_URL="$android_download_base/$android_archive_name.sha256" \
+  INSTALL_TEST_ARCHIVE_URL="$android_download_base/$android_archive_name" \
+  INSTALL_TEST_CHECKSUM="$android_archive.sha256" \
+  INSTALL_TEST_ARCHIVE="$android_archive" \
+  "$HIVE_MEMORY_DIR/install.sh" --version "$android_version" || rc=$?
+_assert_exit "installer: --version installs an Android/AArch64 release" 0 "$rc"
+android_requests=$(printf '%s\n%s' \
+  "$android_download_base/$android_archive_name.sha256" \
+  "$android_download_base/$android_archive_name")
+_assert_eq "installer: --version requests the exact Android assets" \
+  "$android_requests" "$(cat "$android_curl_log")"
+_assert_eq "installer: Android command uses the Termux prefix" \
+  "$android_data/cgraf78/hive-memory/hm" \
+  "$(readlink "$android_prefix/bin/hm")"
+_assert_eq "installer: Android manual uses the Termux prefix" \
+  "$android_data/cgraf78/hive-memory/man/man1/hm.1" \
+  "$(readlink "$android_prefix/share/man/man1/hm.1")"
+android_command_rc=0
+android_command_output=$("$android_prefix/bin/hm") || android_command_rc=$?
+_assert_exit "installer: Android public command exits successfully" \
+  0 "$android_command_rc"
+_assert_eq "installer: Android public command executes selected release" \
+  android "$android_command_output"
+
+# The canonical prefix selects the real Termux row without trusting the same
+# Android classifier being tested. Assert its two inputs independently before
+# proving that the x86_64 emulator is rejected before curl or that an AArch64
+# runner consumes the local Android fixture successfully.
+if [[ "$host_prefix" == /data/data/com.termux/files/usr ]]; then
+  _assert_eq "installer: real Termux reports Linux to Android classifier" \
+    Linux "$host_uname_s"
+  _assert_eq "installer: real Termux exposes an Android classifier signal" \
+    1 "$host_has_android_signal"
+fi
+
+if [[ "$host_prefix" == /data/data/com.termux/files/usr &&
+  "$host_is_android" -eq 1 ]]; then
+  termux_root="$workspace/real-termux"
+  termux_home="$termux_root/home"
+  termux_data="$termux_root/data"
+  termux_prefix="$termux_root/prefix"
+  termux_curl_log="$termux_root/curl.log"
+  mkdir -p "$termux_home"
+  rm -f "$termux_curl_log"
+  case $host_uname_m in
+    aarch64 | arm64)
+      rc=0
+      PATH="$android_curl_bin:$host_path" \
+        HOME="$termux_home" XDG_DATA_HOME="$termux_data" \
+        ANDROID_ROOT="$host_android_root" PREFIX="$termux_prefix" \
+        INSTALL_TEST_CURL_LOG="$termux_curl_log" \
+        INSTALL_TEST_LATEST_URL="$android_latest_url" \
+        INSTALL_TEST_TAG_URL="$android_tag_url" \
+        INSTALL_TEST_CHECKSUM_URL="$android_download_base/$android_archive_name.sha256" \
+        INSTALL_TEST_ARCHIVE_URL="$android_download_base/$android_archive_name" \
+        INSTALL_TEST_CHECKSUM="$android_archive.sha256" \
+        INSTALL_TEST_ARCHIVE="$android_archive" \
+        "$HIVE_MEMORY_DIR/install.sh" --version "$android_version" || rc=$?
+      _assert_exit "installer: real AArch64 Termux selects Android release" 0 "$rc"
+      ;;
+    x86_64 | amd64)
+      rc=0
+      PATH="$android_curl_bin:$host_path" \
+        HOME="$termux_home" XDG_DATA_HOME="$termux_data" \
+        ANDROID_ROOT="$host_android_root" PREFIX="$termux_prefix" \
+        INSTALL_TEST_CURL_LOG="$termux_curl_log" \
+        INSTALL_TEST_LATEST_URL="$android_latest_url" \
+        INSTALL_TEST_TAG_URL="$android_tag_url" \
+        INSTALL_TEST_CHECKSUM_URL="$android_download_base/$android_archive_name.sha256" \
+        INSTALL_TEST_ARCHIVE_URL="$android_download_base/$android_archive_name" \
+        INSTALL_TEST_CHECKSUM="$android_archive.sha256" \
+        INSTALL_TEST_ARCHIVE="$android_archive" \
+        "$HIVE_MEMORY_DIR/install.sh" --version "$android_version" \
+        >"$termux_root/out" 2>"$termux_root/err" || rc=$?
+      _assert_exit "installer: real x86_64 Termux rejects unpublished Android asset" \
+        1 "$rc"
+      _assert_contains "installer: real Termux reports the unavailable platform" \
+        'no published release for android-x86_64' \
+        "$(cat "$termux_root/err")"
+      if [[ ! -s "$termux_curl_log" ]]; then
+        _pass "installer: real Termux rejects unavailable platform before curl"
+      else
+        _fail "installer: real Termux rejects unavailable platform before curl"
+      fi
+      ;;
+    *)
+      _fail "installer: real Termux architecture is covered: $host_uname_m"
+      ;;
+  esac
 fi
 
 _test_summary
