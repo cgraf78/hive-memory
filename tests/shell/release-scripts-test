@@ -119,5 +119,8 @@ _assert_contains "release workflow: uses exact reusable tag command" \
 _ci_workflow=$(cat "$HIVE_MEMORY_DIR/.github/workflows/ci.yml")
 _assert_contains "ci workflow: verifies the complete shared CI snapshot" \
   "cgraf78/actions/.github/actions/verify-consumer-sync@" "$_ci_workflow"
+_assert_contains "ci workflow: multiline shell suites fail on the first error" \
+  $'test-command: |\n        set -euo pipefail\n        tests/shell/install-test' \
+  "$_ci_workflow"
 
 _test_summary
