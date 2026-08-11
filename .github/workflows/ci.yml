@@ -19,7 +19,7 @@ env:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@023a7d521187d9a1dc281a4b2beddbf03845d689
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@aee0fb5381622e78aa46299cf1e60556c027f238
     with:
       android-package-smoke-command: |
         scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
@@ -32,8 +32,16 @@ jobs:
       # the target and deliberately skips the optional host musl linker.
       package-smoke-musl-target: x86_64-unknown-linux-musl
       package-smoke-command: |
-        scripts/package-release.sh "$RUST_TARGET" linux-x86_64-musl
+        archive=$(scripts/package-release.sh "$RUST_TARGET" linux-x86_64-musl)
         scripts/smoke-release.sh linux-x86_64-musl
+        install_root=$(mktemp -d)
+        trap 'rm -rf "$install_root"' EXIT
+        mkdir -p "$install_root/home"
+        HOME="$install_root/home" ./install.sh --archive "$archive" \
+          --data-home "$install_root/data" --bin-dir "$install_root/bin" \
+          --man-dir "$install_root/man"
+        "$install_root/bin/hm" --version
+        test -f "$install_root/data/cgraf78/hive-memory/man/man1/hm.1"
       termux-command: scripts/termux-ci.sh
       # CI runs the official Termux APK in an x86_64 Android emulator, so this
       # host build exists only for that runtime. Tagged releases deliberately
@@ -47,7 +55,7 @@ jobs:
           .termux-ci/hm
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@023a7d521187d9a1dc281a4b2beddbf03845d689
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@aee0fb5381622e78aa46299cf1e60556c027f238
     with:
       matrix-set: full
       profiles: base
@@ -55,6 +63,7 @@ jobs:
       # Shell-owned release behavior lives under tests/shell. Cargo integration
       # tests stay in the conventional tests/*.rs location.
       test-command: |
+        tests/shell/install-test
         tests/shell/release-scripts-test
         tests/shell/automation-test
 
@@ -72,7 +81,7 @@ jobs:
       # files, so `.github/cgraf78-actions.lock` cannot be interpolated. This
       # gate verifies every unavoidable action literal and all vendored release
       # scripts still match that single reviewed dependency decision.
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@023a7d521187d9a1dc281a4b2beddbf03845d689
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@aee0fb5381622e78aa46299cf1e60556c027f238
 
   source-install:
     name: Locked source install

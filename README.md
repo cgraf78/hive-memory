@@ -51,11 +51,21 @@ file-sync (Google Drive, Dropbox, git) carries the same memory to every machine.
 
 ## 60-second quick start
 
-Install the CLI from a checkout:
+Install the latest published CLI and manual page without a Rust toolchain:
 
 ```sh
-cargo install --path . --locked
+git clone https://github.com/cgraf78/hive-memory.git
+cd hive-memory
+./install.sh
 ```
+
+The installer verifies the release archive against its published SHA-256 file,
+keeps the complete release under `${XDG_DATA_HOME:-~/.local/share}/cgraf78`,
+and activates `hm` under `~/.local/bin`. Re-running it is an idempotent update.
+Use `--version <tag>` to pin a release, or `--archive <path> --checksum <path>`
+for a previously downloaded archive. Run `./install.sh --help` for destination
+overrides. A checksum detects corruption and wrong assets; it is not a signed
+provenance mechanism.
 
 Create a minimal config at `$XDG_CONFIG_HOME/hive-memory/config.toml` when
 `XDG_CONFIG_HOME` is absolute, or at `~/.config/hive-memory/config.toml`
@@ -643,6 +653,7 @@ formats, or hook contracts are tracked in [SPEC.md](SPEC.md).
 ## Development
 
 ```sh
+cargo install --path . --locked
 cargo fmt --check
 cargo test --locked
 cargo clippy --locked --all-targets --all-features -- -D warnings

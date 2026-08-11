@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# Hive Memory's consumer-side contract for the generated release installer.
+#
+# Generic download and archive hardening belongs to cgraf78/actions. This test
+# deliberately exercises a schema-faithful synthetic local archive so failures
+# can target Hive's binary path, manual page, metadata name, and complete payload
+# without rebuilding Rust. The package-smoke CI job separately feeds the exact
+# archive emitted by package-release.sh through this generated installer.
+
+set -uo pipefail
+
+HIVE_MEMORY_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+
+# shellcheck source=helpers.sh
+. "$(dirname "$0")/helpers.sh"
+
+echo "=== Standalone release installer ==="
+
+_sha256_file() {
+  local file=$1
+  if command -v sha256sum >/dev/null 2>&1; then
+    (cd "$(dirname "$file")" && sha256sum "$(basename "$file")")
+  else
+    (cd "$(dirname "$file")" && shasum -a 256 "$(basename "$file")")
+  fi
+}
+
+# Keep this consumer contract deterministic across the shared Linux, macOS,
+# and Termux shell matrix. Platform-selection behavior belongs to the generated
+# installer's provider suite, which separately exercises every published
+# platform. This fixture instead proves Hive's exact archive schema and payload,
+# so it pins a synthetic Linux host and clears Termux's ambient Android marker.
+uname_bin=$(mktemp -d)
+CLEANUP_DIRS+=("$uname_bin")
+cat >"$uname_bin/uname" <<'EOF'
+#!/usr/bin/env bash
+case ${1:-} in
+  -s) printf '%s\n' Linux ;;
+  -m) printf '%s\n' x86_64 ;;
+  -o) printf '%s\n' GNU/Linux ;;
+  *) exit 2 ;;
+esac
+EOF
+chmod 0755 "$uname_bin/uname"
+PATH="$uname_bin:$PATH"
+ANDROID_ROOT=
+export PATH ANDROID_ROOT
+
+_make_archive() {
+  local workspace=$1 version=$2 marker=$3
+  local platform=linux-x86_64-musl
+  local archive="$workspace/hm-${version}-${platform}.tar.gz"
+  local payload="$workspace/payload-$marker"
+  local commit_suffix=${version##*-}
+
+  mkdir -p "$payload/man/man1"
+  {
+    printf '%s\n' '#!/usr/bin/env sh'
+    printf "printf '%%s\\\\n' '%s'\n" "$marker"
+  } >"$payload/hm"
+  chmod 0755 "$payload/hm"
+  printf '%s\n' '# Hive Memory fixture' >"$payload/README.md"
+  printf '%s\n' 'MIT fixture' >"$payload/LICENSE"
+  printf '%s\n' '.TH HM 1' >"$payload/man/man1/hm.1"
+  cat >"$payload/.hive-memory-install.json" <<EOF
+{
+  "schema": 1,
+  "method": "release",
+  "artifact_platform": "$platform",
+  "version": "$version",
+  "tag": "$version",
+  "commit": "${commit_suffix}${commit_suffix}${commit_suffix}${commit_suffix}${commit_suffix}",
+  "repo": "cgraf78/hive-memory"
+}
+EOF
+  tar -C "$payload" -czf "$archive" .
+  _sha256_file "$archive" >"$archive.sha256"
+  printf '%s\n' "$archive"
+}
+
+if [[ -x "$HIVE_MEMORY_DIR/install.sh" ]]; then
+  _pass "installer: generated entry point exists and is executable"
+else
+  _fail "installer: generated entry point exists and is executable"
+  _test_summary
+fi
+
+workspace=$(mktemp -d)
+CLEANUP_DIRS+=("$workspace")
+home="$workspace/home"
+data_home="$workspace/data"
+bin_dir="$home/.local/bin"
+man_dir="$data_home/man/man1"
+mkdir -p "$home"
+
+v1=20260810-120000-deadbeef
+archive_v1=$(_make_archive "$workspace" "$v1" first)
+
+rc=0
+HOME="$home" XDG_DATA_HOME="$data_home" \
+  "$HIVE_MEMORY_DIR/install.sh" \
+  --archive "$archive_v1" --checksum "$archive_v1.sha256" || rc=$?
+_assert_exit "installer: installs a valid local release archive" 0 "$rc"
+
+installed_output=$(
+  XDG_CONFIG_HOME="$workspace/config" \
+    XDG_STATE_HOME="$workspace/state" \
+    XDG_CACHE_HOME="$workspace/cache" \
+    "$bin_dir/hm"
+)
+_assert_eq "installer: public command executes installed release" \
+  "first" "$installed_output"
+
+stable_root="$data_home/cgraf78/hive-memory"
+if [[ -e "$stable_root/README.md" && -e "$stable_root/LICENSE" ]]; then
+  _pass "installer: retains the complete release payload"
+else
+  _fail "installer: retains the complete release payload"
+fi
+_assert_eq "installer: public manual resolves to packaged page" \
+  "$stable_root/man/man1/hm.1" "$(readlink "$man_dir/hm.1")"
+
+# Installing a CLI must not initialize application-owned config, state, cache,
+# or a memory store. Those are runtime policy and user data, not package data.
+for absent in config state cache; do
+  if [[ ! -e "$workspace/$absent" ]]; then
+    _pass "installer: does not create runtime $absent"
+  else
+    _fail "installer: does not create runtime $absent"
+  fi
+done
+
+first_command_target=$(readlink "$bin_dir/hm")
+first_manual_target=$(readlink "$man_dir/hm.1")
+rc=0
+HOME="$home" XDG_DATA_HOME="$data_home" \
+  "$HIVE_MEMORY_DIR/install.sh" \
+  --archive "$archive_v1" --checksum "$archive_v1.sha256" || rc=$?
+_assert_exit "installer: same-release reinstall is idempotent" 0 "$rc"
+_assert_eq "installer: idempotence preserves command activation" \
+  "$first_command_target" "$(readlink "$bin_dir/hm")"
+_assert_eq "installer: idempotence preserves manual activation" \
+  "$first_manual_target" "$(readlink "$man_dir/hm.1")"
+
+v2=20260810-120001-feedface
+archive_v2=$(_make_archive "$workspace" "$v2" second)
+rc=0
+HOME="$home" XDG_DATA_HOME="$data_home" \
+  "$HIVE_MEMORY_DIR/install.sh" \
+  --archive "$archive_v2" --checksum "$archive_v2.sha256" || rc=$?
+_assert_exit "installer: activates a validated update" 0 "$rc"
+_assert_eq "installer: updated command uses the new release" \
+  "second" "$("$bin_dir/hm")"
+
+# A failed update must leave the last complete version active. Use a checksum
+# failure here because it occurs before the archive can be trusted or staged.
+printf '%064d  %s\n' 0 "$(basename "$archive_v1")" >"$archive_v1.bad.sha256"
+rc=0
+HOME="$home" XDG_DATA_HOME="$data_home" \
+  "$HIVE_MEMORY_DIR/install.sh" \
+  --archive "$archive_v1" --checksum "$archive_v1.bad.sha256" \
+  >"$workspace/bad.out" 2>"$workspace/bad.err" || rc=$?
+if [[ "$rc" -ne 0 ]]; then
+  _pass "installer: rejects a corrupt checksum"
+else
+  _fail "installer: rejects a corrupt checksum"
+fi
+_assert_eq "installer: failed update preserves prior command" \
+  "second" "$("$bin_dir/hm")"
+
+# Standalone installation must coexist safely with package managers such as
+# Shdeps. An unowned command path is never evidence that this installer owns it.
+collision=$(mktemp -d)
+CLEANUP_DIRS+=("$collision")
+collision_home="$collision/home"
+collision_data="$collision/data"
+mkdir -p "$collision_home/.local/bin"
+printf '%s\n' 'user-owned' >"$collision_home/.local/bin/hm"
+rc=0
+HOME="$collision_home" XDG_DATA_HOME="$collision_data" \
+  "$HIVE_MEMORY_DIR/install.sh" \
+  --archive "$archive_v1" --checksum "$archive_v1.sha256" \
+  >"$collision/out" 2>"$collision/err" || rc=$?
+if [[ "$rc" -ne 0 ]]; then
+  _pass "installer: refuses a user-owned command"
+else
+  _fail "installer: refuses a user-owned command"
+fi
+_assert_eq "installer: preserves a user-owned command" \
+  "user-owned" "$(cat "$collision_home/.local/bin/hm")"
+if [[ ! -e "$collision_data/cgraf78/hive-memory" ]]; then
+  _pass "installer: command collision publishes no partial install"
+else
+  _fail "installer: command collision publishes no partial install"
+fi
+
+_test_summary

@@ -31,6 +31,8 @@ _assert_eq "release config: publishes hm-prefixed archives" "hm" "$RELEASE_ASSET
 _assert_eq "release config: builds the hm binary" "hm" "$RELEASE_BINARY"
 _assert_eq "release config: keys install metadata off the repo slug" \
   "hive-memory" "$RELEASE_SLUG"
+_assert_eq "release config: opts into the generated standalone installer" \
+  "true" "$RELEASE_STANDALONE_INSTALLER"
 
 # A declared entry that no longer exists fails the release on a runner rather
 # than here, which is a slow way to discover a rename.
