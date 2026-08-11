@@ -9,8 +9,16 @@ const LOCKED_PERFORMANCE_BUDGET: &str =
     "cargo test --release --locked --test perf_budget -- --ignored --nocapture --test-threads=1";
 const LOCKED_CLOUD_SYNC_SIM: &str =
     "cargo test --locked --test cloud_sync_sim -- --ignored --nocapture";
-const PACKAGE_SMOKE: &str = "scripts/package-release.sh \"$RUST_TARGET\" linux-x86_64-musl\n\
-scripts/smoke-release.sh linux-x86_64-musl";
+const PACKAGE_SMOKE: &str = r#"archive=$(scripts/package-release.sh "$RUST_TARGET" linux-x86_64-musl)
+scripts/smoke-release.sh linux-x86_64-musl
+install_root=$(mktemp -d)
+trap 'rm -rf "$install_root"' EXIT
+mkdir -p "$install_root/home"
+HOME="$install_root/home" ./install.sh --archive "$archive" \
+  --data-home "$install_root/data" --bin-dir "$install_root/bin" \
+  --man-dir "$install_root/man"
+"$install_root/bin/hm" --version
+test -f "$install_root/data/cgraf78/hive-memory/man/man1/hm.1""#;
 const SHARED_RUST_WORKFLOW: &str = "cgraf78/actions/.github/workflows/rust-ci.yml@";
 // These inputs encode fleet policy in the reusable workflow. Hive only owns
 // product-specific setup, packaging, and runtime commands; repeating a shared
@@ -315,6 +323,16 @@ fn missing_or_drifted_product_inputs_are_rejected() {
     let missing_smoke =
         valid_workflow().replace("        scripts/smoke-release.sh linux-x86_64-musl\n", "");
     assert!(validate_workflow(&missing_smoke).is_err());
+
+    let missing_install = valid_workflow().replace(
+        "        HOME=\"$install_root/home\" ./install.sh --archive \"$archive\" \\\n",
+        "",
+    );
+    assert!(validate_workflow(&missing_install).is_err());
+
+    let missing_installed_smoke =
+        valid_workflow().replace("        \"$install_root/bin/hm\" --version\n", "");
+    assert!(validate_workflow(&missing_installed_smoke).is_err());
 }
 
 #[test]

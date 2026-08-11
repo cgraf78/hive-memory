@@ -1,5 +1,6 @@
 # type<TAB>repository-relative path
 # `fixture` records are discovered but intentionally excluded from ShellCheck.
+program	install.sh
 program	scripts/download-longmemeval-fixture
 program	scripts/package-release.sh
 program	scripts/release-lib.sh
@@ -14,4 +15,5 @@ program	tests/fixtures/fake-llm
 program	tests/fixtures/fake-llm-poison
 program	tests/shell/automation-test
 program	tests/shell/helpers.sh
+program	tests/shell/install-test
 program	tests/shell/release-scripts-test
