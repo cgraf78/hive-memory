@@ -1432,6 +1432,10 @@ fn merge_ranked_sources_local(
     let mut hits = Vec::new();
     let mut seen_ids = BTreeSet::new();
     let mut seen_content = BTreeSet::new();
+    // BM25 and lexical scores have different scales, so a global score sort
+    // would let one backend erase the other's useful recall. Preserve each
+    // source's internal rank and take candidates round-robin instead. Deduplicate
+    // only when admitting a hit so overlap never consumes the caller's limit.
     loop {
         let mut advanced = false;
         for source in &mut sources {
@@ -1464,6 +1468,9 @@ fn merge_ranked_sources(
     let mut hits = Vec::new();
     let mut seen_ids = BTreeSet::new();
     let mut seen_content = BTreeSet::new();
+    // Keep the same round-robin contract as local search. Within one source's
+    // turn, skip entries already supplied by an earlier stream so a heavily
+    // overlapping backend still gets a chance to contribute one distinct hit.
     loop {
         let mut advanced = false;
         for source in &mut sources {
