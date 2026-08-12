@@ -152,11 +152,15 @@ pub fn write_atomic(
     write_atomic_with_mode(final_path, contents, options, PublishMode::Replace)
 }
 
-/// Atomically create bytes at a caller-selected final path.
+/// Create bytes at a caller-selected final path without replacing an existing file.
 ///
-/// Unlike [`write_atomic`], this fails if `final_path` already exists, including
-/// a concurrent create between temp-file write and publish. Use this for
-/// append-only inbox files where overwriting another writer would be data loss.
+/// Unlike [`write_atomic`], this is collision-safe: it fails if `final_path`
+/// already exists, including a concurrent create between temp-file write and
+/// publish. Installation is atomic when the filesystem supports the hard-link
+/// publish path. Sync-backed filesystems that reject hard links use a create-new
+/// copy instead, preserving the critical no-overwrite guarantee but not
+/// crash-atomic visibility. Use this for append-only inbox files where
+/// overwriting another writer would be data loss.
 pub fn write_atomic_create_new(
     final_path: &Path,
     contents: &[u8],

@@ -818,6 +818,11 @@ fn hook_prompt_recall_action(
         },
     };
 
+    // Incremental prompt recall emits at most three NEW memories at a time. The
+    // search above still considers the complete local projection and expands
+    // past memories already seen in this session; this cap bounds one hook
+    // payload rather than limiting which memories remain searchable, and later
+    // prompts can advance to the next eligible results.
     let selected_entries = hits
         .iter()
         .filter(|hit| !known_ids.contains(&hit.entry.id))
@@ -856,6 +861,10 @@ fn hook_prompt_recall_action(
         return Ok((None, recall));
     }
 
+    // Prompt-submit runs synchronously on every turn, so its incremental context
+    // uses an independently bounded per-prompt envelope. The floor leaves room
+    // for one useful section and the ceiling bounds per-prompt context churn;
+    // neither changes the configured budget used by other context surfaces.
     let max_tokens = usize::try_from(config.defaults.hook_context_max_tokens)?.clamp(200, 1_200);
     let context_input = memory_context::ContextInput {
         store_name: store_name.as_str(),
@@ -959,6 +968,13 @@ fn prompt_recall_query(prompt: &str, path_hint: Option<&str>) -> Option<String> 
         }
     }
 
+    // This is a bounded relevance sketch for one automatic recall, not a cap on
+    // the indexed memory corpus. Concrete code/path terms are more discriminating
+    // than task prose, so prefer up to three of them and fill a four-term query
+    // with plain terms. Plain-language-only prompts use two terms: longer queries
+    // raise lexical term-coverage requirements and add little value on this hot
+    // path.
+    // Manual search and the normal context surfaces keep their existing inputs.
     let terms = if !code_terms.is_empty() {
         let mut terms = code_terms.into_iter().take(3).collect::<Vec<_>>();
         terms.extend(
