@@ -304,9 +304,24 @@ if [[ -z "$archive" ]]; then
   command -v curl >/dev/null 2>&1 || die 'curl is required for online installation'
   [[ -z "$checksum" ]] || die '--checksum is valid only with --archive'
 
+  # Bound connection setup, silent bodies, trickling transfers, and transient
+  # failures for every GitHub request. Three calls at their worst-case retry
+  # windows consume 546 seconds, below the online installer's ten-minute
+  # network budget.
+  curl_net_opts=(
+    --connect-timeout 10
+    --max-time 60
+    --speed-limit 1024
+    --speed-time 30
+    --retry 2
+    --retry-all-errors
+    --retry-delay 1
+  )
+
   if [[ -z "$requested_version" ]]; then
     latest_url=https://github.com/$release_repo/releases/latest
-    resolved_url=$(curl -fsSL --proto '=https' --proto-redir '=https' \
+    resolved_url=$(curl "${curl_net_opts[@]}" -fsSL \
+      --proto '=https' --proto-redir '=https' \
       -o /dev/null -w '%{url_effective}' "$latest_url") ||
       die "cannot resolve the latest $release_repo release"
     latest_prefix=https://github.com/$release_repo/releases/tag/
@@ -326,10 +341,10 @@ if [[ -z "$archive" ]]; then
   archive_is_private=1
   checksum=$archive.sha256
   download_base=https://github.com/$release_repo/releases/download/$requested_version
-  curl -fsSL --proto '=https' --proto-redir '=https' \
+  curl "${curl_net_opts[@]}" -fsSL --proto '=https' --proto-redir '=https' \
     "$download_base/$archive_name.sha256" -o "$checksum" ||
     die "cannot download checksum for $archive_name"
-  curl -fsSL --proto '=https' --proto-redir '=https' \
+  curl "${curl_net_opts[@]}" -fsSL --proto '=https' --proto-redir '=https' \
     "$download_base/$archive_name" -o "$archive" ||
     die "cannot download $archive_name"
 fi

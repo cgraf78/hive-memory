@@ -111,6 +111,13 @@ url=
 fs_sl_count=0
 proto_count=0
 proto_redir_count=0
+connect_timeout_count=0
+max_time_count=0
+speed_limit_count=0
+speed_time_count=0
+retry_count=0
+retry_all_errors_count=0
+retry_delay_count=0
 while [[ $# -gt 0 ]]; do
   case $1 in
     -fsSL)
@@ -125,6 +132,40 @@ while [[ $# -gt 0 ]]; do
     --proto-redir)
       [[ $# -ge 2 && $2 == '=https' ]] || exit 64
       proto_redir_count=$((proto_redir_count + 1))
+      shift 2
+      ;;
+    --connect-timeout)
+      [[ $# -ge 2 && $2 == 10 ]] || exit 64
+      connect_timeout_count=$((connect_timeout_count + 1))
+      shift 2
+      ;;
+    --max-time)
+      [[ $# -ge 2 && $2 == 60 ]] || exit 64
+      max_time_count=$((max_time_count + 1))
+      shift 2
+      ;;
+    --speed-limit)
+      [[ $# -ge 2 && $2 == 1024 ]] || exit 64
+      speed_limit_count=$((speed_limit_count + 1))
+      shift 2
+      ;;
+    --speed-time)
+      [[ $# -ge 2 && $2 == 30 ]] || exit 64
+      speed_time_count=$((speed_time_count + 1))
+      shift 2
+      ;;
+    --retry)
+      [[ $# -ge 2 && $2 == 2 ]] || exit 64
+      retry_count=$((retry_count + 1))
+      shift 2
+      ;;
+    --retry-all-errors)
+      retry_all_errors_count=$((retry_all_errors_count + 1))
+      shift
+      ;;
+    --retry-delay)
+      [[ $# -ge 2 && $2 == 1 ]] || exit 64
+      retry_delay_count=$((retry_delay_count + 1))
       shift 2
       ;;
     -o)
@@ -153,7 +194,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$fs_sl_count" -eq 1 && "$proto_count" -eq 1 &&
-  "$proto_redir_count" -eq 1 ]] || exit 64
+  "$proto_redir_count" -eq 1 && "$connect_timeout_count" -eq 1 &&
+  "$max_time_count" -eq 1 && "$speed_limit_count" -eq 1 &&
+  "$speed_time_count" -eq 1 && "$retry_count" -eq 1 &&
+  "$retry_all_errors_count" -eq 1 && "$retry_delay_count" -eq 1 ]] ||
+  exit 64
 [[ -n "$url" ]] || {
   printf 'curl URL is missing\n' >&2
   exit 64
@@ -343,37 +388,49 @@ curl_stub_env=(
   "INSTALL_TEST_CHECKSUM=$latest_archive.sha256"
   "INSTALL_TEST_ARCHIVE=$latest_archive"
 )
+curl_network_args=(
+  --connect-timeout 10
+  --max-time 60
+  --speed-limit 1024
+  --speed-time 30
+  --retry 2
+  --retry-all-errors
+  --retry-delay 1
+)
 _assert_curl_stub_rejects "installer fixture: curl requires -fsSL" \
   env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
-  --proto '=https' --proto-redir '=https' \
+  --proto '=https' --proto-redir '=https' "${curl_network_args[@]}" \
   -o /dev/null -w '%{url_effective}' "$latest_url"
 _assert_curl_stub_rejects "installer fixture: curl rejects duplicate -fsSL" \
   env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
   -fsSL -fsSL --proto '=https' --proto-redir '=https' \
+  "${curl_network_args[@]}" \
   -o /dev/null -w '%{url_effective}' "$latest_url"
 _assert_curl_stub_rejects "installer fixture: curl requires --proto" \
   env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
-  -fsSL --proto-redir '=https' \
+  -fsSL --proto-redir '=https' "${curl_network_args[@]}" \
   -o /dev/null -w '%{url_effective}' "$latest_url"
 _assert_curl_stub_rejects "installer fixture: curl rejects duplicate --proto" \
   env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
   -fsSL --proto '=https' --proto '=https' --proto-redir '=https' \
+  "${curl_network_args[@]}" \
   -o /dev/null -w '%{url_effective}' "$latest_url"
 _assert_curl_stub_rejects "installer fixture: curl rejects weakened --proto" \
   env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
-  -fsSL --proto '=http' --proto-redir '=https' \
+  -fsSL --proto '=http' --proto-redir '=https' "${curl_network_args[@]}" \
   -o /dev/null -w '%{url_effective}' "$latest_url"
 _assert_curl_stub_rejects "installer fixture: curl requires --proto-redir" \
   env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
-  -fsSL --proto '=https' \
+  -fsSL --proto '=https' "${curl_network_args[@]}" \
   -o /dev/null -w '%{url_effective}' "$latest_url"
 _assert_curl_stub_rejects "installer fixture: curl rejects duplicate --proto-redir" \
   env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
   -fsSL --proto '=https' --proto-redir '=https' --proto-redir '=https' \
+  "${curl_network_args[@]}" \
   -o /dev/null -w '%{url_effective}' "$latest_url"
 _assert_curl_stub_rejects "installer fixture: curl rejects weakened --proto-redir" \
   env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
-  -fsSL --proto '=https' --proto-redir '=all' \
+  -fsSL --proto '=https' --proto-redir '=all' "${curl_network_args[@]}" \
   -o /dev/null -w '%{url_effective}' "$latest_url"
 rc=0
 PATH="$latest_curl_bin:$PATH" \
