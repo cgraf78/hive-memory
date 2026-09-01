@@ -112,6 +112,10 @@ fi
 _release_workflow=$(cat "$HIVE_MEMORY_DIR/.github/workflows/release.yml")
 _assert_contains "release workflow: uses exact reusable tag command" \
   'tag-command: scripts/release-tag.sh' "$_release_workflow"
+_assert_contains "release workflow: grants an OIDC token for attestations" \
+  '      id-token: write' "$_release_workflow"
+_assert_contains "release workflow: grants attestation publication" \
+  '      attestations: write' "$_release_workflow"
 
 # The broader consumer verifier keeps the action pin and all generated files in
 # one contract; checking its exact action name prevents a silent fallback to
