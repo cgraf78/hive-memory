@@ -1,6 +1,6 @@
 # hive-memory
 
-[![CI](https://github.com/cgraf78/hive-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/cgraf78/hive-memory/actions/workflows/ci.yml)
+[![Tests](https://github.com/cgraf78/hive-memory/actions/workflows/test.yml/badge.svg)](https://github.com/cgraf78/hive-memory/actions/workflows/test.yml)
 [![Release](https://github.com/cgraf78/hive-memory/actions/workflows/release.yml/badge.svg)](https://github.com/cgraf78/hive-memory/actions/workflows/release.yml)
 
 **Durable, shareable, plain-text memory for AI agents — across sessions,
