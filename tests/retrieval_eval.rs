@@ -70,22 +70,31 @@ fn retrieval_corpus_search_baseline() {
     let corpus = load_corpus();
     let materialized = materialize(&corpus);
 
-    for case in &corpus.search_case {
-        let hits = search(SearchInput {
-            store_root: &materialized.root,
-            entries: &materialized.entries,
-            query: &case.query,
-            scopes: &["global".to_owned(), "project".to_owned()],
-            sources: &["remembered".to_owned()],
-            include_inbox: false,
-            agent_id: Some("codex"),
-            project_id: case.project_id.as_deref(),
-            limit: 20,
-        })
-        .unwrap_or_else(|err| panic!("search case {} failed: {err}", case.name));
-        let subjects = hit_subjects(&hits);
-        assert_includes(&case.name, &subjects, &case.include);
-        assert_excludes(&case.name, &subjects, &case.exclude);
+    // Corpus recall must not depend on which agent identity asks: run the
+    // baseline under both the long-standing "codex" fixture id and "muse".
+    for agent_id in ["codex", "muse"] {
+        for case in &corpus.search_case {
+            let hits = search(SearchInput {
+                store_root: &materialized.root,
+                entries: &materialized.entries,
+                query: &case.query,
+                scopes: &["global".to_owned(), "project".to_owned()],
+                sources: &["remembered".to_owned()],
+                include_inbox: false,
+                agent_id: Some(agent_id),
+                project_id: case.project_id.as_deref(),
+                limit: 20,
+            })
+            .unwrap_or_else(|err| {
+                panic!(
+                    "search case {} failed for agent {agent_id}: {err}",
+                    case.name
+                )
+            });
+            let subjects = hit_subjects(&hits);
+            assert_includes(&case.name, &subjects, &case.include);
+            assert_excludes(&case.name, &subjects, &case.exclude);
+        }
     }
 }
 
@@ -95,54 +104,56 @@ fn retrieval_corpus_context_baseline() {
     let materialized = materialize(&corpus);
     let bodies_by_subject = bodies_by_subject(&corpus);
 
-    for case in &corpus.context_case {
-        let output = assemble_context(ContextInput {
-            store_name: "personal",
-            store_root: &materialized.root,
-            entries: &materialized.entries,
-            scopes: &["global".to_owned(), "project".to_owned()],
-            sources: &["remembered".to_owned(), "curated".to_owned()],
-            include_inbox: false,
-            include_search_only: false,
-            agent_id: Some("codex"),
-            project_id: case.project_id.as_deref(),
-            path_hint: None,
-            max_tokens: 4_000,
-            inject_strategy: InjectStrategy::Relevance,
-            explain: true,
-        })
-        .unwrap_or_else(|err| panic!("context case {} failed: {err}", case.name));
-        let body = output.markdown;
-        for expected in &case.include {
-            let expected_body = bodies_by_subject
-                .get(expected)
-                .unwrap_or_else(|| panic!("unknown expected subject {expected}"));
-            assert!(
-                body.contains(expected_body.as_str()),
-                "context case {} missing expected subject {expected}; body:\n{body}",
-                case.name
-            );
-        }
-        for forbidden in &case.exclude {
-            let forbidden_body = bodies_by_subject
-                .get(forbidden)
-                .unwrap_or_else(|| panic!("unknown forbidden subject {forbidden}"));
-            assert!(
-                !body.contains(forbidden_body.as_str()),
-                "context case {} included forbidden subject {forbidden}; body:\n{body}",
-                case.name
-            );
-        }
-        if case.name == "active project startup context" {
-            let active_body = bodies_by_subject
-                .get("active-agents-checkrun")
-                .expect("active body");
-            assert_eq!(
-                body.matches(active_body).count(),
-                1,
-                "context case {} should emit the duplicate project fact once; body:\n{body}",
-                case.name
-            );
+    for agent_id in ["codex", "muse"] {
+        for case in &corpus.context_case {
+            let output = assemble_context(ContextInput {
+                store_name: "personal",
+                store_root: &materialized.root,
+                entries: &materialized.entries,
+                scopes: &["global".to_owned(), "project".to_owned()],
+                sources: &["remembered".to_owned(), "curated".to_owned()],
+                include_inbox: false,
+                include_search_only: false,
+                agent_id: Some(agent_id),
+                project_id: case.project_id.as_deref(),
+                path_hint: None,
+                max_tokens: 4_000,
+                inject_strategy: InjectStrategy::Relevance,
+                explain: true,
+            })
+            .unwrap_or_else(|err| panic!("context case {} failed: {err}", case.name));
+            let body = output.markdown;
+            for expected in &case.include {
+                let expected_body = bodies_by_subject
+                    .get(expected)
+                    .unwrap_or_else(|| panic!("unknown expected subject {expected}"));
+                assert!(
+                    body.contains(expected_body.as_str()),
+                    "context case {} missing expected subject {expected}; body:\n{body}",
+                    case.name
+                );
+            }
+            for forbidden in &case.exclude {
+                let forbidden_body = bodies_by_subject
+                    .get(forbidden)
+                    .unwrap_or_else(|| panic!("unknown forbidden subject {forbidden}"));
+                assert!(
+                    !body.contains(forbidden_body.as_str()),
+                    "context case {} included forbidden subject {forbidden}; body:\n{body}",
+                    case.name
+                );
+            }
+            if case.name == "active project startup context" {
+                let active_body = bodies_by_subject
+                    .get("active-agents-checkrun")
+                    .expect("active body");
+                assert_eq!(
+                    body.matches(active_body).count(),
+                    1,
+                    "context case {} should emit the duplicate project fact once; body:\n{body}",
+                    case.name
+                );
+            }
         }
     }
 }

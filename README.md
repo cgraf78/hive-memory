@@ -24,7 +24,7 @@ file-sync (Google Drive, Dropbox, git) carries the same memory to every machine.
 
 - **One memory across sessions and agents.** Write a fact once with `hm
   remember`; recall it from any future session, with `claude`, `codex`,
-  `gemini`, or your own tooling.
+  `gemini`, `muse`, or your own tooling.
 - **Cross-machine by file-sync.** A store is a directory with a stable UUID
   identity. Sync it however you already sync files; identity survives moves and
   renames.
