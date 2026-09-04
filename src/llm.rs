@@ -615,4 +615,24 @@ mod tests {
 
         assert!(detect(None, &[], None, Some("")).is_none());
     }
+
+    /// The documented backend set and the adapter table must agree: a new
+    /// backend means updating both this test's documented list and ADAPTERS.
+    #[test]
+    fn adapters_match_documented_backends() {
+        const DOCUMENTED_CLI: &[&str] = &["claude", "codex", "gemini"];
+        let labels: Vec<&str> = ADAPTERS.iter().map(|a| a.label).collect();
+        for expected in DOCUMENTED_CLI {
+            assert!(
+                labels.contains(expected),
+                "documented backend has no adapter: {expected}"
+            );
+        }
+        for label in &labels {
+            assert!(
+                DOCUMENTED_CLI.contains(label),
+                "adapter has no documented backend: {label}"
+            );
+        }
+    }
 }
