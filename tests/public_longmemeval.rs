@@ -337,19 +337,39 @@ fn longmemeval_s_retrieval_scoreboard() {
         let start = Instant::now();
         let actual = match retriever {
             Retriever::Lexical => {
-                let hits = search(SearchInput {
-                    store_root: &materialized.root,
-                    entries: &haystack_entries,
-                    query: &case.question,
-                    scopes: &["global".to_owned()],
-                    sources: &["remembered".to_owned()],
-                    include_inbox: false,
-                    agent_id: Some("codex"),
-                    project_id: None,
-                    limit: ITEM_RETRIEVAL_LIMIT,
-                })
-                .unwrap_or_else(|err| panic!("case {} search failed: {err}", case.question_id));
-                unique_session_hits(&hits, &materialized.session_id_by_item_id)
+                // Global-scope recall must not depend on the agent identity:
+                // score the long-standing "codex" fixture id and require the
+                // mirrored "muse" identity to retrieve the same sessions.
+                let mut per_agent = BTreeMap::new();
+                for agent_id in ["codex", "muse"] {
+                    let hits = search(SearchInput {
+                        store_root: &materialized.root,
+                        entries: &haystack_entries,
+                        query: &case.question,
+                        scopes: &["global".to_owned()],
+                        sources: &["remembered".to_owned()],
+                        include_inbox: false,
+                        agent_id: Some(agent_id),
+                        project_id: None,
+                        limit: ITEM_RETRIEVAL_LIMIT,
+                    })
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "case {} search failed for agent {agent_id}: {err}",
+                            case.question_id
+                        )
+                    });
+                    per_agent.insert(
+                        agent_id,
+                        unique_session_hits(&hits, &materialized.session_id_by_item_id),
+                    );
+                }
+                assert_eq!(
+                    per_agent["codex"], per_agent["muse"],
+                    "case {} global-scope recall differed between codex and muse",
+                    case.question_id
+                );
+                per_agent.remove("codex").expect("codex sessions")
             }
             Retriever::Bm25 => {
                 // Restrict candidates to this case's haystack, mirroring the

@@ -498,35 +498,39 @@ mod tests {
 
     #[test]
     fn kind_only_retag_preserves_event_visibility_metadata() {
-        let root = temp_dir("retag-divergent-event");
-        let written = write(&root, Some(note::MemoryKind::Preference), true);
-        let event_path = written.event_path.as_ref().expect("event path");
-        let mut event = event::parse_event(
-            &fs::read_to_string(event_path).expect("read event before divergence"),
-        )
-        .expect("parse event before divergence");
-        event.scope = "agent-private".to_owned();
-        event.audience = vec!["codex".to_owned()];
-        let rendered = event::render_event(&event).expect("render divergent event");
-        fs::write(event_path, rendered).expect("write divergent event");
+        // Retag must preserve visibility metadata for any agent audience,
+        // including agent ids with no special-casing such as `muse`.
+        for agent_id in ["codex", "muse"] {
+            let root = temp_dir(&format!("retag-divergent-event-{agent_id}"));
+            let written = write(&root, Some(note::MemoryKind::Preference), true);
+            let event_path = written.event_path.as_ref().expect("event path");
+            let mut event = event::parse_event(
+                &fs::read_to_string(event_path).expect("read event before divergence"),
+            )
+            .expect("parse event before divergence");
+            event.scope = "agent-private".to_owned();
+            event.audience = vec![agent_id.to_owned()];
+            let rendered = event::render_event(&event).expect("render divergent event");
+            fs::write(event_path, rendered).expect("write divergent event");
 
-        retag_record(RetagRecordInput {
-            root: &root,
-            note_path: &relative(&root, &written.note_path),
-            update_kind: true,
-            kind: Some(note::MemoryKind::Incident),
-            scope: None,
-            project_id: None,
-            classified: ClassifiedUpdate::Keep,
-            options: options(),
-        })
-        .expect("retag");
+            retag_record(RetagRecordInput {
+                root: &root,
+                note_path: &relative(&root, &written.note_path),
+                update_kind: true,
+                kind: Some(note::MemoryKind::Incident),
+                scope: None,
+                project_id: None,
+                classified: ClassifiedUpdate::Keep,
+                options: options(),
+            })
+            .expect("retag");
 
-        let event = event::parse_event(&fs::read_to_string(event_path).expect("read event"))
-            .expect("parse event");
-        assert_eq!(event.kind, Some(note::MemoryKind::Incident));
-        assert_eq!(event.scope, "agent-private");
-        assert_eq!(event.audience, vec!["codex"]);
+            let event = event::parse_event(&fs::read_to_string(event_path).expect("read event"))
+                .expect("parse event");
+            assert_eq!(event.kind, Some(note::MemoryKind::Incident));
+            assert_eq!(event.scope, "agent-private");
+            assert_eq!(event.audience, vec![agent_id]);
+        }
     }
 
     #[test]
