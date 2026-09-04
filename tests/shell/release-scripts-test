@@ -120,7 +120,9 @@ _assert_contains "release workflow: grants attestation publication" \
 # The broader consumer verifier keeps the action pin and all generated files in
 # one contract; checking its exact action name prevents a silent fallback to
 # the older release-script-only check.
-_ci_workflow=$(cat "$HIVE_MEMORY_DIR/.github/workflows/ci.yml")
+_ci_workflow=$(cat "$HIVE_MEMORY_DIR/.github/workflows/test.yml")
+_assert_contains "tests workflow: uses the standard display name" \
+  "name: Tests" "$_ci_workflow"
 _assert_contains "ci workflow: verifies the complete shared CI snapshot" \
   "cgraf78/actions/.github/actions/verify-consumer-sync@" "$_ci_workflow"
 _assert_contains "ci workflow: multiline shell suites fail on the first error" \

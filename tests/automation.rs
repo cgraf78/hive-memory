@@ -204,7 +204,7 @@ fn valid_dependabot() -> String {
 }
 
 fn valid_workflow() -> String {
-    include_str!("../.github/workflows/ci.yml").to_owned()
+    include_str!("../.github/workflows/test.yml").to_owned()
 }
 
 #[test]
