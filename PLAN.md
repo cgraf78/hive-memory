@@ -215,6 +215,12 @@ read_stores = ["personal"]
 write_stores = ["personal"]
 allow_all_stores = false
 
+[agents.grok]
+default_store = "personal"
+read_stores = ["personal"]
+write_stores = ["personal"]
+allow_all_stores = false
+
 [privacy]
 allow_all_stores_flag = true
 secret_refuses_cloud_roots = true
