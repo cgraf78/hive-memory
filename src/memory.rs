@@ -499,8 +499,9 @@ mod tests {
     #[test]
     fn kind_only_retag_preserves_event_visibility_metadata() {
         // Retag must preserve visibility metadata for any agent audience,
-        // including agent ids with no special-casing such as `muse`.
-        for agent_id in ["codex", "muse"] {
+        // including first-class ids with no special-casing such as `muse`
+        // and `grok`.
+        for agent_id in ["codex", "muse", "grok"] {
             let root = temp_dir(&format!("retag-divergent-event-{agent_id}"));
             let written = write(&root, Some(note::MemoryKind::Preference), true);
             let event_path = written.event_path.as_ref().expect("event path");
