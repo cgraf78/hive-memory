@@ -20,6 +20,10 @@ pub const VERDICT_VERSION: u32 = 1;
 /// The prompt always goes to stdin so memory bodies are not exposed through
 /// process listings or argv length limits. The custom `command` backend is the
 /// escape hatch if a vendor CLI changes its non-interactive contract.
+///
+/// `grok` is a first-class memory agent, not a classifier adapter: `grok -p`
+/// is a tool-using headless session, so auto-classification would run tools
+/// against memory. Use `backend = "command"` with a stdin-only wrapper instead.
 const ADAPTERS: &[Adapter] = &[
     Adapter {
         label: "codex",

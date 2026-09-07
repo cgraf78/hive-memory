@@ -349,8 +349,8 @@ impl Error for SensitivityParseError {}
 
 /// Per-agent store policy from config.
 ///
-/// This is configured by agent id, such as `codex` or `claude`, and controls
-/// which stores that agent can read from, write to, and use by default.
+/// This is configured by agent id, such as `codex`, `claude`, or `grok`, and
+/// controls which stores that agent can read from, write to, and use by default.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentConfig {
     /// Store this agent should write/read by default.
@@ -2284,6 +2284,33 @@ mod tests {
         assert_eq!(policy.read_stores, vec!["personal"]);
         assert_eq!(policy.write_stores, vec!["personal"]);
         assert!(!policy.allow_all_stores);
+    }
+
+    #[test]
+    fn grok_agent_section_loads_conservative_personal_affinity() {
+        let loaded = LoadedConfig::from_str_with_env(
+            r#"
+            default_store = "personal"
+
+            [stores.personal]
+            root = "/tmp/personal"
+
+            [agents.grok]
+            default_store = "personal"
+            read_stores = ["personal"]
+            write_stores = ["personal"]
+            allow_all_stores = false
+            "#,
+            env,
+        )
+        .expect("config loads");
+
+        let policy = loaded.config.effective_agent_policy("grok");
+        assert_eq!(policy.default_store, "personal");
+        assert_eq!(policy.read_stores, vec!["personal"]);
+        assert_eq!(policy.write_stores, vec!["personal"]);
+        assert!(!policy.allow_all_stores);
+        assert!(loaded.config.agents.contains_key("grok"));
     }
 
     #[test]

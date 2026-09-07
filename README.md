@@ -24,7 +24,7 @@ file-sync (Google Drive, Dropbox, git) carries the same memory to every machine.
 
 - **One memory across sessions and agents.** Write a fact once with `hm
   remember`; recall it from any future session, with `claude`, `codex`,
-  `gemini`, `muse`, or your own tooling.
+  `gemini`, `grok`, `muse`, or your own tooling.
 - **Cross-machine by file-sync.** A store is a directory with a stable UUID
   identity. Sync it however you already sync files; identity survives moves and
   renames.
@@ -337,8 +337,11 @@ In `mode = "auto"`, Hive Memory only auto-detects backend CLIs whose labels also
 appear in `[agents]` (`claude`, `codex`, `gemini`) — those agents already read
 memory through context, so classification adds no new implicit reader. Set
 `mode = "on"` with an explicit `backend` (or a `command` that reads a prompt on
-stdin and prints a JSON verdict) to use any other CLI. Inspect or test without
-writing via `hm classify --pending` and `hm classify --dry-run`.
+stdin and prints a JSON verdict) to use any other CLI. `grok` is a first-class
+memory agent, but `grok -p` has full tool access, so it is not a built-in
+classifier adapter; use `backend = "command"` / `mode = "on"` with a stdin-only
+wrapper if you want Grok to classify. Inspect or test without writing via
+`hm classify --pending` and `hm classify --dry-run`.
 
 `hm retag <id> --kind <kind>` corrects a record's kind by hand. It can also
 repair persisted scope/project metadata, for example
@@ -430,6 +433,12 @@ config, project bindings, per-agent read/write allowlists, and explicit flags:
 
 ```toml
 [agents.codex]
+default_store = "personal"
+read_stores = ["personal"]
+write_stores = ["personal"]
+allow_all_stores = false
+
+[agents.grok]
 default_store = "personal"
 read_stores = ["personal"]
 write_stores = ["personal"]
