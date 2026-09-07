@@ -62,6 +62,8 @@ mod tests {
     #[test]
     fn non_private_records_do_not_require_agent_identity() {
         assert!(audience_allows(&entry("global", Vec::new(), "codex"), None));
+        assert!(audience_allows(&entry("global", Vec::new(), "muse"), None));
+        assert!(audience_allows(&entry("global", Vec::new(), "grok"), None));
     }
 
     #[test]
@@ -84,6 +86,59 @@ mod tests {
         ));
         assert!(!audience_allows(
             &entry("agent-private", vec!["codex"], "codex"),
+            None
+        ));
+        // `muse` follows the same audience rule as every other agent id: an
+        // explicit audience grants only the named agent, and a legacy
+        // writer-only record is readable only by its writer.
+        assert!(audience_allows(
+            &entry("agent-private", vec!["muse"], "codex"),
+            Some("muse")
+        ));
+        assert!(!audience_allows(
+            &entry("agent-private", vec!["codex"], "codex"),
+            Some("muse")
+        ));
+        assert!(!audience_allows(
+            &entry("agent-private", vec!["muse"], "muse"),
+            Some("codex")
+        ));
+        assert!(audience_allows(
+            &entry("agent-private", Vec::new(), "muse"),
+            Some("muse")
+        ));
+        assert!(!audience_allows(
+            &entry("agent-private", Vec::new(), "codex"),
+            Some("muse")
+        ));
+        assert!(!audience_allows(
+            &entry("agent-private", vec!["muse"], "muse"),
+            None
+        ));
+        // `grok` is a first-class memory agent with the same audience rule:
+        // listed audience only, or legacy writer-only records for that writer.
+        assert!(audience_allows(
+            &entry("agent-private", vec!["grok"], "codex"),
+            Some("grok")
+        ));
+        assert!(!audience_allows(
+            &entry("agent-private", vec!["codex"], "codex"),
+            Some("grok")
+        ));
+        assert!(!audience_allows(
+            &entry("agent-private", vec!["grok"], "grok"),
+            Some("codex")
+        ));
+        assert!(audience_allows(
+            &entry("agent-private", Vec::new(), "grok"),
+            Some("grok")
+        ));
+        assert!(!audience_allows(
+            &entry("agent-private", Vec::new(), "codex"),
+            Some("grok")
+        ));
+        assert!(!audience_allows(
+            &entry("agent-private", vec!["grok"], "grok"),
             None
         ));
     }

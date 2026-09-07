@@ -115,6 +115,12 @@ read_stores = ["personal"]
 write_stores = ["personal"]
 allow_all_stores = false
 
+[agents.grok]
+default_store = "personal"
+read_stores = ["personal"]
+write_stores = ["personal"]
+allow_all_stores = false
+
 [privacy]
 allow_all_stores_flag = true
 secret_refuses_cloud_roots = true       # see Security and Privacy Model
@@ -167,11 +173,13 @@ Validation rules:
 - In `mode = "auto"`, backend auto-detection only considers known backend labels
   that also exist under `[agents]`; `mode = "on"` or explicit `backend = ...`
   opts into the selected adapter. When multiple allowed backends are installed,
-  auto-detection prefers `codex`, then `claude`, then `gemini`. Secret stores
-  are never sent to classifier backends, and audience-restricted
-  (`agent-private`) records are never part of the classifier queue: their bodies
-  are visible only to the listed agents, not to whichever backend CLI wins
-  detection.
+  auto-detection prefers `codex`, then `claude`, then `gemini`. `grok` is a
+  first-class memory agent (`[agents.grok]`) but not a built-in classifier
+  backend: `grok -p` has tool access, so use `backend = "command"` /
+  `mode = "on"` with a stdin-only wrapper instead. Secret stores are never sent
+  to classifier backends, and audience-restricted (`agent-private`) records are
+  never part of the classifier queue: their bodies are visible only to the
+  listed agents, not to whichever backend CLI wins detection.
 
 Why this shape: humans get one readable TOML file; launchers get deterministic
 overrides; agents get explicit store affinity; and future schema migration has

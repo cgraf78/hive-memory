@@ -1,6 +1,6 @@
 # hive-memory
 
-[![CI](https://github.com/cgraf78/hive-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/cgraf78/hive-memory/actions/workflows/ci.yml)
+[![Tests](https://github.com/cgraf78/hive-memory/actions/workflows/test.yml/badge.svg)](https://github.com/cgraf78/hive-memory/actions/workflows/test.yml)
 [![Release](https://github.com/cgraf78/hive-memory/actions/workflows/release.yml/badge.svg)](https://github.com/cgraf78/hive-memory/actions/workflows/release.yml)
 
 **Durable, shareable, plain-text memory for AI agents — across sessions,
@@ -24,7 +24,7 @@ file-sync (Google Drive, Dropbox, git) carries the same memory to every machine.
 
 - **One memory across sessions and agents.** Write a fact once with `hm
   remember`; recall it from any future session, with `claude`, `codex`,
-  `gemini`, or your own tooling.
+  `gemini`, `grok`, `muse`, or your own tooling.
 - **Cross-machine by file-sync.** A store is a directory with a stable UUID
   identity. Sync it however you already sync files; identity survives moves and
   renames.
@@ -333,12 +333,16 @@ timeout_seconds = 60
 apply_confidence = "high"
 ```
 
-In `mode = "auto"`, Hive Memory only auto-detects backend CLIs whose labels also
-appear in `[agents]` (`claude`, `codex`, `gemini`) — those agents already read
-memory through context, so classification adds no new implicit reader. Set
-`mode = "on"` with an explicit `backend` (or a `command` that reads a prompt on
-stdin and prints a JSON verdict) to use any other CLI. Inspect or test without
-writing via `hm classify --pending` and `hm classify --dry-run`.
+In `mode = "auto"`, Hive Memory only auto-detects built-in classifier backends
+(`codex`, then `claude`, then `gemini`) whose labels also appear as `[agents]`
+keys — those CLIs already read memory through context, so classification adds
+no new implicit reader. `[agents.grok]` is store affinity for Grok as a memory
+agent; it does not make `grok` a classifier backend. `grok -p` has full tool
+access, so use `backend = "command"` / `mode = "on"` with a stdin-only wrapper
+if you want Grok to classify. Set `mode = "on"` with an explicit `backend` (or
+a `command` that reads a prompt on stdin and prints a JSON verdict) to use any
+other CLI. Inspect or test without writing via `hm classify --pending` and
+`hm classify --dry-run`.
 
 `hm retag <id> --kind <kind>` corrects a record's kind by hand. It can also
 repair persisted scope/project metadata, for example
@@ -430,6 +434,12 @@ config, project bindings, per-agent read/write allowlists, and explicit flags:
 
 ```toml
 [agents.codex]
+default_store = "personal"
+read_stores = ["personal"]
+write_stores = ["personal"]
+allow_all_stores = false
+
+[agents.grok]
 default_store = "personal"
 read_stores = ["personal"]
 write_stores = ["personal"]

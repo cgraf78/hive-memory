@@ -2203,6 +2203,40 @@ mod tests {
     }
 
     #[test]
+    fn indexed_search_enforces_audience_for_muse() {
+        let dir = temp_dir("indexed-audience-muse");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "agent-private",
+            "Agent-private note about the deploy key rotation.",
+            timestamp(1_778_946_153),
+            vec!["muse".to_owned()],
+        );
+        let entries = entries(&root, &cache);
+        let index = build_index(&root, &entries);
+
+        let wrong = search_indexed(
+            indexed_input(&root, &entries, "deploy key", &[], Some("codex"), None),
+            &index,
+        )
+        .expect("search");
+        assert!(
+            wrong.is_empty(),
+            "agent-private record leaked to wrong agent"
+        );
+
+        let right = search_indexed(
+            indexed_input(&root, &entries, "deploy key", &[], Some("muse"), None),
+            &index,
+        )
+        .expect("search");
+        assert_eq!(right.len(), 1);
+    }
+
+    #[test]
     fn entries_fingerprint_is_order_independent_and_content_sensitive() {
         let dir = temp_dir("fingerprint");
         let root = dir.join("store");
@@ -3511,6 +3545,50 @@ mod tests {
 
         assert_eq!(codex_hits.len(), 1);
         assert!(claude_hits.is_empty());
+    }
+
+    #[test]
+    fn search_filters_agent_private_audience_for_muse() {
+        let dir = temp_dir("audience-muse");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "agent-private",
+            "Private TOML note.",
+            timestamp(1_778_946_153),
+            vec!["muse".to_owned()],
+        );
+        let entries = entries(&root, &cache);
+
+        let muse_hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries,
+            query: "toml",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: Some("muse"),
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+        let codex_hits = search(SearchInput {
+            store_root: &root,
+            entries: &entries,
+            query: "toml",
+            scopes: &[],
+            sources: &[],
+            include_inbox: false,
+            agent_id: Some("codex"),
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+
+        assert_eq!(muse_hits.len(), 1);
+        assert!(codex_hits.is_empty());
     }
 
     #[test]
