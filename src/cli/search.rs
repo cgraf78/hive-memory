@@ -111,13 +111,17 @@ pub(crate) fn run(args: SearchArgs, context: CliContext) -> Result<()> {
         project_id: project_id.as_deref(),
         limit: args.limit,
     };
-    let hits = run_search_backend(
+    let report = run_search_backend(
         &config,
         &resolved_store.name,
         &store_config.root,
         search_input,
         args.project_only,
     )?;
+    let hits = report.hits;
+    for warning in &report.warnings {
+        eprintln!("warning: {warning}");
+    }
 
     if args.json {
         let output = hits
@@ -164,7 +168,7 @@ fn run_search_backend(
     store_root: &Path,
     input: search::SearchInput<'_>,
     project_only: bool,
-) -> Result<Vec<search::SearchHit>> {
+) -> Result<search::SearchReport> {
     if config
         .defaults
         .search_backend
@@ -172,7 +176,7 @@ fn run_search_backend(
         .eq_ignore_ascii_case("tantivy")
     {
         match tantivy_search(config, store_name, store_root, input.clone(), project_only) {
-            Ok(hits) => return Ok(hits),
+            Ok(report) => return Ok(report),
             Err(err) => {
                 eprintln!(
                     "warning: full-text search backend unavailable ({err}); using lexical search"
@@ -181,9 +185,9 @@ fn run_search_backend(
         }
     }
     if project_only {
-        Ok(search::search_project_only(input)?)
+        Ok(search::search_project_only_report(input)?)
     } else {
-        Ok(search::search(input)?)
+        Ok(search::search_report(input)?)
     }
 }
 
@@ -205,7 +209,7 @@ fn tantivy_search(
     store_root: &Path,
     input: search::SearchInput<'_>,
     project_only: bool,
-) -> std::result::Result<Vec<search::SearchHit>, search::SearchError> {
+) -> std::result::Result<search::SearchReport, search::SearchError> {
     let dir = config.cache_dir.join("search").join(store_name);
     let index = retrieval::SearchIndex::open_or_create_in_dir(&dir)
         .map_err(|err| search::SearchError::Retrieval(err.to_string()))?;
@@ -232,9 +236,9 @@ fn tantivy_search(
         }
     }
     if project_only {
-        search::search_indexed_project_only(input, &index)
+        search::search_indexed_project_only_report(input, &index)
     } else {
-        search::search_indexed(input, &index)
+        search::search_indexed_report(input, &index)
     }
 }
 

@@ -12,8 +12,9 @@ use std::fmt::{self, Display};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const MAX_CURATED_FILE_BYTES: u64 = 1_048_576;
-const MAX_CURATED_DEPTH: usize = 16;
+pub(crate) const MAX_CURATED_FILE_BYTES: u64 = 1_048_576;
+/// Maximum recursion depth shared by the curated and promotion-event walkers.
+pub(crate) const MAX_CURATED_DEPTH: usize = 16;
 
 /// One curated Markdown file discovered inside a store.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,8 +83,12 @@ impl CuratedError {
 
 /// Best-effort broad collection plus every omission observed during the walk.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CuratedCollection {
+pub struct CuratedCollection {
+    /// Curated files that were read successfully.
     pub files: Vec<CuratedFile>,
+    /// Files and directories skipped during the walk (oversized, unreadable,
+    /// or over the depth bound). Callers that render results should surface
+    /// these so silently missing memory is visible.
     pub warnings: Vec<CuratedError>,
 }
 
@@ -100,6 +105,18 @@ pub fn collect(
     store_root: &Path,
     project_id: Option<&str>,
 ) -> Result<Vec<CuratedFile>, CuratedError> {
+    Ok(collect_report(store_root, project_id)?.files)
+}
+
+/// Return project-scoped curated files plus every omission observed.
+///
+/// This is the warning-preserving counterpart to [`collect`]; prefer it when
+/// the caller can surface diagnostics (search does, context currently does
+/// not).
+pub fn collect_report(
+    store_root: &Path,
+    project_id: Option<&str>,
+) -> Result<CuratedCollection, CuratedError> {
     let mut files = Vec::new();
     let mut warnings = Vec::new();
     collect_global(store_root, &mut files, &mut warnings);
@@ -109,7 +126,7 @@ pub fn collect(
         }
     }
     files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    Ok(files)
+    Ok(CuratedCollection { files, warnings })
 }
 
 /// Return every curated Markdown file in a store.
@@ -123,7 +140,7 @@ pub fn collect_all(store_root: &Path) -> Result<Vec<CuratedFile>, CuratedError> 
 }
 
 /// Return every readable curated file and report individual omissions.
-pub(crate) fn collect_all_report(store_root: &Path) -> CuratedCollection {
+pub fn collect_all_report(store_root: &Path) -> CuratedCollection {
     let mut files = Vec::new();
     let mut warnings = Vec::new();
     collect_global(store_root, &mut files, &mut warnings);

@@ -202,8 +202,6 @@ description = "Personal memory"
 sensitivity = "private"
 
 [policies]
-append_only_inbox = true
-allow_direct_curated_edits = false
 retention = { mode = "keep-raw" } # or { mode = "archive-after-days", days = 90 }
 
 [capabilities]

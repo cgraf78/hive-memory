@@ -152,12 +152,14 @@ pub struct ManifestStore {
 ///
 /// These are intentionally stored with the hive instead of only in user config:
 /// collaborators and future hosts need to see the store's own safety defaults.
+///
+/// Note: earlier schema-1 manifests also carried `append_only_inbox` and
+/// `allow_direct_curated_edits` here. Both were dead: every write already mints
+/// a unique-id path (append-only is structural), and no code path may refuse
+/// the sanctioned curation flow or human direct edits. The fields were removed;
+/// unknown TOML keys are ignored on parse, so old manifests still load.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestPolicies {
-    /// Whether raw inbox writes should be append-only.
-    pub append_only_inbox: bool,
-    /// Whether tools may edit curated memory files directly.
-    pub allow_direct_curated_edits: bool,
     /// Raw inbox retention policy.
     pub retention: RetentionPolicy,
 }
@@ -324,8 +326,6 @@ impl StoreManifest {
 impl Default for ManifestPolicies {
     fn default() -> Self {
         Self {
-            append_only_inbox: true,
-            allow_direct_curated_edits: false,
             retention: RetentionPolicy {
                 mode: "keep-raw".to_owned(),
                 days: None,
@@ -650,8 +650,6 @@ mod tests {
 
         assert_eq!(manifest.schema_version, SUPPORTED_MANIFEST_SCHEMA_VERSION);
         assert_eq!(manifest.created_by, CREATED_BY);
-        assert!(manifest.policies.append_only_inbox);
-        assert!(!manifest.policies.allow_direct_curated_edits);
         assert_eq!(manifest.policies.retention.mode, "keep-raw");
         assert!(manifest.capabilities.json_events);
         assert!(manifest.capabilities.local_outbox);
@@ -665,9 +663,42 @@ mod tests {
         let parsed = StoreManifest::from_toml_str(&toml).expect("parse manifest");
 
         assert!(toml.contains("[store]"));
-        assert!(toml.contains("[policies]"));
+        assert!(toml.contains("[policies.retention]"));
         assert!(toml.contains("[capabilities]"));
+        assert!(!toml.contains("append_only_inbox"));
+        assert!(!toml.contains("allow_direct_curated_edits"));
         assert_eq!(parsed, manifest);
+    }
+
+    #[test]
+    fn manifest_ignores_removed_policy_keys() {
+        // Stores initialized before the dead `append_only_inbox` /
+        // `allow_direct_curated_edits` keys were removed must still load.
+        let toml = r#"
+schema_version = 1
+created_by = "hive-memory"
+created_at = "2026-05-16T00:00:00Z"
+updated_at = "2026-05-16T00:00:00Z"
+
+[store]
+id = "018f5f57-bd9b-7d33-9e21-1f44f0c5a013"
+name = "personal"
+sensitivity = "private"
+
+[policies]
+append_only_inbox = true
+allow_direct_curated_edits = false
+retention = { mode = "keep-raw" }
+
+[capabilities]
+json_events = true
+local_outbox = true
+compaction = "manual"
+"#;
+        let parsed = StoreManifest::from_toml_str(toml).expect("old manifest parses");
+
+        assert_eq!(parsed.store.id, "018f5f57-bd9b-7d33-9e21-1f44f0c5a013");
+        assert_eq!(parsed.policies.retention.mode, "keep-raw");
     }
 
     #[test]
