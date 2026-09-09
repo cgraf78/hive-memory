@@ -7,8 +7,9 @@ use crate::{
 use anyhow::Result;
 use clap::Args;
 use hive_memory::config::Config;
-use hive_memory::{config, index, note, retrieval, search};
+use hive_memory::{config, entity, event, index, note, outbox, retrieval, search};
 use serde::Serialize;
+use std::collections::BTreeSet;
 use std::path::Path;
 use time::OffsetDateTime;
 
@@ -87,17 +88,37 @@ pub(crate) fn run(args: SearchArgs, context: CliContext) -> Result<()> {
     };
     let include_inbox = search_include_inbox(args.include_inbox, &sources);
 
+    let supplement = load_outbox_supplement(
+        &config,
+        &resolved_store.name,
+        &store_config.root,
+        &report.entries,
+    )?;
+    // An empty supplement keeps the exact pre-outbox entry slices so search
+    // output stays byte-identical while no payload is queued for this store.
+    let combined_entries;
+    let base_entries: &[index::IndexEntry] = if supplement.entries.is_empty() {
+        report.entries.as_slice()
+    } else {
+        combined_entries = report
+            .entries
+            .iter()
+            .cloned()
+            .chain(supplement.entries.iter().cloned())
+            .collect::<Vec<_>>();
+        combined_entries.as_slice()
+    };
+
     let filtered_entries;
     let entries = if let Some(cutoff) = since {
-        filtered_entries = report
-            .entries
+        filtered_entries = base_entries
             .iter()
             .filter(|entry| entry_created_at_is_since(entry, cutoff))
             .cloned()
             .collect::<Vec<_>>();
         filtered_entries.as_slice()
     } else {
-        report.entries.as_slice()
+        base_entries
     };
 
     let search_input = search::SearchInput {
@@ -122,11 +143,22 @@ pub(crate) fn run(args: SearchArgs, context: CliContext) -> Result<()> {
     for warning in &report.warnings {
         eprintln!("warning: {warning}");
     }
+    for warning in &supplement.warnings {
+        eprintln!("warning: {warning}");
+    }
 
     if args.json {
         let output = hits
             .iter()
-            .map(|hit| search_json_hit(&resolved_store.name, &manifest.store.id, hit, args.explain))
+            .map(|hit| {
+                search_json_hit(
+                    &resolved_store.name,
+                    &manifest.store.id,
+                    hit,
+                    args.explain,
+                    supplement.pending_ids.contains(hit.entry.id.as_str()),
+                )
+            })
             .collect::<Vec<_>>();
         println!("{}", serde_json::to_string_pretty(&output)?);
         return Ok(());
@@ -154,9 +186,146 @@ pub(crate) fn run(args: SearchArgs, context: CliContext) -> Result<()> {
             print_score_trace(&hit.trace);
         }
         println!("note: {}", hit.entry.note_path);
+        if supplement.pending_ids.contains(hit.entry.id.as_str()) {
+            println!("pending: true");
+        }
         println!("snippet: {}", hit.snippet);
     }
     Ok(())
+}
+
+/// Pending outbox entries merged into one search invocation.
+struct OutboxSupplement {
+    /// Synthetic index entries built from queued payloads.
+    entries: Vec<index::IndexEntry>,
+    /// Entry ids that are queued (not yet flushed), for `pending` marking.
+    pending_ids: BTreeSet<String>,
+    /// Non-fatal diagnostics rendered as `warning:` lines.
+    warnings: Vec<String>,
+}
+
+/// Load queued outbox payloads for `store_name` as search-ready entries.
+///
+/// Pending writes are user data that reads must surface: each queued payload
+/// is parsed and scored exactly like a canonical entry, marked `pending` at
+/// render time. Unbound items are included the same way — they cannot flush
+/// until bound, but hiding them from reads would lose acknowledged writes —
+/// with an additional warning that names the binding repair. Canonical entries
+/// win id ties so an already-flushed payload never double-reports.
+fn load_outbox_supplement(
+    config: &Config,
+    store_name: &str,
+    store_root: &Path,
+    canonical_entries: &[index::IndexEntry],
+) -> Result<OutboxSupplement> {
+    let mut supplement = OutboxSupplement {
+        entries: Vec::new(),
+        pending_ids: BTreeSet::new(),
+        warnings: Vec::new(),
+    };
+    let listed = match outbox::pending_search_items(&config.data_dir, store_name) {
+        Ok(listed) => listed,
+        Err(err) => {
+            // Reads stay available when the outbox root itself is unreadable;
+            // doctor owns outbox health reporting, search only notes the gap.
+            supplement
+                .warnings
+                .push(format!("failed to read local outbox: {err}"));
+            return Ok(supplement);
+        }
+    };
+    supplement.warnings.extend(listed.warnings);
+    let unbound = listed
+        .items
+        .iter()
+        .filter(|item| item.meta.state == outbox::OutboxState::Unbound)
+        .count();
+    if unbound > 0 {
+        // Same vocabulary as the doctor `outbox.unbound` check so one repair
+        // (explicit binding) is named consistently everywhere it surfaces.
+        supplement.warnings.push(format!(
+            "{unbound} outbox item(s) require explicit store binding"
+        ));
+    }
+    if listed.items.is_empty() {
+        return Ok(supplement);
+    }
+    // Reported verbatim so a broken registry fails exactly as the search below
+    // would: search maps the same load to `SearchError::EntityRegistry`, whose
+    // display is the bare registry message.
+    let registry = entity::EntityRegistry::load_for_store(store_root)
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    let canonical_ids: BTreeSet<&str> = canonical_entries
+        .iter()
+        .map(|entry| entry.id.as_str())
+        .collect();
+    for item in listed.items {
+        let note_text = match String::from_utf8(item.note) {
+            Ok(text) => text,
+            Err(_) => {
+                supplement.warnings.push(format!(
+                    "skipping outbox item {}: note payload is not valid UTF-8",
+                    item.meta.id
+                ));
+                continue;
+            }
+        };
+        let parsed = match note::parse_note(&note_text) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                supplement
+                    .warnings
+                    .push(format!("skipping outbox item {}: {err}", item.meta.id));
+                continue;
+            }
+        };
+        if parsed.body.is_empty() {
+            // `indexed_body` falls back to a canonical store read for empty
+            // bodies; a pending payload has no canonical file yet, so the
+            // fallback would fail the whole search. Skip with a warning.
+            supplement.warnings.push(format!(
+                "skipping outbox item {}: note payload has an empty body",
+                item.meta.id
+            ));
+            continue;
+        }
+        let parsed_event = match item.event {
+            None => None,
+            Some(bytes) => match String::from_utf8(bytes) {
+                Ok(text) => match event::parse_event(&text) {
+                    Ok(parsed) => Some(parsed),
+                    Err(err) => {
+                        supplement.warnings.push(format!(
+                            "outbox item {} has an unreadable event payload, using note metadata: {err}",
+                            item.meta.id
+                        ));
+                        None
+                    }
+                },
+                Err(_) => {
+                    supplement.warnings.push(format!(
+                        "outbox item {} has an unreadable event payload, using note metadata",
+                        item.meta.id
+                    ));
+                    None
+                }
+            },
+        };
+        let entry = index::entry_from_parsed_note(
+            &parsed.front_matter,
+            &parsed.body,
+            &item.meta.final_note_path,
+            item.meta.final_event_path.as_deref(),
+            parsed_event.as_ref(),
+            &registry,
+        );
+        if canonical_ids.contains(entry.id.as_str()) {
+            continue;
+        }
+        supplement.pending_ids.insert(entry.id.clone());
+        supplement.entries.push(entry);
+    }
+    Ok(supplement)
 }
 
 /// Run `hm search` through the configured backend. The Tantivy backend raises
@@ -336,6 +505,10 @@ struct SearchJsonHit {
     score: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     score_trace: Option<SearchJsonScoreTrace>,
+    /// True when the hit is a queued outbox payload not yet flushed into the
+    /// store. Absent for canonical hits so empty-outbox output is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending: Option<bool>,
     created_at: String,
 }
 
@@ -358,6 +531,7 @@ fn search_json_hit(
     manifest_store_id: &str,
     hit: &search::SearchHit,
     explain: bool,
+    pending: bool,
 ) -> SearchJsonHit {
     let entry = &hit.entry;
     SearchJsonHit {
@@ -380,6 +554,7 @@ fn search_json_hit(
         snippet: hit.snippet.clone(),
         score: hit.score,
         score_trace: explain.then(|| search_json_score_trace(&hit.trace)),
+        pending: pending.then_some(true),
         created_at: entry.created_at.clone(),
     }
 }

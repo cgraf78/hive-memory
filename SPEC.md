@@ -1064,6 +1064,9 @@ V1 behavior:
 - deterministic ordering: exactness/term score, newer timestamp, then
   lexical path.
 - default result limit: 20 unless `--limit` is provided.
+- includes queued outbox payloads for the resolved store, marked pending
+  (`pending: true` in human output, `"pending": true` in JSON); canonical
+  entries win id ties so flushed payloads never double-report.
 
 Output:
 

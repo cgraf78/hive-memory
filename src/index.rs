@@ -1212,6 +1212,23 @@ fn read_paired_event(
     }
 }
 
+/// Build a search-ready entry from an already-parsed note/event pair.
+///
+/// Index rebuilds own the canonical entry contract; pending-outbox reads reuse
+/// it so queued payloads filter, rank, and render exactly like canonical
+/// entries. `note_path` is store-relative — for pending items, the final path
+/// recorded in outbox metadata, since the payload has no canonical file yet.
+pub fn entry_from_parsed_note(
+    front_matter: &note::NoteFrontMatter,
+    body: &str,
+    note_path: &str,
+    event_path: Option<&str>,
+    event: Option<&event::MemoryEvent>,
+    registry: &entity::EntityRegistry,
+) -> IndexEntry {
+    entry_from_note(front_matter, body, note_path, event_path, event, registry)
+}
+
 fn entry_from_note(
     front_matter: &note::NoteFrontMatter,
     body: &str,

@@ -535,6 +535,113 @@ pub fn flush(input: FlushInput<'_>) -> Result<FlushReport, OutboxError> {
     Ok(report)
 }
 
+/// One outbox payload prepared for read-path visibility.
+#[derive(Debug, Clone)]
+pub struct PendingSearchItem {
+    /// Parsed outbox metadata.
+    pub meta: OutboxMeta,
+    /// Raw `note.md` payload bytes.
+    pub note: Vec<u8>,
+    /// Raw `event.json` payload bytes, when the item carries a readable event.
+    pub event: Option<Vec<u8>>,
+}
+
+/// Outbox payloads visible to reads for one store, plus non-fatal diagnostics.
+#[derive(Debug, Clone, Default)]
+pub struct PendingSearchReport {
+    /// Payloads queued for the requested store in deterministic scan order.
+    pub items: Vec<PendingSearchItem>,
+    /// Per-item problems; the affected item is skipped but the read continues.
+    pub warnings: Vec<String>,
+}
+
+/// List outbox payloads queued for `store` so reads can surface them.
+///
+/// Queued writes are user data that must stay visible while they wait for a
+/// flush. Only a failed scan of the outbox root itself is a hard error; every
+/// per-item problem (unparsable metadata, missing payload, hash mismatch)
+/// becomes a warning and the item is skipped, mirroring how flush buckets one
+/// bad item without stranding the rest. Items queued for other stores are
+/// ignored: metadata, not the directory name, selects ownership, matching
+/// flush policy.
+pub fn pending_search_items(
+    data_dir: &Path,
+    store: &str,
+) -> Result<PendingSearchReport, OutboxError> {
+    let mut report = PendingSearchReport::default();
+    let outbox_root = data_dir.join("outbox");
+    let item_dirs = match collect_item_dirs(&outbox_root) {
+        Ok(paths) => paths,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(report),
+        Err(err) => return Err(io_error("scan outbox", &outbox_root, err)),
+    };
+
+    for item_dir in item_dirs {
+        let meta = match read_meta(&item_dir.join("meta.toml")) {
+            Ok(meta) => meta,
+            Err(err) => {
+                let fallback = path_item_report(&item_dir, "pending", err.to_string());
+                report.warnings.push(format!(
+                    "skipping outbox item {}: {}",
+                    fallback.id, fallback.message
+                ));
+                continue;
+            }
+        };
+        if meta.store != store {
+            continue;
+        }
+        let note = match fs::read(item_dir.join("note.md")) {
+            Ok(note) => note,
+            Err(err) => {
+                report.warnings.push(format!(
+                    "skipping outbox item {}: failed to read note payload: {err}",
+                    meta.id
+                ));
+                continue;
+            }
+        };
+        if sha256(&note) != meta.note_sha256 {
+            report.warnings.push(format!(
+                "skipping outbox item {}: payload hash does not match outbox metadata",
+                meta.id
+            ));
+            continue;
+        }
+        // The event sidecar is repair/fallback input for reads: a missing or
+        // mismatched event degrades to note-only metadata with a warning rather
+        // than hiding the queued note. Flush keeps the stricter contract and
+        // refuses incomplete event metadata at publish time.
+        let event = if meta.final_event_path.is_some() {
+            match fs::read(item_dir.join("event.json")) {
+                Ok(event) => {
+                    if Some(sha256(&event)) != meta.event_sha256 {
+                        report.warnings.push(format!(
+                            "outbox item {} has an unreadable event payload, using note metadata",
+                            meta.id
+                        ));
+                        None
+                    } else {
+                        Some(event)
+                    }
+                }
+                Err(err) => {
+                    report.warnings.push(format!(
+                        "outbox item {} has an unreadable event payload, using note metadata: {err}",
+                        meta.id
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        report.items.push(PendingSearchItem { meta, note, event });
+    }
+
+    Ok(report)
+}
+
 /// Flush one outbox item, returning its bucketed result.
 ///
 /// This function never returns `Err`: a flush batch must survive a single bad
@@ -1174,5 +1281,130 @@ mod tests {
         let written = fs::read(store_root.join(relative)).expect("destination written");
         assert_eq!(written, payload);
         let _ = fs::remove_dir_all(store_root.parent().expect("base"));
+    }
+
+    /// Build an isolated data dir for a `pending_search_items` test.
+    fn pending_fixture(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "hm-outbox-pending-{tag}-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("create fixture data dir");
+        base
+    }
+
+    /// Enqueue one note-only item through the real envelope so listing tests
+    /// exercise on-disk metadata exactly as production writes it.
+    fn enqueue_note(data_dir: &Path, store: &str, id: &str, note: &[u8]) {
+        enqueue(EnqueueInput {
+            data_dir,
+            store,
+            id,
+            expected_store_id: Some("store-id".to_owned()),
+            final_note_path: format!("inbox/notes/2026/09/09/{id}.md"),
+            note: note.to_vec(),
+            final_event_path: None,
+            event: None,
+            state: OutboxState::Pending,
+            options: write::AtomicWriteOptions::default(),
+        })
+        .expect("enqueue fixture item");
+    }
+
+    /// `pending_search_items` is the read path into the outbox: it must return
+    /// only the requested store's payloads in deterministic order so one
+    /// store's search never surfaces another store's queued writes.
+    #[test]
+    fn pending_search_items_filters_by_store() {
+        let data_dir = pending_fixture("store");
+        enqueue_note(&data_dir, "personal", "item-b", b"note b");
+        enqueue_note(&data_dir, "other", "item-other", b"note other");
+        enqueue_note(&data_dir, "personal", "item-a", b"note a");
+
+        let report = pending_search_items(&data_dir, "personal").expect("list personal");
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        let ids: Vec<&str> = report
+            .items
+            .iter()
+            .map(|item| item.meta.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["item-a", "item-b"]);
+        assert_eq!(report.items[0].note, b"note a");
+        assert!(report.items[0].event.is_none());
+
+        let other = pending_search_items(&data_dir, "other").expect("list other");
+        assert_eq!(other.items.len(), 1);
+        assert_eq!(other.items[0].meta.id, "item-other");
+
+        let missing = pending_search_items(&data_dir, "absent").expect("list absent store");
+        assert!(missing.items.is_empty());
+        assert!(missing.warnings.is_empty());
+        let _ = fs::remove_dir_all(&data_dir);
+    }
+
+    /// A missing outbox directory is the common empty case, not an error: reads
+    /// must behave exactly as if no outbox support existed.
+    #[test]
+    fn pending_search_items_empty_when_outbox_missing() {
+        let data_dir = pending_fixture("missing");
+        let report = pending_search_items(&data_dir, "personal").expect("missing outbox");
+        assert!(report.items.is_empty());
+        assert!(report.warnings.is_empty());
+        let _ = fs::remove_dir_all(&data_dir);
+    }
+
+    /// One corrupt item must degrade to a warning, never fail the read or hide
+    /// its healthy siblings: unparsable metadata, a torn payload, and a hash
+    /// mismatch each skip only their own item.
+    #[test]
+    fn pending_search_items_skips_bad_items_with_warnings() {
+        let data_dir = pending_fixture("bad");
+        enqueue_note(&data_dir, "personal", "item-good", b"good note");
+        let bad_meta = data_dir
+            .join("outbox")
+            .join("personal")
+            .join("item-badmeta");
+        fs::create_dir_all(&bad_meta).expect("create bad meta dir");
+        fs::write(bad_meta.join("meta.toml"), "not = [valid").expect("write bad meta");
+        enqueue_note(&data_dir, "personal", "item-torn", b"original bytes");
+        fs::write(
+            data_dir
+                .join("outbox")
+                .join("personal")
+                .join("item-torn")
+                .join("note.md"),
+            b"tampered bytes",
+        )
+        .expect("tamper payload");
+
+        let report = pending_search_items(&data_dir, "personal").expect("list with bad items");
+        let ids: Vec<&str> = report
+            .items
+            .iter()
+            .map(|item| item.meta.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["item-good"]);
+        assert_eq!(report.warnings.len(), 2, "{:?}", report.warnings);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("item-badmeta")
+                    && warning.contains("skipping outbox item")),
+            "{:?}",
+            report.warnings
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("item-torn")
+                    && warning.contains("payload hash does not match")),
+            "{:?}",
+            report.warnings
+        );
+        let _ = fs::remove_dir_all(&data_dir);
     }
 }
