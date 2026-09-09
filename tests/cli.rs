@@ -3239,6 +3239,40 @@ fn search_finds_remembered_note() {
 }
 
 #[test]
+fn search_warns_about_unreadable_curated_file() {
+    let dir = temp_dir("search-curated-warning");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    fs::create_dir_all(personal.join("rules")).expect("rules dir");
+    fs::write(
+        personal.join("rules/good.md"),
+        "Use TOML for human-editable configuration.\n",
+    )
+    .expect("good curated file");
+    fs::write(personal.join("rules/broken.md"), [0xff, 0xfe]).expect("invalid utf8 file");
+
+    let mut search = cargo_bin_cmd!("hm");
+    search
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "search",
+            "toml",
+            "--source",
+            "curated",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hits: 1"))
+        .stdout(predicate::str::contains("curated:rules/good.md"))
+        .stderr(predicate::str::contains("warning:"))
+        .stderr(predicate::str::contains("broken.md"));
+}
+
+#[test]
 fn search_without_project_finds_project_scoped_memory() {
     let dir = temp_dir("search-cross-project");
     let config = dir.join("config.toml");

@@ -473,8 +473,7 @@ id = "<uuid>"
 name = "personal"
 
 [policies]
-allow_direct_curated_edits = false
-append_only_inbox = true
+retention = { mode = "keep-raw" }
 ```
 
 ## Event and Note IDs

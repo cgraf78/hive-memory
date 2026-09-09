@@ -61,6 +61,17 @@ pub struct SearchHit {
     pub snippet: String,
 }
 
+/// Search hits plus non-fatal diagnostics from curated-file collection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchReport {
+    /// Ranked search hits.
+    pub hits: Vec<SearchHit>,
+    /// Curated files skipped while collecting (oversized, unreadable, or over
+    /// the depth bound), rendered for display. Hits are complete for everything
+    /// readable; these name the memory that could not be searched.
+    pub warnings: Vec<String>,
+}
+
 /// Structured scoring components for one search hit.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchScoreTrace {
@@ -195,6 +206,14 @@ impl From<crate::curated::CuratedError> for SearchError {
 /// score subject/tags so metadata searches do not need to parse every note
 /// twice.
 pub fn search(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
+    Ok(search_report(input)?.hits)
+}
+
+/// Search curated files and indexed notes, keeping collection diagnostics.
+///
+/// This is the warning-preserving counterpart to [`search`]; prefer it when
+/// the caller can surface diagnostics to the user.
+pub fn search_report(input: SearchInput<'_>) -> Result<SearchReport, SearchError> {
     search_with_mode(input, false)
 }
 
@@ -203,6 +222,13 @@ pub fn search(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
 /// This is an explicit narrowing surface. Ordinary search is cross-project and
 /// uses project identity only to rank related results higher.
 pub fn search_project_only(input: SearchInput<'_>) -> Result<Vec<SearchHit>, SearchError> {
+    Ok(search_project_only_report(input)?.hits)
+}
+
+/// Search only memory owned by the active project, keeping diagnostics.
+///
+/// This is the warning-preserving counterpart to [`search_project_only`].
+pub fn search_project_only_report(input: SearchInput<'_>) -> Result<SearchReport, SearchError> {
     search_with_mode(input, true)
 }
 
@@ -261,13 +287,13 @@ pub fn search_local_index(
 fn search_with_mode(
     input: SearchInput<'_>,
     project_only: bool,
-) -> Result<Vec<SearchHit>, SearchError> {
+) -> Result<SearchReport, SearchError> {
     let registry = entity::EntityRegistry::load_for_store(input.store_root)
         .map_err(|err| SearchError::EntityRegistry(err.to_string()))?;
     let query = SearchQuery::parse(input.query, &registry)?;
     let project_ids = project_filter_ids(input.store_root, input.project_id)?;
 
-    let mut hits = curated_hits(&input, &query, &registry, project_only)?;
+    let (mut hits, warnings) = curated_hits(&input, &query, &registry, project_only)?;
 
     for entry in input.entries {
         if !source_allowed(entry, input.sources, input.include_inbox) {
@@ -308,7 +334,7 @@ fn search_with_mode(
         query.temporal_intent(),
         input.limit,
     );
-    Ok(hits)
+    Ok(SearchReport { hits, warnings })
 }
 
 fn curated_hits(
@@ -316,23 +342,30 @@ fn curated_hits(
     query: &SearchQuery,
     registry: &entity::EntityRegistry,
     project_only: bool,
-) -> Result<Vec<SearchHit>, SearchError> {
+) -> Result<(Vec<SearchHit>, Vec<String>), SearchError> {
     let mut hits = Vec::new();
     if !curated_source_allowed(input.sources) {
-        return Ok(hits);
+        return Ok((hits, Vec::new()));
     }
 
-    let curated_files = if project_only {
-        crate::curated::collect(input.store_root, input.project_id)?
+    // Use the report-returning collectors so oversized/unreadable curated
+    // files surface as warnings instead of silently missing from results.
+    let collection = if project_only {
+        crate::curated::collect_report(input.store_root, input.project_id)?
     } else {
-        crate::curated::collect_all(input.store_root)?
+        crate::curated::collect_all_report(input.store_root)
     };
+    let warnings = collection
+        .warnings
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
     let project_ids = project_filter_ids(input.store_root, input.project_id)?;
-    for curated in curated_files {
-        if !curated_scope_allowed(&curated, input.scopes) {
+    for curated in &collection.files {
+        if !curated_scope_allowed(curated, input.scopes) {
             continue;
         }
-        let entry = curated_entry(&curated, registry);
+        let entry = curated_entry(curated, registry);
         if !project_allowed(&entry, project_ids.as_ref(), project_only) {
             continue;
         }
@@ -355,7 +388,7 @@ fn curated_hits(
         });
     }
 
-    Ok(hits)
+    Ok((hits, warnings))
 }
 
 fn finish_hits(
@@ -1224,6 +1257,14 @@ pub fn search_indexed(
     input: SearchInput<'_>,
     index: &SearchIndex,
 ) -> Result<Vec<SearchHit>, SearchError> {
+    Ok(search_indexed_report(input, index)?.hits)
+}
+
+/// Search the prebuilt index, keeping curated-collection diagnostics.
+pub fn search_indexed_report(
+    input: SearchInput<'_>,
+    index: &SearchIndex,
+) -> Result<SearchReport, SearchError> {
     search_indexed_with_mode(input, index, false)
 }
 
@@ -1232,6 +1273,14 @@ pub fn search_indexed_project_only(
     input: SearchInput<'_>,
     index: &SearchIndex,
 ) -> Result<Vec<SearchHit>, SearchError> {
+    Ok(search_indexed_project_only_report(input, index)?.hits)
+}
+
+/// Search the prebuilt index for project-owned memory, keeping diagnostics.
+pub fn search_indexed_project_only_report(
+    input: SearchInput<'_>,
+    index: &SearchIndex,
+) -> Result<SearchReport, SearchError> {
     search_indexed_with_mode(input, index, true)
 }
 
@@ -1250,7 +1299,7 @@ pub fn search_indexed_local(
     let project_ids = input
         .project_id
         .map(|project_id| local_project_family_ids(project_id, project_aliases));
-    search_indexed_with_resources(
+    Ok(search_indexed_with_resources(
         input,
         index,
         false,
@@ -1259,14 +1308,15 @@ pub fn search_indexed_local(
         false,
         Some(project_aliases),
         Some(projection_entries),
-    )
+    )?
+    .hits)
 }
 
 fn search_indexed_with_mode(
     input: SearchInput<'_>,
     index: &SearchIndex,
     project_only: bool,
-) -> Result<Vec<SearchHit>, SearchError> {
+) -> Result<SearchReport, SearchError> {
     let registry = entity::EntityRegistry::load_for_store(input.store_root)
         .map_err(|err| SearchError::EntityRegistry(err.to_string()))?;
     let project_ids = project_filter_ids(input.store_root, input.project_id)?;
@@ -1292,7 +1342,7 @@ fn search_indexed_with_resources(
     collect_canonical_curated: bool,
     local_project_aliases: Option<&BTreeMap<String, String>>,
     local_projection_entries: Option<&[IndexEntry]>,
-) -> Result<Vec<SearchHit>, SearchError> {
+) -> Result<SearchReport, SearchError> {
     let query = SearchQuery::parse(input.query, registry)?;
     let by_id: HashMap<&str, &IndexEntry> = input
         .entries
@@ -1376,11 +1426,16 @@ fn search_indexed_with_resources(
             registry,
             local_project_aliases.expect("local search carries project aliases"),
         )?;
-        return Ok(merge_ranked_sources_local(
-            vec![indexed_hits, lexical_hits],
-            requested_limit,
-            local_project_aliases.expect("local search carries project aliases"),
-        ));
+        // Local search never walks canonical curated files (the projection
+        // already carries their bodies), so there are no collection warnings.
+        return Ok(SearchReport {
+            hits: merge_ranked_sources_local(
+                vec![indexed_hits, lexical_hits],
+                requested_limit,
+                local_project_aliases.expect("local search carries project aliases"),
+            ),
+            warnings: Vec::new(),
+        });
     }
 
     // Tantivy raises semantic recall, but it must complement rather than replace
@@ -1398,16 +1453,19 @@ fn search_indexed_with_resources(
         limit: usize::MAX,
         ..input.clone()
     };
-    let lexical_hits = if project_only {
-        search_project_only(lexical_input)?
+    let lexical_report = if project_only {
+        search_project_only_report(lexical_input)?
     } else {
-        search(lexical_input)?
+        search_report(lexical_input)?
     };
-    Ok(merge_ranked_sources(
-        vec![indexed_hits, lexical_hits],
-        requested_limit,
-        input.store_root,
-    ))
+    Ok(SearchReport {
+        hits: merge_ranked_sources(
+            vec![indexed_hits, lexical_report.hits],
+            requested_limit,
+            input.store_root,
+        ),
+        warnings: lexical_report.warnings,
+    })
 }
 
 fn merge_ranked_sources_local(
@@ -3269,6 +3327,56 @@ mod tests {
         assert_eq!(
             curated_hits[0].snippet,
             "Use TOML for human-editable configuration."
+        );
+    }
+
+    #[test]
+    fn search_report_surfaces_skipped_curated_files_as_warnings() {
+        let dir = temp_dir("curated-warnings");
+        let root = dir.join("store");
+        fs::create_dir_all(root.join("rules")).expect("rules dir");
+        fs::write(
+            root.join("rules/good.md"),
+            "Use TOML for human-editable configuration.\n",
+        )
+        .expect("good curated file");
+        fs::write(root.join("rules/broken.md"), [0xff, 0xfe]).expect("invalid utf8 file");
+        let oversized =
+            vec![b'x'; usize::try_from(crate::curated::MAX_CURATED_FILE_BYTES + 1).expect("size")];
+        fs::write(root.join("rules/oversized.md"), oversized).expect("oversized file");
+        let sources = vec!["curated".to_owned()];
+
+        let report = search_report(SearchInput {
+            store_root: &root,
+            entries: &[],
+            query: "toml",
+            scopes: &[],
+            sources: &sources,
+            include_inbox: false,
+            agent_id: None,
+            project_id: None,
+            limit: 20,
+        })
+        .expect("search");
+
+        assert_eq!(report.hits.len(), 1);
+        assert_eq!(report.hits[0].entry.id, "curated:rules/good.md");
+        assert_eq!(report.warnings.len(), 2);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("broken.md")),
+            "unreadable file warns: {:?}",
+            report.warnings
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("oversized.md")),
+            "oversized file warns: {:?}",
+            report.warnings
         );
     }
 

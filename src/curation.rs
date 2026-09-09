@@ -6,7 +6,7 @@
 //! curated entry, and record a promotion event for audit/idempotency.
 
 use crate::index::IndexEntry;
-use crate::{event, id, note, store, write};
+use crate::{event, id, note, project, store, write};
 use fs4::FileExt;
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -430,41 +430,100 @@ fn validate_target(path: &Path) -> Result<PathBuf, CurationError> {
             }
         }
     }
-    let first = normalized
-        .components()
-        .next()
-        .and_then(|component| match component {
-            Component::Normal(value) => value.to_str(),
-            _ => None,
-        });
-    if !matches!(first, Some("memories" | "people" | "rules")) {
-        return Err(CurationError::InvalidTarget(
-            "target must live under memories/, people/, or rules/".to_owned(),
-        ));
-    }
     if normalized.as_os_str().is_empty() {
         return Err(CurationError::InvalidTarget(
             "target must not be empty".to_owned(),
         ));
     }
+    // Promotion targets must land where the curated collector actually looks:
+    // `rules/`, `people/`, `memories/global/`, and per-project
+    // `memories/projects/<safe-id>/` (see `crate::curated`). Anything else —
+    // `memories/agents/`, `inbox/`, a bare `memories/projects/` file — would be
+    // silently invisible to search and context, so reject it here.
+    let components = normalized
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let collected = match components.as_slice() {
+        ["rules", rest @ ..] | ["people", rest @ ..] if !rest.is_empty() => true,
+        ["memories", "global", rest @ ..] if !rest.is_empty() => true,
+        ["memories", "projects", id, rest @ ..]
+            if !rest.is_empty() && project::is_safe_project_id(id) =>
+        {
+            true
+        }
+        _ => false,
+    };
+    if !collected {
+        return Err(CurationError::InvalidTarget(
+            "target must live under rules/, people/, memories/global/, or memories/projects/<project-id>/"
+                .to_owned(),
+        ));
+    }
+    if normalized.extension().and_then(|value| value.to_str()) != Some("md") {
+        return Err(CurationError::InvalidTarget(
+            "target must be a Markdown (.md) file".to_owned(),
+        ));
+    }
     Ok(normalized)
 }
 
+/// Bound on promotion-event files collected during one scan.
+///
+/// Event sidecars live at `inbox/events/YYYY/MM/*.json`; anything beyond this
+/// many files is a runaway tree, not a store. Erroring (instead of silently
+/// truncating) keeps promotion state honest: a truncated scan could miss a
+/// promotion event and append a duplicate curated entry.
+const MAX_EVENT_SCAN_FILES: usize = 100_000;
+
 fn collect_json_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
-    collect_json_files_into(root, &mut paths)?;
+    collect_json_files_into(root, &mut paths, 0)?;
     paths.sort();
     Ok(paths)
 }
 
-fn collect_json_files_into(root: &Path, paths: &mut Vec<PathBuf>) -> std::io::Result<()> {
+fn collect_json_files_into(
+    root: &Path,
+    paths: &mut Vec<PathBuf>,
+    depth: usize,
+) -> std::io::Result<()> {
+    // Inspect directory entries without following symlinks: a synced store can
+    // otherwise smuggle in a link cycle (or an escape to outside the store)
+    // and this walk would never terminate. Recursion depth matches the curated
+    // collector so both walkers share one documented bound.
     for entry in fs::read_dir(root)? {
         let entry = entry?;
         let path = entry.path();
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
-            collect_json_files_into(&path, paths)?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            if depth >= crate::curated::MAX_CURATED_DEPTH {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "event directory {} exceeds maximum depth {}",
+                        path.display(),
+                        crate::curated::MAX_CURATED_DEPTH
+                    ),
+                ));
+            }
+            collect_json_files_into(&path, paths, depth + 1)?;
         } else if path.extension().and_then(|value| value.to_str()) == Some("json") {
+            if paths.len() >= MAX_EVENT_SCAN_FILES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "event scan exceeded maximum of {MAX_EVENT_SCAN_FILES} files at {}",
+                        path.display()
+                    ),
+                ));
+            }
             paths.push(path);
         }
     }
@@ -532,5 +591,130 @@ fn io_error(action: &'static str, path: &Path, err: std::io::Error) -> CurationE
         action,
         path: path.to_path_buf(),
         message: err.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_target_accepts_actually_collected_dirs() {
+        for target in [
+            "rules/preferences.md",
+            "rules/nested/deep.md",
+            "people/alice.md",
+            "memories/global/MEMORY.md",
+            "memories/global/nested/topic.md",
+            "memories/projects/my-project/notes.md",
+            "memories/projects/my-project/nested/notes.md",
+        ] {
+            assert!(
+                validate_target(Path::new(target)).is_ok(),
+                "target should be accepted: {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_target_rejects_uncollected_dirs() {
+        // `memories/agents/` exists in stores but the curated collector never
+        // walks it; promoting there would silently hide the entry from search
+        // and context.
+        for target in [
+            "memories/agents/worker.md",
+            "memories/projects/direct-file.md",
+            "memories/MEMORY.md",
+            "inbox/notes/note.md",
+            "generated/cache.md",
+        ] {
+            assert!(
+                matches!(
+                    validate_target(Path::new(target)),
+                    Err(CurationError::InvalidTarget(_))
+                ),
+                "target should be rejected: {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_target_rejects_parent_escape_and_absolute_paths() {
+        for target in [
+            "../outside.md",
+            "memories/global/../../outside.md",
+            "memories/projects/../global/evil.md",
+            "/etc/hive-memory/evil.md",
+        ] {
+            assert!(
+                matches!(
+                    validate_target(Path::new(target)),
+                    Err(CurationError::InvalidTarget(_))
+                ),
+                "target should be rejected: {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_target_requires_markdown_extension() {
+        for target in [
+            "rules/preferences.txt",
+            "rules/no-extension",
+            "memories/global/MEMORY.markdown",
+            "rules/upper.MD",
+        ] {
+            assert!(
+                matches!(
+                    validate_target(Path::new(target)),
+                    Err(CurationError::InvalidTarget(_))
+                ),
+                "target should be rejected: {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn event_scan_skips_symlinks_and_terminates_on_link_cycle() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("events");
+        let nested = root.join("a").join("b");
+        fs::create_dir_all(&nested).expect("event dirs");
+        fs::write(root.join("top.json"), "{}").expect("top event");
+        fs::write(nested.join("nested.json"), "{}").expect("nested event");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            // A cycle back to an ancestor: the old `entry.metadata()` walk
+            // followed this forever. The symlink-skipping walk must terminate.
+            symlink(&root, nested.join("cycle")).expect("dir cycle symlink");
+            // A symlink to a real event file must not double-count it.
+            symlink(root.join("top.json"), root.join("alias.json")).expect("file symlink");
+            // A dangling symlink must not fail the scan (the old walk errored
+            // here because `metadata()` follows the link).
+            symlink(root.join("missing.json"), root.join("dangling.json"))
+                .expect("dangling symlink");
+        }
+
+        let paths = collect_json_files(&root).expect("event scan terminates");
+
+        assert_eq!(paths.len(), 2);
+        assert!(paths.iter().any(|path| path.ends_with("top.json")));
+        assert!(paths.iter().any(|path| path.ends_with("nested.json")));
+    }
+
+    #[test]
+    fn event_scan_rejects_runaway_depth() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut deep = dir.path().join("events");
+        for level in 0..=crate::curated::MAX_CURATED_DEPTH + 1 {
+            deep = deep.join(format!("level{level}"));
+        }
+        fs::create_dir_all(&deep).expect("deep event dirs");
+        fs::write(deep.join("deep.json"), "{}").expect("deep event");
+
+        let err = collect_json_files(&dir.path().join("events")).expect_err("depth cap trips");
+
+        assert!(err.to_string().contains("exceeds maximum depth"));
     }
 }
