@@ -21,6 +21,9 @@ jobs:
   rust:
     uses: cgraf78/actions/.github/workflows/rust-ci.yml@b750c292f00e079c2270df0d8f4c8bdaf43e0356
     with:
+      # Full matrix on every PR: scheduled-only legs let main break
+      # silently between daily runs and cannot validate their fixes.
+      matrix-set: full
       android-package-smoke-command: |
         scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
         scripts/smoke-release.sh "$ASSET_PLATFORM"
