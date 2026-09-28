@@ -245,6 +245,10 @@ else
 fi
 
 workspace=$(mktemp -d)
+# Keep the installer's attestation tier deterministic: a developer's logged-in
+# GitHub CLI would otherwise try to verify the synthetic archives and fail.
+export GH_CONFIG_DIR="$workspace/gh-config"
+unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
 CLEANUP_DIRS+=("$workspace")
 home="$workspace/home"
 data_home="$workspace/data"
@@ -468,7 +472,11 @@ android_uname_bin="$android_root/uname-bin"
 android_curl_bin="$android_root/fake-bin"
 android_curl_log="$android_root/curl.log"
 android_version=20260810-120003-acde1234
-mkdir -p "$android_home" "$android_uname_bin"
+mkdir -p "$android_home" "$android_uname_bin" "$android_prefix/bin"
+# The installer's version probe isolates into PREFIX/bin on Android, mirroring
+# Termux, so the synthetic prefix needs the env and sh that Termux provides.
+ln -s "$(command -v env)" "$android_prefix/bin/env"
+ln -s "$(command -v sh)" "$android_prefix/bin/sh"
 android_archive=$(_make_archive \
   "$android_root" "$android_version" android android-aarch64)
 _make_curl_stub "$android_curl_bin"
