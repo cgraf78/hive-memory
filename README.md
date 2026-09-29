@@ -64,8 +64,12 @@ keeps the complete release under `${XDG_DATA_HOME:-~/.local/share}/cgraf78`,
 and activates `hm` under `~/.local/bin`. Re-running it is an idempotent update.
 Use `--version <tag>` to pin a release, or `--archive <path> --checksum <path>`
 for a previously downloaded archive. Run `./install.sh --help` for destination
-overrides. A checksum detects corruption and wrong assets; it is not a signed
-provenance mechanism.
+overrides. A checksum alone detects corruption and wrong assets; it is not a
+signed provenance mechanism. When GitHub CLI 2.49+ is logged in to github.com,
+online installs also verify the archive's GitHub artifact attestation and reject
+it on failure; otherwise the installer proceeds on the checksum and says so.
+Pass `--require-attestation` to make provenance verification mandatory
+(online installs only).
 
 Create a minimal config at `$XDG_CONFIG_HOME/hive-memory/config.toml` when
 `XDG_CONFIG_HOME` is absolute, or at `~/.config/hive-memory/config.toml`
@@ -102,10 +106,13 @@ hm context --max-tokens 1200
 ```text
 Hive Memory Context
 store: personal
+agent: unknown
+project: none
+path: none
 scopes: global,project
 sources: curated,remembered
 
-<memory id="…" agent="human" store="personal" scope="project" project_id="github-com-acme-api-…" trust="remembered">
+<memory id="…" agent="human" store="personal" scope="global" trust="remembered">
 Prefer small, focused patches with tests.
 </memory>
 ```
@@ -394,8 +401,9 @@ first match wins:
 2. `HIVE_MEMORY_PROJECT_ID` (environment)
 3. a `.hive-memory-project` marker file (TOML with an `id`), found by walking
    ancestors
-4. the normalized VCS remote URL — works across `.git`, `.hg`, `.jj`, and `.svn`
-   (read directly from on-disk VCS config, no subprocess on the common path)
+4. the normalized VCS remote URL from `.git`, `.hg`, or `.jj` config (read
+   directly from on-disk VCS config, no subprocess on the common path); `.svn`
+   only marks the repository root, so SVN checkouts use the path key below
 5. a `$HOME`-relative path key as a final fallback
 
 ```sh
@@ -479,7 +487,7 @@ questions:
 
 **Interactive per-command latency** (small store, warm, single invocation):
 
-| Command | Core binary (mean) | Via `hm` launcher (mean) |
+| Command | Core binary (mean) | Via external `hm` launcher (mean) |
 | --- | --- | --- |
 | `hm search` | ~3ms | ~14ms |
 | `hm context` | ~5ms | ~19ms |
@@ -487,10 +495,12 @@ questions:
 | `hm doctor --quick` | ~3ms | ~12ms |
 | `hm sync-status` | ~3ms | ~13ms |
 
-The core binary is single-digit milliseconds per command. The `hm` launcher (a
-thin shell wrapper that detects the calling agent so writes can record a session
-receipt) adds roughly 10ms of shell startup on top — still well under what a
-human perceives as instant.
+The core binary is single-digit milliseconds per command. The launcher column
+measures an external `hm` wrapper from the author's dotfiles (a thin shell
+script that detects the calling agent so writes can record a session receipt);
+this repository does not ship it, and `install.sh` installs the `hm` binary
+and man page without any wrapper. The wrapper adds roughly 10ms of shell
+startup on top — still well under what a human perceives as instant.
 
 **Core engine p95 at ~5000 notes** (release build, warm index, p95 over repeated
 runs, each measurement includes full process startup and JSON serialization
@@ -521,8 +531,8 @@ guarantees. Real-world conditions shift them:
   top of these local-disk figures.
 - The **first query after a write or change** rebuilds the local index before it
   is warm; the figures above are warm-index numbers.
-- The **`hm` launcher** adds a few milliseconds of shell startup that the raw
-  core binary does not.
+- An **external `hm` launcher** (such as the dotfiles wrapper above) adds
+  roughly 10ms of shell startup that the raw core binary does not.
 - Writes are append-only single files (fast, no global lock) and the entire
   index is rebuildable, so recovery is `hm refresh`, not a migration.
 
@@ -530,7 +540,7 @@ guarantees. Real-world conditions shift them:
 integration test, which builds a 5000-note synthetic store and prints each `p95`:
 
 ```sh
-cargo test --release --locked --test perf_budget -- --ignored --nocapture
+cargo test --release --locked --test perf_budget -- --ignored --nocapture --test-threads=1
 ```
 
 ---

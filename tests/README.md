@@ -9,6 +9,8 @@ Shell-level distribution contracts live under `tests/shell/`:
   release packager.
 - `release-scripts-test` owns Hive Memory's release configuration and payload
   declarations; generic release machinery remains tested in `cgraf78/actions`.
+- `automation-test` checks repository-owned dependency-automation documentation
+  contracts, such as the README keeping locked source installs.
 
 This directory contains Rust integration tests for Hive Memory.
 

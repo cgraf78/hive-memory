@@ -16,7 +16,9 @@ use time::OffsetDateTime;
 /// Arguments for `hm search`.
 #[derive(Debug, Args)]
 pub(crate) struct SearchArgs {
-    /// Case-insensitive substring query.
+    /// Text query. Exact case-insensitive phrase matches rank highest, then
+    /// term and alias matches; `search_backend = "tantivy"` interleaves BM25
+    /// results.
     query: String,
     /// Maximum hits to show.
     #[arg(long, default_value_t = 20)]

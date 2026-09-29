@@ -15,14 +15,21 @@ conflict, prefer this file for v1 behavior and update both documents deliberatel
 | agent store affinity | yes | per-agent default/read/write store policy |
 | remember/note | yes | append-only Markdown notes |
 | JSON sidecars | yes | always for `remember`; configurable for `note` |
-| search | yes | simple deterministic text search backed by local index |
-| local triage index | yes | rebuildable jsonl index in cache_dir; not full FTS |
+| search | yes | deterministic lexical search backed by local index; BM25 opt-in (below) |
+| local triage index | yes | rebuildable jsonl index in cache_dir |
 | context | yes | curated + remembered by default; raw inbox opt-in |
 | local outbox/flush | yes | required for laptop/offline ergonomics; data_dir, not state_dir |
 | `hm promote` / `hm inbox` | yes | curation workflow that bridges raw inbox to curated memory |
 | trust-boundary rendering | yes | source-labeled blocks; raw notes excluded by default |
 | path normalization | yes | NFC + lowercase-on-case-insensitive + forward slashes |
 | performance budget | yes | `hm context` p95 ≤ 200ms warm / ≤ 500ms cold on 5k-note store |
+| Tantivy BM25 search backend | optional | `[defaults].search_backend = "tantivy"` for search and hook recall; rebuildable cache under `cache_dir/search/`; falls back to lexical on failure |
+| `hm sync-status` | optional | read-only store/index freshness report |
+| `hm retag` | optional | corrects persisted kind, scope, or project metadata on one record |
+| `hm classify` | optional | background LLM classification; `[classifier].mode = "off"` by default |
+| `hm capture` | optional | LLM fact extraction staged as raw inbox notes; `--promote` reconciles instead |
+| `hm reconcile` | optional | LLM ADD/UPDATE/DELETE/NOOP decision applied via remember + supersedes |
+| `hm eval` | optional | retrieval corpus A/B metrics and miss/bad-hit fixture capture |
 | import claude-memory | deferred | useful migration, not core write path |
 | compact proposals | deferred | proposal-only after core commands work |
 | cross-host curated writes | deferred | v1 curation is single-user per store |
@@ -102,6 +109,8 @@ context_sources = ["curated", "remembered"] # curated|remembered|inbox|all
 event_sidecar = "always" # never|always
 hook_context_max_tokens = 4000
 context_cache_max_age = "7d"
+context_strategy = "adaptive" # adaptive|recency|relevance (hm context selection)
+search_backend = "lexical"    # lexical|tantivy (search/recall candidate generation)
 
 [agents.codex]
 default_store = "personal"
@@ -130,6 +139,7 @@ allow_hook_secret_writes = false        # non-interactive hooks stay safer by de
 [offline]
 enabled = true
 mode = "auto" # auto|always|never
+archive_retention_days = 30
 
 [performance]
 context_warm_p95_ms = 200
@@ -166,6 +176,8 @@ Validation rules:
   `default_store` with `read_stores = [default_store]` and
   `write_stores = [default_store]`, which preserves simple single-store installs.
 - local override config may replace scalar values and merge tables.
+- unrecognized `defaults.context_strategy` or `defaults.search_backend` values
+  degrade to `adaptive` / `lexical` instead of failing, so hooks keep working.
 - CLI flags and environment variables override merged config, not source files.
 - `[classifier]` defaults to `mode = "off"`. Invalid `mode`, `backend`,
   `apply_confidence`, non-positive limits/timeouts, invalid `min_interval`, or
@@ -260,7 +272,7 @@ schema reported by `hm --version` is the store/record `schema_version`, not the
 cache's internal versions, which are an implementation detail of the local
 triage index and never appear in the stability contract.
 
-The `schema <n>` in `hm --version`'s `hm X.Y.Z (git <short-sha>, schema <n>)`
+The `schema <n>` in `hm --version`'s `hm YYYYMMDD-HHMMSS-<8hex> (schema <n>)`
 line is specifically the manifest/store `schema_version` — the single number the
 stability contract freezes. The per-artifact schema versions (config, Markdown
 front matter, JSON event, outbox metadata), which all share the value `1` in v1
@@ -579,11 +591,11 @@ Rules:
 - Humans may edit curated files directly when needed; `doctor` detects edits
   by hash/mtime and avoids overwriting them during stale compactions.
 
-Concurrency note: v1 does not provide cross-host curated coordination. README
-and `hm doctor` MUST surface this: "Do not run `hm promote` or `hm edit` on
-two hosts simultaneously against the same store. Use one curation host per
-store." This is honest about what file-system locks under cloud sync can and
-cannot guarantee.
+Concurrency note: v1 does not provide cross-host curated coordination. Surfacing
+this in README and `hm doctor` ("Do not run `hm promote` on two hosts
+simultaneously against the same store. Use one curation host per store.") is
+DEFERRED; v1 prints no such warning. This is honest about what file-system
+locks under cloud sync can and cannot guarantee.
 
 Why curated files: raw notes are durable evidence, but agents need concise,
 high-signal context. Curated memory is the promoted/summarized layer.
@@ -606,8 +618,8 @@ Canonical-form rules used everywhere paths appear in metadata or comparison:
 
 Paths in front matter and JSON events MUST be normalized at write time.
 Comparison (search, context filtering, alias matching) MUST normalize both
-sides. `hm doctor --fix` rewrites non-normalized paths in a safe quarantine
-step rather than mutating canonical files.
+sides. Having `hm doctor --fix` rewrite non-normalized paths in a safe
+quarantine step rather than mutating canonical files is DEFERRED.
 
 Absolute paths to user code (e.g. `project_path`) are sensitive metadata.
 Context output includes only the path hints needed for project disambiguation
@@ -644,8 +656,10 @@ State dir contents (ephemeral, OK to lose):
 locks/                  # local process locks (fcntl/flock)
 runs/                   # last flush/doctor metadata and session receipts
 context-cache/           # last successful hook context per agent/project/store
-quarantine/             # safe quarantine for stale temps/conflicts
 ```
+
+`hm doctor --fix` quarantines stale temps and cloud conflict copies inside the
+affected store, under `<store>/.quarantine/`, not in the state dir.
 
 Cache dir contents (rebuildable, safe to delete):
 
@@ -926,7 +940,10 @@ Input rules:
 
 - If `--text` is provided, stdin is ignored unless a command explicitly supports
   combining them.
-- If `--text` is absent and stdin is not a TTY, read stdin.
+- If `--text` is absent and stdin is not a TTY, read stdin. In v1,
+  `hm capture` and `hm reconcile` read stdin whenever `--text` is absent;
+  `hm remember` and `hm note` require `--text`, and reading their body from
+  stdin is DEFERRED.
 - If both text and stdin are absent for write commands, return CLI usage error.
 - Comma-list flags trim whitespace and reject empty entries.
 - `--force` is narrowly scoped per command and disabled for non-interactive
@@ -935,10 +952,10 @@ Input rules:
   optimization; it MUST NOT bypass privacy, manifest identity, or generated-file
   drift refusals. `--force` MUST NOT bypass manifest identity checks on outbox
   flush (see Local State section).
-- `--idempotency-key KEY` may be passed to write commands. Reusing the same key
-  with the same normalized payload returns the existing ID; reusing it with a
-  different payload is a safety refusal. Retrying callers should use this after
-  a transient backend failure.
+- `--idempotency-key KEY` is DEFERRED and not accepted in v1. The frozen
+  contract, once shipped: reusing the same key with the same normalized payload
+  returns the existing ID; reusing it with a different payload is a safety
+  refusal. Retrying callers should use this after a transient backend failure.
 - Write commands run built-in secret detectors before writing canonical memory
   or durable outbox data. Likely credentials, private keys, API tokens, SSH keys,
   OAuth tokens, and high-entropy bearer strings are exit `4`
@@ -959,15 +976,18 @@ hm --store work remember --scope project --project /repo --text "Release uses ca
 
 Inputs:
 
-- `--text TEXT` or stdin required.
-- optional `--scope`, `--project`, `--subject`, `--tags`, `--confidence`,
-  `--audience` (repeatable), `--idempotency-key`, `--allow-secret-write`.
+- `--text TEXT` required (stdin input is DEFERRED).
+- optional `--scope`, `--project`/`--project-id`, `--subject`, `--tags`,
+  `--kind`, `--confidence`, `--audience`, `--allow-secret-write`, and others
+  (validity window, `--supersedes`, source provenance, sidecar and inference
+  toggles, `--json`); see `hm remember --help` for the full list.
+  `--idempotency-key` is DEFERRED.
 - defaults: active store, configured default write scope `global`, confidence
-  `high`, empty audience. An explicit CLI `--project` or `--project-id` defaults
-  a remembered write to project scope. Ambient `HIVE_MEMORY_PROJECT` context
-  preserves conservative text/kind inference so a long-lived session does not
-  accidentally trap global preferences in whichever repository was last active.
-  Explicit `--scope` always wins.
+  `medium`, empty audience. An explicit CLI `--project` or `--project-id`
+  defaults a remembered write to project scope. Ambient `HIVE_MEMORY_PROJECT`
+  context preserves conservative text/kind inference so a long-lived session
+  does not accidentally trap global preferences in whichever repository was
+  last active. Explicit `--scope` always wins.
 
 Writes:
 
@@ -975,14 +995,17 @@ Writes:
 - JSON event sidecar according to `event_sidecar` policy.
 - The note is written with `entry_kind = "remember"` and is included by default
   in `hm context` as `trust = "remembered"` after source labeling and escaping.
-- Exact normalized duplicates in the same store/scope/project/audience are
-  idempotent by default for `remember`: return the existing ID instead of writing
-  another note. `--idempotency-key` makes retry behavior explicit and stricter.
+- Duplicate suppression is DEFERRED: v1 writes a new note on every call and
+  reports `created = true` / `duplicate_of = null`. Once shipped, exact
+  normalized duplicates in the same store/scope/project/audience are idempotent
+  by default for `remember` (return the existing ID instead of writing another
+  note), and `--idempotency-key` makes retry behavior explicit and stricter.
 - When `HIVE_MEMORY_SESSION_ID` is present, append a lightweight write receipt
-  under `state_dir/runs/<session-id>/writes.jsonl` after a successful created or
-  duplicate/idempotent write. The receipt records the resolved store, scope,
-  project ID, note ID, and created/duplicate status. Receipts are ephemeral
-  coordination state for hooks; deleting them must never lose canonical memory.
+  under `state_dir/runs/<session-id>/writes.jsonl` after a successful write
+  (and, once duplicate suppression ships, after a duplicate/idempotent one).
+  The receipt records the resolved store, scope, project ID, note ID, and
+  created/duplicate status. Receipts are ephemeral coordination state for
+  hooks; deleting them must never lose canonical memory.
 
 Output:
 
@@ -998,7 +1021,8 @@ Errors/refusals:
 - refuse write store outside the effective agent `write_stores` policy.
 - refuse likely secret material unless `--allow-secret-write` is permitted for a
   resolved `secret` store.
-- refuse broad/sensitive scope mismatch unless `--force` and config allows it.
+- refusing a broad/sensitive scope mismatch (with a `--force` override when
+  config allows it) is DEFERRED; v1 has no `remember --force`.
 - write to outbox when active store is unavailable and offline fallback is enabled.
 
 ### `hm note`
@@ -1007,13 +1031,13 @@ Purpose: capture a more freeform note, usually project/session scoped.
 
 Differences from `remember`:
 
-- accepts multiline stdin by default.
+- accepts multiline `--text` (stdin input is DEFERRED, as for `remember`).
 - sets `entry_kind = "note"` with less semantic `subject` structure.
 - should not imply the content is already a stable preference/fact.
 - is excluded from default `hm context`; use `--include-inbox` for triage or
   `hm promote` to turn it into curated memory.
-- does not perform automatic duplicate suppression unless `--idempotency-key` is
-  provided.
+- does not perform automatic duplicate suppression (`--idempotency-key` is
+  DEFERRED).
 
 Use `remember` for high-signal memory; use `note` for raw observations or longer
 session notes.
@@ -1036,8 +1060,11 @@ hm search "remaining work" --since 30m --include-inbox
 V1 behavior:
 
 - simple deterministic text search over Markdown bodies and indexed metadata
-  fields (`subject`, `tags`). Exact case-insensitive phrase matches rank
-  highest; otherwise every query term must be present.
+  fields (`subject`, `tags`). Exact ASCII-case-insensitive phrase matches rank
+  highest. Otherwise, after stopword removal, 1–3-term queries need every term
+  and longer queries need at least 60% of terms (minimum 3); terms match via
+  inflections and concept aliases, negation/intent terms are always required,
+  and deterministic entity aliases can recall hits without term matches.
 - backed by the local triage index for filtering; matched lines are read from
   canonical files for snippets.
 - collapses note/event pairs (same `id`) into a single hit; the Markdown body
@@ -1073,8 +1100,11 @@ Output:
 - human: compact list of matches with snippets.
 - JSON: array of match objects.
 
-Future: post-v1, the simple text path can be replaced by SQLite/FTS without
-changing output contracts.
+`[defaults].search_backend = "tantivy"` adds a local Tantivy BM25 index (a
+rebuildable cache under `cache_dir/search/`) to candidate generation without
+changing output contracts. BM25 results are interleaved round-robin with
+lexical/alias results, so lexical ordering rules apply only within the lexical
+stream. Retrieval failures fall back to the lexical path with a warning.
 
 ### `hm context`
 
@@ -1408,7 +1438,7 @@ Purpose: promote a raw inbox note into curated memory.
 Examples:
 
 ```bash
-hm promote <note-id>                           # default: curated/global/MEMORY.md
+hm promote <note-id>                           # default: memories/global/MEMORY.md
 hm promote <note-id> --to memories/global/PREFERENCES.md
 hm promote <note-id> --to memories/projects/<id>/MEMORY.md --as-bullet
 ```
@@ -1529,11 +1559,12 @@ Checks (all surfaces at default verbosity unless noted):
   than 7 days; reports unbound items as a separate error class.
 - store roots have suspicious permissions, e.g. world-readable private/secret
   stores.
-- write targets resolve through symlinks or escape expected roots.
+- store roots are symlinks. Checking that write targets resolve through
+  symlinks or escape expected roots is DEFERRED.
 - private/secret stores appear inside git repos without an explicit
-  acknowledgement.
-- secret-sensitivity store has a cloud-synced root (refused at config load,
-  but doctor re-checks symlinks and mount points).
+  acknowledgement (DEFERRED; not implemented in v1).
+- secret-sensitivity store has a cloud-synced root (refused at config load;
+  a doctor re-check of symlinks and mount points is DEFERRED).
 - agent-private notes lack an explicit `audience`.
 - `fsync` policy + filesystem combination: warns when `fsync = "required"`
   is set on a known FUSE/cloud-drive mount where parent-dir fsync is a no-op.
@@ -1542,10 +1573,11 @@ Modes:
 
 - default: read-only diagnostics.
 - `--quick`: config/root checks suitable for hooks.
-- `--fix`: safe repairs only, e.g. create missing directories, create generated
-  `.gitignore` files, quarantine stale temp files under `state/quarantine/`,
-  rewrite non-normalized paths in metadata via quarantine. Never deletes
-  canonical notes/events by default.
+- `--fix`: safe repairs only, e.g. create missing directories, restore the
+  managed generated `.gitignore`, and quarantine stale temp files and cloud
+  conflict copies under `<store>/.quarantine/<category>/<timestamp>/`
+  (preserving the store-relative path). Rewriting non-normalized paths in
+  metadata is DEFERRED. Never deletes canonical notes/events by default.
 - `--json`: machine-readable diagnostic report.
 
 ### `hm compact`
@@ -1805,8 +1837,11 @@ CI enforcement:
 - the integration test suite generates a synthetic 5000-note store under
   `tempfile`, then benchmarks context, search, lifecycle hooks, and unchanged
   background refresh; CI fails when measured p95 exceeds budget.
-- `hm doctor` exposes the last-measured latencies and warns when they drift
-  above budget on a real user's store.
+- DEFERRED (not implemented in v1): `hm doctor` exposes the last-measured
+  latencies and warns when they drift above budget on a real user's store. v1
+  parses and validates `[performance]` but no command reads it; the CI budget
+  comes from constants in the `perf_budget` test, scaled by
+  `HIVE_MEMORY_PERF_BUDGET_MULTIPLIER` (4 in CI).
 
 Out-of-budget scenarios:
 
@@ -1960,8 +1995,10 @@ Use GitHub Actions for tests and releases.
 
 Recommended repository: `cgraf78/hive-memory`.
 
-`hm --version` should print `hm X.Y.Z (git <short-sha>, schema <n>)` when build
-metadata is available. Checksums use SHA-256 lines compatible with `sha256sum -c`.
+`hm --version` prints `hm YYYYMMDD-HHMMSS-<8hex> (schema <n>)`: the generated
+release version (UTC commit timestamp plus the first eight hex digits of the
+build commit, shared with release tags and archive names) followed by the store
+schema version. Checksums use SHA-256 lines compatible with `sha256sum -c`.
 Linux releases use musl targets so normal installs do not depend on a distro
 glibc baseline.
 
@@ -2156,7 +2193,8 @@ Test categories per module:
 
 ### Search
 
-- case-insensitive exact phrase match, with all-term fallback.
+- case-insensitive exact phrase match, with term-coverage fallback (all terms
+  for 1–3-term queries, at least 60% / minimum 3 for longer ones).
 - `--store` / `--scope` filters; multi-store `--stores` / `--all-stores` are
   DEFERRED (single resolved store in v1).
 - agent policy constrains the default and explicit read store.

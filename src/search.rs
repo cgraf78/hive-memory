@@ -25,8 +25,11 @@ pub struct SearchInput<'a> {
     pub store_root: &'a Path,
     /// Candidate metadata entries.
     pub entries: &'a [IndexEntry],
-    /// Case-insensitive text query. Exact substring matches rank highest; when
-    /// no exact phrase match exists, every query term must be present.
+    /// ASCII-case-insensitive text query. Exact phrase matches rank highest.
+    /// Otherwise, after stopword removal, 1-3-term queries need every term and
+    /// longer queries need at least 60% of terms (minimum 3); terms match via
+    /// inflections and concept aliases, negation/intent terms are always
+    /// required, and entity aliases can recall hits without term matches.
     pub query: &'a str,
     /// Optional scope filter. Empty means all scopes allowed by source policy.
     pub scopes: &'a [String],
