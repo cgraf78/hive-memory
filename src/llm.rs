@@ -1,8 +1,9 @@
 //! LLM backend detection and one-shot structured invocation.
 //!
-//! This module is only called from the background classification worker. Hot
-//! paths should not probe or invoke model CLIs: the availability story is that
-//! the detached worker tries a backend and exits quietly when none is usable.
+//! Called by the background classifier worker and the explicit `hm capture` /
+//! `hm reconcile` commands. Hook and hot paths must not probe or invoke model
+//! CLIs: the availability story is that the detached worker tries a backend and
+//! exits quietly when none is usable.
 
 use crate::note;
 use serde::Deserialize;

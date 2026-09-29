@@ -42,3 +42,13 @@ decomposition strategies:
   retrieved item hits back to benchmark session ids for scoring.
 - `exchange` stores each user-led exchange as one memory record, then scores the
   same session-level retrieval target.
+
+Set `HIVE_MEMORY_LONGMEMEVAL_RETRIEVER` to choose the candidate-generation
+backend under test:
+
+- `lexical` runs the shipped deterministic `search()` path. This is the
+  default.
+- `bm25` runs a dependency-free Okapi BM25 ranker over the same corpus, used to
+  compare statistical ranking against the lexical heuristic.
+
+Any other value fails the run.

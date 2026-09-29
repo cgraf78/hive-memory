@@ -138,11 +138,18 @@ is unavailable or invalid.
 .I <store>/manifest.toml
 Store identity and metadata.
 .TP
-.I <store>/memories/
-Remembered and curated memory content.
-.TP
 .I <store>/inbox/
-Raw notes and staged capture candidates.
+Remembered and raw notes under
+.IR inbox/notes/YYYY/MM/DD/ ,
+their JSON event sidecars under
+.IR inbox/events/ ,
+and staged capture candidates.
+.TP
+.IR <store>/memories/ ", " <store>/rules/ ", " <store>/people/
+Curated memory content, including the default
+.B hm promote
+target under
+.IR memories/global/ .
 .SH SECURITY
 Hive Memory refuses common secret-looking content on the write path and labels
 context blocks by source, scope, store, and trust. Context output is data for an
