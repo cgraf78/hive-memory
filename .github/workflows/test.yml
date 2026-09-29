@@ -19,7 +19,7 @@ env:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@b750c292f00e079c2270df0d8f4c8bdaf43e0356
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@cff4d77cf738c278a8c1279a89b20c9c546d9c5b
     with:
       # Full matrix on every PR: scheduled-only legs let main break
       # silently between daily runs and cannot validate their fixes.
@@ -58,7 +58,7 @@ jobs:
           .termux-ci/hm
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@b750c292f00e079c2270df0d8f4c8bdaf43e0356
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@cff4d77cf738c278a8c1279a89b20c9c546d9c5b
     with:
       matrix-set: full
       profiles: base
@@ -85,7 +85,7 @@ jobs:
       # files, so `.github/cgraf78-actions.lock` cannot be interpolated. This
       # gate verifies every unavoidable action literal and all vendored release
       # scripts still match that single reviewed dependency decision.
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@b750c292f00e079c2270df0d8f4c8bdaf43e0356
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@cff4d77cf738c278a8c1279a89b20c9c546d9c5b
 
   source-install:
     name: Locked source install
