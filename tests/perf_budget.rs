@@ -1,4 +1,3 @@
-use assert_cmd::cargo::cargo_bin_cmd;
 use hive_memory::config::Sensitivity;
 use hive_memory::note::{self, Confidence};
 use hive_memory::outbox;
@@ -9,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use time::OffsetDateTime;
+
+mod common;
 
 const SYNTHETIC_NOTES: usize = 5_000;
 const RUNS: usize = 30;
@@ -700,7 +701,7 @@ impl FlushFixture {
 }
 
 fn hm_command<const N: usize>(config: &Path, args: [&str; N]) -> assert_cmd::Command {
-    let mut command = cargo_bin_cmd!("hm");
+    let mut command = common::hermetic_hm();
     command.arg("--config").arg(config).args(args);
     command
 }

@@ -10,11 +10,12 @@
 //! hotspot there; it re-implements the minimal config/store/outbox fixtures it
 //! needs against the public `hive_memory` API.
 
-use assert_cmd::cargo::cargo_bin_cmd;
 use hive_memory::{outbox, store};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+mod common;
 
 /// Create a unique temp directory for one test.
 fn temp_dir(name: &str) -> PathBuf {
@@ -70,7 +71,7 @@ fn fixture(name: &str) -> Fixture {
 
 /// Initialize the store root via `hm stores init` and return its manifest id.
 fn init_store(store_root: &Path) -> String {
-    cargo_bin_cmd!("hm")
+    common::hermetic_hm()
         .args([
             "stores",
             "init",
@@ -120,7 +121,7 @@ fn write_note_item(
 
 /// Run `hm flush --json` and return (success, stdout).
 fn run_flush(config: &Path) -> (bool, String) {
-    let output = cargo_bin_cmd!("hm")
+    let output = common::hermetic_hm()
         .args([
             "--config",
             config.to_str().expect("utf8 config"),
@@ -198,7 +199,7 @@ fn corrupt_item_does_not_strand_healthy_sibling() {
     assert_eq!(item_result(&stdout, "item-a"), "failed");
     assert_eq!(item_result(&stdout, "item-b"), "flushed");
 
-    // The healthy item B reached the store despite A being unparseable.
+    // The healthy item B reached the store despite A being unparsable.
     assert_eq!(
         fs::read(fx.store_root.join(b_final)).expect("read flushed B"),
         b_body

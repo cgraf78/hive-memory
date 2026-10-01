@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 # Shared shell test helpers.
 
+# Keep the caller's shell startup file out of every child shell. The suites
+# shadow tools like `uname` and `curl` with bash stubs on PATH, and a
+# non-interactive bash sources BASH_ENV before running a stub. A startup file
+# that itself calls `uname` then re-enters the stub and recurses forever; one
+# that prints anything corrupts captured output. The suite's own process has
+# already sourced it by now, which is harmless: no stub is on PATH yet.
+unset BASH_ENV
+
 PASS=0
 FAIL=0
 CLEANUP_DIRS=()

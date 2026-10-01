@@ -9,11 +9,12 @@
 //! against a labeled set, and is the gate to run before bumping
 //! `llm::VERDICT_VERSION` (which re-queues every prior LLM verdict).
 
-use assert_cmd::cargo::cargo_bin_cmd;
 use predicates::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+mod common;
 
 fn temp_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -29,7 +30,7 @@ fn temp_dir(name: &str) -> PathBuf {
 }
 
 fn init_store(root: &Path, name: &str) {
-    cargo_bin_cmd!("hm")
+    common::hermetic_hm()
         .args([
             "stores",
             "init",
@@ -78,7 +79,7 @@ fn classifier_verdict_flows_into_relevance_context() {
     .expect("write config");
     init_store(&store, "personal");
 
-    cargo_bin_cmd!("hm")
+    common::hermetic_hm()
         .args([
             "--config",
             config.to_str().expect("utf8 config"),
@@ -94,7 +95,7 @@ fn classifier_verdict_flows_into_relevance_context() {
         .assert()
         .success();
 
-    cargo_bin_cmd!("hm")
+    common::hermetic_hm()
         .args([
             "--config",
             config.to_str().expect("utf8 config"),
@@ -106,7 +107,7 @@ fn classifier_verdict_flows_into_relevance_context() {
         .success()
         .stdout(predicate::str::contains("Repo alpha deploy window"));
 
-    cargo_bin_cmd!("hm")
+    common::hermetic_hm()
         .env("FAKE_LLM_KIND", "incident")
         .args([
             "--config",
@@ -116,7 +117,7 @@ fn classifier_verdict_flows_into_relevance_context() {
         .assert()
         .success();
 
-    cargo_bin_cmd!("hm")
+    common::hermetic_hm()
         .args([
             "--config",
             config.to_str().expect("utf8 config"),

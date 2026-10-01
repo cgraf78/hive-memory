@@ -12,10 +12,11 @@
 //! - curated discovery surfaces the expected files while never following a
 //!   symlink out of the store.
 
-use assert_cmd::cargo::cargo_bin_cmd;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+mod common;
 
 fn temp_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -32,7 +33,7 @@ fn temp_dir(name: &str) -> PathBuf {
 
 /// Initialize a store root with a manifest via the real `hm stores init`.
 fn init_store(root: &Path, name: &str) {
-    cargo_bin_cmd!("hm")
+    common::hermetic_hm()
         .args([
             "stores",
             "init",
@@ -115,7 +116,7 @@ fn alias_path_escape_is_not_injected_into_context() {
     )
     .expect("write hostile aliases");
 
-    let output = cargo_bin_cmd!("hm")
+    let output = common::hermetic_hm()
         .args([
             "--config",
             config.to_str().expect("utf8 config"),
@@ -170,7 +171,7 @@ fn normal_alias_id_still_resolves_curated_dir() {
     )
     .expect("write aliases");
 
-    let output = cargo_bin_cmd!("hm")
+    let output = common::hermetic_hm()
         .args([
             "--config",
             config.to_str().expect("utf8 config"),
@@ -239,7 +240,7 @@ fn no_identity_write_to_non_default_store_is_refused() {
     // No --as-agent: previously this skipped policy entirely and let --store
     // target ANY store. It must now be refused for a non-default store with
     // privacy-refusal exit code 4.
-    let output = cargo_bin_cmd!("hm")
+    let output = common::hermetic_hm()
         .args([
             "--config",
             config.to_str().expect("utf8 config"),
@@ -270,7 +271,7 @@ fn no_identity_write_to_default_store_succeeds() {
 
     // A plain human shell with NO --as-agent must keep working against the
     // default store. This is the path the fail-closed change must not break.
-    cargo_bin_cmd!("hm")
+    common::hermetic_hm()
         .args([
             "--config",
             config.to_str().expect("utf8 config"),
@@ -298,7 +299,7 @@ fn agent_private_audience_is_filtered_by_invoking_agent() {
     // text (search filters on body/metadata, not the scope field).
     let search_token = "claudeonlytoken";
     let secret_body = "Agent-private memory only claude may read: claudeonlytoken.";
-    cargo_bin_cmd!("hm")
+    common::hermetic_hm()
         .args([
             "--config",
             config.to_str().expect("utf8 config"),
@@ -316,7 +317,7 @@ fn agent_private_audience_is_filtered_by_invoking_agent() {
         .success();
 
     // codex must NOT see a claude-only record in search or context.
-    let codex_search = cargo_bin_cmd!("hm")
+    let codex_search = common::hermetic_hm()
         .args([
             "--config",
             config.to_str().expect("utf8 config"),
@@ -339,7 +340,7 @@ fn agent_private_audience_is_filtered_by_invoking_agent() {
         "codex saw a claude-only agent-private record in search: {codex_search_out}"
     );
 
-    let codex_context = cargo_bin_cmd!("hm")
+    let codex_context = common::hermetic_hm()
         .args([
             "--config",
             config.to_str().expect("utf8 config"),
@@ -362,7 +363,7 @@ fn agent_private_audience_is_filtered_by_invoking_agent() {
     );
 
     // claude (the listed audience) must see it.
-    let claude_search = cargo_bin_cmd!("hm")
+    let claude_search = common::hermetic_hm()
         .args([
             "--config",
             config.to_str().expect("utf8 config"),
@@ -394,7 +395,7 @@ fn retag_cannot_read_or_declassify_agent_private_memory() {
     write_single_store_config(&config, &dir, &personal);
     init_store(&personal, "personal");
 
-    let remembered = cargo_bin_cmd!("hm")
+    let remembered = common::hermetic_hm()
         .args([
             "--config",
             config.to_str().expect("utf8 config"),
@@ -419,7 +420,7 @@ fn retag_cannot_read_or_declassify_agent_private_memory() {
         serde_json::from_slice(&remembered.stdout).expect("remember json");
     let id = remembered["id"].as_str().expect("memory id");
 
-    cargo_bin_cmd!("hm")
+    common::hermetic_hm()
         .args([
             "--config",
             config.to_str().expect("utf8 config"),
@@ -434,7 +435,7 @@ fn retag_cannot_read_or_declassify_agent_private_memory() {
         .failure()
         .stderr(predicates::str::contains("not visible to the active agent"));
 
-    cargo_bin_cmd!("hm")
+    common::hermetic_hm()
         .args([
             "--config",
             config.to_str().expect("utf8 config"),
@@ -483,7 +484,7 @@ fn retag_requires_read_and_write_store_access() {
     .expect("write config");
     init_store(&personal, "personal");
 
-    let remembered = cargo_bin_cmd!("hm")
+    let remembered = common::hermetic_hm()
         .args([
             "--config",
             config.to_str().expect("utf8 config"),
@@ -502,7 +503,7 @@ fn retag_requires_read_and_write_store_access() {
         serde_json::from_slice(&remembered.stdout).expect("remember json");
     let id = remembered["id"].as_str().expect("memory id");
 
-    let retag = cargo_bin_cmd!("hm")
+    let retag = common::hermetic_hm()
         .args([
             "--config",
             config.to_str().expect("utf8 config"),
@@ -573,7 +574,7 @@ fn curated_collect_surfaces_files_and_skips_outside_symlink() {
     fs::create_dir_all(personal.join("rules")).expect("rules dir");
     symlink_file(&outside.join("leak.md"), &personal.join("rules/leak.md"));
 
-    let output = cargo_bin_cmd!("hm")
+    let output = common::hermetic_hm()
         .args([
             "--config",
             config.to_str().expect("utf8 config"),

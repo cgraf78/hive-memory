@@ -1,9 +1,10 @@
-use assert_cmd::cargo::cargo_bin_cmd;
 use hive_memory::config::Sensitivity;
 use hive_memory::store::{self, StoreInitOptions};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+mod common;
 
 // These are intentionally filesystem-level simulations instead of tests for a
 // specific cloud vendor. The v1 contract is that independent immutable writes
@@ -226,22 +227,10 @@ fn write_config(path: &Path, root: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-/// Build an `hm` invocation pinned to `config` and isolated from the caller's
-/// hm environment.
-///
-/// `--config` alone is not hermetic: `HIVE_MEMORY_STORE` (and the project,
-/// session, and agent selectors) override what the config says, so a developer
-/// shell or agent session that exports them would aim these simulations at a
-/// store the temp config does not define. Scrub the whole `HIVE_MEMORY_*`
-/// namespace rather than a fixed list so newly added selectors cannot
-/// reintroduce the leak.
+/// Build an `hm` invocation pinned to `config`, isolated from the caller's hm
+/// environment by [`common::hermetic_hm`].
 fn hm_cmd(config: &Path) -> assert_cmd::Command {
-    let mut cmd = cargo_bin_cmd!("hm");
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("HIVE_MEMORY_") {
-            cmd.env_remove(&key);
-        }
-    }
+    let mut cmd = common::hermetic_hm();
     cmd.arg("--config").arg(config);
     cmd
 }
