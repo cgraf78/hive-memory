@@ -30,6 +30,8 @@ Spawn the binary through `common::hermetic_hm()` (`tests/common/mod.rs`): it
 drops inherited `HIVE_MEMORY_*` selectors and gives each test its own fresh XDG
 config/data/state/cache sandbox, removed when the test finishes, so a spawn
 that forgets `--config` cannot read the developer's live config. `clippy.toml`
-rejects assert_cmd's raw binary constructors everywhere else. The shell
+rejects assert_cmd's raw binary constructors everywhere else. Run fixture
+`git` through `common::git()`, which drops inherited `GIT_*` variables such as
+a hook's `GIT_DIR` and ignores global and system Git config. The shell
 suites unset `BASH_ENV` in `helpers.sh` so their bash stubs never source the
 caller's startup file.

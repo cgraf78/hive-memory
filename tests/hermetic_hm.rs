@@ -6,6 +6,7 @@
 //! isolation and cleanup guarantees are pinned here rather than inferred from
 //! the suites that use them.
 
+use assert_cmd::assert::OutputAssertExt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -121,14 +122,17 @@ fn unnamed_threads_get_distinct_sandboxes() {
 /// `common::hermetic_hm()`, but Clippy cannot see a raw `std::process::Command`
 /// built from Cargo's binary-path variable, or one that runs whatever `hm` is
 /// first on `PATH` (the developer's install, with their live config). Catch
-/// both bypasses by source scan.
+/// both bypasses by source scan, plus a raw `git` that would inherit the
+/// caller's `GIT_DIR` instead of going through `common::git()`.
 #[test]
-fn only_the_hermetic_builder_spawns_hm() {
+fn only_the_hermetic_builders_spawn_hm_and_git() {
     // Assembled at runtime so this file does not match its own needles.
     let needles = [
         ["CARGO_BIN", "_EXE_"].concat(),
         ["Command::new(", "\"hm\")"].concat(),
+        ["Command::new(", "\"git\")"].concat(),
     ];
+    let builders = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/common/mod.rs");
     let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
     let mut offenders = Vec::new();
     let mut pending = vec![tests_dir];
@@ -137,7 +141,7 @@ fn only_the_hermetic_builder_spawns_hm() {
             let path = entry.expect("tests dir entry").path();
             if path.is_dir() {
                 pending.push(path);
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
+            } else if path.extension().is_some_and(|ext| ext == "rs") && path != builders {
                 let source = fs::read_to_string(&path).expect("read test source");
                 for needle in &needles {
                     if source.contains(needle.as_str()) {
@@ -149,7 +153,7 @@ fn only_the_hermetic_builder_spawns_hm() {
     }
     assert!(
         offenders.is_empty(),
-        "spawn hm through common::hermetic_hm(): {offenders:?}"
+        "spawn hm and git through common::hermetic_hm() and common::git(): {offenders:?}"
     );
 }
 
@@ -192,11 +196,12 @@ fn temp_dirs_are_removed_when_their_thread_exits() {
 const PROBE_HOME: &str = "HM_HERMETIC_PROBE_HOME";
 
 /// Ordinary CI runs with a clean environment, so nothing else would notice if
-/// `hermetic_hm()` stopped scrubbing `HIVE_MEMORY_*` or sandboxing XDG: the
-/// only symptom would be writes into a developer's real home. Re-run this
-/// binary's probe with a caller environment aimed at a sentinel home and
-/// require that nothing lands there. Changing the process's own environment
-/// instead would race every other test in this binary.
+/// `hermetic_hm()` stopped scrubbing `HIVE_MEMORY_*` or sandboxing XDG, or if
+/// `common::git()` stopped dropping `GIT_DIR`: the only symptom would be writes
+/// into a developer's real home or repository. Re-run this binary's probe with
+/// a caller environment aimed at a sentinel home and repository and require
+/// that neither changes. Changing the process's own environment instead would
+/// race every other test in this binary.
 #[test]
 fn hostile_caller_environment_cannot_redirect_hm() {
     let home = common::temp_dir("hostile-home");
@@ -222,6 +227,19 @@ fn hostile_caller_environment_cannot_redirect_hm() {
         ),
     )
     .expect("write trap config");
+    // Git exports these to hooks, so a test run from one inherits them.
+    let sentinel_repo = common::temp_dir("hostile-repo");
+    common::git()
+        .args([
+            "-C",
+            sentinel_repo.to_str().expect("utf8 repo"),
+            "init",
+            "-q",
+        ])
+        .assert()
+        .success();
+    let sentinel_git_config = sentinel_repo.join(".git/config");
+    let sentinel_before = fs::read(&sentinel_git_config).expect("read sentinel git config");
 
     let output = std::process::Command::new(std::env::current_exe().expect("test binary path"))
         .args(["--exact", "hostile_env_probe", "--test-threads=1"])
@@ -233,6 +251,9 @@ fn hostile_caller_environment_cannot_redirect_hm() {
         .env("XDG_CACHE_HOME", home.join(".cache"))
         .env("HIVE_MEMORY_CONFIG", &trap_config)
         .env("HIVE_MEMORY_STORE", "trap")
+        .env("GIT_DIR", sentinel_repo.join(".git"))
+        .env("GIT_WORK_TREE", &sentinel_repo)
+        .env("GIT_INDEX_FILE", sentinel_repo.join(".git/index"))
         .output()
         .expect("run probe");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -267,18 +288,41 @@ fn hostile_caller_environment_cannot_redirect_hm() {
         leaked.is_empty(),
         "a spawned process wrote into the caller's home: {leaked:?}"
     );
+    assert_eq!(
+        fs::read(&sentinel_git_config).expect("reread sentinel git config"),
+        sentinel_before,
+        "a test fixture's git command wrote into the caller's repository"
+    );
 }
 
-/// The child half of `hostile_caller_environment_cannot_redirect_hm`: run
-/// commands that write the store manifest, a record, and the XDG-fallback
-/// data, state, and cache, from a config that sets none of those directories,
-/// then one that forgets `--config`.
+/// The child half of `hostile_caller_environment_cannot_redirect_hm`: build a
+/// fixture repository with a remote, then run `hm` commands that write the
+/// store manifest, a record, and the XDG-fallback data, state, and cache, from
+/// a config that sets none of those directories, then one that forgets
+/// `--config`.
 #[test]
 fn hostile_env_probe() {
     if std::env::var_os(PROBE_HOME).is_none() {
         return;
     }
     let dir = common::temp_dir("probe");
+    let repo = dir.join("repo");
+    let repo_arg = repo.to_str().expect("utf8 repo");
+    let remote = "https://example.invalid/probe.git";
+    common::git()
+        .args(["init", "-q", repo_arg])
+        .assert()
+        .success();
+    common::git()
+        .args(["-C", repo_arg, "remote", "add", "origin", remote])
+        .assert()
+        .success();
+    let url = common::git()
+        .args(["-C", repo_arg, "remote", "get-url", "origin"])
+        .output()
+        .expect("git remote get-url");
+    assert_eq!(String::from_utf8_lossy(&url.stdout).trim(), remote);
+
     let store = dir.join("store");
     let config = dir.join("config.toml");
     fs::write(
