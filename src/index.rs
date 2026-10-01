@@ -2858,6 +2858,85 @@ mod tests {
         assert_ne!(before, after, "a cross-directory move must be visible");
     }
 
+    /// A synced rewrite can land within the same second as the original write
+    /// (a classifier or retag right after `remember`). Sub-second mtime
+    /// resolution is what separates the two, so truncating the per-file mtime
+    /// to whole seconds would reopen the stale-cache window for that rewrite.
+    #[test]
+    fn fingerprint_detects_sub_second_mtime_change() {
+        let dir = temp_dir("fingerprint-sub-second-mtime");
+        let root = dir.join("store");
+        let note_dir = root.join("inbox/notes/2026/05/16");
+        fs::create_dir_all(&note_dir).expect("note dir");
+        let rewritten = note_dir.join("a.md");
+        let newest = note_dir.join("b.md");
+        fs::write(&rewritten, "placeholder").expect("note a");
+        fs::write(&newest, "placeholder").expect("note b");
+        // Start on a whole second so a few milliseconds cannot cross a second
+        // boundary, and keep a sibling newest so only the per-file combine can
+        // see the shift (not the newest-file aggregate).
+        let base = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        set_mtime(&rewritten, base);
+        set_mtime(&newest, base + std::time::Duration::from_secs(3600));
+        let before = canonical_fingerprint(&root).expect("before");
+
+        // `set_mtime` touches only this file, so no directory mtime moves.
+        let shifted = base + std::time::Duration::from_millis(3);
+        set_mtime(&rewritten, shifted);
+        assert_eq!(
+            mtime(&rewritten),
+            shifted,
+            "the test filesystem must keep sub-second mtimes"
+        );
+
+        let after = canonical_fingerprint(&root).expect("after");
+        assert_eq!(
+            after.latest_file_modified_nanos, before.latest_file_modified_nanos,
+            "the sibling must stay the newest file"
+        );
+        assert_ne!(
+            before.canonical_files_combined, after.canonical_files_combined,
+            "a millisecond mtime shift must change the per-file combine"
+        );
+    }
+
+    /// Old and new `hm` binaries share one cache during the auto-update window
+    /// and must parse each other's index headers. The wire key for the
+    /// per-file combine is frozen as `canonical_names_combined` (its pre-widening
+    /// name); renaming the Rust field must not rename the serialized key.
+    #[test]
+    fn index_header_keeps_legacy_combined_key_on_the_wire() {
+        let wire = r#"{
+            "hm_index_format": 1,
+            "fingerprint": {
+                "schema_version": 12,
+                "store_root": "/store",
+                "canonical_dirs": 3,
+                "latest_directory_modified_nanos": 42,
+                "canonical_files": 10,
+                "latest_file_modified_nanos": 43,
+                "canonical_names_combined": 12345,
+                "entity_registry_modified_nanos": 0
+            },
+            "entry_count": 0,
+            "entries_sha256": "",
+            "projection_sha256": "",
+            "projection": null
+        }"#;
+        let header: IndexHeader = serde_json::from_str(wire).expect("parse legacy-keyed header");
+        assert_eq!(header.fingerprint.canonical_files_combined, 12345);
+
+        // Compare only the fingerprint object: new header-level fields are
+        // `#[serde(default)]` and stay cross-version compatible, so a whole-
+        // header comparison would fail on a legitimate addition.
+        let reserialized = serde_json::to_value(&header).expect("serialize header");
+        let original: serde_json::Value = serde_json::from_str(wire).expect("wire json");
+        assert_eq!(
+            reserialized["fingerprint"], original["fingerprint"],
+            "the fingerprint must serialize back to the same wire keys"
+        );
+    }
+
     #[test]
     fn prune_removes_only_vanished_temporary_store_index() {
         let dir = temp_dir("prune-temp-index");

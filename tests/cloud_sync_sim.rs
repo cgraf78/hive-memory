@@ -226,19 +226,32 @@ fn write_config(path: &Path, root: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+/// Build an `hm` invocation pinned to `config` and isolated from the caller's
+/// hm environment.
+///
+/// `--config` alone is not hermetic: `HIVE_MEMORY_STORE` (and the project,
+/// session, and agent selectors) override what the config says, so a developer
+/// shell or agent session that exports them would aim these simulations at a
+/// store the temp config does not define. Scrub the whole `HIVE_MEMORY_*`
+/// namespace rather than a fixed list so newly added selectors cannot
+/// reintroduce the leak.
+fn hm_cmd(config: &Path) -> assert_cmd::Command {
+    let mut cmd = cargo_bin_cmd!("hm");
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("HIVE_MEMORY_") {
+            cmd.env_remove(&key);
+        }
+    }
+    cmd.arg("--config").arg(config);
+    cmd
+}
+
 fn hm<const N: usize>(config: &Path, args: [&str; N]) {
-    cargo_bin_cmd!("hm")
-        .arg("--config")
-        .arg(config)
-        .args(args)
-        .assert()
-        .success();
+    hm_cmd(config).args(args).assert().success();
 }
 
 fn hm_stdout<const N: usize>(config: &Path, args: [&str; N]) -> String {
-    let output = cargo_bin_cmd!("hm")
-        .arg("--config")
-        .arg(config)
+    let output = hm_cmd(config)
         .args(args)
         .assert()
         .success()
