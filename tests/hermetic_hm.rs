@@ -1,9 +1,10 @@
-//! Contract tests for the shared `common::hermetic_hm()` builder.
+//! Contract tests for the shared `tests/common` helpers.
 //!
-//! Every other integration crate trusts this builder to keep spawned `hm`
-//! processes away from the developer's real XDG state and from each other, so
-//! its isolation and cleanup guarantees are pinned here rather than inferred
-//! from the suites that use it.
+//! Every other integration crate trusts `common::hermetic_hm()` to keep
+//! spawned `hm` processes away from the developer's real XDG state and from
+//! each other, and `common::temp_dir()` to clean up after each test, so those
+//! isolation and cleanup guarantees are pinned here rather than inferred from
+//! the suites that use them.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -160,4 +161,27 @@ fn each_test_runs_on_its_own_named_thread() {
         std::thread::current().name(),
         Some("each_test_runs_on_its_own_named_thread")
     );
+}
+
+#[test]
+fn temp_dirs_are_distinct_and_empty() {
+    let first = common::temp_dir("same");
+    let second = common::temp_dir("same");
+    assert_ne!(first, second);
+    for dir in [&first, &second] {
+        assert_eq!(fs::read_dir(dir).expect("scratch dir exists").count(), 0);
+    }
+}
+
+/// Store and config fixtures used to be left in the temp dir by every run.
+#[test]
+fn temp_dirs_are_removed_when_their_thread_exits() {
+    let dir = std::thread::spawn(|| {
+        let dir = common::temp_dir("cleanup-probe");
+        fs::write(dir.join("config.toml"), "").expect("write into scratch dir");
+        dir
+    })
+    .join()
+    .expect("probe thread");
+    assert!(!dir.exists(), "{} outlived its thread", dir.display());
 }

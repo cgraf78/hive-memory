@@ -2,27 +2,15 @@ use hive_memory::config::Sensitivity;
 use hive_memory::store::{self, StoreInitOptions};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 mod common;
+use common::temp_dir;
 
 // These are intentionally filesystem-level simulations instead of tests for a
 // specific cloud vendor. The v1 contract is that independent immutable writes
 // merge, suspicious conflict copies are quarantined for manual recovery, and
 // ordinary rename propagation can be reindexed without losing searchability.
-
-fn temp_dir(name: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock after epoch")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!(
-        "hive-memory-cloud-sync-{name}-{}-{nanos}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&path).expect("create temp dir");
-    path
-}
 
 #[test]
 #[ignore = "CI runs the cloud-sync simulation explicitly"]

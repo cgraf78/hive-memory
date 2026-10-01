@@ -12,22 +12,9 @@
 use predicates::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 mod common;
-
-fn temp_dir(name: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock after epoch")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!(
-        "hive-memory-classify-eval-{name}-{}-{nanos}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&path).expect("create temp dir");
-    path
-}
+use common::temp_dir;
 
 fn init_store(root: &Path, name: &str) {
     common::hermetic_hm()

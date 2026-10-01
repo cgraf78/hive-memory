@@ -20,10 +20,12 @@ This directory contains Rust integration tests for Hive Memory.
 - `cloud_sync_sim.rs` simulates cloud sync behavior without requiring live
   credentials.
 - `hermetic_hm.rs` pins the isolation and cleanup contract of the shared
-  `common::hermetic_hm()` builder.
+  `tests/common` helpers.
 
 Use temporary stores and explicit environment overrides in tests. Do not depend
 on the developer's real `hm` database, project state, or cloud credentials.
+Create scratch directories with `common::temp_dir()` (unit tests in `src/` use
+`crate::test_support::temp_dir()`), which removes them when the test ends.
 Spawn the binary through `common::hermetic_hm()` (`tests/common/mod.rs`): it
 drops inherited `HIVE_MEMORY_*` selectors and gives each test its own fresh XDG
 config/data/state/cache sandbox, removed when the test finishes, so a spawn

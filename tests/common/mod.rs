@@ -2,7 +2,45 @@
 //!
 //! Each `tests/*.rs` file is its own crate; they pull this in with
 //! `mod common;`. Living in a subdirectory keeps Cargo from compiling it as a
-//! test target of its own.
+//! test target of its own. Every crate compiles its own copy and uses only
+//! some of the helpers, so each public helper allows `dead_code`.
+
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+
+thread_local! {
+    /// Root for this thread's `temp_dir()` scratch directories, removed with
+    /// everything under it when the thread exits.
+    static SCRATCH_ROOT: tempfile::TempDir = tempfile::Builder::new()
+        .prefix(concat!("hive-memory-", env!("CARGO_CRATE_NAME"), "-"))
+        .tempdir()
+        .expect("create scratch root");
+}
+
+/// Create a new, empty directory labelled `name` for one test's stores and
+/// configs, removed when the test ends.
+///
+/// libtest runs each test on its own thread and joins it before exiting, so
+/// tying the directory to the thread deletes it on pass or fail without every
+/// test holding a guard. Every call returns a distinct directory, even for a
+/// repeated `name`. A detached background `hm` that writes after its test ends
+/// can recreate part of one; the random names keep that harmless.
+#[allow(dead_code)]
+pub fn temp_dir(name: &str) -> PathBuf {
+    SCRATCH_ROOT.with(|root| {
+        tempfile::Builder::new()
+            .prefix(&format!("{name}-"))
+            // tempfile defaults to 0700. Keep the umask-style 0755 that the
+            // old `create_dir_all` fixtures had, so store-permission checks see
+            // an ordinary directory unless a test chmods it on purpose.
+            .permissions(std::fs::Permissions::from_mode(0o755))
+            .tempdir_in(root.path())
+            .expect("create scratch dir")
+            // The thread-scoped root owns cleanup, so the path can outlive this
+            // handle for the rest of the test.
+            .keep()
+    })
+}
 
 thread_local! {
     /// This thread's XDG sandbox. `TempDir` creates a new, uniquely named
@@ -44,6 +82,7 @@ thread_local! {
 // `clippy.toml` disallows the raw constructors everywhere else so new tests
 // cannot bypass this builder.
 #[expect(clippy::disallowed_macros)]
+#[allow(dead_code)]
 pub fn hermetic_hm() -> assert_cmd::Command {
     let mut command = assert_cmd::cargo::cargo_bin_cmd!("hm");
     for (key, _) in std::env::vars_os() {

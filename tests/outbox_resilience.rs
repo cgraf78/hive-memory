@@ -13,23 +13,9 @@
 use hive_memory::{outbox, store};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 mod common;
-
-/// Create a unique temp directory for one test.
-fn temp_dir(name: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock after epoch")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!(
-        "hive-memory-outbox-{name}-{}-{nanos}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&path).expect("create temp dir");
-    path
-}
+use common::temp_dir;
 
 /// Layout shared by every test: a config file, a data dir, and a store root.
 struct Fixture {

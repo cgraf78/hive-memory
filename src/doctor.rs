@@ -2528,18 +2528,7 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
 
-    fn doctor_temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "hm-doctor-{tag}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).expect("create temp dir");
-        dir
-    }
+    use crate::test_support::temp_dir as doctor_temp_dir;
 
     fn doctor_note(id: &str, body: &str) -> String {
         format!(

@@ -39,3 +39,6 @@ pub mod version;
 pub mod visibility;
 pub mod write;
 pub mod write_classify;
+
+#[cfg(test)]
+pub(crate) mod test_support;

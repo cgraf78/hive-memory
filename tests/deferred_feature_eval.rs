@@ -18,8 +18,11 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
+
+mod common;
+use common::temp_dir;
 
 #[derive(Debug, Deserialize)]
 struct Corpus {
@@ -549,15 +552,4 @@ fn memory_kind(value: &str) -> MemoryKind {
         "reference" => MemoryKind::Reference,
         other => panic!("unknown memory kind {other}"),
     }
-}
-
-fn temp_dir(name: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock after epoch")
-        .as_nanos();
-    let path =
-        std::env::temp_dir().join(format!("hive-memory-{name}-{}-{nanos}", std::process::id()));
-    fs::create_dir_all(&path).expect("create temp dir");
-    path
 }

@@ -41,6 +41,7 @@ This directory owns the `hm` CLI and library implementation.
   secret detection.
 - `eval.rs` owns retrieval eval corpus and fixture helpers; `version.rs`
   reports embedded build version metadata.
+- `test_support.rs` (unit tests only) owns self-cleaning scratch directories.
 
 ## Design Notes
 
