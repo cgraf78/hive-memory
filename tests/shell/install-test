@@ -17,6 +17,21 @@ HIVE_MEMORY_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 
 echo "=== Standalone release installer ==="
 
+# helpers.sh must keep the caller's BASH_ENV out of the bash stubs this suite
+# puts on PATH (see its header). Source it under a startup file that counts
+# its reads: the shell doing the sourcing reads it once, and a child bash must
+# not read it again. A clean CI environment would never notice otherwise.
+bash_env_dir=$(mktemp -d)
+CLEANUP_DIRS+=("$bash_env_dir")
+printf 'printf x >>%q\n' "$bash_env_dir/reads" >"$bash_env_dir/rc"
+# POSIXLY_CORRECT would stop bash from reading BASH_ENV at all. The child
+# shell expands its own "$1".
+# shellcheck disable=SC2016
+env -u POSIXLY_CORRECT BASH_ENV="$bash_env_dir/rc" \
+  bash -c '. "$1"; bash -c :' _ "$(dirname "$0")/helpers.sh" >/dev/null
+_assert_eq "helpers.sh: child shells do not source BASH_ENV" x \
+  "$(cat "$bash_env_dir/reads")"
+
 _sha256_file() {
   local file=$1
   if command -v sha256sum >/dev/null 2>&1; then

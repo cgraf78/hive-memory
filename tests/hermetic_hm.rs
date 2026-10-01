@@ -185,3 +185,136 @@ fn temp_dirs_are_removed_when_their_thread_exits() {
     .expect("probe thread");
     assert!(!dir.exists(), "{} outlived its thread", dir.display());
 }
+
+/// Set only on the child copy of this binary that
+/// `hostile_caller_environment_cannot_redirect_hm` spawns; it turns
+/// `hostile_env_probe` from a no-op into the real check.
+const PROBE_HOME: &str = "HM_HERMETIC_PROBE_HOME";
+
+/// Ordinary CI runs with a clean environment, so nothing else would notice if
+/// `hermetic_hm()` stopped scrubbing `HIVE_MEMORY_*` or sandboxing XDG: the
+/// only symptom would be writes into a developer's real home. Re-run this
+/// binary's probe with a caller environment aimed at a sentinel home and
+/// require that nothing lands there. Changing the process's own environment
+/// instead would race every other test in this binary.
+#[test]
+fn hostile_caller_environment_cannot_redirect_hm() {
+    let home = common::temp_dir("hostile-home");
+    // A live config where the caller's XDG_CONFIG_HOME says one is. A spawn
+    // that forgets `--config` must not find it.
+    let xdg_trap_config = home.join(".config/hive-memory/config.toml");
+    fs::create_dir_all(xdg_trap_config.parent().expect("trap config dir"))
+        .expect("create trap config dir");
+    fs::write(
+        &xdg_trap_config,
+        format!(
+            "default_store = \"trap\"\n\n[stores.trap]\nroot = \"{}\"\n",
+            home.join("xdg-trap-store").display()
+        ),
+    )
+    .expect("write XDG trap config");
+    let trap_config = home.join("trap-config.toml");
+    fs::write(
+        &trap_config,
+        format!(
+            "default_store = \"trap\"\n\n[stores.trap]\nroot = \"{}\"\n",
+            home.join("trap-store").display()
+        ),
+    )
+    .expect("write trap config");
+
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+        .args(["--exact", "hostile_env_probe", "--test-threads=1"])
+        .env(PROBE_HOME, &home)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env("HIVE_MEMORY_CONFIG", &trap_config)
+        .env("HIVE_MEMORY_STORE", "trap")
+        .output()
+        .expect("run probe");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "probe failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Only the traps planted above may exist; anything else was written by a
+    // spawned process.
+    let planted = [
+        trap_config.clone(),
+        home.join(".config"),
+        home.join(".config/hive-memory"),
+        xdg_trap_config.clone(),
+    ];
+    let mut leaked = Vec::new();
+    let mut pending = vec![home.clone()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir).expect("read sentinel home") {
+            let path = entry.expect("sentinel home entry").path();
+            if path.is_dir() {
+                pending.push(path.clone());
+            }
+            if !planted.contains(&path) {
+                leaked.push(path);
+            }
+        }
+    }
+    assert!(
+        leaked.is_empty(),
+        "a spawned process wrote into the caller's home: {leaked:?}"
+    );
+}
+
+/// The child half of `hostile_caller_environment_cannot_redirect_hm`: run
+/// commands that write the store manifest, a record, and the XDG-fallback
+/// data, state, and cache, from a config that sets none of those directories,
+/// then one that forgets `--config`.
+#[test]
+fn hostile_env_probe() {
+    if std::env::var_os(PROBE_HOME).is_none() {
+        return;
+    }
+    let dir = common::temp_dir("probe");
+    let store = dir.join("store");
+    let config = dir.join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "default_store = \"personal\"\n\n[stores.personal]\nroot = \"{}\"\n",
+            store.display()
+        ),
+    )
+    .expect("write probe config");
+    let config = config.to_str().expect("utf8 config");
+    let store = store.to_str().expect("utf8 store");
+    for args in [
+        vec!["stores", "init", "personal", "--root", store],
+        vec!["--config", config, "remember", "--text", "probe fact"],
+        vec!["--config", config, "search", "probe"],
+        vec!["--config", config, "refresh", "--force"],
+    ] {
+        common::hermetic_hm().args(&args).assert().success();
+    }
+
+    // With `HIVE_MEMORY_CONFIG` scrubbed and XDG sandboxed, a forgotten
+    // `--config` finds neither the caller's env-selected config nor their XDG
+    // one, and fails instead of reading or writing a trap store.
+    let home = std::env::var_os(PROBE_HOME).expect("probe home");
+    let forgot = common::hermetic_hm()
+        .args(["stores", "list"])
+        .output()
+        .expect("run hm without --config");
+    let stderr = String::from_utf8_lossy(&forgot.stderr);
+    assert!(
+        !forgot.status.success() && stderr.contains("failed to read config"),
+        "a spawn without --config must find no config: {stderr}"
+    );
+    assert!(
+        !stderr.contains(&*Path::new(&home).to_string_lossy()),
+        "a spawn without --config looked in the caller's home: {stderr}"
+    );
+}
