@@ -22,3 +22,8 @@ This directory contains Rust integration tests for Hive Memory.
 
 Use temporary stores and explicit environment overrides in tests. Do not depend
 on the developer's real `hm` database, project state, or cloud credentials.
+Spawn the binary through `common::hermetic_hm()` (`tests/common/mod.rs`): it
+drops inherited `HIVE_MEMORY_*` selectors and gives each test its own XDG
+config/data/state/cache sandbox, so a spawn that forgets `--config` cannot
+read the developer's live config. The shell suites unset `BASH_ENV` in `helpers.sh` so
+their bash stubs never source the caller's startup file.

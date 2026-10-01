@@ -699,8 +699,13 @@ Local triage index:
   `{id, store_id, entry_kind, scope, project_id, audience, tags, subject,
   confidence, kind, classified, agent_id, host_id, created_at, body, note_path,
   event_path}`.
-- Rebuilt on `hm flush` and lazily on read commands when the inbox directory's
-  recursive mtime/inode marker has changed since the last build.
+- Rebuilt on `hm flush` and lazily on read commands when the canonical-file
+  marker has changed since the last build. The marker combines directory
+  mtimes, the file count, the newest file mtime, and an order-independent hash
+  of every canonical file's (store-relative path, size, mtime), so an in-place
+  rewrite delivered by mtime-preserving cloud sync invalidates it even when no
+  directory mtime moves. File contents are never read for freshness; an edit
+  that keeps both the old size and the old mtime needs `hm refresh`.
 - NOT full-text search — search still reads matched lines from the underlying
   files. The index exists to make `hm context` and filter operations fast.
 - Always rebuildable from canonical files. Deletion is harmless.

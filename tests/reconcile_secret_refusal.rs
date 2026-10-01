@@ -10,11 +10,12 @@
 //! promotes through the same fake backend, proving the guard is the thing
 //! rejecting the secret, not a broken backend.
 
-use assert_cmd::cargo::cargo_bin_cmd;
 use predicates::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+mod common;
 
 fn temp_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -30,7 +31,7 @@ fn temp_dir(name: &str) -> PathBuf {
 }
 
 fn init_store(root: &Path, name: &str) {
-    cargo_bin_cmd!("hm")
+    common::hermetic_hm()
         .args([
             "stores",
             "init",
@@ -139,7 +140,7 @@ fn reconcile_refuses_secret_candidate_and_writes_nothing() {
     init_store(&personal, "personal");
 
     let secret = format!("aws key for the deploy bot: {}", aws_access_key());
-    cargo_bin_cmd!("hm")
+    common::hermetic_hm()
         .args([
             "--config",
             config.to_str().expect("utf8 config"),
@@ -154,7 +155,7 @@ fn reconcile_refuses_secret_candidate_and_writes_nothing() {
 
     // Nothing durable was written: a default (non-inbox) search finds no record,
     // and no outbox item was enqueued either.
-    cargo_bin_cmd!("hm")
+    common::hermetic_hm()
         .args([
             "--config",
             config.to_str().expect("utf8 config"),
@@ -182,7 +183,7 @@ fn reconcile_refuses_password_assignment_candidate() {
 
     // A `key = value` secret with a realistic value (the `secret-assignment`
     // detector). Use `--text` here to exercise the non-stdin path too.
-    cargo_bin_cmd!("hm")
+    common::hermetic_hm()
         .args([
             "--config",
             config.to_str().expect("utf8 config"),
@@ -196,7 +197,7 @@ fn reconcile_refuses_password_assignment_candidate() {
             "refusing to reconcile a candidate that looks like a secret",
         ));
 
-    cargo_bin_cmd!("hm")
+    common::hermetic_hm()
         .args([
             "--config",
             config.to_str().expect("utf8 config"),
@@ -220,7 +221,7 @@ fn reconcile_accepts_normal_candidate_through_same_backend() {
     write_capture_config(&config, &dir, &personal, &backend);
     init_store(&personal, "personal");
 
-    cargo_bin_cmd!("hm")
+    common::hermetic_hm()
         .args([
             "--config",
             config.to_str().expect("utf8 config"),
@@ -232,7 +233,7 @@ fn reconcile_accepts_normal_candidate_through_same_backend() {
         .success()
         .stdout(predicate::str::contains("add: wrote"));
 
-    cargo_bin_cmd!("hm")
+    common::hermetic_hm()
         .args([
             "--config",
             config.to_str().expect("utf8 config"),
@@ -267,7 +268,7 @@ fn capture_promote_drops_secret_fact_but_promotes_normal_one() {
     write_capture_config(&config, &dir, &personal, &backend);
     init_store(&personal, "personal");
 
-    cargo_bin_cmd!("hm")
+    common::hermetic_hm()
         .args([
             "--config",
             config.to_str().expect("utf8 config"),
@@ -282,7 +283,7 @@ fn capture_promote_drops_secret_fact_but_promotes_normal_one() {
         .stdout(predicate::str::contains("promoted 1 captured fact(s)"));
 
     // The normal fact is durable memory; the secret was never written.
-    cargo_bin_cmd!("hm")
+    common::hermetic_hm()
         .args([
             "--config",
             config.to_str().expect("utf8 config"),
@@ -294,7 +295,7 @@ fn capture_promote_drops_secret_fact_but_promotes_normal_one() {
         .stdout(predicate::str::contains(
             "the user prefers ripgrep for searching",
         ));
-    cargo_bin_cmd!("hm")
+    common::hermetic_hm()
         .args([
             "--config",
             config.to_str().expect("utf8 config"),

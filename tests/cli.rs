@@ -6,22 +6,14 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod common;
+
+// Every `hm` this suite spawns goes through the shared hermetic builder, which
+// scrubs inherited `HIVE_MEMORY_*` selectors and sandboxes the XDG base dirs.
 macro_rules! cargo_bin_cmd {
-    ("hm") => {{
-        let mut command = assert_cmd::cargo::cargo_bin_cmd!("hm");
-        let thread = std::thread::current();
-        let test_name = thread.name().unwrap_or("unnamed-cli-test");
-        let sandbox = std::env::temp_dir().join(format!(
-            "hive-memory-cli-xdg-{}-{}",
-            std::process::id(),
-            hive_memory::hash::sha256_hex(test_name.as_bytes())
-        ));
-        command
-            .env("XDG_DATA_HOME", sandbox.join("data"))
-            .env("XDG_STATE_HOME", sandbox.join("state"))
-            .env("XDG_CACHE_HOME", sandbox.join("cache"));
-        command
-    }};
+    ("hm") => {
+        common::hermetic_hm()
+    };
 }
 
 fn temp_dir(name: &str) -> PathBuf {
