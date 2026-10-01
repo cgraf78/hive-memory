@@ -31,6 +31,15 @@ use time::OffsetDateTime;
 // canonical-free lifecycle hook reads. Bumped to 12 when the header began
 // authenticating the entry-row count, row content, and header-resident local
 // projection so damage cannot be silently accepted as a complete generation.
+//
+// Deliberately NOT bumped when the per-file combine widened from names to
+// (path, size, mtime): the combined value changes for every non-empty store,
+// so every older cache already fails the freshness comparison and is rebuilt
+// once. Keeping 12 lets an older and a newer `hm` on the same host (mid
+// auto-update) keep serving each other's generation as a stale-while-
+// revalidate hook view instead of treating it as unreadable. While both run,
+// each still rebuilds whenever it reads the other's generation; that costs
+// one canonical parse per alternation and ends when the old binary is gone.
 const INDEX_FINGERPRINT_SCHEMA_VERSION: u32 = 12;
 
 /// Format version for the embedded index header line.
@@ -201,7 +210,9 @@ pub struct LocalIndexProjection {
 struct IndexFingerprint {
     // This is intentionally a cache schema, not a store schema. Bump it when
     // freshness semantics change so stale sidecars are rebuilt instead of being
-    // silently trusted across releases.
+    // silently trusted across releases. A change that already alters a field's
+    // value for every non-empty store (see the v12 note on the constant) may
+    // skip the bump, since no older cache can compare equal anyway.
     schema_version: u32,
     // Local cache directories can be shared by tests, alternate configs, and
     // renamed store aliases. Keep the root in the fingerprint as a second guard
@@ -218,15 +229,21 @@ struct IndexFingerprint {
     // file, which the OS dirent cache already warms during enumeration).
     canonical_files: usize,
     latest_file_modified_nanos: u128,
-    // Order-independent combine (XOR) of a cheap hash of each canonical file's
-    // store-relative path. File count + newest mtime miss the cloud-sync case
-    // where a delete+add nets the SAME count and the added file's mtime is <=
-    // the prior newest (mtime-preserving sync): both signals stay identical, so
-    // the cache is served stale and the new note is invisible until `hm refresh`.
-    // Folding the path-set membership in makes the fingerprint sensitive to WHICH
-    // files exist, not just how many. The names are already in hand from
-    // enumeration, so this adds no stat or file read — just a hash per dirent.
-    canonical_names_combined: u64,
+    // Order-independent combine of a hash of each canonical file's
+    // (store-relative path, size, mtime). Count + newest mtime are aggregates
+    // that cloud sync slips past: rclone/Drive preserve the writer's mtime and
+    // Drive folder mtimes never move, so a delete+add netting the same count,
+    // or an in-place rewrite (retag, classifier) whose mtime is older than some
+    // other file, left every aggregate unchanged and the cache served the old
+    // record until `hm refresh`. Per-file mtime catches any rewrite that carries
+    // the writer's fresh mtime; size additionally catches one whose mtime looks
+    // untouched. Path, size, and mtime all come from the stat the walk already
+    // does, so this adds no syscall and no file read.
+    //
+    // The serialized key keeps its pre-widening name so older and newer `hm`
+    // binaries can still parse each other's headers (see the schema comment).
+    #[serde(rename = "canonical_names_combined")]
+    canonical_files_combined: u64,
     entity_registry_modified_nanos: u128,
 }
 
@@ -411,10 +428,11 @@ fn lock_path_matches_file(_file: &File, _path: &Path) -> std::io::Result<bool> {
 ///
 /// Context and search run on latency-sensitive hook paths. They should pay for
 /// full Markdown/event parsing only when canonical inbox files changed; the
-/// embedded-header fingerprint uses directory + file metadata so hot reads do
-/// not stat every note for content. That catches create/delete/rename/replace
-/// changes cheaply; content-only manual edits rely on explicit `hm refresh`,
-/// which is the same maintenance path hooks already run after writes.
+/// embedded-header fingerprint uses directory + per-file metadata (path, size,
+/// mtime) so hot reads never open notes. That catches create/delete/rename and
+/// in-place rewrites, including ones delivered by mtime-preserving cloud sync;
+/// only an edit that keeps both the old size and the old mtime relies on an
+/// explicit `hm refresh`, the same maintenance path hooks run after writes.
 ///
 /// Concurrent rebuilds of the same store are serialized by a cache-key-scoped
 /// advisory lock so two sessions cannot redundantly scan the store or fight over
@@ -1445,26 +1463,45 @@ fn collect_note_paths(root: &Path, paths: &mut Vec<PathBuf>) -> Result<(), Index
 ///
 /// Folding file count and max file mtime in here keeps the freshness signal to
 /// ONE directory traversal: directory mtime catches most create/delete/rename
-/// changes cheaply, and the file count + newest file mtime catch in-place
-/// replaces and the cloud-sync case where a file lands under a date dir whose
-/// own mtime is preserved. The XOR-combined name hash additionally catches a
-/// delete+add that nets the same count under an mtime-preserving sync, where
-/// neither count nor newest mtime would move. We deliberately stop short of
-/// per-file content hashing, which would re-read every note on the hot path.
+/// changes cheaply, and the file count + newest file mtime catch the case where
+/// a file lands under a date dir whose own mtime is preserved. The combined
+/// per-file (path, size, mtime) hash catches what those aggregates cannot see
+/// under mtime-preserving sync: a same-count delete+add, a cross-directory
+/// move, and an in-place rewrite of any file that is not the newest.
+///
+/// We deliberately stop short of content hashing and ctime. Hashing would read
+/// every note on every hot-path check, and on a streaming FUSE mount (rclone,
+/// which is how Drive is mounted on Linux) an uncached read is a network
+/// download. ctime adds nothing there (rclone reports ctime == mtime) and on
+/// macOS File Provider it moves for materialization, eviction, and xattr
+/// updates that do not change content, which would turn hot reads into
+/// spurious rebuilds. The only rewrite this misses keeps BOTH the old size and
+/// the old mtime. `hm` writers always stamp a fresh mtime, so on filesystems
+/// with sub-second mtimes (ext4, APFS, Drive's millisecond metadata) that takes
+/// deliberate mtime restoration; on coarse ones (HFS+, exFAT) a same-size
+/// rewrite within the same second can also slip by. `hm refresh` repairs both.
 #[derive(Default)]
 struct CanonicalScan {
+    // Byte length of the store root path, so per-file hashing covers only the
+    // store-relative suffix of each joined path (the root is fingerprinted
+    // separately and need not be rehashed per file).
+    root_len: usize,
     dirs: usize,
     files: usize,
     latest_directory_modified_nanos: u128,
     latest_file_modified_nanos: u128,
-    // Running XOR of each file's name hash. XOR is order-independent, so the
-    // value depends on the file SET and not on enumeration order; a delete+add
-    // that swaps one file for a differently-named one flips it.
-    names_combined: u64,
+    // Wrapping sum of each file's identity hash. Addition is order-independent,
+    // so the value depends on the file SET and not on enumeration order. Unlike
+    // XOR it does not cancel equal terms pairwise, and the per-file hash is
+    // fully mixed, so an accidental collision needs a ~2^-64 coincidence.
+    files_combined: u64,
 }
 
 fn canonical_fingerprint(store_root: &Path) -> Result<IndexFingerprint, IndexError> {
-    let mut scan = CanonicalScan::default();
+    let mut scan = CanonicalScan {
+        root_len: store_root.as_os_str().as_encoded_bytes().len(),
+        ..CanonicalScan::default()
+    };
     collect_canonical(&store_root.join("inbox/notes"), &mut scan)?;
     collect_canonical(&store_root.join("inbox/events"), &mut scan)?;
     collect_canonical(&store_root.join("rules"), &mut scan)?;
@@ -1480,13 +1517,15 @@ fn canonical_fingerprint(store_root: &Path) -> Result<IndexFingerprint, IndexErr
         // invalidates the cache (file-SET membership, not just file count).
         // v11: publishes curated records, project aliases, and entity aliases
         // in the atomic local projection used by lifecycle hooks.
+        // v12 (unbumped widening): the per-file combine hashes (path, size,
+        // mtime) so synced in-place rewrites invalidate the cache.
         schema_version: INDEX_FINGERPRINT_SCHEMA_VERSION,
         store_root: store_root.display().to_string(),
         canonical_dirs: scan.dirs,
         latest_directory_modified_nanos: scan.latest_directory_modified_nanos,
         canonical_files: scan.files,
         latest_file_modified_nanos: scan.latest_file_modified_nanos,
-        canonical_names_combined: scan.names_combined,
+        canonical_files_combined: scan.files_combined,
         entity_registry_modified_nanos: optional_modified_nanos(&store_root.join("entities.toml"))?,
     })
 }
@@ -1549,17 +1588,23 @@ fn collect_canonical(root: &Path, scan: &mut CanonicalScan) -> Result<(), IndexE
                 Err(err) => return Err(io_error("read canonical file metadata", &path, err)),
             };
             scan.files += 1;
-            // Fold the file's identity (its name) into the set membership signal.
-            // The name is already in hand from enumeration, so this is just a
-            // hash — no stat, no read. XOR keeps the combine order-independent.
-            scan.names_combined ^= name_hash(&entry.file_name());
             // One extra stat per file. The dirent is already warm from
             // enumeration, so this stays cheap relative to a full note re-read,
             // and it is what lets an mtime-preserving cloud-sync arrival be seen.
-            scan.latest_file_modified_nanos = scan.latest_file_modified_nanos.max(modified_nanos(
+            let modified = modified_nanos(
                 file_metadata
                     .modified()
                     .map_err(|err| io_error("read canonical file modified time", &path, err))?,
+            );
+            scan.latest_file_modified_nanos = scan.latest_file_modified_nanos.max(modified);
+            // Every walked path is `store_root.join(..)`, so slicing off the
+            // root bytes leaves the store-relative path.
+            let path_bytes = path.as_os_str().as_encoded_bytes();
+            let relative = path_bytes.get(scan.root_len..).unwrap_or(path_bytes);
+            scan.files_combined = scan.files_combined.wrapping_add(file_identity_hash(
+                relative,
+                file_metadata.len(),
+                modified,
             ));
         }
     }
@@ -1572,21 +1617,33 @@ fn modified_nanos(time: SystemTime) -> u128 {
         .unwrap_or(0)
 }
 
-/// Cheap, stable 64-bit hash of a canonical file's name (FNV-1a over the raw
-/// `OsStr` bytes via its lossy UTF-8 view). Used only to give the freshness
-/// fingerprint sensitivity to file-set membership; it never needs to be
-/// cryptographic, just well-distributed and deterministic across runs so a
-/// delete+add of differently-named files flips the XOR combine. Note names are
-/// ULID-stamped (`note-<ulid>.md`), so even content-identical notes hash apart.
-fn name_hash(name: &std::ffi::OsStr) -> u64 {
+/// Cheap, stable 64-bit hash of one canonical file's identity: its
+/// store-relative path bytes, size, and mtime.
+///
+/// FNV-1a over the bytes, then the MurmurHash3 64-bit finalizer so a change
+/// in the trailing size/mtime bytes avalanches across the whole word; the
+/// additive combine relies on per-file hashes looking independent. It never
+/// needs to be cryptographic (the cache is local and not adversarial), only
+/// deterministic: `std`'s `DefaultHasher` is avoided because its algorithm may
+/// change between Rust releases, which would make every toolchain bump look
+/// like a canonical change.
+fn file_identity_hash(relative_path: &[u8], size: u64, modified_nanos: u128) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = FNV_OFFSET;
-    for byte in name.to_string_lossy().as_bytes() {
+    // Size and mtime are fixed-width, so two equal-length inputs can only
+    // match byte-for-byte if path, size, and mtime all match; no separator.
+    let size = size.to_le_bytes();
+    let modified = modified_nanos.to_le_bytes();
+    for byte in [relative_path, &size, &modified].into_iter().flatten() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(FNV_PRIME);
     }
-    hash
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    hash ^ (hash >> 33)
 }
 
 fn relative_path(root: &Path, path: &Path, path_case: memory_path::PathCase) -> String {
@@ -2545,7 +2602,7 @@ mod tests {
         .expect("rebuild");
 
         assert_eq!(fingerprint.canonical_files, 0);
-        assert_eq!(fingerprint.canonical_names_combined, 0);
+        assert_eq!(fingerprint.canonical_files_combined, 0);
         assert!(report.entries.is_empty());
         assert!(report.projection.entries.is_empty());
         assert!(report.warnings.is_empty());
@@ -2554,9 +2611,8 @@ mod tests {
     /// A delete+add that nets the SAME file count, under an mtime-preserving
     /// cloud-sync arrival where the added file's mtime is <= the prior newest,
     /// leaves dir count, file count, and newest mtime all unchanged. Only the
-    /// per-file name-hash combine moves, so without it the cache would be served
-    /// stale and the new note invisible until `hm refresh`. This is the real
-    /// false-negative the v10 name signal exists to close.
+    /// per-file combine moves, so without it the cache would be served stale and
+    /// the new note invisible until `hm refresh`.
     #[test]
     fn freshness_detects_same_count_file_swap_under_preserved_mtime() {
         let dir = temp_dir("freshness-file-swap");
@@ -2602,8 +2658,8 @@ mod tests {
             "B's mtime must equal A's so the mtime signal cannot move"
         );
         assert_ne!(
-            before.canonical_names_combined, after.canonical_names_combined,
-            "the name-hash combine must change so the swap is visible"
+            before.canonical_files_combined, after.canonical_files_combined,
+            "the per-file combine must change so the swap is visible"
         );
         assert_ne!(
             before, after,
@@ -2623,7 +2679,7 @@ mod tests {
             latest_directory_modified_nanos: 42,
             canonical_files: 10,
             latest_file_modified_nanos: 42,
-            canonical_names_combined: 0,
+            canonical_files_combined: 0,
             entity_registry_modified_nanos: 0,
         };
         let one_more_file = IndexFingerprint {
@@ -2631,6 +2687,175 @@ mod tests {
             ..base.clone()
         };
         assert_ne!(base, one_more_file);
+    }
+
+    fn set_mtime(path: &Path, mtime: SystemTime) {
+        // Directories open read-only on Unix; futimens only needs ownership.
+        File::open(path)
+            .or_else(|_| File::options().write(true).open(path))
+            .expect("open for set_times")
+            .set_times(fs::FileTimes::new().set_modified(mtime))
+            .expect("set mtime");
+    }
+
+    fn mtime(path: &Path) -> SystemTime {
+        fs::metadata(path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime")
+    }
+
+    /// Record the mtime of every directory and file under `root`.
+    fn snapshot_mtimes(root: &Path) -> BTreeMap<PathBuf, SystemTime> {
+        let mut out = BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(path) = pending.pop() {
+            out.insert(path.clone(), mtime(&path));
+            if path.is_dir() {
+                for entry in fs::read_dir(&path).expect("read dir") {
+                    pending.push(entry.expect("dir entry").path());
+                }
+            }
+        }
+        out
+    }
+
+    /// Put back the recorded mtimes of every path that still exists.
+    ///
+    /// This models what a peer machine observes after rclone/Drive delivers an
+    /// in-place rewrite: the file keeps the mtime the writer gave it (here the
+    /// recorded one, the worst case) and Drive folder mtimes never move.
+    fn restore_mtimes(snapshot: &BTreeMap<PathBuf, SystemTime>) {
+        // Children first so restoring a file cannot disturb its parent again.
+        for (path, recorded) in snapshot.iter().rev() {
+            if path.exists() {
+                set_mtime(path, *recorded);
+            }
+        }
+    }
+
+    fn retag_scope(root: &Path, written: &memory::WriteRecordResult, scope: &str) {
+        memory::retag_record(memory::RetagRecordInput {
+            root,
+            note_path: &relative_path(root, &written.note_path, memory_path::PathCase::Sensitive),
+            update_kind: false,
+            kind: None,
+            scope: Some(scope.to_owned()),
+            project_id: None,
+            classified: memory::ClassifiedUpdate::Keep,
+            options: options(),
+        })
+        .expect("retag record");
+    }
+
+    fn scope_of(report: &LoadIndexReport, id: &str) -> String {
+        report
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.scope.clone())
+            .expect("entry present")
+    }
+
+    /// HM-1: a retag that narrows a record on another machine arrives by sync
+    /// as an in-place rewrite. Even when every file and directory mtime looks
+    /// untouched afterwards (the worst case of mtime-preserving sync), the
+    /// rewritten bytes change the file size, so the cached index must not keep
+    /// serving the old, wider scope.
+    #[test]
+    fn synced_rewrite_with_preserved_mtimes_invalidates_index() {
+        let dir = temp_dir("synced-rewrite-preserved-mtime");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        let written = write_record(&root, true);
+        let first = load_or_rebuild_index(load_input("personal", &root, &cache)).expect("first");
+        assert_eq!(scope_of(&first, &written.id), "global");
+
+        let snapshot = snapshot_mtimes(&root);
+        retag_scope(&root, &written, "project");
+        restore_mtimes(&snapshot);
+
+        let second = load_or_rebuild_index(load_input("personal", &root, &cache)).expect("second");
+        assert_eq!(
+            scope_of(&second, &written.id),
+            "project",
+            "the cached index must not serve the pre-rewrite scope"
+        );
+        assert!(
+            second.rebuilt,
+            "the synced rewrite must invalidate the cache"
+        );
+    }
+
+    /// The realistic sync shape: the writer's rewrite carries a NEW mtime, but
+    /// a sibling written later (or by a host with a fast clock) is still the
+    /// newest file, the size is unchanged (equal-length scope swap), and the
+    /// date directories keep their mtimes. Only the per-file mtime moves.
+    #[test]
+    fn synced_same_size_rewrite_older_than_newest_file_invalidates_index() {
+        let dir = temp_dir("synced-rewrite-same-size");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        let rewritten = write_record(&root, true);
+        let newest = write_record(&root, true);
+        let base = mtime(&rewritten.note_path);
+        let far = base + std::time::Duration::from_secs(3600);
+        set_mtime(&newest.note_path, far);
+        set_mtime(newest.event_path.as_deref().expect("event"), far);
+        let first = load_or_rebuild_index(load_input("personal", &root, &cache)).expect("first");
+        assert_eq!(scope_of(&first, &rewritten.id), "global");
+
+        let snapshot = snapshot_mtimes(&root);
+        let note_size = fs::metadata(&rewritten.note_path).expect("note").len();
+        retag_scope(&root, &rewritten, "narrow");
+        assert_eq!(
+            fs::metadata(&rewritten.note_path).expect("note").len(),
+            note_size,
+            "the equal-length scope swap must keep the note size"
+        );
+        restore_mtimes(&snapshot);
+        let synced = base + std::time::Duration::from_secs(60);
+        set_mtime(&rewritten.note_path, synced);
+        set_mtime(rewritten.event_path.as_deref().expect("event"), synced);
+
+        let second = load_or_rebuild_index(load_input("personal", &root, &cache)).expect("second");
+        assert_eq!(
+            scope_of(&second, &rewritten.id),
+            "narrow",
+            "the cached index must not serve the pre-rewrite scope"
+        );
+        assert!(
+            second.rebuilt,
+            "the synced rewrite must invalidate the cache"
+        );
+    }
+
+    /// Moving a curated file between canonical directories keeps its name,
+    /// size, and mtime. File identity is the store-relative path, so the move
+    /// must still change the fingerprint when directory mtimes do not move.
+    #[test]
+    fn fingerprint_detects_same_name_move_between_directories() {
+        let dir = temp_dir("fingerprint-same-name-move");
+        let root = dir.join("store");
+        fs::create_dir_all(root.join("rules")).expect("rules dir");
+        fs::create_dir_all(root.join("memories")).expect("memories dir");
+        fs::write(root.join("rules/shared.md"), "curated").expect("rule");
+        let before = canonical_fingerprint(&root).expect("before");
+
+        let snapshot = snapshot_mtimes(&root);
+        fs::rename(
+            root.join("rules/shared.md"),
+            root.join("memories/shared.md"),
+        )
+        .expect("move curated file");
+        restore_mtimes(&snapshot);
+        set_mtime(
+            &root.join("memories/shared.md"),
+            snapshot[&root.join("rules/shared.md")],
+        );
+
+        let after = canonical_fingerprint(&root).expect("after");
+        assert_ne!(before, after, "a cross-directory move must be visible");
     }
 
     #[test]

@@ -100,6 +100,98 @@ fn cloud_renamed_notes_are_reindexed() {
     assert!(search.contains("renamed-by-cloud.md"));
 }
 
+/// A retag on host A arrives at host B as an in-place rewrite carrying A's
+/// mtime, older than B's own newest note, under date folders whose mtimes the
+/// cloud never moves. B's warm read path (no `hm refresh`) must stop serving
+/// the record at its old, wider scope.
+#[test]
+#[ignore = "CI runs the cloud-sync simulation explicitly"]
+fn synced_retag_narrows_peer_search_without_refresh() {
+    let dir = temp_dir("synced-retag");
+    let host_a = dir.join("host-a");
+    let host_b = dir.join("host-b");
+    init_store(&host_a);
+    // Separate config dirs give each host its own local cache, as on real
+    // machines; only the store tree is shared through "sync".
+    fs::create_dir_all(dir.join("a")).expect("host A config dir");
+    fs::create_dir_all(dir.join("b")).expect("host B config dir");
+    let config_a = write_config(&dir.join("a/config.toml"), &host_a);
+    let config_b = write_config(&dir.join("b/config.toml"), &host_b);
+
+    let remembered = hm_stdout(
+        &config_a,
+        [
+            "remember",
+            "--scope",
+            "global",
+            "--project-id",
+            "repo-alpha",
+            "--text",
+            "synced retag narrows Cedar policy memory",
+            "--json",
+        ],
+    );
+    let remembered: serde_json::Value = serde_json::from_str(&remembered).expect("remember json");
+    let id = remembered["id"].as_str().expect("memory id").to_owned();
+    copy_tree(&host_a, &host_b);
+    hm(&config_a, ["retag", &id, "--scope", "project"]);
+    // B writes after A's retag but before sync delivers it, so B's own note is
+    // the newest file and A's preserved retag mtime cannot move that aggregate.
+    hm(
+        &config_b,
+        ["remember", "--text", "host B writes a newer note"],
+    );
+    let peer_search = ["search", "Cedar policy", "--scope", "global"];
+    assert!(hm_stdout(&config_b, peer_search).contains("hits: 1"));
+
+    sync_rewrites(&host_a, &host_b);
+
+    assert!(
+        hm_stdout(&config_b, peer_search).contains("hits: 0"),
+        "host B must not keep serving the pre-retag global scope"
+    );
+}
+
+/// Deliver files that exist on both hosts but differ, the way rclone/Drive
+/// does: overwrite in place, keep the source mtime, leave folder mtimes alone.
+fn sync_rewrites(source: &Path, destination: &Path) {
+    for entry in fs::read_dir(source).expect("read sync source") {
+        let entry = entry.expect("sync entry");
+        let from = entry.path();
+        let to = destination.join(entry.file_name());
+        if entry.file_type().expect("sync file type").is_dir() {
+            if to.is_dir() {
+                sync_rewrites(&from, &to);
+            }
+            continue;
+        }
+        if !to.is_file() || fs::read(&from).ok() == fs::read(&to).ok() {
+            continue;
+        }
+        let parent = to.parent().expect("sync parent");
+        let parent_mtime = modified(parent);
+        fs::write(&to, fs::read(&from).expect("read synced file")).expect("rewrite synced file");
+        set_modified(&to, modified(&from));
+        set_modified(parent, parent_mtime);
+    }
+}
+
+fn modified(path: &Path) -> SystemTime {
+    fs::metadata(path)
+        .expect("metadata")
+        .modified()
+        .expect("mtime")
+}
+
+fn set_modified(path: &Path, mtime: SystemTime) {
+    // Directories open read-only on Unix; futimens only needs ownership.
+    fs::File::open(path)
+        .or_else(|_| fs::File::options().write(true).open(path))
+        .expect("open for set_times")
+        .set_times(fs::FileTimes::new().set_modified(mtime))
+        .expect("set mtime");
+}
+
 fn init_store(root: &Path) {
     store::init_store(&StoreInitOptions {
         name: "personal".to_owned(),

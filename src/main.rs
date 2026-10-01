@@ -1950,8 +1950,8 @@ fn rebuild_store_index(config: &Config, store_name: &str) -> Result<index::LoadI
     };
     // Read commands share one hot-path loader. It validates a cheap canonical
     // file fingerprint before reusing JSONL so hooks do not parse thousands of
-    // notes on every session boundary, while file create/delete/rename changes
-    // still invalidate the cache on the next read.
+    // notes on every session boundary, while file create/delete/rename and
+    // in-place rewrite changes still invalidate the cache on the next read.
     let report = index::load_or_rebuild_index(index::LoadIndexInput {
         store_name,
         store_root: &store_config.root,
