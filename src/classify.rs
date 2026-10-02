@@ -572,15 +572,7 @@ mod tests {
         }
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "hive-memory-classify-{name}-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).expect("create temp dir");
-        path
-    }
+    use crate::test_support::temp_dir;
 
     #[test]
     fn pending_selects_unreviewed_and_stale_llm_versions() {

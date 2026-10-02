@@ -54,6 +54,8 @@ fn env_commit(name: &str) -> Option<String> {
 fn git_commit() -> Option<String> {
     let output = Command::new("git")
         .args(["rev-parse", "HEAD"])
+        // `git` on PATH may be a bash wrapper script; see `build_version`.
+        .env_remove("BASH_ENV")
         .output()
         .ok()?;
     if !output.status.success() {
@@ -84,6 +86,9 @@ fn build_version(commit: &str) -> String {
     let output = Command::new("bash")
         .arg("scripts/release-version.sh")
         .env("HIVE_MEMORY_BUILD_COMMIT", commit)
+        // A non-interactive bash sources the caller's BASH_ENV first, and a
+        // startup file that prints anything corrupts the captured version.
+        .env_remove("BASH_ENV")
         .output()
         .unwrap_or_else(|error| panic!("failed to run scripts/release-version.sh: {error}"));
 

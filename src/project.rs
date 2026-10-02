@@ -1031,20 +1031,8 @@ fn short_hash(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock after epoch")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "hive-memory-project-{name}-{}-{nanos}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&path).expect("create temp dir");
-        path
-    }
+    use crate::test_support::temp_dir;
 
     #[test]
     fn normalizes_common_git_url_forms() {

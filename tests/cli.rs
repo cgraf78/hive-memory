@@ -3,10 +3,10 @@ use hive_memory::{hook as memory_hook, outbox, store};
 use predicates::prelude::*;
 use std::fs::{self, OpenOptions};
 use std::path::PathBuf;
-use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 mod common;
+use common::temp_dir;
 
 // Every `hm` this suite spawns goes through the shared hermetic builder, which
 // scrubs inherited `HIVE_MEMORY_*` selectors and sandboxes the XDG base dirs.
@@ -14,19 +14,6 @@ macro_rules! cargo_bin_cmd {
     ("hm") => {
         common::hermetic_hm()
     };
-}
-
-fn temp_dir(name: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock after epoch")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!(
-        "hive-memory-cli-{name}-{}-{nanos}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&path).expect("create temp dir");
-    path
 }
 
 fn write_config(
@@ -5796,12 +5783,12 @@ fn remember_project_hint_feeds_project_context() {
     init_store(&personal, "personal");
     fs::create_dir_all(file.parent().expect("file parent")).expect("repo src");
     fs::write(&file, "// source\n").expect("source file");
-    let init = Command::new("git")
+    let init = common::git()
         .args(["-C", repo.to_str().expect("utf8 repo"), "init"])
         .output()
         .expect("git init");
     assert!(init.status.success());
-    let remote = Command::new("git")
+    let remote = common::git()
         .args([
             "-C",
             repo.to_str().expect("utf8 repo"),
@@ -5865,12 +5852,12 @@ fn remember_project_hint_infers_project_scope_and_kind() {
     init_store(&personal, "personal");
     fs::create_dir_all(file.parent().expect("file parent")).expect("repo src");
     fs::write(&file, "// source\n").expect("source file");
-    let init = Command::new("git")
+    let init = common::git()
         .args(["-C", repo.to_str().expect("utf8 repo"), "init"])
         .output()
         .expect("git init");
     assert!(init.status.success());
-    let remote = Command::new("git")
+    let remote = common::git()
         .args([
             "-C",
             repo.to_str().expect("utf8 repo"),
@@ -5926,7 +5913,7 @@ fn remember_explicit_project_defaults_to_project_scope_for_generic_text() {
     write_config(&config, &personal, &work);
     init_store(&personal, "personal");
     fs::create_dir_all(&repo).expect("repo dir");
-    let init = Command::new("git")
+    let init = common::git()
         .args(["-C", repo.to_str().expect("utf8 repo"), "init"])
         .output()
         .expect("git init");
@@ -5964,7 +5951,7 @@ fn remember_ambient_project_hint_keeps_generic_preference_global() {
     write_config(&config, &personal, &work);
     init_store(&personal, "personal");
     fs::create_dir_all(&repo).expect("repo dir");
-    let init = Command::new("git")
+    let init = common::git()
         .args(["-C", repo.to_str().expect("utf8 repo"), "init"])
         .output()
         .expect("git init");
@@ -8985,12 +8972,12 @@ fn projects_resolve_uses_git_root_from_file_hint() {
     write_config(&config, &personal, &work);
     fs::create_dir_all(file.parent().expect("file parent")).expect("repo src");
     fs::write(&file, "fn main() {}\n").expect("source file");
-    let init = Command::new("git")
+    let init = common::git()
         .args(["-C", repo.to_str().expect("utf8 repo"), "init"])
         .output()
         .expect("git init");
     assert!(init.status.success());
-    let remote = Command::new("git")
+    let remote = common::git()
         .args([
             "-C",
             repo.to_str().expect("utf8 repo"),

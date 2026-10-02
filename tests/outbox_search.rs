@@ -9,9 +9,9 @@
 use hive_memory::{note, outbox, store, write};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 mod common;
+use common::temp_dir;
 
 // Every `hm` this suite spawns goes through the shared hermetic builder, which
 // scrubs inherited `HIVE_MEMORY_*` selectors and sandboxes the XDG base dirs.
@@ -19,19 +19,6 @@ macro_rules! cargo_bin_cmd {
     ("hm") => {
         common::hermetic_hm()
     };
-}
-
-fn temp_dir(name: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock after epoch")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!(
-        "hive-memory-outbox-search-{name}-{}-{nanos}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&path).expect("create temp dir");
-    path
 }
 
 struct Fixture {

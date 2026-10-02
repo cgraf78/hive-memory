@@ -573,9 +573,7 @@ mod tests {
 
     #[test]
     fn detect_prefers_config_override_then_path_order() {
-        let temp =
-            std::env::temp_dir().join(format!("hive-memory-llm-path-{}", std::process::id()));
-        fs::create_dir_all(&temp).expect("create temp dir");
+        let temp = crate::test_support::temp_dir("llm-path");
         for name in ["claude", "codex"] {
             let path = temp.join(name);
             fs::write(&path, "#!/usr/bin/env bash\nexit 0\n").expect("write stub");

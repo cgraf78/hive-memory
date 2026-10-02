@@ -482,7 +482,6 @@ mod tests {
     use crate::note;
     use crate::write::FsyncPolicy;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn timestamp() -> OffsetDateTime {
         OffsetDateTime::from_unix_timestamp(1_778_946_153)
@@ -521,18 +520,7 @@ mod tests {
         }
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock after epoch")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "hive-memory-event-{name}-{}-{nanos}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&path).expect("create temp dir");
-        path
-    }
+    use crate::test_support::temp_dir;
 
     #[test]
     fn event_round_trips_as_json() {
