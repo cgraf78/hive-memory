@@ -462,11 +462,27 @@ pub enum ConfigWarning {
     UnknownSubkey(String),
 }
 
+impl ConfigWarning {
+    /// Dotted path of an unknown key (e.g. `typo` or `stores.work.extra`), or
+    /// `None` for any other kind of warning.
+    ///
+    /// Structured callers (`hm sync-status --json`) report this instead of the
+    /// display text, so diagnostics never have to parse the warning message.
+    pub fn unknown_key(&self) -> Option<&str> {
+        match self {
+            Self::UnknownTopLevelKey(key) | Self::UnknownSubkey(key) => Some(key),
+        }
+    }
+}
+
 impl Display for ConfigWarning {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // External tooling greps stderr for this exact prefix; keep it stable
+        // even though new callers should read the structured key.
         match self {
-            Self::UnknownTopLevelKey(key) => write!(f, "unknown config key: {key}"),
-            Self::UnknownSubkey(key) => write!(f, "unknown config key: {key}"),
+            Self::UnknownTopLevelKey(key) | Self::UnknownSubkey(key) => {
+                write!(f, "unknown config key: {key}")
+            }
         }
     }
 }

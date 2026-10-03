@@ -933,6 +933,24 @@ Stable `--json` success field sets. Fields are mandatory unless explicitly noted
 - `hm projects unbind --json`:
   `{ "project_id", "removed", "binding" }`, where `binding` is `null` when no
   local binding existed.
+- `hm sync-status --json`:
+  `{ "store", "store_source", "store_id", "manifest_schema_version", "root",
+  "reachable", "manifest_error", "store_error", "index_path", "index_exists",
+  "index_modified_at", "newest_note_at", "newest_event_at",
+  "newest_canonical_at", "index_stale", "cloud_conflict_files", "hosts",
+  "unknown_config_keys" }`, where each host contains
+  `{ "host_id", "last_seen_at", "records" }`. `reachable` is true only when
+  the store manifest reads and the store tree (minus `.quarantine/`) scans
+  without an I/O error. A missing root sets only `manifest_error`; a scan
+  failure (for example a dead network mount) sets `store_error` to the first
+  failure and its path. Either way the command still exits 0 with the report,
+  and the scan fields (`newest_*`, `index_stale`, `cloud_conflict_files`) are
+  meaningful only when `reachable` is true. `cloud_conflict_files` counts the
+  same conflict-copy names `hm doctor` reports, so it drops to 0 once
+  `hm doctor --fix` quarantines them. `unknown_config_keys` is the sorted list
+  of dotted config key paths the binary does not understand (for example
+  `["future_policy", "stores.work.extra"]`); the matching
+  `warning: unknown config key: <key>` stderr lines are still emitted.
 - `hm doctor --json`:
   `{ "ok", "summary", "checks" }`, where `summary` contains
   `{ "errors", "warnings" }` and each check contains

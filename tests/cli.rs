@@ -6039,9 +6039,208 @@ fn sync_status_reports_reachable_store_and_index_freshness() {
     let fresh: serde_json::Value =
         serde_json::from_slice(&fresh.stdout).expect("fresh sync-status json");
     assert_eq!(fresh["reachable"], true);
+    assert_eq!(fresh["store_error"], serde_json::Value::Null);
+    assert_eq!(fresh["unknown_config_keys"], serde_json::json!([]));
     assert_eq!(fresh["index_exists"], true);
     assert_eq!(fresh["index_stale"], false);
     assert!(fresh["index_modified_at"].as_str().is_some());
+}
+
+#[test]
+fn sync_status_reports_unknown_config_keys_in_json_and_on_stderr() {
+    let dir = temp_dir("sync-status-unknown-keys");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    let mut contents = fs::read_to_string(&config).expect("read config");
+    // A top-level key and a nested store key, the two shapes a config can
+    // carry ahead of (or behind) the installed `hm`. Top-level keys must come
+    // before the first table header to stay top-level in TOML.
+    contents.insert_str(0, "future_policy = true\n");
+    contents.push_str("extra_store_key = 1\n");
+    fs::write(&config, contents).expect("write config");
+    init_store(&personal, "personal");
+
+    let output = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "sync-status",
+            "--json",
+        ])
+        .output()
+        .expect("run sync-status");
+    assert!(output.status.success(), "sync-status failed: {output:?}");
+    let status: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("sync-status json");
+    assert_eq!(
+        status["unknown_config_keys"],
+        serde_json::json!(["future_policy", "stores.work.extra_store_key"])
+    );
+    // Older diagnostics grep this exact stderr text; the JSON field is an
+    // addition, not a replacement.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("warning: unknown config key: future_policy"),
+        "{stderr}"
+    );
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "stores",
+            "list",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "warning: unknown config key: stores.work.extra_store_key",
+        ));
+}
+
+/// Makes a directory unreadable for one test and restores it on drop, even
+/// when the test panics, so the scratch-dir cleanup can still remove it.
+struct Unreadable<'a>(&'a std::path::Path);
+
+impl<'a> Unreadable<'a> {
+    /// Returns `None` when mode bits do not restrict this user (root in a CI
+    /// container), so callers skip instead of asserting on a readable fixture.
+    fn new(path: &'a std::path::Path) -> Option<Self> {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+        let guard = Self(path);
+        fs::read_dir(path).is_err().then_some(guard)
+    }
+}
+
+impl Drop for Unreadable<'_> {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(self.0, fs::Permissions::from_mode(0o755));
+    }
+}
+
+#[test]
+fn sync_status_reports_unreadable_store_root_as_unreachable() {
+    // A dead network or FUSE mount fails every access under the root with a
+    // non-NotFound error (ENOTCONN, EIO, EACCES). The report must still come
+    // out, as JSON with `reachable: false`, so a caller can tell "store down"
+    // from "hm broken".
+    let dir = temp_dir("sync-status-unreadable-root");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    let Some(_unreadable) = Unreadable::new(&personal) else {
+        eprintln!("skipping: mode bits do not restrict this user");
+        return;
+    };
+
+    let output = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "sync-status",
+            "--json",
+        ])
+        .output()
+        .expect("run sync-status");
+    assert!(output.status.success(), "sync-status failed: {output:?}");
+    let status: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("sync-status json");
+    assert_eq!(status["reachable"], false);
+    assert!(status["manifest_error"].as_str().is_some(), "{status}");
+    assert!(status["store_error"].as_str().is_some(), "{status}");
+}
+
+#[test]
+fn sync_status_reports_unreadable_store_subtree_as_unreachable() {
+    // The manifest reads fine but part of the canonical tree does not, so
+    // recall would fail on that part. That is not a reachable store.
+    let dir = temp_dir("sync-status-unreadable-subtree");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    let notes = personal.join("inbox/notes");
+    fs::create_dir_all(&notes).expect("create notes dir");
+    let Some(_unreadable) = Unreadable::new(&notes) else {
+        eprintln!("skipping: mode bits do not restrict this user");
+        return;
+    };
+
+    let output = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "sync-status",
+            "--json",
+        ])
+        .output()
+        .expect("run sync-status");
+    assert!(output.status.success(), "sync-status failed: {output:?}");
+    let status: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("sync-status json");
+    assert_eq!(status["reachable"], false);
+    assert_eq!(status["manifest_error"], serde_json::Value::Null);
+    let store_error = status["store_error"].as_str().expect("store_error");
+    assert!(store_error.contains("inbox/notes"), "{store_error}");
+}
+
+#[test]
+fn sync_status_stops_counting_conflicts_once_quarantined() {
+    // `hm doctor --fix` moves conflict copies under `.quarantine`; a health
+    // check keyed on `cloud_conflict_files` must clear after that, and must
+    // count the same names `hm doctor` does.
+    let dir = temp_dir("sync-status-conflicts");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    let notes = personal.join("inbox/notes");
+    fs::create_dir_all(&notes).expect("create notes dir");
+    let conflict = notes.join("note (conflicted copy).md");
+    fs::write(&conflict, "x").expect("write conflict copy");
+    // Not a conflict copy under `hm doctor`'s rule, despite the substring.
+    fs::write(notes.join("conflict-resolution.md"), "x").expect("write note");
+
+    let status = |label: &str| -> serde_json::Value {
+        let output = cargo_bin_cmd!("hm")
+            .args([
+                "--config",
+                config.to_str().expect("utf8 config"),
+                "sync-status",
+                "--json",
+            ])
+            .output()
+            .expect("run sync-status");
+        assert!(output.status.success(), "{label}: {output:?}");
+        serde_json::from_slice(&output.stdout).expect("sync-status json")
+    };
+    assert_eq!(status("before fix")["cloud_conflict_files"], 1);
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "doctor",
+            "--fix",
+        ])
+        .output()
+        .expect("run doctor --fix");
+    assert!(
+        !conflict.exists(),
+        "doctor --fix should quarantine the copy"
+    );
+    let after = status("after fix");
+    assert_eq!(after["cloud_conflict_files"], 0);
+    assert_eq!(after["reachable"], true);
 }
 
 #[test]
@@ -6665,6 +6864,9 @@ fn sync_status_reports_unavailable_store_without_failing() {
     assert_eq!(status["store"], "personal");
     assert_eq!(status["reachable"], false);
     assert!(status["manifest_error"].as_str().is_some());
+    // A missing root is an empty tree, not a scan failure; only an
+    // unreadable one sets `store_error`.
+    assert_eq!(status["store_error"], serde_json::Value::Null);
     assert_eq!(status["index_exists"], false);
     assert_eq!(status["index_stale"], false);
 }

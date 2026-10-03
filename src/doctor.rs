@@ -2160,7 +2160,10 @@ fn collect_cloud_conflicts_into(
     Ok(())
 }
 
-fn is_cloud_conflict_name(name: &str) -> bool {
+/// Whether a file name looks like a cloud-sync conflict copy.
+///
+/// Shared with `hm sync-status` so both diagnostics count the same files.
+pub fn is_cloud_conflict_name(name: &str) -> bool {
     // Different sync tools use slightly different wording and capitalization.
     // Match only the filename, not contents, so doctor can stay cheap and avoid
     // echoing potentially sensitive memory text into diagnostics.
@@ -2211,7 +2214,11 @@ fn collect_stale_temp_files_into(
     Ok(())
 }
 
-fn is_quarantine_dir(path: &Path) -> bool {
+/// Whether `path` is a store's `.quarantine` directory.
+///
+/// `hm doctor --fix` moves conflict copies there; scans skip it so a resolved
+/// conflict stops counting.
+pub fn is_quarantine_dir(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name == ".quarantine")
