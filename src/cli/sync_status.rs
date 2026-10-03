@@ -1,9 +1,9 @@
 //! Read-only store and index synchronization diagnostics.
 
-use crate::{CliContext, StoreAccess, load_config, resolve_agent_id, resolve_store};
-use anyhow::Result;
+use crate::{CliContext, StoreAccess, load_config_with_warnings, resolve_agent_id, resolve_store};
+use anyhow::{Result, anyhow};
 use clap::Args;
-use hive_memory::{index, store};
+use hive_memory::{doctor, index, store};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -30,8 +30,13 @@ struct SyncStatusJsonOutput {
     store_id: Option<String>,
     manifest_schema_version: Option<u32>,
     root: PathBuf,
+    /// True only when the manifest reads and the store tree scans cleanly.
     reachable: bool,
     manifest_error: Option<String>,
+    /// First I/O failure while scanning the store tree, with its path. A dead
+    /// network or FUSE mount lands here (ENOTCONN, EIO) instead of aborting
+    /// the report, so callers can tell "store down" from "hm broken".
+    store_error: Option<String>,
     index_path: PathBuf,
     index_exists: bool,
     index_modified_at: Option<String>,
@@ -41,6 +46,31 @@ struct SyncStatusJsonOutput {
     index_stale: bool,
     cloud_conflict_files: usize,
     hosts: Vec<HostSyncStatus>,
+    /// Sorted dotted paths of config keys this `hm` does not understand.
+    ///
+    /// The config syncs independently of `hm` releases, so a key can run ahead
+    /// of (or outlive) the installed binary; unknown keys only warn, leaving
+    /// that policy silently on defaults. This is the structured form of the
+    /// `warning: unknown config key:` stderr lines, which are still printed.
+    unknown_config_keys: Vec<String>,
+}
+
+/// Result of one read-only walk over a store's tree.
+#[derive(Debug, Default)]
+struct StoreScan {
+    newest_note: Option<SystemTime>,
+    newest_event: Option<SystemTime>,
+    cloud_conflict_files: usize,
+}
+
+impl StoreScan {
+    fn run(root: &Path) -> Result<Self> {
+        Ok(Self {
+            newest_note: newest_file_mtime(&root.join("inbox/notes"))?,
+            newest_event: newest_file_mtime(&root.join("inbox/events"))?,
+            cloud_conflict_files: count_conflict_files(root)?,
+        })
+    }
 }
 
 /// Per-host activity summary derived from the local index.
@@ -105,7 +135,15 @@ fn host_sync_status(index_path: &Path) -> Vec<HostSyncStatus> {
 }
 
 pub(crate) fn run(args: SyncStatusArgs, context: CliContext) -> Result<()> {
-    let config = load_config(context.config_path.as_deref())?;
+    let loaded = load_config_with_warnings(context.config_path.as_deref())?;
+    let unknown_config_keys = loaded
+        .warnings
+        .iter()
+        .filter_map(|warning| warning.unknown_key().map(str::to_owned))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let config = loaded.config;
     let agent_id = resolve_agent_id(context.as_agent.clone());
     let resolved_store = resolve_store(
         &config,
@@ -126,10 +164,18 @@ pub(crate) fn run(args: SyncStatusArgs, context: CliContext) -> Result<()> {
         Err(err) => (false, None, None, Some(err.to_string())),
     };
 
-    let notes_root = store_config.root.join("inbox/notes");
-    let events_root = store_config.root.join("inbox/events");
-    let newest_note = newest_file_mtime(&notes_root)?;
-    let newest_event = newest_file_mtime(&events_root)?;
+    // A scan failure is a finding about the store, not a failure of this
+    // command: report it and keep the rest of the (local) diagnostics.
+    let (scan, store_error) = match StoreScan::run(&store_config.root) {
+        Ok(scan) => (scan, None),
+        Err(err) => (StoreScan::default(), Some(err.to_string())),
+    };
+    let reachable = reachable && store_error.is_none();
+    let StoreScan {
+        newest_note,
+        newest_event,
+        cloud_conflict_files,
+    } = scan;
     let newest_canonical = [newest_note, newest_event].into_iter().flatten().max();
     let index_path =
         index::scoped_index_path(&config.cache_dir, &resolved_store.name, &store_config.root);
@@ -140,7 +186,6 @@ pub(crate) fn run(args: SyncStatusArgs, context: CliContext) -> Result<()> {
         (Some(canonical), Some(index_modified)) => canonical > index_modified,
         _ => false,
     };
-    let cloud_conflict_files = count_conflict_files(&store_config.root)?;
     let hosts = host_sync_status(&index_path);
 
     let output = SyncStatusJsonOutput {
@@ -151,6 +196,7 @@ pub(crate) fn run(args: SyncStatusArgs, context: CliContext) -> Result<()> {
         root: store_config.root.clone(),
         reachable,
         manifest_error,
+        store_error,
         index_path,
         index_exists,
         index_modified_at: system_time_rfc3339(index_modified),
@@ -160,6 +206,7 @@ pub(crate) fn run(args: SyncStatusArgs, context: CliContext) -> Result<()> {
         index_stale,
         cloud_conflict_files,
         hosts,
+        unknown_config_keys,
     };
 
     if args.json {
@@ -172,6 +219,9 @@ pub(crate) fn run(args: SyncStatusArgs, context: CliContext) -> Result<()> {
     println!("reachable: {}", if output.reachable { "yes" } else { "no" });
     if let Some(error) = output.manifest_error.as_deref() {
         println!("manifest_error: {error}");
+    }
+    if let Some(error) = output.store_error.as_deref() {
+        println!("store_error: {error}");
     }
     println!(
         "index: {} ({})",
@@ -202,7 +252,9 @@ fn file_mtime(path: &Path) -> Result<Option<SystemTime>> {
     match path.metadata() {
         Ok(metadata) => Ok(Some(metadata.modified()?)),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err.into()),
+        // Keep the OS cause in the message itself: the CLI error printer
+        // shows only the outermost anyhow context.
+        Err(err) => Err(anyhow!("stat {}: {err}", path.display())),
     }
 }
 
@@ -223,7 +275,7 @@ fn count_conflict_files(root: &Path) -> Result<usize> {
         if path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.to_ascii_lowercase().contains("conflict"))
+            .is_some_and(doctor::is_cloud_conflict_name)
         {
             count += 1;
         }
@@ -232,6 +284,11 @@ fn count_conflict_files(root: &Path) -> Result<usize> {
     Ok(count)
 }
 
+/// Visit every regular file under `root`, skipping `.quarantine` directories.
+///
+/// The quarantine holds conflict copies `hm doctor --fix` already set aside;
+/// counting them (or failing on them) would report a resolved problem forever.
+/// A missing `root` is an empty tree; any other I/O error carries its path.
 fn visit_files<F>(root: &Path, visit: &mut F) -> Result<()>
 where
     F: FnMut(&Path) -> Result<()>,
@@ -239,14 +296,19 @@ where
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err.into()),
+        Err(err) => return Err(anyhow!("read {}: {err}", root.display())),
     };
 
     for entry in entries {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
+        let entry = entry.map_err(|err| anyhow!("read {}: {err}", root.display()))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|err| anyhow!("stat {}: {err}", entry.path().display()))?;
         let path = entry.path();
         if file_type.is_dir() {
+            if doctor::is_quarantine_dir(&path) {
+                continue;
+            }
             visit_files(&path, visit)?;
         } else if file_type.is_file() {
             visit(&path)?;
