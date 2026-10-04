@@ -373,7 +373,10 @@ policies, outbox state, event pairing, agent-private audiences, classifier
 status, secret-looking content, and cloud-sync conflicts. `--fix` performs only
 safe layout repairs — it never initializes missing stores or rewrites your
 memory. `hm sync-status` reports store and index freshness without mutating
-anything.
+anything. Its `--json` form also gives scripts a structured health signal:
+`reachable: false` for a store that is missing or cannot be read (such as a
+dropped network mount), with the cause in `manifest_error` or `store_error`,
+and `unknown_config_keys` for config keys this `hm` does not understand yet.
 
 ### Offline writes and the outbox
 

@@ -6,7 +6,9 @@
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
-use hive_memory::config::{Config, ConfigPaths, EventSidecarPolicy, Sensitivity, StoreConfig};
+use hive_memory::config::{
+    Config, ConfigPaths, EventSidecarPolicy, LoadedConfig, Sensitivity, StoreConfig,
+};
 use hive_memory::{
     capture, classify, config, doctor, event, hook as memory_hook, id, index, llm, memory, note,
     outbox, path as memory_path, project, reconcile, search, secret, store, visibility, write,
@@ -673,13 +675,21 @@ fn resolve_write_kind(
 /// The path resolution policy lives in `ConfigPaths`; this function only
 /// connects that library contract to terminal diagnostics.
 fn load_config(config_path: Option<&std::path::Path>) -> Result<Config> {
+    Ok(load_config_with_warnings(config_path)?.config)
+}
+
+/// [`load_config`] for commands that also report warnings in structured form.
+///
+/// The stderr lines are still printed: they are the long-standing interface
+/// for humans and for older tooling that greps them.
+fn load_config_with_warnings(config_path: Option<&std::path::Path>) -> Result<LoadedConfig> {
     let paths = ConfigPaths::resolve(config_path)?;
     let loaded = paths.load()?;
     for warning in &loaded.warnings {
         eprintln!("warning: {warning}");
     }
     protect_local_support_roots(&loaded.config)?;
-    Ok(loaded.config)
+    Ok(loaded)
 }
 
 /// Keep local memory material behind an owner-only directory boundary.
