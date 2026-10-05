@@ -19,7 +19,7 @@ env:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@cff4d77cf738c278a8c1279a89b20c9c546d9c5b
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@dea363fed9e62883887a39790006a111a458af31
     with:
       # Full matrix on every PR: scheduled-only legs let main break
       # silently between daily runs and cannot validate their fixes.
@@ -58,7 +58,7 @@ jobs:
           .termux-ci/hm
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@cff4d77cf738c278a8c1279a89b20c9c546d9c5b
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@dea363fed9e62883887a39790006a111a458af31
     with:
       matrix-set: full
       profiles: base
@@ -78,6 +78,11 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # Name checkout's throwaway initial branch so Git skips its hint.
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: init.defaultBranch
+          GIT_CONFIG_VALUE_0: main
         with:
           persist-credentials: false
 
@@ -85,7 +90,7 @@ jobs:
       # files, so `.github/cgraf78-actions.lock` cannot be interpolated. This
       # gate verifies every unavoidable action literal and all vendored release
       # scripts still match that single reviewed dependency decision.
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@cff4d77cf738c278a8c1279a89b20c9c546d9c5b
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@dea363fed9e62883887a39790006a111a458af31
 
   source-install:
     name: Locked source install
@@ -93,6 +98,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # Name checkout's throwaway initial branch so Git skips its hint.
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: init.defaultBranch
+          GIT_CONFIG_VALUE_0: main
         with:
           persist-credentials: false
 
@@ -112,6 +122,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # Name checkout's throwaway initial branch so Git skips its hint.
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: init.defaultBranch
+          GIT_CONFIG_VALUE_0: main
         with:
           persist-credentials: false
 
@@ -138,6 +153,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # Name checkout's throwaway initial branch so Git skips its hint.
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: init.defaultBranch
+          GIT_CONFIG_VALUE_0: main
         with:
           persist-credentials: false
 
