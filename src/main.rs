@@ -78,7 +78,7 @@ enum Command {
     Search(SearchArgs),
     /// Assemble agent-readable memory context.
     Context(ContextArgs),
-    /// Report store/index freshness without mutating memory.
+    /// Report store/index health without mutating memory.
     SyncStatus(SyncStatusArgs),
     /// Correct persisted kind, scope, or project metadata on a record.
     Retag(RetagArgs),

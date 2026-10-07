@@ -42,6 +42,15 @@ use time::OffsetDateTime;
 // one canonical parse per alternation and ends when the old binary is gone.
 const INDEX_FINGERPRINT_SCHEMA_VERSION: u32 = 12;
 
+/// Store-relative trees the freshness fingerprint walks: every canonical
+/// record recall can serve lives under one of these.
+///
+/// Shared with `hm sync-status`, whose bounded reachability probe lists the top
+/// level of exactly these trees, so "reachable" tracks what recall reads. Every
+/// non-generated directory of [`crate::store::CANONICAL_DIRS`] sits under one.
+pub const FINGERPRINT_ROOTS: [&str; 5] =
+    ["inbox/notes", "inbox/events", "rules", "people", "memories"];
+
 /// Format version for the embedded index header line.
 ///
 /// The header is the first physical line of `cache/indexes/<key>.jsonl`. It
@@ -1502,11 +1511,9 @@ fn canonical_fingerprint(store_root: &Path) -> Result<IndexFingerprint, IndexErr
         root_len: store_root.as_os_str().as_encoded_bytes().len(),
         ..CanonicalScan::default()
     };
-    collect_canonical(&store_root.join("inbox/notes"), &mut scan)?;
-    collect_canonical(&store_root.join("inbox/events"), &mut scan)?;
-    collect_canonical(&store_root.join("rules"), &mut scan)?;
-    collect_canonical(&store_root.join("people"), &mut scan)?;
-    collect_canonical(&store_root.join("memories"), &mut scan)?;
+    for tree in FINGERPRINT_ROOTS {
+        collect_canonical(&store_root.join(tree), &mut scan)?;
+    }
     Ok(IndexFingerprint {
         // v8: entity extraction includes deterministic quoted/proper-name
         // phrase links in addition to built-in aliases and the store registry.
@@ -1992,6 +1999,29 @@ mod tests {
 
         assert!(second.rebuilt);
         assert_eq!(second.entries.len(), 1);
+    }
+
+    #[test]
+    fn fingerprint_roots_cover_the_store_skeleton() {
+        // A record tree added to the init skeleton but not here would be
+        // neither fingerprinted nor probed by `hm sync-status`.
+        for tree in FINGERPRINT_ROOTS {
+            assert!(
+                crate::store::CANONICAL_DIRS
+                    .iter()
+                    .any(|dir| Path::new(dir).starts_with(tree)),
+                "{tree} is not part of the store skeleton"
+            );
+        }
+        for dir in crate::store::CANONICAL_DIRS {
+            assert!(
+                *dir == "generated"
+                    || FINGERPRINT_ROOTS
+                        .iter()
+                        .any(|tree| Path::new(dir).starts_with(tree)),
+                "{dir} holds records but no fingerprint root covers it"
+            );
+        }
     }
 
     #[test]
