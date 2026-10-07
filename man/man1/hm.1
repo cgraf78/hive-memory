@@ -54,7 +54,9 @@ narrows to that project.
 Assemble agent-readable context within a token budget.
 .TP
 .B sync-status
-Report store and index freshness without mutating state.
+Report store and index health without mutating state; cheap by default,
+.B --scan
+walks the whole store for staleness and conflict copies.
 .TP
 .B retag
 Correct a record's persisted kind, scope, or project identity.

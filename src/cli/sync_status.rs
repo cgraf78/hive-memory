@@ -15,6 +15,11 @@ pub(crate) struct SyncStatusArgs {
     /// Emit machine-readable output.
     #[arg(long)]
     json: bool,
+    /// Walk the whole store tree to measure newest record times, index
+    /// staleness, and cloud conflict copies. Off by default: on a cloud mount
+    /// the walk costs one remote directory listing per directory.
+    #[arg(long)]
+    scan: bool,
 }
 
 impl SyncStatusArgs {
@@ -30,19 +35,27 @@ struct SyncStatusJsonOutput {
     store_id: Option<String>,
     manifest_schema_version: Option<u32>,
     root: PathBuf,
-    /// True only when the manifest reads and the store tree scans cleanly.
+    /// True only when the manifest reads and the store probe (or, with
+    /// `--scan`, the full tree walk) finds no I/O error.
     reachable: bool,
     manifest_error: Option<String>,
-    /// First I/O failure while scanning the store tree, with its path. A dead
-    /// network or FUSE mount lands here (ENOTCONN, EIO) instead of aborting
-    /// the report, so callers can tell "store down" from "hm broken".
+    /// First I/O failure while probing or scanning the store tree, with its
+    /// path. A dead network or FUSE mount lands here (ENOTCONN, EIO) instead of
+    /// aborting the report, so callers can tell "store down" from "hm broken".
     store_error: Option<String>,
+    /// Whether this report walked the whole store tree (`--scan`) and finished.
+    /// The walk-derived fields (`newest_*`, `index_stale`,
+    /// `cloud_conflict_files`) are measured only when this is true; otherwise
+    /// they hold their empty values (null, false, 0).
+    store_scanned: bool,
     index_path: PathBuf,
     index_exists: bool,
     index_modified_at: Option<String>,
     newest_note_at: Option<String>,
     newest_event_at: Option<String>,
     newest_canonical_at: Option<String>,
+    /// With a scan, whether the next search would rebuild the index (see
+    /// `index::index_is_fresh`); a missing index is stale.
     index_stale: bool,
     cloud_conflict_files: usize,
     hosts: Vec<HostSyncStatus>,
@@ -61,16 +74,94 @@ struct StoreScan {
     newest_note: Option<SystemTime>,
     newest_event: Option<SystemTime>,
     cloud_conflict_files: usize,
+    /// Whether the next read would rebuild the index (see
+    /// [`index::index_is_fresh`]); a missing index counts as stale.
+    index_stale: bool,
 }
 
 impl StoreScan {
-    fn run(root: &Path) -> Result<Self> {
-        Ok(Self {
-            newest_note: newest_file_mtime(&root.join("inbox/notes"))?,
-            newest_event: newest_file_mtime(&root.join("inbox/events"))?,
-            cloud_conflict_files: count_conflict_files(root)?,
-        })
+    /// Walk the store for every walk-derived field, listing each directory
+    /// once, then check index freshness.
+    ///
+    /// Cost is one directory listing per store directory plus one `stat` per
+    /// inbox file, which is why only `--scan` runs it: on an rclone mount whose
+    /// directory cache has expired, each listing is a Drive API call behind
+    /// the mount-wide rate pacer (rclone's default allows 10 calls/s after a
+    /// burst), so a store with a few hundred dated inbox directories takes
+    /// seconds to tens of seconds.
+    ///
+    /// The index freshness check then walks the canonical trees again (a
+    /// listing per directory, a `stat` per directory and file) and reads the
+    /// local index; on an rclone mount those listings normally come from the
+    /// directory cache the first walk just filled, not from Drive.
+    fn run(root: &Path, cache_dir: &Path, store_name: &str) -> Result<Self> {
+        let notes = root.join("inbox/notes");
+        let events = root.join("inbox/events");
+        let mut scan = Self::default();
+        // The inbox trees are walked from their own tops (which follows a
+        // symlinked tree, as recall does) and then skipped by the root walk.
+        for (tree, newest) in [
+            (&notes, &mut scan.newest_note),
+            (&events, &mut scan.newest_event),
+        ] {
+            // Conflict copies count only where `hm doctor` looks, which is
+            // not inside a symlinked tree: a count `hm doctor --fix` cannot
+            // clear would warn forever.
+            let doctor_walks = tree
+                .symlink_metadata()
+                .is_ok_and(|metadata| metadata.is_dir());
+            visit_files(tree, &[], &mut |path| {
+                if doctor_walks {
+                    scan.cloud_conflict_files += usize::from(is_conflict_copy(path));
+                }
+                if let Some(modified) = file_mtime(path)? {
+                    *newest = Some(newest.map_or(modified, |current| current.max(modified)));
+                }
+                Ok(())
+            })?;
+        }
+        visit_files(root, &[&notes, &events], &mut |path| {
+            scan.cloud_conflict_files += usize::from(is_conflict_copy(path));
+            Ok(())
+        })?;
+        scan.index_stale = !index::index_is_fresh(cache_dir, store_name, root)?;
+        Ok(scan)
     }
+}
+
+fn is_conflict_copy(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(doctor::is_cloud_conflict_name)
+}
+
+/// Bounded reachability probe: list the top level of each canonical tree.
+///
+/// Work is constant (one directory listing per tree) whatever the store's
+/// size, so callers on a deadline can afford it, while still catching a dead
+/// mount or an unreadable tree that would break recall. A missing tree, or
+/// one that is not a directory, is empty, as the index fingerprint treats it.
+fn probe_store(root: &Path) -> Result<()> {
+    for tree in index::FINGERPRINT_ROOTS {
+        let tree = root.join(tree);
+        match std::fs::read_dir(&tree) {
+            // Pull one batch of entries: opening a FUSE directory can succeed
+            // while listing it is what reaches the backend and fails. (Tests
+            // cannot fake that split; chmod makes the open itself fail.)
+            Ok(mut entries) => {
+                if let Some(Err(err)) = entries.next() {
+                    return Err(anyhow!("read {}: {err}", tree.display()));
+                }
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
+            Err(err) => return Err(anyhow!("read {}: {err}", tree.display())),
+        }
+    }
+    Ok(())
 }
 
 /// Per-host activity summary derived from the local index.
@@ -154,7 +245,7 @@ pub(crate) fn run(args: SyncStatusArgs, context: CliContext) -> Result<()> {
     )?;
     let store_config = &config.stores[resolved_store.name.as_str()];
     let manifest = store::read_manifest(&store_config.root);
-    let (reachable, store_id, manifest_schema_version, manifest_error) = match manifest {
+    let (manifest_read, store_id, manifest_schema_version, manifest_error) = match manifest {
         Ok(manifest) => (
             true,
             Some(manifest.store.id),
@@ -164,28 +255,38 @@ pub(crate) fn run(args: SyncStatusArgs, context: CliContext) -> Result<()> {
         Err(err) => (false, None, None, Some(err.to_string())),
     };
 
-    // A scan failure is a finding about the store, not a failure of this
-    // command: report it and keep the rest of the (local) diagnostics.
-    let (scan, store_error) = match StoreScan::run(&store_config.root) {
-        Ok(scan) => (scan, None),
-        Err(err) => (StoreScan::default(), Some(err.to_string())),
+    // A probe or scan failure is a finding about the store, not a failure of
+    // this command: report it and keep the rest of the (local) diagnostics.
+    // Only a store whose manifest reads is walked: a missing root, or the
+    // empty directory an unmounted cloud mountpoint leaves behind, would
+    // otherwise "scan" clean and report zeros as measured. It still gets the
+    // probe, so a dead mount keeps its `store_error`.
+    let (scan, store_error) = if args.scan && manifest_read {
+        match StoreScan::run(&store_config.root, &config.cache_dir, &resolved_store.name) {
+            Ok(scan) => (Some(scan), None),
+            Err(err) => (None, Some(err.to_string())),
+        }
+    } else {
+        (
+            None,
+            probe_store(&store_config.root)
+                .err()
+                .map(|err| err.to_string()),
+        )
     };
-    let reachable = reachable && store_error.is_none();
+    let reachable = manifest_read && store_error.is_none();
+    let store_scanned = scan.is_some();
     let StoreScan {
         newest_note,
         newest_event,
         cloud_conflict_files,
-    } = scan;
+        index_stale,
+    } = scan.unwrap_or_default();
     let newest_canonical = [newest_note, newest_event].into_iter().flatten().max();
     let index_path =
         index::scoped_index_path(&config.cache_dir, &resolved_store.name, &store_config.root);
     let index_modified = file_mtime(&index_path)?;
     let index_exists = index_modified.is_some();
-    let index_stale = match (newest_canonical, index_modified) {
-        (Some(_), None) => true,
-        (Some(canonical), Some(index_modified)) => canonical > index_modified,
-        _ => false,
-    };
     let hosts = host_sync_status(&index_path);
 
     let output = SyncStatusJsonOutput {
@@ -197,6 +298,7 @@ pub(crate) fn run(args: SyncStatusArgs, context: CliContext) -> Result<()> {
         reachable,
         manifest_error,
         store_error,
+        store_scanned,
         index_path,
         index_exists,
         index_modified_at: system_time_rfc3339(index_modified),
@@ -232,11 +334,20 @@ pub(crate) fn run(args: SyncStatusArgs, context: CliContext) -> Result<()> {
             "missing"
         }
     );
-    println!(
-        "index_stale: {}",
-        if output.index_stale { "yes" } else { "no" }
-    );
-    println!("cloud_conflict_files: {}", output.cloud_conflict_files);
+    if output.store_scanned {
+        println!(
+            "index_stale: {}",
+            if output.index_stale { "yes" } else { "no" }
+        );
+        println!("cloud_conflict_files: {}", output.cloud_conflict_files);
+    } else if args.scan {
+        // Asked for, but the walk failed or the root is missing: the reason
+        // is in `store_error` or `manifest_error` above.
+        println!("store_scan: incomplete");
+    } else {
+        // Do not print the unmeasured defaults as if they were findings.
+        println!("store_scan: skipped (pass --scan for index_stale and cloud_conflict_files)");
+    }
     for host in &output.hosts {
         println!(
             "host {}: last_seen={} records={}",
@@ -258,44 +369,27 @@ fn file_mtime(path: &Path) -> Result<Option<SystemTime>> {
     }
 }
 
-fn newest_file_mtime(root: &Path) -> Result<Option<SystemTime>> {
-    let mut newest = None;
-    visit_files(root, &mut |path| {
-        if let Some(modified) = file_mtime(path)? {
-            newest = Some(newest.map_or(modified, |current: SystemTime| current.max(modified)));
-        }
-        Ok(())
-    })?;
-    Ok(newest)
-}
-
-fn count_conflict_files(root: &Path) -> Result<usize> {
-    let mut count = 0;
-    visit_files(root, &mut |path| {
-        if path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(doctor::is_cloud_conflict_name)
-        {
-            count += 1;
-        }
-        Ok(())
-    })?;
-    Ok(count)
-}
-
-/// Visit every regular file under `root`, skipping `.quarantine` directories.
+/// Visit every regular file under `root`, skipping `.quarantine` directories
+/// and the directories in `skip`.
 ///
 /// The quarantine holds conflict copies `hm doctor --fix` already set aside;
 /// counting them (or failing on them) would report a resolved problem forever.
-/// A missing `root` is an empty tree; any other I/O error carries its path.
-fn visit_files<F>(root: &Path, visit: &mut F) -> Result<()>
+/// A missing `root`, or one that is not a directory, is an empty tree, as the
+/// index fingerprint treats it; any other I/O error carries its path.
+fn visit_files<F>(root: &Path, skip: &[&PathBuf], visit: &mut F) -> Result<()>
 where
     F: FnMut(&Path) -> Result<()>,
 {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(());
+        }
         Err(err) => return Err(anyhow!("read {}: {err}", root.display())),
     };
 
@@ -306,10 +400,10 @@ where
             .map_err(|err| anyhow!("stat {}: {err}", entry.path().display()))?;
         let path = entry.path();
         if file_type.is_dir() {
-            if doctor::is_quarantine_dir(&path) {
+            if doctor::is_quarantine_dir(&path) || skip.contains(&&path) {
                 continue;
             }
-            visit_files(&path, visit)?;
+            visit_files(&path, skip, visit)?;
         } else if file_type.is_file() {
             visit(&path)?;
         }

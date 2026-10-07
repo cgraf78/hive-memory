@@ -372,11 +372,16 @@ files, sensitive-store permissions and cloud-root policy, project bindings, agen
 policies, outbox state, event pairing, agent-private audiences, classifier
 status, secret-looking content, and cloud-sync conflicts. `--fix` performs only
 safe layout repairs — it never initializes missing stores or rewrites your
-memory. `hm sync-status` reports store and index freshness without mutating
-anything. Its `--json` form also gives scripts a structured health signal:
+memory. `hm sync-status` reports store and index health without mutating
+anything. By default it stays cheap on a cloud mount: it reads the manifest
+and lists only the top level of each canonical tree. `--scan` walks the whole
+store to add index staleness, the newest record times, and the cloud conflict
+copy count, which on a cloud mount can cost a remote listing per store
+directory. Its `--json` form also gives scripts a structured health signal:
 `reachable: false` for a store that is missing or cannot be read (such as a
 dropped network mount), with the cause in `manifest_error` or `store_error`,
 and `unknown_config_keys` for config keys this `hm` does not understand yet.
+Read the `--scan` fields only when `store_scanned` is true.
 
 ### Offline writes and the outbox
 
@@ -654,7 +659,7 @@ commands also support `--json`.
 | `hm promote <note-id> --to <path>` | Promote a raw note into curated memory |
 | `hm hook session-start\|prompt-submit\|tool-complete\|stop` | Agent lifecycle hooks |
 | `hm refresh` / `hm flush` / `hm outbox` | Rebuild state; publish queued offline writes |
-| `hm sync-status` | Report store/index freshness (read-only) |
+| `hm sync-status` | Report store/index health (read-only; `--scan` walks the store) |
 | `hm doctor` | Top-level diagnostics (`--quick`, `--fix`, `--json`) |
 | `hm eval` | Capture retrieval misses/bad hits as eval fixtures |
 

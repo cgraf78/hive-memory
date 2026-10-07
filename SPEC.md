@@ -24,7 +24,7 @@ conflict, prefer this file for v1 behavior and update both documents deliberatel
 | path normalization | yes | NFC + lowercase-on-case-insensitive + forward slashes |
 | performance budget | yes | `hm context` p95 ≤ 200ms warm / ≤ 500ms cold on 5k-note store |
 | Tantivy BM25 search backend | optional | `[defaults].search_backend = "tantivy"` for search and hook recall; rebuildable cache under `cache_dir/search/`; falls back to lexical on failure |
-| `hm sync-status` | optional | read-only store/index freshness report |
+| `hm sync-status` | optional | read-only store/index health report; `--scan` walks the store |
 | `hm retag` | optional | corrects persisted kind, scope, or project metadata on one record |
 | `hm classify` | optional | background LLM classification; `[classifier].mode = "off"` by default |
 | `hm capture` | optional | LLM fact extraction staged as raw inbox notes; `--promote` reconciles instead |
@@ -935,19 +935,37 @@ Stable `--json` success field sets. Fields are mandatory unless explicitly noted
   local binding existed.
 - `hm sync-status --json`:
   `{ "store", "store_source", "store_id", "manifest_schema_version", "root",
-  "reachable", "manifest_error", "store_error", "index_path", "index_exists",
-  "index_modified_at", "newest_note_at", "newest_event_at",
+  "reachable", "manifest_error", "store_error", "store_scanned", "index_path",
+  "index_exists", "index_modified_at", "newest_note_at", "newest_event_at",
   "newest_canonical_at", "index_stale", "cloud_conflict_files", "hosts",
   "unknown_config_keys" }`, where each host contains
-  `{ "host_id", "last_seen_at", "records" }`. `reachable` is true only when
-  the store manifest reads and the store tree (minus `.quarantine/`) scans
-  without an I/O error. A missing root sets only `manifest_error`; a scan
-  failure (for example a dead network mount) sets `store_error` to the first
-  failure and its path. Either way the command still exits 0 with the report,
-  and the scan fields (`newest_*`, `index_stale`, `cloud_conflict_files`) are
-  meaningful only when `reachable` is true. `cloud_conflict_files` counts the
-  same conflict-copy names `hm doctor` reports, so it drops to 0 once
-  `hm doctor --fix` quarantines them. `unknown_config_keys` is the sorted list
+  `{ "host_id", "last_seen_at", "records" }`. By default the command does
+  bounded store work whatever the store's size: it reads the manifest and
+  lists the top level of each canonical tree (`inbox/notes`, `inbox/events`,
+  `rules`, `people`, `memories`), never below, because on a cloud mount every
+  directory listing can be a remote call. `--scan` additionally walks the
+  whole store tree (minus `.quarantine/`), then rechecks the canonical trees
+  for index freshness. `reachable` is true only when the manifest reads and
+  that probe (or, with `--scan`, the walk) hits no I/O error. A missing root sets only `manifest_error`; a probe or walk failure
+  (for example a dead network mount) sets `store_error` to the first failure
+  and its path. Either way the command still exits 0 with the report.
+  `store_scanned` is true only when `--scan` ran, the manifest read (so a
+  missing root or an empty mountpoint is never walked), and the walk
+  finished; the scan fields (`newest_*`, `index_stale`,
+  `cloud_conflict_files`) are measured only then and otherwise hold null,
+  `false`, and `0`, even for a reachable store, so callers must gate them on
+  `store_scanned` (before it existed, `reachable` alone implied a scan). With
+  a scan, `index_stale` is true exactly when the next search would rebuild
+  the index: it is missing (including in a store with no records yet) or
+  damaged, was built by an `hm` with a different index schema, or no longer
+  matches the store's canonical trees (file paths, sizes, and mtimes;
+  directory count and newest directory mtime; the `entities.toml` mtime),
+  the same fingerprint hot reads check, so deletions and synced arrivals with
+  older preserved mtimes count. The `newest_*` times are informational file
+  mtimes. The other index fields and `hosts` come from the local index file
+  and need no scan. `cloud_conflict_files` counts the same conflict-copy
+  names `hm doctor` reports, so it drops to 0 once `hm doctor --fix`
+  quarantines them. `unknown_config_keys` is the sorted list
   of dotted config key paths the binary does not understand (for example
   `["future_policy", "stores.work.extra"]`); the matching
   `warning: unknown config key: <key>` stderr lines are still emitted.

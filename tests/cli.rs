@@ -6002,6 +6002,7 @@ fn sync_status_reports_reachable_store_and_index_freshness() {
             config.to_str().expect("utf8 config"),
             "sync-status",
             "--json",
+            "--scan",
         ])
         .output()
         .expect("run sync-status");
@@ -6010,6 +6011,7 @@ fn sync_status_reports_reachable_store_and_index_freshness() {
     assert_eq!(stale["store"], "personal");
     assert_eq!(stale["store_source"], "global-default");
     assert_eq!(stale["reachable"], true);
+    assert_eq!(stale["store_scanned"], true);
     assert!(stale["store_id"].as_str().is_some());
     assert_eq!(stale["index_exists"], false);
     assert_eq!(stale["index_stale"], true);
@@ -6032,6 +6034,7 @@ fn sync_status_reports_reachable_store_and_index_freshness() {
             config.to_str().expect("utf8 config"),
             "sync-status",
             "--json",
+            "--scan",
         ])
         .output()
         .expect("run fresh sync-status");
@@ -6044,6 +6047,410 @@ fn sync_status_reports_reachable_store_and_index_freshness() {
     assert_eq!(fresh["index_exists"], true);
     assert_eq!(fresh["index_stale"], false);
     assert!(fresh["index_modified_at"].as_str().is_some());
+}
+
+/// Store with two remembered notes and a freshly built index, for the
+/// `index_stale` edge cases. Returns the config path and the note files.
+fn indexed_two_note_store(dir: &std::path::Path) -> (std::path::PathBuf, Vec<std::path::PathBuf>) {
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    for text in [
+        "The first memory the index will hold.",
+        "The second memory the index will hold.",
+    ] {
+        cargo_bin_cmd!("hm")
+            .args([
+                "--config",
+                config.to_str().expect("utf8 config"),
+                "remember",
+                "--text",
+                text,
+            ])
+            .assert()
+            .success();
+    }
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--quiet",
+        ])
+        .assert()
+        .success();
+    let mut notes = Vec::new();
+    let mut pending = vec![personal.join("inbox/notes")];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir).expect("list notes") {
+            let path = entry.expect("note entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                notes.push(path);
+            }
+        }
+    }
+    notes.sort();
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    (config, notes)
+}
+
+fn scanned_index_stale(config: &std::path::Path) -> serde_json::Value {
+    let output = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "sync-status",
+            "--json",
+            "--scan",
+        ])
+        .output()
+        .expect("run sync-status");
+    assert!(output.status.success(), "sync-status failed: {output:?}");
+    let status: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("sync-status json");
+    assert_eq!(status["store_scanned"], true, "{status}");
+    status["index_stale"].clone()
+}
+
+#[test]
+fn sync_status_scan_reports_index_stale_after_a_note_is_deleted() {
+    // A deletion leaves every remaining mtime older than the index, so an
+    // mtime comparison calls the index fresh while search would rebuild it.
+    let dir = temp_dir("sync-status-stale-delete");
+    let (config, notes) = indexed_two_note_store(&dir);
+    assert_eq!(scanned_index_stale(&config), false);
+    fs::remove_file(&notes[0]).expect("delete note");
+    assert_eq!(scanned_index_stale(&config), true);
+}
+
+#[test]
+fn sync_status_scan_reports_index_stale_for_an_old_mtime_arrival() {
+    // rclone and Drive preserve the writer's mtime, so a note synced in from
+    // another machine can land with an mtime older than the local index.
+    let dir = temp_dir("sync-status-stale-arrival");
+    let (config, notes) = indexed_two_note_store(&dir);
+    let dated = dir.join("personal/inbox/notes/2020/01/01");
+    fs::create_dir_all(&dated).expect("create dated dir");
+    let arrival = dated.join("20200101T000000.000000Z_other_1_human_000000000001.md");
+    fs::copy(&notes[0], &arrival).expect("copy note");
+    backdate_to_2020(&arrival);
+    assert_eq!(scanned_index_stale(&config), true);
+}
+
+#[test]
+fn sync_status_scan_reports_index_stale_for_a_backdated_rewrite() {
+    // A synced in-place rewrite (retag, classifier) keeps the file count and
+    // can carry an mtime older than the index; only the per-file fingerprint
+    // sees it, which is the case the index's own freshness check exists for.
+    let dir = temp_dir("sync-status-stale-rewrite");
+    let (config, notes) = indexed_two_note_store(&dir);
+    let mut rewritten = fs::read_to_string(&notes[0]).expect("read note");
+    rewritten.push_str("\nA rewrite from another machine.\n");
+    fs::write(&notes[0], rewritten).expect("rewrite note");
+    backdate_to_2020(&notes[0]);
+    assert_eq!(scanned_index_stale(&config), true);
+}
+
+/// Set a file's mtime to 2020-01-01, older than any index a test builds.
+fn backdate_to_2020(path: &std::path::Path) {
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open file")
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800))
+        .expect("backdate file");
+}
+
+#[test]
+fn sync_status_skips_the_store_walk_by_default() {
+    // The default report must stay cheap on a cloud mount, so it does not walk
+    // the store: the walk-derived fields keep their "not measured" values and
+    // `store_scanned` says so, even when the walk would have found something.
+    let dir = temp_dir("sync-status-default");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Only a scan should see this unindexed memory.",
+        ])
+        .assert()
+        .success();
+    fs::write(personal.join("inbox/notes/note (conflicted copy).md"), "x")
+        .expect("write conflict copy");
+
+    let output = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "sync-status",
+            "--json",
+        ])
+        .output()
+        .expect("run sync-status");
+    assert!(output.status.success(), "sync-status failed: {output:?}");
+    let status: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("sync-status json");
+    assert_eq!(status["reachable"], true, "{status}");
+    assert_eq!(status["store_scanned"], false, "{status}");
+    assert_eq!(status["store_error"], serde_json::Value::Null);
+    assert_eq!(status["newest_note_at"], serde_json::Value::Null);
+    assert_eq!(status["newest_event_at"], serde_json::Value::Null);
+    assert_eq!(status["newest_canonical_at"], serde_json::Value::Null);
+    assert_eq!(status["index_stale"], false);
+    assert_eq!(status["cloud_conflict_files"], 0);
+    // Index facts are local and stay measured without a scan.
+    assert_eq!(status["index_exists"], false);
+
+    let output = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "sync-status",
+        ])
+        .output()
+        .expect("run text sync-status");
+    assert!(output.status.success(), "sync-status failed: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("store_scan: skipped"), "{stdout}");
+    assert!(!stdout.contains("index_stale:"), "{stdout}");
+}
+
+#[test]
+fn sync_status_default_reads_only_the_top_of_canonical_trees() {
+    // Directory-read budget for the default report: it may list the top level
+    // of each canonical tree, never below and never elsewhere. Every directory one level down is
+    // unreadable here, so any descent would surface as `store_error`; on an
+    // rclone mount each such directory is a Drive API listing when cold.
+    let dir = temp_dir("sync-status-budget");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "A dated directory the default report must not open.",
+        ])
+        .assert()
+        .success();
+    let mut below_top = Vec::new();
+    // Root-level directories outside every canonical tree (`generated/`) are
+    // off limits too; `inbox/` itself must stay listable to reach its trees.
+    for entry in fs::read_dir(&personal).expect("list root") {
+        let path = entry.expect("root entry").path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if path.is_dir()
+            && !hive_memory::index::FINGERPRINT_ROOTS
+                .iter()
+                .any(|tree| tree.split('/').next() == Some(name))
+        {
+            below_top.push(path);
+        }
+    }
+    for tree in hive_memory::index::FINGERPRINT_ROOTS {
+        let tree = personal.join(tree);
+        fs::create_dir_all(tree.join("nested")).expect("create nested dir");
+        for entry in fs::read_dir(&tree).expect("list tree") {
+            let path = entry.expect("tree entry").path();
+            if path.is_dir() {
+                below_top.push(path);
+            }
+        }
+    }
+    let mut guards = Vec::new();
+    for path in &below_top {
+        let Some(guard) = Unreadable::new(path) else {
+            eprintln!("skipping: mode bits do not restrict this user");
+            return;
+        };
+        guards.push(guard);
+    }
+
+    let status = |extra: &[&str]| -> serde_json::Value {
+        let output = cargo_bin_cmd!("hm")
+            .args([
+                "--config",
+                config.to_str().expect("utf8 config"),
+                "sync-status",
+                "--json",
+            ])
+            .args(extra)
+            .output()
+            .expect("run sync-status");
+        assert!(output.status.success(), "sync-status failed: {output:?}");
+        serde_json::from_slice(&output.stdout).expect("sync-status json")
+    };
+    let fast = status(&[]);
+    assert_eq!(fast["reachable"], true, "{fast}");
+    assert_eq!(fast["store_error"], serde_json::Value::Null, "{fast}");
+
+    // The opt-in walk does descend, which is what makes the budget above
+    // meaningful rather than vacuous.
+    let scanned = status(&["--scan"]);
+    assert_eq!(scanned["reachable"], false, "{scanned}");
+    assert!(scanned["store_error"].as_str().is_some(), "{scanned}");
+}
+
+fn sync_status_output(config: &std::path::Path, extra: &[&str]) -> std::process::Output {
+    let output = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "sync-status",
+        ])
+        .args(extra)
+        .output()
+        .expect("run sync-status");
+    assert!(output.status.success(), "sync-status failed: {output:?}");
+    output
+}
+
+#[test]
+fn sync_status_treats_a_non_directory_tree_as_empty() {
+    // The index fingerprint, and so recall, reads a tree top that is not a
+    // directory as empty; neither the probe nor the walk may call that store
+    // unreachable.
+    let dir = temp_dir("sync-status-file-tree");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    let events = personal.join("inbox/events");
+    fs::remove_dir_all(&events).expect("remove events dir");
+    fs::write(&events, "x").expect("write events file");
+
+    for extra in [&["--json"][..], &["--json", "--scan"][..]] {
+        let output = sync_status_output(&config, extra);
+        let status: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("sync-status json");
+        assert_eq!(status["reachable"], true, "{extra:?}: {status}");
+        assert_eq!(status["store_error"], serde_json::Value::Null, "{status}");
+    }
+}
+
+#[test]
+fn sync_status_scan_of_a_missing_root_measures_nothing() {
+    // A missing mountpoint is a dropped store, not an empty one: `--scan`
+    // must not report walk-derived values for it as measured.
+    let dir = temp_dir("sync-status-scan-missing");
+    let config = dir.join("config.toml");
+    let personal = dir.join("missing-personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+
+    let output = sync_status_output(&config, &["--json", "--scan"]);
+    let status: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("sync-status json");
+    assert_eq!(status["reachable"], false, "{status}");
+    assert!(status["manifest_error"].as_str().is_some(), "{status}");
+    assert_eq!(status["store_scanned"], false, "{status}");
+    assert_eq!(status["index_stale"], false, "{status}");
+}
+
+#[test]
+fn sync_status_scan_of_an_empty_mountpoint_measures_nothing() {
+    // An unmounted cloud mount usually leaves an empty directory behind.
+    let dir = temp_dir("sync-status-scan-empty");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    fs::create_dir_all(&personal).expect("create empty mountpoint");
+
+    let output = sync_status_output(&config, &["--json", "--scan"]);
+    let status: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("sync-status json");
+    assert_eq!(status["reachable"], false, "{status}");
+    assert!(status["manifest_error"].as_str().is_some(), "{status}");
+    assert_eq!(status["store_scanned"], false, "{status}");
+}
+
+#[test]
+fn sync_status_scan_text_reports_measured_fields() {
+    let dir = temp_dir("sync-status-scan-text");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+
+    let output = sync_status_output(&config, &["--scan"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("index_stale: "), "{stdout}");
+    assert!(stdout.contains("cloud_conflict_files: 0"), "{stdout}");
+    assert!(!stdout.contains("store_scan:"), "{stdout}");
+}
+
+#[test]
+fn sync_status_scan_text_reports_a_failed_walk_as_incomplete() {
+    // A requested walk that failed must not tell the user to pass `--scan`.
+    let dir = temp_dir("sync-status-scan-text-failed");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    let dated = personal.join("inbox/notes/2026");
+    fs::create_dir_all(&dated).expect("create dated dir");
+    let Some(_unreadable) = Unreadable::new(&dated) else {
+        eprintln!("skipping: mode bits do not restrict this user");
+        return;
+    };
+
+    let output = sync_status_output(&config, &["--scan"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("reachable: no"), "{stdout}");
+    assert!(stdout.contains("store_scan: incomplete"), "{stdout}");
+    assert!(!stdout.contains("--scan"), "{stdout}");
+    assert!(!stdout.contains("index_stale:"), "{stdout}");
+}
+
+#[test]
+fn sync_status_scan_follows_a_symlinked_inbox_tree() {
+    // Recall follows a symlinked tree top, so the scan's newest times must
+    // too, as the per-tree walks did before the walks were merged; the
+    // conflict count keeps matching `hm doctor`, which does not.
+    let dir = temp_dir("sync-status-scan-symlink");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    let elsewhere = dir.join("notes-elsewhere/2026/01/01");
+    fs::create_dir_all(&elsewhere).expect("create linked notes");
+    fs::write(elsewhere.join("note.md"), "x").expect("write linked note");
+    fs::write(elsewhere.join("note (conflicted copy).md"), "x").expect("write linked copy");
+    let notes = personal.join("inbox/notes");
+    fs::remove_dir_all(&notes).expect("remove notes dir");
+    std::os::unix::fs::symlink(dir.join("notes-elsewhere"), &notes).expect("symlink notes");
+
+    let output = sync_status_output(&config, &["--json", "--scan"]);
+    let status: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("sync-status json");
+    assert_eq!(status["store_scanned"], true, "{status}");
+    assert!(status["newest_note_at"].as_str().is_some(), "{status}");
+    // `hm doctor` does not follow the link, so `--fix` could never clear a
+    // copy counted there.
+    assert_eq!(status["cloud_conflict_files"], 0, "{status}");
 }
 
 #[test]
@@ -6217,6 +6624,7 @@ fn sync_status_stops_counting_conflicts_once_quarantined() {
                 config.to_str().expect("utf8 config"),
                 "sync-status",
                 "--json",
+                "--scan",
             ])
             .output()
             .expect("run sync-status");
