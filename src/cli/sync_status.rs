@@ -54,6 +54,8 @@ struct SyncStatusJsonOutput {
     newest_note_at: Option<String>,
     newest_event_at: Option<String>,
     newest_canonical_at: Option<String>,
+    /// With a scan, whether the next search would rebuild the index (see
+    /// `index::index_is_fresh`); a missing index is stale.
     index_stale: bool,
     cloud_conflict_files: usize,
     hosts: Vec<HostSyncStatus>,
@@ -72,11 +74,14 @@ struct StoreScan {
     newest_note: Option<SystemTime>,
     newest_event: Option<SystemTime>,
     cloud_conflict_files: usize,
+    /// Whether the next read would rebuild the index (see
+    /// [`index::index_is_fresh`]); a missing index counts as stale.
+    index_stale: bool,
 }
 
 impl StoreScan {
-    /// Walk the store, listing each directory once, for every walk-derived
-    /// field.
+    /// Walk the store for every walk-derived field, listing each directory
+    /// once, then check index freshness.
     ///
     /// Cost is one directory listing per store directory plus one `stat` per
     /// inbox file, which is why only `--scan` runs it: on an rclone mount whose
@@ -84,7 +89,12 @@ impl StoreScan {
     /// the mount-wide rate pacer (rclone's default allows 10 calls/s after a
     /// burst), so a store with a few hundred dated inbox directories takes
     /// seconds to tens of seconds.
-    fn run(root: &Path) -> Result<Self> {
+    ///
+    /// The index freshness check then walks the canonical trees again (a
+    /// listing per directory, a `stat` per directory and file) and reads the
+    /// local index; on an rclone mount those listings normally come from the
+    /// directory cache the first walk just filled, not from Drive.
+    fn run(root: &Path, cache_dir: &Path, store_name: &str) -> Result<Self> {
         let notes = root.join("inbox/notes");
         let events = root.join("inbox/events");
         let mut scan = Self::default();
@@ -114,6 +124,7 @@ impl StoreScan {
             scan.cloud_conflict_files += usize::from(is_conflict_copy(path));
             Ok(())
         })?;
+        scan.index_stale = !index::index_is_fresh(cache_dir, store_name, root)?;
         Ok(scan)
     }
 }
@@ -251,7 +262,7 @@ pub(crate) fn run(args: SyncStatusArgs, context: CliContext) -> Result<()> {
     // otherwise "scan" clean and report zeros as measured. It still gets the
     // probe, so a dead mount keeps its `store_error`.
     let (scan, store_error) = if args.scan && manifest_read {
-        match StoreScan::run(&store_config.root) {
+        match StoreScan::run(&store_config.root, &config.cache_dir, &resolved_store.name) {
             Ok(scan) => (Some(scan), None),
             Err(err) => (None, Some(err.to_string())),
         }
@@ -269,17 +280,13 @@ pub(crate) fn run(args: SyncStatusArgs, context: CliContext) -> Result<()> {
         newest_note,
         newest_event,
         cloud_conflict_files,
+        index_stale,
     } = scan.unwrap_or_default();
     let newest_canonical = [newest_note, newest_event].into_iter().flatten().max();
     let index_path =
         index::scoped_index_path(&config.cache_dir, &resolved_store.name, &store_config.root);
     let index_modified = file_mtime(&index_path)?;
     let index_exists = index_modified.is_some();
-    let index_stale = match (newest_canonical, index_modified) {
-        (Some(_), None) => true,
-        (Some(canonical), Some(index_modified)) => canonical > index_modified,
-        _ => false,
-    };
     let hosts = host_sync_status(&index_path);
 
     let output = SyncStatusJsonOutput {

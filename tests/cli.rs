@@ -6049,6 +6049,122 @@ fn sync_status_reports_reachable_store_and_index_freshness() {
     assert!(fresh["index_modified_at"].as_str().is_some());
 }
 
+/// Store with two remembered notes and a freshly built index, for the
+/// `index_stale` edge cases. Returns the config path and the note files.
+fn indexed_two_note_store(dir: &std::path::Path) -> (std::path::PathBuf, Vec<std::path::PathBuf>) {
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    for text in [
+        "The first memory the index will hold.",
+        "The second memory the index will hold.",
+    ] {
+        cargo_bin_cmd!("hm")
+            .args([
+                "--config",
+                config.to_str().expect("utf8 config"),
+                "remember",
+                "--text",
+                text,
+            ])
+            .assert()
+            .success();
+    }
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "refresh",
+            "--quiet",
+        ])
+        .assert()
+        .success();
+    let mut notes = Vec::new();
+    let mut pending = vec![personal.join("inbox/notes")];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir).expect("list notes") {
+            let path = entry.expect("note entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                notes.push(path);
+            }
+        }
+    }
+    notes.sort();
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    (config, notes)
+}
+
+fn scanned_index_stale(config: &std::path::Path) -> serde_json::Value {
+    let output = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "sync-status",
+            "--json",
+            "--scan",
+        ])
+        .output()
+        .expect("run sync-status");
+    assert!(output.status.success(), "sync-status failed: {output:?}");
+    let status: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("sync-status json");
+    assert_eq!(status["store_scanned"], true, "{status}");
+    status["index_stale"].clone()
+}
+
+#[test]
+fn sync_status_scan_reports_index_stale_after_a_note_is_deleted() {
+    // A deletion leaves every remaining mtime older than the index, so an
+    // mtime comparison calls the index fresh while search would rebuild it.
+    let dir = temp_dir("sync-status-stale-delete");
+    let (config, notes) = indexed_two_note_store(&dir);
+    assert_eq!(scanned_index_stale(&config), false);
+    fs::remove_file(&notes[0]).expect("delete note");
+    assert_eq!(scanned_index_stale(&config), true);
+}
+
+#[test]
+fn sync_status_scan_reports_index_stale_for_an_old_mtime_arrival() {
+    // rclone and Drive preserve the writer's mtime, so a note synced in from
+    // another machine can land with an mtime older than the local index.
+    let dir = temp_dir("sync-status-stale-arrival");
+    let (config, notes) = indexed_two_note_store(&dir);
+    let dated = dir.join("personal/inbox/notes/2020/01/01");
+    fs::create_dir_all(&dated).expect("create dated dir");
+    let arrival = dated.join("20200101T000000.000000Z_other_1_human_000000000001.md");
+    fs::copy(&notes[0], &arrival).expect("copy note");
+    backdate_to_2020(&arrival);
+    assert_eq!(scanned_index_stale(&config), true);
+}
+
+#[test]
+fn sync_status_scan_reports_index_stale_for_a_backdated_rewrite() {
+    // A synced in-place rewrite (retag, classifier) keeps the file count and
+    // can carry an mtime older than the index; only the per-file fingerprint
+    // sees it, which is the case the index's own freshness check exists for.
+    let dir = temp_dir("sync-status-stale-rewrite");
+    let (config, notes) = indexed_two_note_store(&dir);
+    let mut rewritten = fs::read_to_string(&notes[0]).expect("read note");
+    rewritten.push_str("\nA rewrite from another machine.\n");
+    fs::write(&notes[0], rewritten).expect("rewrite note");
+    backdate_to_2020(&notes[0]);
+    assert_eq!(scanned_index_stale(&config), true);
+}
+
+/// Set a file's mtime to 2020-01-01, older than any index a test builds.
+fn backdate_to_2020(path: &std::path::Path) {
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open file")
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800))
+        .expect("backdate file");
+}
+
 #[test]
 fn sync_status_skips_the_store_walk_by_default() {
     // The default report must stay cheap on a cloud mount, so it does not walk

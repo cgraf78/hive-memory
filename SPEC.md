@@ -944,9 +944,9 @@ Stable `--json` success field sets. Fields are mandatory unless explicitly noted
   lists the top level of each canonical tree (`inbox/notes`, `inbox/events`,
   `rules`, `people`, `memories`), never below, because on a cloud mount every
   directory listing can be a remote call. `--scan` additionally walks the
-  whole store tree (minus `.quarantine/`) once. `reachable` is true only when
-  the manifest reads and that probe (or, with `--scan`, the walk) hits no I/O
-  error. A missing root sets only `manifest_error`; a probe or walk failure
+  whole store tree (minus `.quarantine/`), then rechecks the canonical trees
+  for index freshness. `reachable` is true only when the manifest reads and
+  that probe (or, with `--scan`, the walk) hits no I/O error. A missing root sets only `manifest_error`; a probe or walk failure
   (for example a dead network mount) sets `store_error` to the first failure
   and its path. Either way the command still exits 0 with the report.
   `store_scanned` is true only when `--scan` ran, the manifest read (so a
@@ -954,11 +954,18 @@ Stable `--json` success field sets. Fields are mandatory unless explicitly noted
   finished; the scan fields (`newest_*`, `index_stale`,
   `cloud_conflict_files`) are measured only then and otherwise hold null,
   `false`, and `0`, even for a reachable store, so callers must gate them on
-  `store_scanned` (before it existed, `reachable` alone implied a scan). The
-  index fields and `hosts` come from the local index file and need no scan.
-  `cloud_conflict_files` counts the same conflict-copy names `hm doctor`
-  reports, so it drops to 0 once `hm doctor --fix` quarantines them.
-  `unknown_config_keys` is the sorted list
+  `store_scanned` (before it existed, `reachable` alone implied a scan). With
+  a scan, `index_stale` is true exactly when the next search would rebuild
+  the index: it is missing (including in a store with no records yet) or
+  damaged, was built by an `hm` with a different index schema, or no longer
+  matches the store's canonical trees (file paths, sizes, and mtimes;
+  directory count and newest directory mtime; the `entities.toml` mtime),
+  the same fingerprint hot reads check, so deletions and synced arrivals with
+  older preserved mtimes count. The `newest_*` times are informational file
+  mtimes. The other index fields and `hosts` come from the local index file
+  and need no scan. `cloud_conflict_files` counts the same conflict-copy
+  names `hm doctor` reports, so it drops to 0 once `hm doctor --fix`
+  quarantines them. `unknown_config_keys` is the sorted list
   of dotted config key paths the binary does not understand (for example
   `["future_policy", "stores.work.extra"]`); the matching
   `warning: unknown config key: <key>` stderr lines are still emitted.

@@ -506,16 +506,7 @@ pub fn load_or_rebuild_index(input: LoadIndexInput<'_>) -> Result<LoadIndexRepor
 /// into a full store scan.
 pub fn load_fresh_index(input: &LoadIndexInput<'_>) -> Result<Option<LoadIndexReport>, IndexError> {
     let path = scoped_index_path(input.cache_dir, input.store_name, input.store_root);
-    let current = canonical_fingerprint(input.store_root)?;
-    // The fingerprint now lives in the index file's header, so one read both
-    // proves freshness and yields entries — and the fingerprint can never refer
-    // to a different rebuild's data. A missing/old-format header, a stale
-    // fingerprint, an oversized file, or any read/parse error is a cache miss
-    // (rebuild), never a hard error on this latency-sensitive boundary.
-    if let Ok((Some(header), entries)) = read_index_inner(&path)
-        && header.fingerprint == current
-        && header_generation_valid(&header, &entries)
-    {
+    if let Some((header, entries)) = read_fresh_generation(&path, input.store_root)? {
         let projection =
             hydrate_local_projection(header.projection.expect("checked projection"), &entries);
         let warnings = incomplete_projection_warnings(&path, &projection);
@@ -528,6 +519,45 @@ pub fn load_fresh_index(input: &LoadIndexInput<'_>) -> Result<Option<LoadIndexRe
         }));
     }
 
+    Ok(None)
+}
+
+/// Whether the cached index for a store is current, without rebuilding it.
+///
+/// True exactly when [`load_or_rebuild_index`] would serve the cached file as
+/// fresh without rebuilding (its one-second lock-contention fallback aside):
+/// it exists, carries a valid generation of this schema, and was built from
+/// the same canonical file set (paths, sizes, mtimes) the store holds now. Unlike a
+/// newest-mtime comparison this also notices deletions and synced arrivals
+/// whose preserved mtime is older than the index. Costs the same canonical
+/// walk as a hot read; fails only when that walk does.
+pub fn index_is_fresh(
+    cache_dir: &Path,
+    store_name: &str,
+    store_root: &Path,
+) -> Result<bool, IndexError> {
+    let path = scoped_index_path(cache_dir, store_name, store_root);
+    Ok(read_fresh_generation(&path, store_root)?.is_some())
+}
+
+/// Read the index at `path` when its generation is valid and its fingerprint
+/// matches `store_root`'s canonical files right now.
+fn read_fresh_generation(
+    path: &Path,
+    store_root: &Path,
+) -> Result<Option<(IndexHeader, Vec<IndexEntry>)>, IndexError> {
+    let current = canonical_fingerprint(store_root)?;
+    // The fingerprint now lives in the index file's header, so one read both
+    // proves freshness and yields entries — and the fingerprint can never refer
+    // to a different rebuild's data. A missing/old-format header, a stale
+    // fingerprint, an oversized file, or any read/parse error is a cache miss
+    // (rebuild), never a hard error on this latency-sensitive boundary.
+    if let Ok((Some(header), entries)) = read_index_inner(path)
+        && header.fingerprint == current
+        && header_generation_valid(&header, &entries)
+    {
+        return Ok(Some((header, entries)));
+    }
     Ok(None)
 }
 
@@ -1999,6 +2029,57 @@ mod tests {
 
         assert!(second.rebuilt);
         assert_eq!(second.entries.len(), 1);
+    }
+
+    #[test]
+    fn index_is_fresh_is_false_without_an_index() {
+        let dir = temp_dir("fresh-missing");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(&root, true);
+
+        assert!(!index_is_fresh(&cache, "personal", &root).expect("freshness"));
+    }
+
+    #[test]
+    fn index_is_fresh_is_true_when_a_read_would_reuse_the_index() {
+        let dir = temp_dir("fresh-current");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(&root, true);
+        load_or_rebuild_index(load_input("personal", &root, &cache)).expect("build index");
+
+        assert!(index_is_fresh(&cache, "personal", &root).expect("freshness"));
+        // Agreement with the reader it predicts: a fresh answer means reuse.
+        let reread = load_or_rebuild_index(load_input("personal", &root, &cache)).expect("reread");
+        assert!(!reread.rebuilt);
+    }
+
+    #[test]
+    fn index_is_fresh_is_false_after_a_canonical_change() {
+        let dir = temp_dir("fresh-changed");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(&root, true);
+        load_or_rebuild_index(load_input("personal", &root, &cache)).expect("build index");
+        let rules = root.join("rules");
+        fs::create_dir_all(&rules).expect("rules dir");
+        fs::write(rules.join("new.md"), "# A new curated rule\n").expect("write rule");
+
+        assert!(!index_is_fresh(&cache, "personal", &root).expect("freshness"));
+    }
+
+    #[test]
+    fn index_is_fresh_is_false_for_a_damaged_index() {
+        let dir = temp_dir("fresh-damaged");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(&root, true);
+        let built =
+            load_or_rebuild_index(load_input("personal", &root, &cache)).expect("build index");
+        fs::write(&built.path, "{bad json").expect("corrupt index");
+
+        assert!(!index_is_fresh(&cache, "personal", &root).expect("freshness"));
     }
 
     #[test]

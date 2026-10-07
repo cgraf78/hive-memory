@@ -376,11 +376,12 @@ memory. `hm sync-status` reports store and index health without mutating
 anything. By default it stays cheap on a cloud mount: it reads the manifest
 and lists only the top level of each canonical tree. `--scan` walks the whole
 store to add index staleness, the newest record times, and the cloud conflict
-copy count, at one directory listing per store directory. Its `--json` form
-also gives scripts a structured health signal: `reachable: false` for a store
-that is missing or cannot be read (such as a dropped network mount), with the
-cause in `manifest_error` or `store_error`, and `unknown_config_keys` for
-config keys this `hm` does not understand yet.
+copy count, which on a cloud mount can cost a remote listing per store
+directory. Its `--json` form also gives scripts a structured health signal:
+`reachable: false` for a store that is missing or cannot be read (such as a
+dropped network mount), with the cause in `manifest_error` or `store_error`,
+and `unknown_config_keys` for config keys this `hm` does not understand yet.
+Read the `--scan` fields only when `store_scanned` is true.
 
 ### Offline writes and the outbox
 
