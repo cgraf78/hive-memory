@@ -216,33 +216,6 @@ fn delivered_ids(state: &Value) -> Vec<String> {
 const PERSISTENT: &[&str] = &["--delivery", "persistent"];
 
 /// Memory block ids in an injected body (pointer blocks included).
-/// Sets `mode` on a directory for one test and restores 0755 on drop, even
-/// when the test panics.
-struct Restricted<'a>(&'a Path);
-
-impl<'a> Restricted<'a> {
-    /// Returns `None` when mode bits do not restrict this user (root in a CI
-    /// container), so callers skip instead of asserting on an open fixture.
-    fn new(path: &'a Path, mode: u32) -> Option<Self> {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("chmod");
-        let guard = Self(path);
-        let probe = path.join(".mode-probe");
-        let writable = fs::write(&probe, b"").is_ok();
-        let _ = fs::remove_file(&probe);
-        let readable = fs::read_dir(path).is_ok();
-        let restricted = (mode & 0o200 == 0 && !writable) || (mode & 0o400 == 0 && !readable);
-        restricted.then_some(guard)
-    }
-}
-
-impl Drop for Restricted<'_> {
-    fn drop(&mut self) {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(self.0, fs::Permissions::from_mode(0o755));
-    }
-}
-
 fn memory_count(body: &str) -> usize {
     body.matches("<memory id=").count()
 }
@@ -388,12 +361,12 @@ fn emitted_memories_count_as_delivered_without_an_acknowledgement() {
 fn failed_reset_fails_the_hook() {
     let fx = Fixture::new("delivery-reset-fails");
     fx.session_start("locked", &fx.repo_a, PERSISTENT);
-    // An unwritable session state dir makes the reset's state write fail.
-    let run = fx.state.join("runs/locked");
-    let Some(lock) = Restricted::new(&run, 0o500) else {
-        eprintln!("skipped: mode bits do not restrict this user (root?)");
-        return;
-    };
+    // A directory where the session's state lock file belongs makes the
+    // reset's locked state update fail while plain reads still work. Unlike
+    // mode bits, this also holds for root, which CI containers run tests as.
+    let lock = fx.state.join("locks/hook-state/locked.lock");
+    let _ = fs::remove_file(&lock);
+    fs::create_dir_all(&lock).expect("block state lock");
     let project = fx.project(&fx.repo_a);
     for args in [
         vec![
@@ -417,7 +390,7 @@ fn failed_reset_fails_the_hook() {
         // as an older hm and retry untracked).
         assert_eq!(output.status.code(), Some(1), "{args:?}");
     }
-    drop(lock);
+    fs::remove_dir(&lock).expect("unblock state lock");
     assert_eq!(delivered_ids(&fx.state_json("locked")).len(), 2);
 }
 
@@ -1540,18 +1513,16 @@ fn hm_get_skips_an_unreadable_fallback_store() {
         .as_str()
         .expect("id")
         .to_owned();
-    // `archive` is searched before `team` and has no cached index; its root
-    // cannot be read.
+    // `archive` is searched before `team` and has no cached index, and its
+    // root is a regular file, so reading it fails (for root too, unlike mode
+    // bits).
     let archive = config.parent().expect("dir").join("archive");
-    let Some(lock) = Restricted::new(&archive, 0o000) else {
-        eprintln!("skipped: mode bits do not restrict this user (root?)");
-        return;
-    };
+    fs::remove_dir_all(&archive).expect("remove archive root");
+    fs::write(&archive, b"not a store").expect("break archive root");
     let out = cargo_bin_cmd!("hm")
         .args(["--config", cfg, "--as-agent", "claude", "get", &id])
-        .output();
-    drop(lock);
-    let out = out.expect("hm get");
+        .output()
+        .expect("hm get");
     assert_eq!(
         out.status.code(),
         Some(0),
