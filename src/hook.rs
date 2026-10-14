@@ -73,6 +73,13 @@ pub struct HookState {
     /// to the next hits, as untracked recall does.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub turn_recall_ids: Vec<String>,
+    /// Memory ids the last turn-lifetime context-change block emitted.
+    ///
+    /// Untracked recall skips the current selection's ids
+    /// (`startup_memory_ids`), so turn recall skips them too; a new selection
+    /// replaces them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub turn_context_ids: Vec<String>,
     /// Counter advanced by every context reset.
     ///
     /// Tracked bookkeeping carries the epoch it was selected in, and an update
@@ -147,6 +154,10 @@ pub struct DeliveryUpdate {
     /// Ids turn-lifetime recall emitted (added to `turn_recall_ids`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub turn_recall_ids: Vec<String>,
+    /// Ids a turn-lifetime context-change block emitted (replace
+    /// `turn_context_ids`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_context_ids: Option<Vec<String>>,
     /// Untracked `context_key` for an emitted selection, complete or not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub untracked_context_key: Option<String>,
@@ -721,6 +732,7 @@ pub fn reset_context_epoch(
             state.delivered_context_key = None;
             state.delivered_recall_key = None;
             state.turn_recall_ids.clear();
+            state.turn_context_ids.clear();
             state.context_epoch = state.context_epoch.wrapping_add(1);
             state.context_key = None;
             state.startup_memory_ids.clear();
@@ -774,6 +786,9 @@ fn apply_update(state: &mut HookState, update: DeliveryUpdate) {
         state.turn_recall_ids.extend(update.turn_recall_ids);
         state.turn_recall_ids.sort();
         state.turn_recall_ids.dedup();
+    }
+    if let Some(ids) = update.turn_context_ids {
+        state.turn_context_ids = ids;
     }
     // Keep the untracked fields as untracked hooks would have left them, so
     // an adapter that falls back to an untracked call (too little room, for
@@ -1510,6 +1525,22 @@ mod tests {
         assert_eq!(state.delivered_recall_key.as_deref(), Some("recall-1"));
         // Turn recall ids are recorded apart from the delivered set.
         assert_eq!(state.turn_recall_ids, ["t1", "t2"]);
+        // Each turn context-change block replaces the previous one's ids, so
+        // recall offers the old project's memories again after a switch.
+        for ids in [["a1", "a2"].as_slice(), ["b1"].as_slice()] {
+            apply_delivery(
+                &dir,
+                "s",
+                DeliveryUpdate {
+                    turn_context_ids: Some(ids.iter().map(|id| (*id).to_owned()).collect()),
+                    ..update(&[], None)
+                },
+                &options(),
+            )
+            .expect("turn selection");
+        }
+        let state = load_state(&dir, "s").expect("state");
+        assert_eq!(state.turn_context_ids, ["b1"]);
         // The untracked fields change only through the explicit mirror.
         assert!(state.context_key.is_none());
         assert!(state.prompt_recall_key.is_none());

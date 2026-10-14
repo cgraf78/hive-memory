@@ -35,6 +35,12 @@ struct Fixture {
 impl Fixture {
     /// Store with two global memories and one memory scoped to repo B.
     fn new(name: &str) -> Self {
+        Self::with_strategy(name, "recency")
+    }
+
+    /// [`Fixture::new`] with another context strategy. Under `relevance`,
+    /// reference memories are search-only: only prompt recall shows them.
+    fn with_strategy(name: &str, strategy: &str) -> Self {
         let dir = temp_dir(name);
         let config = dir.join("config.toml");
         let personal = dir.join("personal");
@@ -61,11 +67,12 @@ impl Fixture {
                 root = "{}"
 
                 [defaults]
-                context_strategy = "recency"
+                context_strategy = "{}"
                 "#,
                 state.display(),
                 state.join("cache").display(),
-                personal.display()
+                personal.display(),
+                strategy
             ),
         )
         .expect("write config");
@@ -209,8 +216,59 @@ fn delivered_ids(state: &Value) -> Vec<String> {
 const PERSISTENT: &[&str] = &["--delivery", "persistent"];
 
 /// Memory block ids in an injected body (pointer blocks included).
+/// Sets `mode` on a directory for one test and restores 0755 on drop, even
+/// when the test panics.
+struct Restricted<'a>(&'a Path);
+
+impl<'a> Restricted<'a> {
+    /// Returns `None` when mode bits do not restrict this user (root in a CI
+    /// container), so callers skip instead of asserting on an open fixture.
+    fn new(path: &'a Path, mode: u32) -> Option<Self> {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("chmod");
+        let guard = Self(path);
+        let probe = path.join(".mode-probe");
+        let writable = fs::write(&probe, b"").is_ok();
+        let _ = fs::remove_file(&probe);
+        let readable = fs::read_dir(path).is_ok();
+        let restricted = (mode & 0o200 == 0 && !writable) || (mode & 0o400 == 0 && !readable);
+        restricted.then_some(guard)
+    }
+}
+
+impl Drop for Restricted<'_> {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(self.0, fs::Permissions::from_mode(0o755));
+    }
+}
+
 fn memory_count(body: &str) -> usize {
     body.matches("<memory id=").count()
+}
+
+/// Memory blocks in `body` as (id, block text), in order.
+fn memory_blocks(body: &str) -> Vec<(String, String)> {
+    let mut blocks = Vec::new();
+    let mut rest = body;
+    while let Some(start) = rest.find("<memory id=\"") {
+        let after = &rest[start..];
+        let end = after.find("</memory>\n").expect("closed block") + "</memory>\n".len();
+        let end = if after[end..].starts_with('\n') {
+            end + 1
+        } else {
+            end
+        };
+        let block = &after[..end];
+        let id = block["<memory id=\"".len()..]
+            .split('"')
+            .next()
+            .expect("id")
+            .to_owned();
+        blocks.push((id, block.to_owned()));
+        rest = &after[end..];
+    }
+    blocks
 }
 
 #[test]
@@ -328,12 +386,14 @@ fn emitted_memories_count_as_delivered_without_an_acknowledgement() {
 
 #[test]
 fn failed_reset_fails_the_hook() {
-    use std::os::unix::fs::PermissionsExt;
     let fx = Fixture::new("delivery-reset-fails");
     fx.session_start("locked", &fx.repo_a, PERSISTENT);
     // An unwritable session state dir makes the reset's state write fail.
     let run = fx.state.join("runs/locked");
-    fs::set_permissions(&run, fs::Permissions::from_mode(0o500)).expect("lock state dir");
+    let Some(lock) = Restricted::new(&run, 0o500) else {
+        eprintln!("skipped: mode bits do not restrict this user (root?)");
+        return;
+    };
     let project = fx.project(&fx.repo_a);
     for args in [
         vec![
@@ -357,7 +417,7 @@ fn failed_reset_fails_the_hook() {
         // as an older hm and retry untracked).
         assert_eq!(output.status.code(), Some(1), "{args:?}");
     }
-    fs::set_permissions(&run, fs::Permissions::from_mode(0o755)).expect("unlock state dir");
+    drop(lock);
     assert_eq!(delivered_ids(&fx.state_json("locked")).len(), 2);
 }
 
@@ -460,20 +520,19 @@ fn turn_lifetime_never_suppresses_later_turns() {
     );
     assert!(delivered_ids(&fx.state_json("turn")).is_empty());
 
-    // Same query next turn: recall shows it again, because the host dropped
-    // the previous turn's context and turn memories are never delivered.
+    // Same query next turn: like untracked recall, it skips what the current
+    // selection carried.
     let second = fx.prompt("turn", &fx.repo_b, "zephyrine release checklist", turn);
     assert!(
-        context_body(&second)
-            .expect("second turn")
+        !context_body(&second)
+            .unwrap_or_default()
             .contains(PROJECT_B)
     );
-    let third = fx.prompt("turn", &fx.repo_b, "zephyrine release checklist", turn);
-    assert!(
-        context_body(&third)
-            .expect("third turn")
-            .contains(PROJECT_B)
-    );
+    // Turn memories never join the delivered set, so a later change back to
+    // the project sends them again.
+    fx.prompt("turn", &fx.repo_a, "Inspect the tests.", turn);
+    let back = fx.prompt("turn", &fx.repo_b, "Inspect the tests.", turn);
+    assert!(context_body(&back).expect("back to B").contains(PROJECT_B));
 }
 
 impl Fixture {
@@ -499,16 +558,16 @@ impl Fixture {
 
 #[test]
 fn turn_recall_moves_past_hits_it_already_showed() {
-    let fx = Fixture::new("delivery-turn-advance");
+    let fx = Fixture::with_strategy("delivery-turn-advance", "relevance");
     for step in 1..=7 {
         fx.remember_reference(&format!("Quasar beacon calibration step {step} of seven."));
     }
     fx.refresh();
     let turn: &[&str] = &["--delivery", "turn"];
-    // The first turn sends the project's context selection instead of
-    // recall; that context is gone after the turn.
+    // The first turn sends the project's context selection (if any) instead
+    // of recall. The references are search-only, so it never carries them.
     let first = fx.prompt("advance", &fx.repo_a, "Inspect the tests.", turn);
-    assert!(context_body(&first).is_some());
+    assert!(!context_body(&first).unwrap_or_default().contains("Quasar"));
 
     // Like untracked recall, each turn moves on to the next hits, so all
     // seven appear across three turns of the same question.
@@ -539,7 +598,7 @@ fn turn_recall_moves_past_hits_it_already_showed() {
 
 #[test]
 fn recall_envelope_counts_raw_bytes_while_the_host_cap_counts_json() {
-    let fx = Fixture::new("delivery-recall-envelope");
+    let fx = Fixture::with_strategy("delivery-recall-envelope", "relevance");
     // Three quote-heavy hits: about 1.4 KB each raw, twice that escaped, so
     // together they fit recall's raw per-prompt envelope (4,800 bytes at the
     // default token budget) but not once escaped.
@@ -601,6 +660,107 @@ fn recall_envelope_counts_raw_bytes_while_the_host_cap_counts_json() {
     let body = context_body(&capped).expect("capped recall");
     assert!(serde_json::to_string(&body).expect("json").len() - 2 <= raw_len + 100);
     assert!(emitted_ids(&capped).len() < 3);
+}
+
+#[test]
+fn muse_prompts_equal_untracked_output_minus_session_start_memories() {
+    // The one designed difference from untracked hooks on Muse: prompt
+    // context leaves out exactly the memories session start already put in
+    // the context Muse keeps. Pin it so it cannot grow silently.
+    let fx = Fixture::new("delivery-muse-equivalence");
+    for step in 1..=3 {
+        fx.remember(
+            &format!("Zephyrine release checklist step {step} for project bravo."),
+            Some(&fx.repo_b.clone()),
+        );
+    }
+    fx.refresh();
+    // Warm the rendered cache so both sessions render the same freshness note.
+    fx.session_start("warm", &fx.repo_a, &[]);
+    fx.session_start("warm", &fx.repo_b, &[]);
+
+    let legacy_start = fx.session_start("legacy", &fx.repo_a, &[]);
+    let tracked_start = fx.session_start("tracked", &fx.repo_a, PERSISTENT);
+    let delivered = memory_blocks(&context_body(&tracked_start).expect("tracked start"))
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        context_body(&legacy_start),
+        context_body(&tracked_start),
+        "session start is unchanged"
+    );
+    let turn: &[&str] = &["--delivery", "turn"];
+
+    let prompts: [(&Path, &str); 3] = [
+        (&fx.repo_b, "Inspect the tests."),
+        (&fx.repo_b, "zephyrine release checklist"),
+        (&fx.repo_a, "delivery fact alpha"),
+    ];
+    for (repo, text) in prompts {
+        let legacy = context_body(&fx.prompt("legacy", repo, text, &[])).unwrap_or_default();
+        let tracked = context_body(&fx.prompt("tracked", repo, text, turn)).unwrap_or_default();
+        let mut expected = legacy.clone();
+        for (id, block) in memory_blocks(&legacy) {
+            if delivered.contains(&id) {
+                expected = expected.replacen(&block, "", 1);
+            }
+        }
+        if legacy.is_empty() {
+            assert!(tracked.is_empty(), "{text}: {tracked}");
+            continue;
+        }
+        if memory_blocks(&expected).is_empty()
+            && memory_blocks(&legacy)
+                .iter()
+                .all(|(id, _)| delivered.contains(id))
+            && !legacy.contains("Hive Memory Context")
+        {
+            // Recall carrying only session-start memories sends nothing.
+            assert!(tracked.is_empty(), "{text}: {tracked}");
+            continue;
+        }
+        assert_eq!(tracked, expected, "{text}");
+    }
+}
+
+#[test]
+fn turn_recall_offers_the_previous_projects_memories_after_a_switch() {
+    // Turn recall skips only the current selection: once the session moves
+    // from A to B, A's selection is gone from view and recall offers its
+    // memories again, as untracked recall does.
+    let fx = Fixture::new("delivery-turn-switch-recall");
+    fx.remember(
+        "Project alpha uses the quillon deploy runbook.",
+        Some(&fx.repo_a.clone()),
+    );
+    fx.refresh();
+    let turn: &[&str] = &["--delivery", "turn"];
+    let a = fx.prompt("switch", &fx.repo_a, "Inspect the tests.", turn);
+    assert!(context_body(&a).expect("A selection").contains("quillon"));
+    let in_a = fx.prompt("switch", &fx.repo_a, "quillon deploy runbook", turn);
+    assert!(!context_body(&in_a).unwrap_or_default().contains("quillon"));
+    let b = fx.prompt("switch", &fx.repo_b, "Inspect the tests.", turn);
+    assert!(!context_body(&b).expect("B selection").contains("quillon"));
+    let legacy_a = fx.prompt("legacy", &fx.repo_a, "Inspect the tests.", &[]);
+    assert!(context_body(&legacy_a).is_some());
+    fx.prompt("legacy", &fx.repo_b, "Inspect the tests.", &[]);
+    let legacy = fx.prompt("legacy", &fx.repo_b, "quillon deploy runbook", &[]);
+    let tracked = fx.prompt("switch", &fx.repo_b, "quillon deploy runbook", turn);
+    assert_eq!(
+        context_body(&tracked)
+            .unwrap_or_default()
+            .contains("quillon"),
+        context_body(&legacy)
+            .unwrap_or_default()
+            .contains("quillon"),
+        "tracked {tracked} legacy {legacy}"
+    );
+    assert!(
+        context_body(&tracked)
+            .unwrap_or_default()
+            .contains("quillon")
+    );
 }
 
 #[test]
@@ -857,20 +1017,25 @@ fn an_untracked_fallback_starts_from_what_tracked_hooks_sent() {
     let again = fx.prompt("fallback", &fx.repo_b, "zephyrine release checklist", &[]);
     assert!(context_body(&again).is_none(), "{again}");
 
-    // Turn lifetime mirrors the same way.
+    // Turn lifetime mirrors the same way, for the selection and for recall.
+    let fx = Fixture::with_strategy("delivery-fallback-turn", "relevance");
+    fx.remember_reference("Orbit reference note for the fallback.");
+    fx.refresh();
     let turn: &[&str] = &["--delivery", "turn"];
     fx.prompt("fallback-turn", &fx.repo_b, "Inspect the tests.", turn);
-    let recall = fx.prompt("fallback-turn", &fx.repo_b, "delivery fact alpha", turn);
+    let plain = fx.prompt("fallback-turn", &fx.repo_b, "Inspect the tests.", &[]);
+    assert!(context_body(&plain).is_none(), "{plain}");
+    let recall = fx.prompt("fallback-turn", &fx.repo_b, "orbit reference note", turn);
     assert!(
         context_body(&recall)
             .expect("turn recall")
-            .contains(GLOBAL_A)
+            .contains("Orbit reference note")
     );
-    let untracked = fx.prompt("fallback-turn", &fx.repo_b, "delivery fact alpha", &[]);
+    let untracked = fx.prompt("fallback-turn", &fx.repo_b, "orbit reference note", &[]);
     assert!(
         !context_body(&untracked)
             .unwrap_or_default()
-            .contains(GLOBAL_A),
+            .contains("Orbit reference note"),
         "{untracked}"
     );
 }
@@ -1354,7 +1519,6 @@ fn hm_get_follows_the_project_store_binding() {
 
 #[test]
 fn hm_get_skips_an_unreadable_fallback_store() {
-    use std::os::unix::fs::PermissionsExt as _;
     let (config, _repo) = bound_store_fixture("delivery-get-unreadable");
     let cfg = config.to_str().expect("utf8");
     let output = cargo_bin_cmd!("hm")
@@ -1379,11 +1543,14 @@ fn hm_get_skips_an_unreadable_fallback_store() {
     // `archive` is searched before `team` and has no cached index; its root
     // cannot be read.
     let archive = config.parent().expect("dir").join("archive");
-    fs::set_permissions(&archive, fs::Permissions::from_mode(0o000)).expect("chmod");
+    let Some(lock) = Restricted::new(&archive, 0o000) else {
+        eprintln!("skipped: mode bits do not restrict this user (root?)");
+        return;
+    };
     let out = cargo_bin_cmd!("hm")
         .args(["--config", cfg, "--as-agent", "claude", "get", &id])
         .output();
-    fs::set_permissions(&archive, fs::Permissions::from_mode(0o755)).expect("restore");
+    drop(lock);
     let out = out.expect("hm get");
     assert_eq!(
         out.status.code(),

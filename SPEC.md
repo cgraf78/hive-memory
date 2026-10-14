@@ -1559,8 +1559,11 @@ context behavior stop re-sending memories the model can still see:
   and prompt recall runs on the other prompts without the repeat check. Its
   memories never join the delivered set, so later selections keep offering
   them. Recall moves past hits it already showed in the epoch
-  (`turn_recall_ids`, pointers included), as untracked recall does; once every
-  hit was shown, it repeats the top hits rather than showing nothing.
+  (`turn_recall_ids`, pointers included) and skips memories the last
+  context-change block carried (`turn_context_ids`), as untracked recall
+  does; once every earlier hit was shown, it repeats the top ones rather than
+  showing nothing. So Muse-style prompt output equals untracked output minus
+  the memories session start already delivered, plus those repeats.
 - `--max-context-bytes N` caps the emitted Markdown at N bytes, the largest
   context the host shows the model whole. `--context-size json` (tracked
   hooks only) counts the Markdown as its JSON-escaped string instead (as jq

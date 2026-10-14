@@ -512,6 +512,8 @@ impl<'a> DeliveryTracker<'a> {
                 .unwrap_or_default(),
             untracked_recall_key: prompt_recall_key.clone().filter(|_| emitted.is_some()),
             untracked_recall_ids: prompt_recall_key.as_ref().and(emitted).unwrap_or_default(),
+            turn_context_ids: (!persistent && selected.emitted && context_key.is_some())
+                .then(|| ids(&selected.output)),
             context_key: context_key.filter(|_| complete),
             prompt_recall_key: prompt_recall_key.filter(|_| complete),
             turn_recall_ids: Vec::new(),
@@ -1318,10 +1320,13 @@ enum RecallKnown {
     Ids(std::collections::BTreeSet<String>),
     /// Tracked: memories visible in the current epoch, plus ids turn recall
     /// already emitted this epoch (gone from view, but recall moves past
-    /// them the way untracked recall does).
+    /// them the way untracked recall does) and the ids of the last turn
+    /// context-change block (skipped like untracked recall skips the
+    /// current selection).
     Tracked {
         delivered: Vec<memory_hook::DeliveredMemory>,
         recalled: std::collections::BTreeSet<String>,
+        selection: std::collections::BTreeSet<String>,
     },
 }
 
@@ -1332,7 +1337,8 @@ impl RecallKnown {
             Self::Tracked {
                 delivered,
                 recalled,
-            } => delivered.len() + recalled.len(),
+                selection,
+            } => delivered.len() + recalled.len() + selection.len(),
         }
     }
 
@@ -1344,17 +1350,22 @@ impl RecallKnown {
         }
     }
 
-    /// Whether `entry` is still in the model's view, so repeating it is
-    /// never useful.
+    /// Whether `entry` is still in the model's view or the current
+    /// selection, so repeating it is never useful.
     fn visible(&self, entry: &index::IndexEntry) -> bool {
         match self {
             Self::Ids(ids) => ids.contains(&entry.id),
-            Self::Tracked { delivered, .. } => {
-                delivered.iter().any(|memory| memory.id == entry.id)
-                    && delivered.contains(&memory_hook::DeliveredMemory {
-                        id: entry.id.clone(),
-                        digest: memory_context::raw_body_digest(&entry.body),
-                    })
+            Self::Tracked {
+                delivered,
+                selection,
+                ..
+            } => {
+                selection.contains(&entry.id)
+                    || delivered.iter().any(|memory| memory.id == entry.id)
+                        && delivered.contains(&memory_hook::DeliveredMemory {
+                            id: entry.id.clone(),
+                            digest: memory_context::raw_body_digest(&entry.body),
+                        })
             }
         }
     }
@@ -1445,6 +1456,7 @@ fn tracked_prompt_recall(
                 known: RecallKnown::Tracked {
                     delivered: tracker.state.delivered.clone(),
                     recalled: tracker.state.turn_recall_ids.iter().cloned().collect(),
+                    selection: tracker.state.turn_context_ids.iter().cloned().collect(),
                 },
                 previous_key: match tracker.lifetime {
                     memory_hook::DeliveryLifetime::Persistent => {
