@@ -45,42 +45,7 @@ const HEURISTIC_SCAN_WINDOW: usize = 256;
 /// clones the caller's records.
 #[must_use]
 pub fn suppressed_ids(entries: &[&IndexEntry], query: Option<&str>) -> BTreeSet<String> {
-    let mut suppressed = BTreeSet::new();
-
-    // Phase 1 — explicit `supersedes` links: authoritative and resolved across
-    // the FULL set via direct id lookup, so a superseded record is hidden no
-    // matter how large the store is or where the records rank. O(n + links).
-    let by_id: HashMap<&str, &IndexEntry> = entries
-        .iter()
-        .map(|entry| (entry.id.as_str(), *entry))
-        .collect();
-    // Map every node that participates in an explicit-supersedes cycle (an SCC of
-    // size >= 2, or a self-loop) to that cycle's single deterministic winner.
-    // Cycles of any length must keep exactly one member, never erase all of them.
-    let cycle_winners = cycle_winners(entries, &by_id);
-    for newer in entries {
-        for target_id in &newer.supersedes {
-            if let Some(older) = by_id.get(target_id.as_str()) {
-                if explicitly_searches_old_fact(
-                    &older.body.to_ascii_lowercase(),
-                    &newer.body.to_ascii_lowercase(),
-                    query,
-                ) {
-                    continue;
-                }
-                // A node in a cycle is suppressed iff it is not its cycle's
-                // winner; this generalizes the reciprocal A<->B special case to
-                // cycles of any length. Acyclic links suppress their target.
-                if let Some(winner) = cycle_winners.get(older.id.as_str()) {
-                    if older.id.as_str() != *winner {
-                        suppressed.insert(older.id.clone());
-                    }
-                } else {
-                    suppressed.insert(older.id.clone());
-                }
-            }
-        }
-    }
+    let mut suppressed = explicit_suppressed_ids(entries, query);
 
     // Phase 2 — natural-language heuristic: inherently pairwise, so it is bounded
     // to the top window of candidates (already priority/recency ordered by the
@@ -103,6 +68,71 @@ pub fn suppressed_ids(entries: &[&IndexEntry], query: Option<&str>) -> BTreeSet<
         }
     }
 
+    suppressed
+}
+
+/// Compute only the records hidden by explicit `supersedes` links, with no
+/// historical-recall exception.
+///
+/// This is phase 1 of [`suppressed_ids`] with no query. It is O(n + links), so
+/// a hot path that must honor every explicit correction across a whole store
+/// (hook prompt recall) can afford it where the pairwise natural-language
+/// heuristic would not be. Input order does not matter.
+#[must_use]
+pub fn explicitly_suppressed_ids(entries: &[&IndexEntry]) -> BTreeSet<String> {
+    explicit_suppressed_ids(entries, None)
+}
+
+/// Phase 1 — explicit `supersedes` links: authoritative and resolved across the
+/// FULL set via direct id lookup, so a superseded record is hidden no matter
+/// how large the store is or where the records rank. O(n + links).
+fn explicit_suppressed_ids(entries: &[&IndexEntry], query: Option<&str>) -> BTreeSet<String> {
+    let mut suppressed = BTreeSet::new();
+    let by_id: HashMap<&str, &IndexEntry> = entries
+        .iter()
+        .map(|entry| (entry.id.as_str(), *entry))
+        .collect();
+    // Map every node that participates in an explicit-supersedes cycle (an SCC of
+    // size >= 2, or a self-loop) to that cycle's single deterministic winner.
+    // Cycles of any length must keep exactly one member, never erase all of them.
+    // Every cycle member links to another member, so cycles live entirely among
+    // the entries that carry links; searching only those keeps a mostly unlinked
+    // store from paying for a graph walk over every record on each prompt.
+    let linked = entries
+        .iter()
+        .copied()
+        .filter(|entry| !entry.supersedes.is_empty())
+        .collect::<Vec<_>>();
+    let linked_by_id: HashMap<&str, &IndexEntry> = linked
+        .iter()
+        .map(|entry| (entry.id.as_str(), *entry))
+        .collect();
+    let cycle_winners = cycle_winners(&linked, &linked_by_id);
+    for newer in &linked {
+        for target_id in &newer.supersedes {
+            if let Some(older) = by_id.get(target_id.as_str()) {
+                if query.is_some()
+                    && explicitly_searches_old_fact(
+                        &older.body.to_ascii_lowercase(),
+                        &newer.body.to_ascii_lowercase(),
+                        query,
+                    )
+                {
+                    continue;
+                }
+                // A node in a cycle is suppressed iff it is not its cycle's
+                // winner; this generalizes the reciprocal A<->B special case to
+                // cycles of any length. Acyclic links suppress their target.
+                if let Some(winner) = cycle_winners.get(older.id.as_str()) {
+                    if older.id.as_str() != *winner {
+                        suppressed.insert(older.id.clone());
+                    }
+                } else {
+                    suppressed.insert(older.id.clone());
+                }
+            }
+        }
+    }
     suppressed
 }
 
@@ -373,7 +403,7 @@ fn is_newer(candidate: &IndexEntry, older: &IndexEntry) -> bool {
 }
 
 fn timestamp_rank(value: &str) -> i128 {
-    // An unparseable `created_at` must rank BELOW every genuinely-dated record,
+    // An unparsable `created_at` must rank BELOW every genuinely-dated record,
     // not at the epoch. Using `unwrap_or_default()` (0 = 1970-01-01) conflated
     // "junk timestamp" with "written at the epoch", so a cycle/heuristic winner
     // could be chosen as a record with a malformed date over a real one. A
@@ -813,7 +843,7 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_timestamp_loses_to_dated_record_in_cycle() {
+    fn unparsable_timestamp_loses_to_dated_record_in_cycle() {
         // Fix C: a junk `created_at` must rank below any real date, not at the
         // epoch. In a 2-cycle where one member has a malformed timestamp, the
         // genuinely-dated record must win regardless of id ordering. Here the
@@ -828,7 +858,7 @@ mod tests {
 
         let suppressed = suppressed_ids(&entries, None);
 
-        // "a" outranks "z" purely because "z"'s timestamp is unparseable, even
+        // "a" outranks "z" purely because "z"'s timestamp is unparsable, even
         // though "z" has the larger id (id is only a tie-break on equal ranks).
         assert_eq!(suppressed.len(), 1);
         assert!(suppressed.contains("z"));

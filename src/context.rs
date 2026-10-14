@@ -579,50 +579,15 @@ fn assemble_context_with_mode(
             .collect()
     };
 
-    // Supersession resolves over TWO distinct sets, kept separate on purpose:
-    //
-    //   suppressors = audience-allowed ∧ valid (NOT scope/project filtered)
-    //   rendered    = all filters (source/scope/project/audience/validity)
-    //
-    // explicit links cross scope, heuristic same-scope.
-    //
-    // Suppressors must NOT be scope/project filtered: per the frozen contract,
-    // an explicit `supersedes` correction is authoritative ACROSS scope, so a
-    // global (or other-project) correction must still retire its target even for
-    // a viewer who narrowed `--scope` and would never render the corrector. The
-    // NL heuristic stays conservative because it independently requires the same
-    // scope+project (`same_scope`), so widening the suppressor input can never
-    // make it fire across scope.
-    //
-    // Suppressors MUST still be audience-allowed: a record the viewer cannot see
-    // (another agent's `agent-private`) must never suppress one it can, or the
-    // viewer would lose both the hidden corrector and the suppressed target.
-    // Audience filtering therefore always wins over `superseded`.
-    //
-    // Suppressors MUST be valid: an expired or not-yet-valid corrector is itself
-    // dropped from rendering, so letting it suppress a live older fact would
-    // leave the viewer with neither (Fix A). This mirrors `search.rs`, which
-    // filters validity before feeding the resolver.
-    //
-    // Suppressors MUST be source-allowed: a raw inbox note is excluded from
-    // context by default, so it must not retire a durable remembered/curated
-    // fact the viewer can actually see. Scope is widened for cross-scope
-    // explicit links; source is not — a low-confidence note overriding canonical
-    // memory would be a footgun, not authority.
-    //
-    // Context has no query, so the historical-recall exception never fires and
-    // superseded survivors are always hidden. This uses the same shared resolver
-    // as search.
-    let suppressors = candidates
-        .iter()
-        .copied()
-        .filter(|entry| {
-            source_allowed(entry, input.sources, input.include_inbox)
-                && visibility::audience_allows(entry, input.agent_id)
-                && validity::allows_current(entry)
-        })
-        .collect::<Vec<_>>();
-    let superseded = supersession::suppressed_ids(&suppressors, None);
+    // Supersession resolves over the suppressor set documented on
+    // `may_suppress`, which is deliberately wider than the rendered set
+    // filtered below: explicit links cross scope, heuristic same-scope.
+    let superseded = superseded_among(
+        &candidates,
+        input.sources,
+        input.include_inbox,
+        input.agent_id,
+    );
 
     for entry in candidates {
         if !source_allowed(entry, input.sources, input.include_inbox) {
@@ -745,6 +710,85 @@ fn assemble_context_with_mode(
         estimated_tokens,
         warnings,
     })
+}
+
+/// Ids that explicit `supersedes` links hide from agent-context injection.
+///
+/// Uses the suppressor set `hm context` uses (audience-allowed, valid, and
+/// source-allowed, but not scope/project filtered), so a surface that injects
+/// memory honors every explicit correction context honors. Prompt recall needs
+/// it because it selects with search, whose supersession sees only
+/// query-matched hits and keeps the historical-recall exception. Only explicit links are resolved: they are the authoritative
+/// contract and O(n), while the pairwise natural-language heuristic is
+/// best-effort and too costly for a per-prompt pass over the whole store.
+/// `sources` and `include_inbox` are the injecting surface's own source policy.
+#[must_use]
+pub fn explicitly_superseded_ids(
+    entries: &[IndexEntry],
+    sources: &[String],
+    include_inbox: bool,
+    agent_id: Option<&str>,
+) -> BTreeSet<String> {
+    let suppressors = entries
+        .iter()
+        .filter(|entry| may_suppress(entry, sources, include_inbox, agent_id))
+        .collect::<Vec<_>>();
+    supersession::explicitly_suppressed_ids(&suppressors)
+}
+
+/// Resolve supersession over `candidates`, already in context priority order
+/// (the natural-language heuristic only scans the top window). Context has no
+/// query, so the historical-recall exception never fires and superseded
+/// survivors are always hidden. This uses the same shared resolver as search.
+fn superseded_among(
+    candidates: &[&IndexEntry],
+    sources: &[String],
+    include_inbox: bool,
+    agent_id: Option<&str>,
+) -> BTreeSet<String> {
+    let suppressors = candidates
+        .iter()
+        .copied()
+        .filter(|entry| may_suppress(entry, sources, include_inbox, agent_id))
+        .collect::<Vec<_>>();
+    supersession::suppressed_ids(&suppressors, None)
+}
+
+/// Whether `entry` may act as a suppressor for a context surface.
+///
+/// The suppressor set is audience-allowed, valid, and source-allowed, but NOT
+/// scope/project filtered, so it is deliberately wider than what a surface
+/// renders:
+///
+/// - Not scope/project filtered: per the frozen contract, an explicit
+///   `supersedes` correction is authoritative ACROSS scope, so a global (or
+///   other-project) correction must still retire its target even for a viewer
+///   who narrowed `--scope` and would never render the corrector. The NL
+///   heuristic stays conservative because it independently requires the same
+///   scope+project (`same_scope`), so widening the suppressor input can never
+///   make it fire across scope.
+/// - Audience-allowed: a record the viewer cannot see (another agent's
+///   `agent-private`) must never suppress one it can, or the viewer would lose
+///   both the hidden corrector and the suppressed target. Audience filtering
+///   therefore always wins over `superseded`.
+/// - Valid: an expired or not-yet-valid corrector is itself dropped from
+///   rendering, so letting it suppress a live older fact would leave the viewer
+///   with neither (Fix A). This mirrors `search.rs`, which filters validity
+///   before feeding the resolver.
+/// - Source-allowed: a raw inbox note is excluded from context by default, so it
+///   must not retire a durable remembered/curated fact the viewer can actually
+///   see. Scope is widened for cross-scope explicit links; source is not — a
+///   low-confidence note overriding canonical memory would be a footgun, not
+///   authority.
+fn may_suppress(
+    entry: &IndexEntry,
+    sources: &[String],
+    include_inbox: bool,
+    agent_id: Option<&str>,
+) -> bool {
+    source_allowed(entry, sources, include_inbox)
+        && visibility::audience_allows(entry, agent_id)
+        && validity::allows_current(entry)
 }
 
 fn local_project_family_ids(

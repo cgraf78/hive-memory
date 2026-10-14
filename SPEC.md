@@ -1293,8 +1293,21 @@ For `hm search` the suppressor and rendered sets coincide in the query-matched,
 audience/scope/validity-filtered hits (plus project filtering only when
 `--project-only` is explicit): search inherently considers only records that
 match the query, which is its legitimate scope. The cross-scope
-behavior above is specific to `hm context`, whose suppressor set is every
-audience-permitted, valid record regardless of the viewer's selected scope.
+behavior above is specific to automatic context surfaces: `hm context`, whose
+suppressor set is every audience-permitted, valid record regardless of the
+viewer's selected scope, and hook prompt recall for explicit links (below).
+
+Hook prompt recall selects with search but injects its result into the agent,
+so it additionally resolves explicit `supersedes` links like `hm context`: over
+every audience-permitted, valid, source-allowed record (source per
+`[defaults].search_sources`), with no historical-recall exception. A query
+built from prompt wording names words that only an old fact contains by
+accident, and the correction may already be visible in the session or not
+match the prompt at all; none of these may re-inject an explicitly superseded
+memory. Recall searches past the superseded hits it drops so they cannot crowd
+out live ones. The natural-language heuristic still applies among search hits
+as in `hm search`; running it across the whole store on every prompt is not
+worth its pairwise cost for a best-effort layer.
 
 There are two clearly separated confidence layers:
 
@@ -1325,12 +1338,12 @@ There are two clearly separated confidence layers:
 
 Invariants:
 
-- **Broad recall reflects current truth.** Both `hm search` (without a
-  historical query) and `hm context` suppress superseded records, so the
-  most-trusted agent read path never injects a fact that a newer record has
-  corrected. This guarantee is *unconditional* for explicit `supersedes` links
-  (resolved across the full set) and *among the top candidates* for the
-  windowed natural-language heuristic.
+- **Broad recall reflects current truth.** `hm search` (without a
+  historical query), `hm context`, and hook prompt recall (for explicit links)
+  suppress superseded records, so the agent read paths never inject a fact that
+  a newer record has explicitly corrected. This guarantee is *unconditional*
+  for explicit `supersedes` links (resolved across the full set) and *among the
+  top candidates* for the windowed natural-language heuristic.
 - **Suppressors are audience-permitted and valid.** Only a record the caller may
   see and that is currently within its validity window can suppress another. An
   `agent-private` corrector the viewer cannot see, or an expired/not-yet-valid
@@ -1341,7 +1354,8 @@ Invariants:
   `checkrun format` correction) keeps the older record visible, so historical
   questions can still find what the fact used to be. `hm context` has no query,
   so this exception never applies there and superseded records are always
-  hidden.
+  hidden. Hook prompt recall is automatic, not an explicit query, so the
+  exception never applies to its explicit links either.
 - **Cycle resolution.** Explicit `supersedes` links can form a cycle of any
   length (A↔B, or A→B→C→A) through a hand-edit or import. Such a cycle must not
   erase all its members. The explicit layer detects cycle membership over the
@@ -1477,8 +1491,10 @@ Behavior:
   recall against `[defaults].search_sources`. Prompt recall keeps raw inbox
   records opt-in through that source policy, suppresses memories already emitted
   to the session, and returns an `inject_context` action only when it selects new
-  useful context. It also runs the durable-memory intent heuristic and records
-  `memory-pending` when the heuristic matches. It returns `inject_context`
+  useful context. Because it injects, prompt recall honors explicit
+  `supersedes` links as `hm context` does (see Supersession), not as
+  interactive search does. It also runs the durable-memory intent heuristic and
+  records `memory-pending` when the heuristic matches. It returns `inject_context`
   and/or `remind` actions as needed.
 - `tool-complete`: after a successful tool event, reads session write receipts,
   clears `memory-pending` when a new receipt proves a memory write occurred,
