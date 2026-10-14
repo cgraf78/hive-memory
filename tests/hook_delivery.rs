@@ -1757,3 +1757,209 @@ fn json_size_limit_counts_escaped_bytes() {
     assert_eq!(fits["delivery"]["skipped_over_budget"], 0);
     assert_eq!(emitted_ids(&fits).len(), emitted_ids(&full).len());
 }
+
+impl Fixture {
+    /// Remember a search-only reference memory with extra `remember` flags and
+    /// return its id.
+    fn remember_reference_with(&self, text: &str, extra: &[&str]) -> String {
+        let output = cargo_bin_cmd!("hm")
+            .args([
+                "--config",
+                self.config_str(),
+                "--as-agent",
+                "claude",
+                "remember",
+                "--json",
+                "--kind",
+                "reference",
+            ])
+            .args(extra)
+            .args(["--text", text])
+            .output()
+            .expect("run remember");
+        assert!(
+            output.status.success(),
+            "remember failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: Value = serde_json::from_slice(&output.stdout).expect("remember JSON");
+        json["id"].as_str().expect("id").to_owned()
+    }
+
+    /// Run `hm search <query> --json` and return the hit ids.
+    fn search_ids(&self, query: &str) -> Vec<String> {
+        let output = cargo_bin_cmd!("hm")
+            .args([
+                "--config",
+                self.config_str(),
+                "--as-agent",
+                "claude",
+                "search",
+                "--json",
+                query,
+            ])
+            .output()
+            .expect("run search");
+        assert!(output.status.success(), "search failed");
+        let json: Value = serde_json::from_slice(&output.stdout).expect("search JSON");
+        json.as_array()
+            .expect("hits")
+            .iter()
+            .map(|hit| hit["id"].as_str().expect("id").to_owned())
+            .collect()
+    }
+
+    /// Prompt recall `text` in a fresh session for each delivery mode
+    /// (untracked, persistent, turn). The first prompt of a session carries
+    /// the context change, so it is spent on an unrelated prompt; returns each
+    /// mode with that first body and the recall body.
+    fn recall_in_every_mode(&self, name: &str, text: &str) -> Vec<RecallRun> {
+        let modes: [(&str, &[&str]); 3] = [
+            ("untracked", &[]),
+            ("persistent", PERSISTENT),
+            ("turn", &["--delivery", "turn"]),
+        ];
+        modes
+            .iter()
+            .map(|(mode, flags)| {
+                let session = format!("{name}-{mode}");
+                let first = self.prompt(&session, &self.repo_a, "Inspect the tests.", flags);
+                let recall = self.prompt(&session, &self.repo_a, text, flags);
+                RecallRun {
+                    mode,
+                    first: context_body(&first).unwrap_or_default(),
+                    recall: context_body(&recall).unwrap_or_default(),
+                    report: recall["recall"].clone(),
+                }
+            })
+            .collect()
+    }
+}
+
+/// One [`Fixture::recall_in_every_mode`] session.
+struct RecallRun {
+    mode: &'static str,
+    first: String,
+    recall: String,
+    /// The recall prompt's `recall` diagnostics.
+    report: Value,
+}
+
+const OLD_RELEASE: &str =
+    "Run ship.sh for zanzibar releases by pushing the branch from a hand-made tmux session.";
+const NEW_RELEASE: &str = "Run ship.sh for zanzibar releases through the ghnet wrapper only.";
+/// Recall query terms: the correction matches three of the four, enough for a
+/// hit, and only the old fact contains "branch".
+const RELEASE_PROMPT: &str = "ship.sh zanzibar releases branch";
+
+#[test]
+fn recall_hides_a_superseded_memory_the_prompt_names() {
+    // The prompt-built query names a word ("branch") only the old fact
+    // contains, so search keeps the old fact as a historical hit. The
+    // correction is already visible from the context change, so recall skips
+    // it, and supersession among the remaining picks no longer sees the link.
+    let fx = Fixture::new("delivery-recall-superseded");
+    let old = fx.remember_reference_with(OLD_RELEASE, &[]);
+    fx.remember_reference_with(NEW_RELEASE, &["--supersedes", &old]);
+    fx.refresh();
+    assert!(
+        fx.search_ids(RELEASE_PROMPT).contains(&old),
+        "explicit search keeps the historical-recall exception"
+    );
+    for run in fx.recall_in_every_mode("superseded", RELEASE_PROMPT) {
+        let (mode, first, recall) = (run.mode, &run.first, &run.recall);
+        assert!(
+            first.contains(NEW_RELEASE),
+            "{mode} context lost the correction: {first}"
+        );
+        assert!(
+            !first.contains(&old),
+            "{mode} context injected {old}: {first}"
+        );
+        assert!(
+            !recall.contains(&old),
+            "{mode} recall injected {old}: {recall}"
+        );
+        // Recall really searched: the visible correction was its only hit.
+        assert_eq!(run.report["candidate_count"], 1, "{mode}: {}", run.report);
+    }
+}
+
+#[test]
+fn recall_hides_a_superseded_memory_whose_correction_does_not_match() {
+    // Search only resolves supersession among query-matched hits, so a
+    // correction that shares no words with the prompt left its target live.
+    let fx = Fixture::with_strategy("delivery-recall-unmatched-correction", "relevance");
+    let live = "Quillfeather backlog grooming happens on Mondays.";
+    fx.remember_reference_with(live, &[]);
+    let old =
+        fx.remember_reference_with("The quillfeather backlog lists the push guard next.", &[]);
+    fx.remember_reference_with(
+        "Durable task tracking moved to the project board.",
+        &["--supersedes", &old],
+    );
+    fx.refresh();
+    for RecallRun { mode, recall, .. } in
+        fx.recall_in_every_mode("unmatched", "quillfeather backlog")
+    {
+        assert!(
+            !recall.contains(&old),
+            "{mode} recall injected {old}: {recall}"
+        );
+        assert!(
+            recall.contains(live),
+            "{mode} recall found nothing: {recall}"
+        );
+    }
+}
+
+#[test]
+fn recall_keeps_a_memory_whose_correction_the_agent_cannot_see() {
+    // A correction private to another agent must not hide the only version
+    // this agent can see, or it would get neither.
+    let fx = Fixture::with_strategy("delivery-recall-private-correction", "relevance");
+    let old = fx.remember_reference_with(OLD_RELEASE, &[]);
+    fx.remember_reference_with(
+        NEW_RELEASE,
+        &[
+            "--supersedes",
+            &old,
+            "--scope",
+            "agent-private",
+            "--audience",
+            "codex",
+        ],
+    );
+    fx.refresh();
+    for RecallRun { mode, recall, .. } in fx.recall_in_every_mode("private", RELEASE_PROMPT) {
+        assert!(
+            recall.contains(&old),
+            "{mode} recall dropped {old}: {recall}"
+        );
+    }
+}
+
+#[test]
+fn superseded_hits_do_not_crowd_out_live_recall() {
+    // Eleven superseded hits outrank the live one (higher confidence). Recall
+    // drops them after searching, so it must search past them, not stop at
+    // its usual ten candidates and come back empty.
+    let fx = Fixture::with_strategy("delivery-recall-crowded", "relevance");
+    let live = fx.remember_reference_with("Nimbus ledger entry live recorded.", &[]);
+    let mut supersedes = Vec::new();
+    for step in 1..=11 {
+        let id = fx.remember_reference_with(
+            &format!("Nimbus ledger entry {step} recorded."),
+            &["--confidence", "high"],
+        );
+        supersedes.extend(["--supersedes".to_owned(), id]);
+    }
+    fx.remember_reference_with("Retired every old ledger note.", &args_ref(&supersedes));
+    fx.refresh();
+    for RecallRun { mode, recall, .. } in fx.recall_in_every_mode("crowded", "nimbus ledger") {
+        assert!(
+            recall.contains(&live),
+            "{mode} recall lost {live}: {recall}"
+        );
+    }
+}

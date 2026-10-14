@@ -1529,6 +1529,21 @@ where
     let entries = cached_report.projection.entries.as_slice();
     let include_inbox = super::search::search_include_inbox(false, sources);
     let session = load_session()?;
+    // Recall injects its hits into the agent, so explicit corrections hide
+    // their targets the way `hm context` does, not the way interactive search
+    // does. Search resolves supersession only among query-matched hits and
+    // keeps an old fact when the query names a word only that fact contains,
+    // which a query built from prompt wording does by accident: a prompt about
+    // pushing a branch re-injected a corrected workflow memory because only the
+    // old text said "branch", and its correction, already visible in the
+    // session, was skipped before rendering could resolve the link. Explicit
+    // `hm search` keeps that historical exception.
+    let superseded = memory_context::explicitly_superseded_ids(
+        entries,
+        sources,
+        include_inbox,
+        agent_id.as_deref(),
+    );
     let search_input = search::SearchInput {
         store_root: &store_config.root,
         entries,
@@ -1541,7 +1556,13 @@ where
         // Search beyond memories already emitted in this session. Applying the
         // old fixed cap before session dedupe permanently hid rank 11+ after the
         // first few prompts even though those memories remained eligible.
-        limit: session.known.len().saturating_add(3).max(10),
+        // Superseded hits are dropped below, so search past those as well.
+        limit: session
+            .known
+            .len()
+            .saturating_add(superseded.len())
+            .saturating_add(3)
+            .max(10),
     };
     // Prefer BM25 recall when the persistent index is already fresh; this is
     // where the prompt hook gains paraphrase/multi-session recall. Fall back to
@@ -1549,7 +1570,7 @@ where
     // a rebuild on its latency budget (refresh/tool-complete keeps it fresh).
     let registry = &cached_report.projection.entity_registry;
     let project_aliases = &cached_report.projection.project_aliases;
-    let hits = match super::search::tantivy_search_local_if_fresh(
+    let mut hits = match super::search::tantivy_search_local_if_fresh(
         config,
         &store_name,
         &cached_report.entries,
@@ -1571,6 +1592,8 @@ where
             }
         },
     };
+
+    hits.retain(|hit| !superseded.contains(&hit.entry.id));
 
     // Incremental prompt recall emits at most three NEW memories at a time. The
     // search above still considers the complete local projection and expands
