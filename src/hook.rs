@@ -48,6 +48,117 @@ pub struct HookState {
     /// RFC3339 timestamp of the last prompt recall update.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_recall_updated_at: Option<String>,
+    /// Memories emitted within the host's limit in the current context epoch.
+    ///
+    /// Only delivery-tracking hooks (`--delivery`) read or write this set. It
+    /// holds memories whose context persists in the transcript, so a later
+    /// hook may skip them until a context reset starts a new epoch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delivered: Vec<DeliveredMemory>,
+    /// Context selection whose memories are all visible in this epoch.
+    ///
+    /// Tracked counterpart of `context_key`. It is separate so an untracked
+    /// hook sharing the session id (a nested agent, an older adapter, tracking
+    /// switched off) can never make a tracked hook skip a re-send.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivered_context_key: Option<String>,
+    /// Tracked counterpart of `prompt_recall_key`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivered_recall_key: Option<String>,
+    /// Memory ids turn-lifetime prompt recall emitted in this epoch.
+    ///
+    /// Tracked counterpart of `prompt_recall_memory_ids` for hosts that drop
+    /// prompt context after the turn. These memories are not visible any
+    /// more, so they never join `delivered`; recall only uses them to move on
+    /// to the next hits, as untracked recall does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub turn_recall_ids: Vec<String>,
+    /// Counter advanced by every context reset.
+    ///
+    /// Tracked bookkeeping carries the epoch it was selected in, and an update
+    /// from an earlier epoch is dropped: it was filtered against a delivered
+    /// set the host no longer shows.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub context_epoch: u64,
+    /// RFC3339 timestamp of the last context reset, for diagnostics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_epoch_started_at: Option<String>,
+}
+
+impl HookState {
+    /// Return whether this exact memory text is already visible in the epoch.
+    pub fn has_delivered(&self, id: &str, digest: &str) -> bool {
+        self.delivered
+            .iter()
+            .any(|memory| memory.id == id && memory.digest == digest)
+    }
+}
+
+/// How long context injected by one hook stays visible to the model.
+///
+/// This is a host fact supplied by the hook adapter. Claude Code and Codex
+/// keep hook context in the transcript until compaction or a clear, while Muse
+/// replaces prompt-submit context on every turn and keeps only session-start
+/// context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryLifetime {
+    /// Context stays in the transcript until the host loses it (compaction,
+    /// clear), which the adapter reports as a context reset.
+    Persistent,
+    /// Context is visible for the current turn only; its memories never join
+    /// the delivered set.
+    Turn,
+}
+
+impl DeliveryLifetime {
+    /// Return the stable lowercase label used on the CLI and in JSON.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Persistent => "persistent",
+            Self::Turn => "turn",
+        }
+    }
+}
+
+/// One memory text delivered to the model, keyed by id and body digest.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DeliveredMemory {
+    /// Memory id.
+    pub id: String,
+    /// Digest of the rendered body, so changed text under one id is new.
+    pub digest: String,
+}
+
+/// Session bookkeeping a hook applies after writing its response.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryUpdate {
+    /// Context epoch the emitted context was selected in.
+    #[serde(default)]
+    pub epoch: u64,
+    /// Memories that become part of the epoch's delivered set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memories: Vec<DeliveredMemory>,
+    /// Context selection now fully visible (sets `delivered_context_key`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_key: Option<String>,
+    /// Prompt recall selection now visible (sets `delivered_recall_key`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_recall_key: Option<String>,
+    /// Ids turn-lifetime recall emitted (added to `turn_recall_ids`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub turn_recall_ids: Vec<String>,
+    /// Untracked `context_key` for an emitted selection, complete or not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub untracked_context_key: Option<String>,
+    /// Ids that selection emitted (for `startup_memory_ids`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub untracked_context_ids: Vec<String>,
+    /// Untracked `prompt_recall_key` for emitted prompt recall.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub untracked_recall_key: Option<String>,
+    /// Ids that recall emitted (for `prompt_recall_memory_ids`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub untracked_recall_ids: Vec<String>,
 }
 
 /// Ephemeral receipt for a successful session memory write.
@@ -587,6 +698,116 @@ pub fn mark_prompt_recall(
     )
 }
 
+/// Start a new context epoch after the host lost earlier context.
+///
+/// Compaction, a clear, or a resume can remove injected context from the
+/// model's view. Everything that suppresses a later injection is cleared: the
+/// delivered set, the tracked and untracked context and recall selections, and
+/// the emitted-id lists turn and untracked recall skip. The epoch counter advances
+/// so in-flight bookkeeping from before the reset is dropped. Durable-memory
+/// debt and write receipts are unrelated to what the model can see and are
+/// preserved.
+pub fn reset_context_epoch(
+    state_dir: &Path,
+    session_id: &str,
+    options: &write::AtomicWriteOptions,
+) -> Result<HookState, HookStateError> {
+    with_state_lock(
+        state_dir,
+        session_id,
+        |state| {
+            let now = rfc3339(OffsetDateTime::now_utc());
+            state.delivered.clear();
+            state.delivered_context_key = None;
+            state.delivered_recall_key = None;
+            state.turn_recall_ids.clear();
+            state.context_epoch = state.context_epoch.wrapping_add(1);
+            state.context_key = None;
+            state.startup_memory_ids.clear();
+            state.prompt_recall_key = None;
+            state.prompt_recall_memory_ids.clear();
+            state.prompt_recall_updated_at = None;
+            state.context_epoch_started_at = Some(now.clone());
+            state.updated_at = Some(now);
+        },
+        options,
+    )
+}
+
+/// Record the memories and selections a tracked hook just emitted.
+///
+/// The caller applies this only after writing its response, so a failed write
+/// never marks anything delivered.
+pub fn apply_delivery(
+    state_dir: &Path,
+    session_id: &str,
+    update: DeliveryUpdate,
+    options: &write::AtomicWriteOptions,
+) -> Result<HookState, HookStateError> {
+    with_state_lock(
+        state_dir,
+        session_id,
+        |state| apply_update(state, update),
+        options,
+    )
+}
+
+fn apply_update(state: &mut HookState, update: DeliveryUpdate) {
+    if update.epoch != state.context_epoch {
+        // Selected before a reset: its memories are not visible in this epoch
+        // and its selection keys describe lost context.
+        return;
+    }
+    let now = rfc3339(OffsetDateTime::now_utc());
+    if !update.memories.is_empty() {
+        state.delivered.extend(update.memories);
+        state.delivered.sort();
+        state.delivered.dedup();
+    }
+    if let Some(context_key) = update.context_key {
+        state.delivered_context_key = Some(context_key);
+    }
+    if let Some(recall_key) = update.prompt_recall_key {
+        state.delivered_recall_key = Some(recall_key);
+    }
+    if !update.turn_recall_ids.is_empty() {
+        state.turn_recall_ids.extend(update.turn_recall_ids);
+        state.turn_recall_ids.sort();
+        state.turn_recall_ids.dedup();
+    }
+    // Keep the untracked fields as untracked hooks would have left them, so
+    // an adapter that falls back to an untracked call (too little room, for
+    // example) does not re-send a selection the session already received.
+    // Tracked hooks never read these fields.
+    if let Some(context_key) = update.untracked_context_key {
+        if state.context_key.as_deref() != Some(context_key.as_str()) {
+            // A new selection replaces the old one's ids, as untracked hooks do.
+            state.startup_memory_ids.clear();
+        }
+        state.context_key = Some(context_key);
+        state
+            .startup_memory_ids
+            .extend(update.untracked_context_ids);
+        // Earlier batches of a drained selection, and anything else still
+        // visible in the epoch, count as sent too.
+        state
+            .startup_memory_ids
+            .extend(state.delivered.iter().map(|memory| memory.id.clone()));
+        state.startup_memory_ids.sort();
+        state.startup_memory_ids.dedup();
+    }
+    if let Some(recall_key) = update.untracked_recall_key {
+        state.prompt_recall_key = Some(recall_key);
+        state
+            .prompt_recall_memory_ids
+            .extend(update.untracked_recall_ids);
+        state.prompt_recall_memory_ids.sort();
+        state.prompt_recall_memory_ids.dedup();
+        state.prompt_recall_updated_at = Some(now.clone());
+    }
+    state.updated_at = Some(now);
+}
+
 /// Return memory ids already sent to the session.
 pub fn known_session_memory_ids(state: &HookState) -> std::collections::BTreeSet<String> {
     state
@@ -709,6 +930,10 @@ fn rfc3339(value: OffsetDateTime) -> String {
 }
 
 fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
@@ -1237,6 +1462,182 @@ mod tests {
             state.context_key.as_deref(),
             Some("agent=codex|store=personal")
         );
+    }
+
+    fn delivered(id: &str, digest: &str) -> DeliveredMemory {
+        DeliveredMemory {
+            id: id.to_owned(),
+            digest: digest.to_owned(),
+        }
+    }
+
+    fn update(ids: &[&str], context_key: Option<&str>) -> DeliveryUpdate {
+        DeliveryUpdate {
+            epoch: 0,
+            memories: ids.iter().map(|id| delivered(id, "d")).collect(),
+            context_key: context_key.map(str::to_owned),
+            ..DeliveryUpdate::default()
+        }
+    }
+
+    #[test]
+    fn apply_delivery_unions_memories_and_sets_keys() {
+        let dir = temp_dir("delivery-apply");
+        apply_delivery(&dir, "s", update(&["b", "a"], Some("ctx-1")), &options())
+            .expect("first apply");
+        let state = apply_delivery(
+            &dir,
+            "s",
+            DeliveryUpdate {
+                epoch: 0,
+                memories: vec![delivered("a", "d"), delivered("c", "d")],
+                context_key: None,
+                prompt_recall_key: Some("recall-1".to_owned()),
+                turn_recall_ids: vec!["t2".to_owned(), "t1".to_owned()],
+                ..DeliveryUpdate::default()
+            },
+            &options(),
+        )
+        .expect("second apply");
+
+        let ids = state
+            .delivered
+            .iter()
+            .map(|memory| memory.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["a", "b", "c"]);
+        assert_eq!(state.delivered_context_key.as_deref(), Some("ctx-1"));
+        assert_eq!(state.delivered_recall_key.as_deref(), Some("recall-1"));
+        // Turn recall ids are recorded apart from the delivered set.
+        assert_eq!(state.turn_recall_ids, ["t1", "t2"]);
+        // The untracked fields change only through the explicit mirror.
+        assert!(state.context_key.is_none());
+        assert!(state.prompt_recall_key.is_none());
+    }
+
+    #[test]
+    fn apply_delivery_mirrors_untracked_fields() {
+        let dir = temp_dir("delivery-mirror");
+        let mirror = |key: &str, ids: &[&str]| DeliveryUpdate {
+            untracked_context_key: Some(key.to_owned()),
+            untracked_context_ids: ids.iter().map(|id| (*id).to_owned()).collect(),
+            ..update(&[], None)
+        };
+        apply_delivery(&dir, "s", mirror("ctx-a", &["a1"]), &options()).expect("first");
+        // More of the same selection (a drained remainder) adds to its ids.
+        let state = apply_delivery(&dir, "s", mirror("ctx-a", &["a2"]), &options()).expect("drain");
+        assert_eq!(state.startup_memory_ids, ["a1", "a2"]);
+        // A new selection replaces them, as untracked hooks do, apart from
+        // memories still visible in the epoch (earlier drained batches).
+        apply_delivery(&dir, "s", update(&["seen"], None), &options()).expect("delivered");
+        let state =
+            apply_delivery(&dir, "s", mirror("ctx-b", &["b1"]), &options()).expect("switch");
+        assert_eq!(state.context_key.as_deref(), Some("ctx-b"));
+        assert_eq!(state.startup_memory_ids, ["b1", "seen"]);
+        let state = apply_delivery(
+            &dir,
+            "s",
+            DeliveryUpdate {
+                untracked_recall_key: Some("recall".to_owned()),
+                untracked_recall_ids: vec!["r1".to_owned()],
+                ..update(&[], None)
+            },
+            &options(),
+        )
+        .expect("recall");
+        assert_eq!(state.prompt_recall_key.as_deref(), Some("recall"));
+        assert_eq!(state.prompt_recall_memory_ids, ["r1"]);
+        // Tracked selection keys are untouched by the mirror.
+        assert!(state.delivered_context_key.is_none());
+        assert!(state.delivered_recall_key.is_none());
+    }
+
+    #[test]
+    fn bookkeeping_from_an_earlier_epoch_is_dropped() {
+        let dir = temp_dir("delivery-stale-epoch");
+        let state = reset_context_epoch(&dir, "s", &options()).expect("reset");
+        assert_eq!(state.context_epoch, 1);
+
+        // A hook that selected before the reset applies afterwards.
+        let state = apply_delivery(&dir, "s", update(&["old"], Some("ctx")), &options())
+            .expect("stale apply");
+        assert!(state.delivered.is_empty());
+        assert!(state.delivered_context_key.is_none());
+
+        let fresh = DeliveryUpdate {
+            epoch: 1,
+            ..update(&["new"], Some("ctx-2"))
+        };
+        let state = apply_delivery(&dir, "s", fresh, &options()).expect("fresh apply");
+        assert!(state.has_delivered("new", "d"));
+        assert_eq!(state.delivered_context_key.as_deref(), Some("ctx-2"));
+    }
+
+    #[test]
+    fn has_delivered_requires_matching_digest() {
+        let state = HookState {
+            delivered: vec![delivered("a", "old-text")],
+            ..HookState::default()
+        };
+        assert!(state.has_delivered("a", "old-text"));
+        assert!(!state.has_delivered("a", "new-text"));
+        assert!(!state.has_delivered("b", "old-text"));
+    }
+
+    #[test]
+    fn reset_context_epoch_clears_visibility_state_only() {
+        let dir = temp_dir("delivery-reset");
+        mark_memory_pending(&dir, "s", "intent", &options()).expect("pending");
+        mark_startup_context(&dir, "s", "ctx", vec!["legacy".to_owned()], &options())
+            .expect("startup");
+        mark_prompt_recall(&dir, "s", "recall", vec!["r".to_owned()], &options()).expect("recall");
+        apply_delivery(&dir, "s", update(&["a"], Some("tracked")), &options()).expect("apply");
+        apply_delivery(
+            &dir,
+            "s",
+            DeliveryUpdate {
+                prompt_recall_key: Some("tracked-recall".to_owned()),
+                turn_recall_ids: vec!["turn".to_owned()],
+                ..update(&[], None)
+            },
+            &options(),
+        )
+        .expect("apply recall");
+
+        let state = reset_context_epoch(&dir, "s", &options()).expect("reset");
+
+        assert!(state.delivered.is_empty());
+        assert!(state.delivered_context_key.is_none());
+        assert!(state.delivered_recall_key.is_none());
+        assert!(state.turn_recall_ids.is_empty());
+        assert_eq!(state.context_epoch, 1);
+        assert!(state.prompt_recall_updated_at.is_none());
+        assert!(state.context_key.is_none());
+        assert!(state.startup_memory_ids.is_empty());
+        assert!(state.prompt_recall_key.is_none());
+        assert!(state.prompt_recall_memory_ids.is_empty());
+        assert!(state.context_epoch_started_at.is_some());
+        // Durable-memory debt is about writes, not visibility.
+        assert!(state.memory_pending);
+    }
+
+    #[test]
+    fn delivery_state_round_trips_and_old_state_loads() {
+        let dir = temp_dir("delivery-roundtrip");
+        let path = state_path(&dir, "s");
+        fs::create_dir_all(path.parent().expect("parent")).expect("parent");
+        fs::write(&path, r#"{"context_key":"ctx","startup_memory_ids":["a"]}"#).expect("old state");
+        let old = load_state(&dir, "s").expect("old state loads");
+        assert!(old.delivered.is_empty());
+        assert_eq!(old.context_epoch, 0);
+
+        apply_delivery(&dir, "s", update(&["a"], Some("ctx-2")), &options()).expect("apply");
+        let state = load_state(&dir, "s").expect("reload");
+        assert!(state.has_delivered("a", "d"));
+        assert_eq!(state.delivered_context_key.as_deref(), Some("ctx-2"));
+        // Untracked fields written by an older binary survive.
+        assert_eq!(state.context_key.as_deref(), Some("ctx"));
+        assert_eq!(state.startup_memory_ids, ["a"]);
     }
 
     #[test]

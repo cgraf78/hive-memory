@@ -50,6 +50,10 @@ related results, while
 .B --project-only
 narrows to that project.
 .TP
+.B get
+Print one memory by id, including one too large for hook context. Notes come
+from the local index; curated files are read from the store.
+.TP
 .B context
 Assemble agent-readable context within a token budget.
 .TP
@@ -85,7 +89,7 @@ Resolve, bind, unbind, alias, list, and show project identities.
 .TP
 .B hook
 Handle agent lifecycle events such as session start, prompt submit, tool
-complete, and stop.
+complete, stop, and context reset (the host lost earlier context).
 .TP
 .B doctor
 Run top-level diagnostics. Use

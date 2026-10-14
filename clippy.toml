@@ -2,8 +2,8 @@
 # (`tests/common/mod.rs`), which scrubs inherited `HIVE_MEMORY_*` selectors
 # and points the XDG base dirs into a per-test sandbox. A raw assert_cmd
 # command would read the developer's real environment and XDG state, so its
-# binary-path helpers are banned everywhere else. `hermetic_hm()` carries the
-# one targeted `#[expect]`.
+# binary-path helpers are banned everywhere else. `hermetic_hm_process()`
+# (which `hermetic_hm()` wraps) carries the one targeted `#[expect]`.
 disallowed-macros = [
   { path = "assert_cmd::cargo_bin_cmd", reason = "spawn hm through common::hermetic_hm()" },
   { path = "assert_cmd::cargo_bin", reason = "spawn hm through common::hermetic_hm()" },

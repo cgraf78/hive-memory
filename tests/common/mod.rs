@@ -126,10 +126,17 @@ pub fn git() -> Command {
 /// afterwards, which takes precedence.
 // `clippy.toml` disallows the raw constructors everywhere else so new tests
 // cannot bypass this builder.
-#[expect(clippy::disallowed_macros)]
 #[allow(dead_code)]
 pub fn hermetic_hm() -> assert_cmd::Command {
-    let mut command = assert_cmd::cargo::cargo_bin_cmd!("hm");
+    assert_cmd::Command::from_std(hermetic_hm_process())
+}
+
+/// [`hermetic_hm`] as a plain [`std::process::Command`], for tests that need
+/// to drive the child process themselves (for example closing its stdout).
+#[expect(clippy::disallowed_macros)]
+#[allow(dead_code)]
+pub fn hermetic_hm_process() -> std::process::Command {
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("hm"));
     for key in inherited_vars("HIVE_MEMORY_") {
         command.env_remove(key);
     }

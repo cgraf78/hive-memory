@@ -17,6 +17,10 @@ use std::path::PathBuf;
 use time::OffsetDateTime;
 
 const MAX_CONTEXT_CACHE_BYTES: u64 = 16 * 1024 * 1024;
+/// Rendered context cache schema. Version 2 added per-section `block` text;
+/// version 1 entries cannot be split into sections and are ignored, so the
+/// hook falls back to the local projection.
+const CONTEXT_CACHE_SCHEMA_VERSION: u32 = 2;
 
 /// Arguments for `hm context`.
 #[derive(Debug, Args)]
@@ -545,6 +549,8 @@ struct ContextCacheSection {
     source_path: String,
     estimated_tokens: usize,
     body: String,
+    /// Exact rendered block, so hooks can re-render a filtered subset.
+    block: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -574,7 +580,7 @@ fn write_context_cache(config: &Config, assembly: &CliContextAssembly) -> Result
             ))
         });
     let entry = ContextCacheEntry {
-        schema_version: 1,
+        schema_version: CONTEXT_CACHE_SCHEMA_VERSION,
         created_at: OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .expect("RFC3339 formatting should not fail"),
@@ -605,6 +611,7 @@ fn write_context_cache(config: &Config, assembly: &CliContextAssembly) -> Result
                 source_path: section.source_path.clone(),
                 estimated_tokens: section.estimated_tokens,
                 body: section.body.clone(),
+                block: section.block.clone(),
             })
             .collect(),
         decisions: assembly
@@ -691,7 +698,7 @@ fn load_context_cache(
     let Ok(entry) = serde_json::from_str::<ContextCacheEntry>(&contents) else {
         return Ok(None);
     };
-    if entry.schema_version != 1 || entry.key != key {
+    if entry.schema_version != CONTEXT_CACHE_SCHEMA_VERSION || entry.key != key {
         return Ok(None);
     }
     if let Some(current_generation) = index_generation(cached_index_path) {
@@ -734,6 +741,7 @@ fn load_context_cache(
             source_path: section.source_path,
             estimated_tokens: section.estimated_tokens,
             body: section.body,
+            block: section.block,
         })
         .collect();
     let decisions = entry

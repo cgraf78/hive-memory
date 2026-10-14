@@ -76,6 +76,8 @@ enum Command {
     Note(WriteMemoryArgs),
     /// Search curated and remembered memory.
     Search(SearchArgs),
+    /// Print one memory by id (for example one too large for hook context).
+    Get(cli::get::GetArgs),
     /// Assemble agent-readable memory context.
     Context(ContextArgs),
     /// Report store/index health without mutating memory.
@@ -316,6 +318,7 @@ fn run(cli: Cli) -> Result<()> {
         Some(Command::Remember(args)) => run_write_memory(note::EntryKind::Remember, args, context),
         Some(Command::Note(args)) => run_write_memory(note::EntryKind::Note, args, context),
         Some(Command::Search(args)) => cli::search::run(args, context),
+        Some(Command::Get(args)) => cli::get::run(args, context),
         Some(Command::Context(args)) => cli::context::run(args, context),
         Some(Command::SyncStatus(args)) => cli::sync_status::run(args, context),
         Some(Command::Retag(args)) => run_retag(args, context),
@@ -347,6 +350,7 @@ impl Cli {
             Some(Command::Stores(command)) => command.wants_json(),
             Some(Command::Remember(args)) | Some(Command::Note(args)) => args.json,
             Some(Command::Search(args)) => args.wants_json(),
+            Some(Command::Get(args)) => args.wants_json(),
             Some(Command::Context(args)) => args.wants_json(),
             Some(Command::SyncStatus(args)) => args.wants_json(),
             Some(Command::Retag(args)) => args.json,

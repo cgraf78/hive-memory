@@ -204,6 +204,16 @@ hm hook stop
   multi-project sessions don't mistake `$HOME` for the active project.
 - **`stop`** reminds the agent at session end if a memory request was never
   satisfied.
+- **`context-reset`** tells `hm` the host lost earlier context (compaction,
+  clear, resume).
+
+Adapters that know their host can opt in to delivery tracking with
+`--delivery persistent|turn`, `--max-context-bytes` (with `--context-size
+json` for hosts that limit the JSON response), and `--reset`. `hm` then
+skips memories the model can still see and emits only what the host shows
+whole; a memory too large for the limit becomes a pointer to
+`hm get --store <store> <id>`.
+See [SPEC.md](SPEC.md) "Delivery Tracking".
 
 > **Note:** There is no automatic capture-on-stop. Memory is written only when
 > an agent (or you) explicitly runs `hm remember` / `hm note` / `hm capture`.

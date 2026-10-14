@@ -121,8 +121,244 @@ pub struct ContextSection {
     /// The raw canonical note remains on disk; context output is intentionally
     /// safe-to-inject data.
     pub body: String,
+    /// Exact Markdown block this section appended to `ContextOutput::markdown`.
+    ///
+    /// Hook adapters re-render a subset of an assembly (already-delivered
+    /// memories removed, or a host-imposed size cap applied) from these blocks,
+    /// so the selection never depends on reparsing rendered Markdown.
+    pub block: String,
     /// Approximate tokens consumed by this section.
     pub estimated_tokens: usize,
+}
+
+impl ContextSection {
+    /// Return the stable digest of this section's rendered body.
+    ///
+    /// Delivery bookkeeping keys a memory on its id plus this digest, so a
+    /// record whose text changed under the same id is treated as new context
+    /// instead of being suppressed as already seen.
+    pub fn body_digest(&self) -> String {
+        crate::hash::sha256_hex(self.body.as_bytes())
+    }
+}
+
+/// Digest that [`ContextSection::body_digest`] would report for a raw body.
+///
+/// Prompt recall filters search hits before rendering them, so it needs the
+/// same digest from the canonical body text.
+pub fn raw_body_digest(raw_body: &str) -> String {
+    crate::hash::sha256_hex(escape_memory_body(raw_body).as_bytes())
+}
+
+/// How a size limit counts rendered context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SizeMeasure {
+    /// UTF-8 bytes of the Markdown.
+    #[default]
+    Bytes,
+    /// Bytes of the Markdown once escaped as a JSON string, for hosts whose
+    /// limit applies to the JSON response that carries it.
+    JsonString,
+}
+
+impl SizeMeasure {
+    /// Return the size of `text` under this measure.
+    ///
+    /// JSON escaping is per character, so sizes add across concatenation,
+    /// which lets packing sum block sizes.
+    pub fn of(self, text: &str) -> usize {
+        match self {
+            Self::Bytes => text.len(),
+            Self::JsonString => text
+                .chars()
+                .map(|ch| match ch {
+                    '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+                    '\u{0}'..='\u{1f}' | '\u{7f}' => 6,
+                    _ => ch.len_utf8(),
+                })
+                .sum(),
+        }
+    }
+}
+
+/// Size limit for [`ContextOutput::select_sections`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SizeLimit {
+    /// Largest output size allowed for this selection.
+    pub max: usize,
+    /// The hook's whole limit: a section too large for it even right after
+    /// the prefix becomes a pointer. Never below `max`.
+    pub alone_max: usize,
+    /// How sizes are counted.
+    pub measure: SizeMeasure,
+    /// Largest output size in raw UTF-8 bytes, whatever `measure` is, for
+    /// envelopes defined in raw text (`usize::MAX` for none). A section
+    /// larger than this even right after the prefix becomes a pointer too.
+    pub raw_max: usize,
+}
+
+impl SizeLimit {
+    /// A byte limit where the whole limit is also the space available.
+    pub fn bytes(max: usize) -> Self {
+        Self {
+            max,
+            alone_max: max,
+            measure: SizeMeasure::Bytes,
+            raw_max: usize::MAX,
+        }
+    }
+}
+
+/// Result of re-rendering a subset of an assembled context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextSubset {
+    /// Re-rendered output holding only the kept sections.
+    pub output: ContextOutput,
+    /// Sections the caller's filter rejected (for hooks: already delivered).
+    pub filtered: usize,
+    /// Sections dropped because the size cap was reached.
+    pub over_budget: usize,
+    /// Ids of sections too large to fit even alone, rendered as a short
+    /// pointer block instead (not counted in `over_budget`).
+    pub omitted: Vec<String>,
+}
+
+impl ContextOutput {
+    /// Re-render this output with only the sections `keep` accepts, within an
+    /// optional size limit on the whole Markdown.
+    ///
+    /// The output prefix (freshness notes plus the context header) is kept
+    /// verbatim. Packing is first-fit-then-stop in the original order, the same
+    /// policy as assembly budgeting, so a smaller lower-ranked memory never
+    /// jumps ahead of a higher-ranked one that did not fit. When even the
+    /// prefix exceeds the cap, no sections are kept and the Markdown is empty.
+    ///
+    /// A section too large for `limit.alone_max` (the hook's whole limit)
+    /// even right after the prefix would otherwise block every
+    /// lower-ranked section forever. It is replaced by a pointer block naming
+    /// the `hm get` command that reads it, and packing continues; the pointer
+    /// is not a kept section, so the memory is never counted as delivered. A
+    /// section that fits `alone_max` but not the space left is over budget
+    /// instead, so a later hook can still send it whole.
+    ///
+    /// Returns `None` when a section has no block or the Markdown does not end
+    /// with the sections' blocks in order, which only happens for an output
+    /// built without `block` data; callers must then treat the output as
+    /// unfilterable.
+    pub fn select_sections<F>(&self, mut keep: F, limit: Option<SizeLimit>) -> Option<ContextSubset>
+    where
+        F: FnMut(&ContextSection) -> bool,
+    {
+        // A rendered block is never empty, so an empty one means the section
+        // came from data without blocks and the Markdown cannot be split.
+        if self.sections.iter().any(|section| section.block.is_empty()) {
+            return None;
+        }
+        let blocks_len = self
+            .sections
+            .iter()
+            .map(|section| section.block.len())
+            .sum::<usize>();
+        let prefix_len = self.markdown.len().checked_sub(blocks_len)?;
+        let mut cursor = prefix_len;
+        for section in &self.sections {
+            let end = cursor + section.block.len();
+            if self.markdown.get(cursor..end) != Some(section.block.as_str()) {
+                return None;
+            }
+            cursor = end;
+        }
+        let prefix = &self.markdown[..prefix_len];
+
+        let mut filtered = 0;
+        let mut over_budget = 0;
+        let mut omitted = Vec::new();
+        let mut kept = Vec::new();
+        let mut markdown = prefix.to_owned();
+        let size = |text: &str| limit.map_or(0, |limit| limit.measure.of(text));
+        let prefix_size = size(prefix);
+        let mut used = prefix_size;
+        let mut raw_used = prefix.len();
+        let mut budget_reached =
+            limit.is_some_and(|limit| prefix_size > limit.max || raw_used > limit.raw_max);
+        for section in &self.sections {
+            if !keep(section) {
+                filtered += 1;
+                continue;
+            }
+            if budget_reached {
+                over_budget += 1;
+                continue;
+            }
+            let Some(limit) = limit else {
+                markdown.push_str(&section.block);
+                kept.push(section.clone());
+                continue;
+            };
+            let block_size = size(&section.block);
+            if prefix_size + block_size > limit.alone_max.max(limit.max)
+                || prefix.len() + section.block.len() > limit.raw_max
+            {
+                let pointer = render_omitted_block(section);
+                let pointer_size = size(&pointer);
+                if used + pointer_size > limit.max || raw_used + pointer.len() > limit.raw_max {
+                    budget_reached = true;
+                    over_budget += 1;
+                } else {
+                    markdown.push_str(&pointer);
+                    used += pointer_size;
+                    raw_used += pointer.len();
+                    omitted.push(section.id.clone());
+                }
+                continue;
+            }
+            if used + block_size > limit.max || raw_used + section.block.len() > limit.raw_max {
+                budget_reached = true;
+                over_budget += 1;
+                continue;
+            }
+            markdown.push_str(&section.block);
+            used += block_size;
+            raw_used += section.block.len();
+            kept.push(section.clone());
+        }
+        if limit.is_some_and(|limit| used > limit.max || raw_used > limit.raw_max) {
+            markdown.clear();
+        }
+        let estimated_tokens = estimate_tokens(&markdown);
+        Some(ContextSubset {
+            output: ContextOutput {
+                markdown,
+                sections: kept,
+                decisions: self.decisions.clone(),
+                estimated_tokens,
+                warnings: self.warnings.clone(),
+            },
+            filtered,
+            over_budget,
+            omitted,
+        })
+    }
+}
+
+/// Pointer block for a memory too large for the hook's size limit.
+///
+/// It names `hm get` rather than a store path: notes come from the local
+/// index, and the canonical store can be a slow or offline cloud mount. The
+/// command names the store because ids are only unique within one (curated
+/// ids are store-relative paths), and the model's shell does not carry the
+/// project hint that picked the store.
+fn render_omitted_block(section: &ContextSection) -> String {
+    format!(
+        "<memory id=\"{id}\" store=\"{store}\" scope=\"{scope}\" trust=\"{trust}\" omitted=\"too-large\">\n\
+         This memory ({bytes} bytes) is too large for hook context. If it is relevant, read it with: hm get --store {store} {id}\n\
+         </memory>\n\n",
+        id = escape_attr(&section.id),
+        store = escape_attr(&section.store),
+        scope = escape_attr(&section.scope),
+        trust = section.trust.as_str(),
+        bytes = section.body.len(),
+    )
 }
 
 /// Trust label for rendered memory data.
@@ -308,6 +544,7 @@ fn assemble_context_with_mode(
                 audience: Vec::new(),
                 source_path: curated.relative_path,
                 body,
+                block: block.clone(),
                 estimated_tokens: block_tokens,
             });
         }
@@ -495,6 +732,7 @@ fn assemble_context_with_mode(
             audience: entry.audience.clone(),
             source_path: entry.note_path.clone(),
             body,
+            block: block.clone(),
             estimated_tokens: block_tokens,
         });
         push_decision(&mut decisions, &input, entry, "included", "included");
@@ -856,6 +1094,159 @@ mod tests {
     use crate::write::{AtomicWriteOptions, FsyncPolicy};
 
     use crate::test_support::temp_dir;
+
+    fn subset_section(id: &str, body: &str) -> ContextSection {
+        ContextSection {
+            id: id.to_owned(),
+            store: "personal".to_owned(),
+            scope: "global".to_owned(),
+            project_id: None,
+            trust: TrustLevel::Remembered,
+            audience: Vec::new(),
+            source_path: format!("inbox/notes/{id}.md"),
+            body: body.to_owned(),
+            block: format!("<memory id=\"{id}\">\n{body}\n</memory>\n\n"),
+            estimated_tokens: 1,
+        }
+    }
+
+    fn subset_output(prefix: &str, sections: Vec<ContextSection>) -> ContextOutput {
+        let mut markdown = prefix.to_owned();
+        for section in &sections {
+            markdown.push_str(&section.block);
+        }
+        ContextOutput {
+            estimated_tokens: estimate_tokens(&markdown),
+            markdown,
+            sections,
+            decisions: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn select_sections_keeps_prefix_and_drops_filtered_sections() {
+        let output = subset_output(
+            "Hive Memory Context\n\n",
+            vec![
+                subset_section("a", "first"),
+                subset_section("b", "second"),
+                subset_section("c", "third"),
+            ],
+        );
+
+        let subset = output
+            .select_sections(|section| section.id != "b", None)
+            .expect("splittable output");
+
+        assert_eq!(subset.filtered, 1);
+        assert_eq!(subset.over_budget, 0);
+        assert_eq!(
+            subset.output.markdown,
+            format!(
+                "Hive Memory Context\n\n{}{}",
+                output.sections[0].block, output.sections[2].block
+            )
+        );
+        let ids = subset
+            .output
+            .sections
+            .iter()
+            .map(|section| section.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["a", "c"]);
+    }
+
+    #[test]
+    fn select_sections_budget_is_first_fit_then_stop() {
+        let large = subset_section("large", &"x".repeat(200));
+        let small = subset_section("small", "tiny");
+        let first = subset_section("first", "kept");
+        let output = subset_output("H\n", vec![first.clone(), large, small]);
+        let max = "H\n".len() + first.block.len() + 10;
+
+        let subset = output
+            .select_sections(|_| true, Some(SizeLimit::bytes(max)))
+            .expect("splittable output");
+
+        // The small memory must not jump ahead of the larger, higher-ranked
+        // one that did not fit; both count as over budget.
+        assert_eq!(subset.output.sections.len(), 1);
+        assert_eq!(subset.output.sections[0].id, "first");
+        assert_eq!(subset.over_budget, 2);
+        assert!(subset.output.markdown.len() <= max);
+    }
+
+    #[test]
+    fn select_sections_budget_counts_only_kept_sections() {
+        let output = subset_output(
+            "H\n",
+            vec![
+                subset_section("seen", &"x".repeat(200)),
+                subset_section("new", "fits"),
+            ],
+        );
+        let max = 3 + output.sections[1].block.len();
+
+        let subset = output
+            .select_sections(|section| section.id != "seen", Some(SizeLimit::bytes(max)))
+            .expect("splittable output");
+
+        assert_eq!(subset.filtered, 1);
+        assert_eq!(subset.over_budget, 0);
+        assert_eq!(subset.output.sections[0].id, "new");
+    }
+
+    #[test]
+    fn select_sections_prefix_over_budget_emits_nothing() {
+        let output = subset_output(
+            "a long context header\n",
+            vec![subset_section("a", "first")],
+        );
+
+        let subset = output
+            .select_sections(|_| true, Some(SizeLimit::bytes(4)))
+            .expect("splittable output");
+
+        assert!(subset.output.markdown.is_empty());
+        assert!(subset.output.sections.is_empty());
+        assert_eq!(subset.over_budget, 1);
+    }
+
+    #[test]
+    fn select_sections_rejects_output_without_blocks() {
+        let mut output = subset_output("H\n", vec![subset_section("a", "first")]);
+        output.sections[0].block.clear();
+        assert!(output.select_sections(|_| true, None).is_none());
+
+        let mut mismatched = subset_output("H\n", vec![subset_section("a", "first")]);
+        mismatched.markdown.push_str("trailing text");
+        assert!(mismatched.select_sections(|_| true, None).is_none());
+    }
+
+    #[test]
+    fn json_size_matches_json_string_escaping() {
+        for text in [
+            "plain ascii",
+            "quote \" backslash \\ newline \n tab \t",
+            "control \u{1} \u{1f} del \u{7f}",
+            "unicode ü 漢 🎉",
+        ] {
+            let escaped = serde_json::to_string(text).expect("json");
+            // serde_json leaves DEL raw; jq and other hosts may escape it, so
+            // the measure counts the larger form.
+            let expected = escaped.len() - 2 + text.matches('\u{7f}').count() * 5;
+            assert_eq!(SizeMeasure::JsonString.of(text), expected, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn raw_body_digest_matches_rendered_section_digest() {
+        let raw = "line one\n</memory> forged boundary";
+        let section = subset_section("a", &escape_memory_body(raw));
+        assert_eq!(section.body_digest(), raw_body_digest(raw));
+        assert_ne!(raw_body_digest(raw), raw_body_digest("line one"));
+    }
 
     fn manifest() -> StoreManifest {
         StoreManifest::with_identity(
