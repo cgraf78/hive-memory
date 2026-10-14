@@ -654,7 +654,7 @@ State dir contents (ephemeral, OK to lose):
 
 ```text
 locks/                  # local process locks (fcntl/flock)
-runs/                   # last flush/doctor metadata and session receipts
+runs/                   # flush/doctor metadata, session receipts, hook state
 context-cache/           # last successful hook context per agent/project/store
 ```
 
@@ -1147,6 +1147,35 @@ changing output contracts. BM25 results are interleaved round-robin with
 lexical/alias results, so lexical ordering rules apply only within the lexical
 stream. Retrieval failures fall back to the lexical path with a warning.
 
+### `hm get`
+
+Purpose: print one memory by id, for example one that hook context replaced
+with a pointer because it is larger than the host's limit.
+
+```bash
+hm get --store <store> <id>   # as hook pointers print it
+hm get <id> --json
+```
+
+Behavior:
+
+- resolves the store the way hook context does: `--store`, else the project's
+  store binding (from `--project` or `HIVE_MEMORY_PROJECT`), else the agent
+  default; without `--store` it then searches every other store the agent may
+  read; a store that cannot be read there is skipped with a warning. Ids are
+  unique only within a store (curated ids are store-relative paths), so hook
+  pointers name the store. Store read policy and the audience rule apply: an
+  `agent-private` record is shown only to its audience.
+- notes come from the local index projection first (the canonical store can be
+  a slow or offline cloud mount); without a projection the index is rebuilt
+  from the store, which can be slow on a cold mount. Curated ids
+  (`curated:<path>`) are always read from the store's curated files, so they
+  can be slow on a cold mount too.
+- prints the id, store, scope, project id, and body; `--json` returns
+  `{ "id", "store", "scope", "project_id", "note_path", "body" }`. A closed
+  output pipe is not an error.
+- an unknown or hidden id is an error (exit `1`).
+
 ### `hm context`
 
 Purpose: assemble concise context for an agent/session.
@@ -1410,6 +1439,9 @@ hm hook session-start --project /repo --json
 hm hook prompt-submit --project /repo --text "$PROMPT" --json
 hm hook tool-complete --project /repo/src/main.rs --status 0 --json
 hm hook stop --json
+hm hook session-start --project /repo --delivery persistent \
+  --max-context-bytes 9000 --json
+hm hook context-reset --json
 ```
 
 Subcommands:
@@ -1419,6 +1451,7 @@ hm hook session-start
 hm hook prompt-submit
 hm hook tool-complete
 hm hook stop
+hm hook context-reset
 ```
 
 Behavior:
@@ -1457,6 +1490,8 @@ Behavior:
 - `stop`: if `memory-pending` remains, returns a reminder action. It may run
   `hm refresh --force` equivalent maintenance when configured, but it MUST NOT
   write canonical memory automatically.
+- `context-reset`: records that the host lost earlier context (see Delivery
+  Tracking). It emits no actions.
 - privacy refusals, manifest identity conflicts, generated-file drift, and
   secret write refusals are surfaced as warnings/actions for hook adapters to
   show to the user; they are not silently downgraded to another store.
@@ -1471,6 +1506,99 @@ Output:
   `candidate_count`, `selected_count`, `selected_ids`, `reason`,
   `reused_previous`, `timed_out`, and `retrieval_ms`; hook adapters may ignore
   this metadata and continue applying only `actions`.
+- With `--delivery`, `session-start` and `prompt-submit` responses add a
+  `delivery` object `{ "lifetime", "reset", "emitted_ids",
+  "skipped_delivered", "skipped_over_budget", "omitted" }`. The field is
+  omitted otherwise, so responses without the delivery flags are unchanged.
+
+#### Delivery Tracking
+
+The delivery flags are optional and opt-in per runtime. Without them every
+hook behaves as described above. They let an adapter that knows its host's
+context behavior stop re-sending memories the model can still see:
+
+- `--delivery persistent|turn` (session-start, prompt-submit) enables tracking.
+  `persistent` means the host keeps this hook's context in the transcript until
+  the adapter reports a context loss; `turn` means the host shows it for the
+  current turn only (for example Muse prompt context). The session keeps a
+  per-epoch delivered set keyed by memory id plus a digest of the rendered
+  body, so changed text under the same id counts as new. Only persistent
+  context joins the set.
+- A memory counts as delivered once the hook emits it whole within
+  `--max-context-bytes`; the bookkeeping is written after the response, so a
+  failed write marks nothing. If the host still discards the output (another
+  hook blocks the prompt, or the hook times out after `hm` returned), those
+  memories stay unsent until the next context reset, the same gap untracked
+  prompt recall already has.
+- Tracked hooks keep their own selection fields (`delivered_context_key`,
+  `delivered_recall_key`) next to the untracked `context_key` and
+  `prompt_recall_key`. Untracked hooks sharing the session id (a nested agent,
+  an older adapter) therefore never make a tracked hook skip a re-send.
+  Tracked bookkeeping also keeps the untracked fields (`context_key`,
+  `startup_memory_ids`, `prompt_recall_key`, `prompt_recall_memory_ids`) as
+  untracked hooks would have left them for output it emitted with nothing
+  left out by the size limit, without ever reading them. An adapter that falls
+  back to an untracked call mid-session then does not re-send a selection the
+  session already received whole, and still sends one it received only in
+  part.
+- With tracking, a changed project/store selection re-renders the selection
+  without memories already in the delivered set; selection and budgeting are
+  otherwise unchanged. When every memory is already visible, the response
+  carries only the context header, so the model still sees the project/path
+  switch. A persistent selection is recorded as current once a response
+  carrying everything that was left (or only the header) is emitted; while the
+  size cap leaves memories out, later prompts keep sending them.
+- Persistent prompt-submit runs prompt recall on every prompt, as untracked
+  hooks do, and gives it precedence: recall is selected first with the full
+  budget, and the context selection fills what is left and skips any memory
+  recall already carries; both go out in one `inject_context` action. Recall
+  skips delivered memories (by id and digest) and does not repeat its previous
+  selection.
+- Turn-lifetime prompt-submit follows the untracked order: a changed
+  selection is sent instead of recall, once per change and fitted to the cap,
+  and prompt recall runs on the other prompts without the repeat check. Its
+  memories never join the delivered set, so later selections keep offering
+  them. Recall moves past hits it already showed in the epoch
+  (`turn_recall_ids`, pointers included) and skips memories the last
+  context-change block carried (`turn_context_ids`), as untracked recall
+  does; once every earlier hit was shown, it repeats the top ones rather than
+  showing nothing. So Muse-style prompt output equals untracked output minus
+  the memories session start already delivered, plus those repeats.
+- `--max-context-bytes N` caps the emitted Markdown at N bytes, the largest
+  context the host shows the model whole. `--context-size json` (tracked
+  hooks only) counts the Markdown as its JSON-escaped string instead (as jq
+  escapes it), for hosts whose limit applies to the JSON response that
+  carries the context. Memories are packed first-fit-then-stop in rank order;
+  those that do not fit are neither emitted nor marked, so they stay eligible
+  for later hooks. With a cap, prompt recall renders all of its (at most
+  three) hits before packing; its per-prompt envelope stays in raw bytes, as
+  without a cap, and only N uses the `--context-size` measure. A memory too
+  large for N (or the recall envelope) even right after the context header is
+  replaced by a short pointer block (`<memory id=... omitted="too-large">`)
+  that names `hm get --store <store> <id>`, and packing continues past it;
+  the pointer never counts as delivering that memory and does not hold the
+  selection open. A memory that fits N but not the space left after recall
+  waits for a later prompt instead. Output that cannot be split into
+  memories is emitted only when it fits. Without tracking the cap applies
+  too, and only emitted ids are recorded.
+- `--reset` (requires `--delivery`) and `hm hook context-reset` start a new
+  context epoch: they clear the delivered set and the tracked and untracked
+  context and recall selections (plus the emitted-id lists that turn and
+  untracked recall skip), advance
+  `context_epoch`, and keep `memory-pending` and write receipts. The next
+  context-emitting hook sends the session's context again. Adapters call these
+  on host context-loss events: compaction, a clear, or a resume. Tracked
+  bookkeeping records the epoch it was selected in, and bookkeeping from an
+  earlier epoch is dropped, so a hook that overlapped a reset cannot mark
+  memories visible in the new epoch. A failed reset fails the hook (status 1)
+  instead of filtering against a stale set.
+- A tracked hook without `HIVE_MEMORY_SESSION_ID` falls back to untracked
+  behavior.
+- Command-line usage errors, including these flags on an `hm` that predates
+  them, exit `2`; adapters may retry without the flags.
+- The rendered context cache (`state_dir/context-cache/`) is schema version 2:
+  each section stores its rendered block so hooks can re-render a filtered
+  subset. Version 1 entries are ignored and rebuilt from the local projection.
 
 ### `hm promote`
 
@@ -2304,6 +2432,12 @@ Test categories per module:
   `recall.reason = "unchanged"` and no duplicate `inject_context` action.
 - `hm hook tool-complete` never emits context or changes the prior project/store
   selection; prompt-submit owns context changes for long-lived sessions.
+- With `--delivery`, a persistent memory is skipped only while it is in the
+  current epoch's delivered set; `--reset`, `hm hook context-reset`, and
+  output dropped by `--max-context-bytes` leave memories eligible to be sent
+  again. Turn-lifetime memories are never delivered; a turn-lifetime selection
+  is sent once per change, as untracked hooks send it, and turn recall moves
+  on to hits it has not shown in the epoch before repeating any.
 - `hm hook tool-complete --status 0 --json` clears memory-pending immediately
   when a receipt proves a write, then schedules bounded detached index refresh.
   The child advances `refreshed_receipts` only after every selected store was

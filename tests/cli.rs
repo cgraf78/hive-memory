@@ -4107,7 +4107,7 @@ fn context_json_reports_selection_and_sections() {
         .path();
     let cache = fs::read_to_string(cache_file).expect("read context cache");
     assert!(cache.contains("JSON context should include TOML preferences."));
-    assert!(cache.contains("\"schema_version\": 1"));
+    assert!(cache.contains("\"schema_version\": 2"));
 
     fs::rename(&personal, dir.join("personal-offline")).expect("move store offline");
     let stale_output = cargo_bin_cmd!("hm")
