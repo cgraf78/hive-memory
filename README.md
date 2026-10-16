@@ -17,6 +17,9 @@ The canonical data is just files on disk: Markdown notes with TOML front matter,
 JSON event sidecars, and curated Markdown. Indexes and caches are rebuildable. A
 human can read and edit the store without ever running the CLI, and any normal
 file-sync (Google Drive, Dropbox, git) carries the same memory to every machine.
+Unlike vendor memory features or MCP memory servers, there is no service to run
+and nothing tied to one agent: it is a CLI over files you already know how to
+back up and sync.
 
 ---
 
@@ -120,6 +123,25 @@ Prefer small, focused patches with tests.
 That output is data, not instructions: every block is labeled with its source
 store, scope, and trust level so an agent can tell curated knowledge from a raw
 note.
+
+### Wire it into your agent
+
+The simplest setup needs no hooks. Add two lines to your agent's instructions
+file (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, or similar):
+
+```markdown
+- Before work that may depend on earlier decisions or preferences, run `hm search "<topic>"`.
+- Save durable facts, preferences, and decisions with `hm remember --text "<fact>"`.
+```
+
+For automatic context at session start and prompt time, plus reminders when you
+ask the agent to remember something, connect your agent's lifecycle hooks to
+`hm hook` (see [Inject relevant project context at prompt time via
+hooks](#inject-relevant-project-context-at-prompt-time-via-hooks)). `hm hook`
+returns a host-neutral action, so each host needs a small adapter.
+[AgentGuard](https://github.com/cgraf78/agentguard) can wire `hm` into Claude
+Code, Codex, Gemini CLI, Grok, Muse, and OpenCode; see its README for
+requirements.
 
 ---
 
@@ -667,7 +689,7 @@ commands also support `--json`.
 | `hm projects resolve\|bind\|unbind\|alias\|list\|show` | Project identity and bindings |
 | `hm inbox list\|stale\|show` | Inspect raw inbox notes |
 | `hm promote <note-id> --to <path>` | Promote a raw note into curated memory |
-| `hm hook session-start\|prompt-submit\|tool-complete\|stop` | Agent lifecycle hooks |
+| `hm hook session-start\|prompt-submit\|tool-complete\|stop\|context-reset` | Agent lifecycle hooks |
 | `hm refresh` / `hm flush` / `hm outbox` | Rebuild state; publish queued offline writes |
 | `hm sync-status` | Report store/index health (read-only; `--scan` walks the store) |
 | `hm doctor` | Top-level diagnostics (`--quick`, `--fix`, `--json`) |
