@@ -31,11 +31,12 @@ rebuildable. [SPEC.md](SPEC.md) is normative for v1 behavior;
 - The dependency tree stays pure Rust: a C-linking crate breaks the
   static musl release build (why tantivy's default features are off).
 - Behavior, file-format, or hook-contract changes need a SPEC.md
-  update. README performance numbers come from the `perf_budget` test.
+  update. The README scaling table comes from the `perf_budget` test.
 
 ## Testing
 
-CI runs these through the shared `cgraf78/actions` workflows:
+CI runs these, through the shared `cgraf78/actions` Rust workflow or
+jobs defined in `test.yml`:
 
 ```sh
 cargo fmt --check
@@ -49,6 +50,8 @@ HIVE_MEMORY_PERF_BUDGET_MULTIPLIER=4 cargo test --release --locked --test perf_b
 cargo test --locked --test cloud_sync_sim -- --ignored --nocapture
 ```
 
+- `test.yml` lists the `tests/shell/*` suites by hand; add a new shell
+  suite there and to the ShellCheck inventory, or CI never runs it.
 - `[lints.rust] warnings = "deny"`; edition 2024; no MSRV job. Drop the
   perf multiplier locally to apply the stricter budget.
 - CI also smoke-tests a packaged musl archive (`scripts/package-release.sh`,
