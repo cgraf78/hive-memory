@@ -72,7 +72,10 @@ signed provenance mechanism. When GitHub CLI 2.49+ is logged in to github.com,
 online installs also verify the archive's GitHub artifact attestation and reject
 it on failure; otherwise the installer proceeds on the checksum and says so.
 Pass `--require-attestation` to make provenance verification mandatory
-(online installs only).
+(online installs only). For manual verification and troubleshooting, see the
+[shared attestation verification guide](https://github.com/cgraf78/actions/blob/main/docs/workflow-api.md#verifying-published-attestations).
+It explains how to constrain the source repository and the separate shared
+signer workflow pinned by the release.
 
 Create a minimal config at `$XDG_CONFIG_HOME/hive-memory/config.toml` when
 `XDG_CONFIG_HOME` is absolute, or at `~/.config/hive-memory/config.toml`
@@ -745,6 +748,11 @@ names (e.g. `hm-<version>-linux-x86_64-musl.tar.gz`,
 `hm-<version>-android-aarch64.tar.gz`, and
 `hm-<version>-macos-aarch64.tar.gz`). Release archives include the `hm`
 binary, project metadata, and the `man/man1/hm.1` manual page.
+
+After publication, follow the [shared attestation verification guide](https://github.com/cgraf78/actions/blob/main/docs/workflow-api.md#verifying-published-attestations)
+to verify downloaded assets against this source repository and the shared
+signer workflow commit pinned at the release tag. Use the release-time pin
+when verifying older releases.
 
 ## License
 
