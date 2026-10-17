@@ -23,6 +23,11 @@ The sync also owns `.release-scripts.manifest`. That small generated list lets
 CI notice when a formerly shared script was removed upstream without guessing
 that repo-specific files such as `release.conf` should be deleted too.
 
+For post-publication verification and troubleshooting, use the
+[shared attestation verification guide](https://github.com/cgraf78/actions/blob/main/docs/workflow-api.md#verifying-published-attestations).
+Verify both the source repository and the shared signer workflow commit pinned
+at the release tag; the current actions lock may differ for older releases.
+
 Repo-owned pieces:
 
 - `release.conf` declares the env namespace, archive naming, and the payload

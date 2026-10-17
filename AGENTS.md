@@ -93,3 +93,6 @@ cargo test --locked --test cloud_sync_sim -- --ignored --nocapture
   hash), not Cargo semver; `release.yml` fires only on that shape.
 - Assets: `linux-{x86_64,aarch64}-musl`, `macos-{x86_64,aarch64}`, and
   `android-aarch64` archives, with checksums and attestations.
+- Verify published assets using the [shared attestation verification guide](https://github.com/cgraf78/actions/blob/main/docs/workflow-api.md#verifying-published-attestations).
+  Constrain the source repository and the shared signer workflow commit pinned
+  at the release tag, including when verifying older releases.
