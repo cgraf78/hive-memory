@@ -27,7 +27,6 @@ const SHARED_RUST_WORKFLOW: &str = "cgraf78/actions/.github/workflows/rust-ci.ym
 // enabling that shared opt-in would add an unused apt/network dependency.
 const FORBIDDEN_RUST_INPUTS: &[&str] = &[
     "rust-toolchain",
-    "msrv-toolchain",
     "msrv-command",
     "test-command",
     "fmt-command",
@@ -135,6 +134,18 @@ fn validate_workflow(yaml: &str) -> Result<(), String> {
                 "rust job must inherit shared {input} policy without an override"
             ));
         }
+    }
+    // Cargo owns the compatibility promise; CI must exercise that exact
+    // toolchain while the reusable workflow owns the check command itself.
+    let manifest: toml::Value = toml::from_str(include_str!("../Cargo.toml"))
+        .map_err(|error| format!("invalid Cargo manifest: {error}"))?;
+    let msrv = manifest
+        .get("package")
+        .and_then(|package| package.get("rust-version"))
+        .and_then(toml::Value::as_str)
+        .ok_or("Cargo.toml must declare package.rust-version")?;
+    if mapping_value(inputs, "msrv-toolchain").and_then(Value::as_str) != Some(msrv) {
+        return Err("rust job must check Cargo.toml's minimum Rust version".into());
     }
     if mapping_value(inputs, "package-smoke-musl-target").and_then(Value::as_str)
         != Some("x86_64-unknown-linux-musl")
@@ -290,7 +301,6 @@ fn a_standalone_rustsec_job_is_rejected() {
 fn shared_rust_policy_overrides_are_rejected() {
     for (input, value) in [
         ("rust-toolchain", "nightly"),
-        ("msrv-toolchain", "1.88"),
         ("msrv-command", "cargo check"),
         ("test-command", "cargo test"),
         ("fmt-command", "true"),
@@ -348,4 +358,35 @@ fn an_unlocked_product_test_is_rejected() {
 fn malformed_yaml_is_rejected() {
     assert!(validate_dependabot("version: [\n").is_err());
     assert!(validate_workflow("jobs: [\n").is_err());
+}
+
+#[test]
+fn a_missing_minimum_rust_check_is_rejected() {
+    let mut document: Value = serde_yaml_ng::from_str(&valid_workflow()).unwrap();
+    document["jobs"]["rust"]["with"]
+        .as_mapping_mut()
+        .unwrap()
+        .remove(Value::String("msrv-toolchain".into()));
+    assert!(validate_workflow(&serde_yaml_ng::to_string(&document).unwrap()).is_err());
+}
+
+#[test]
+fn a_drifted_minimum_rust_check_is_rejected() {
+    let mut document: Value = serde_yaml_ng::from_str(&valid_workflow()).unwrap();
+    document["jobs"]["rust"]["with"]["msrv-toolchain"] = Value::String("1.0".into());
+    assert!(validate_workflow(&serde_yaml_ng::to_string(&document).unwrap()).is_err());
+}
+
+#[test]
+fn an_empty_minimum_rust_check_is_rejected() {
+    let mut document: Value = serde_yaml_ng::from_str(&valid_workflow()).unwrap();
+    document["jobs"]["rust"]["with"]["msrv-toolchain"] = Value::String(String::new());
+    assert!(validate_workflow(&serde_yaml_ng::to_string(&document).unwrap()).is_err());
+}
+
+#[test]
+fn a_nonstring_minimum_rust_check_is_rejected() {
+    let mut document: Value = serde_yaml_ng::from_str(&valid_workflow()).unwrap();
+    document["jobs"]["rust"]["with"]["msrv-toolchain"] = Value::Bool(false);
+    assert!(validate_workflow(&serde_yaml_ng::to_string(&document).unwrap()).is_err());
 }
