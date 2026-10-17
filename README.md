@@ -712,6 +712,10 @@ formats, or hook contracts are tracked in [SPEC.md](SPEC.md).
 
 ## Development
 
+Building from source requires Rust 1.89 or newer with the checked-in lockfile.
+CI checks this minimum alongside the current stable toolchain. Installing a
+published binary with `install.sh` does not require Rust.
+
 ```sh
 cargo install --path . --locked
 cargo fmt --check

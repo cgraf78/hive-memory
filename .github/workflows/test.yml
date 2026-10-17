@@ -21,6 +21,9 @@ jobs:
   rust:
     uses: cgraf78/actions/.github/workflows/rust-ci.yml@e3a25ae946aea8fd57da3bf2ffbf9f94ea84b8d9
     with:
+      # Cargo's minimum is a source-install contract; keep it exercised in the
+      # shared quality gate alongside the default stable toolchain.
+      msrv-toolchain: "1.89"
       # Full matrix on every PR: scheduled-only legs let main break
       # silently between daily runs and cannot validate their fixes.
       matrix-set: full

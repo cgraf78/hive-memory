@@ -52,8 +52,10 @@ cargo test --locked --test cloud_sync_sim -- --ignored --nocapture
 
 - `test.yml` lists the `tests/shell/*` suites by hand; add a new shell
   suite there and to the ShellCheck inventory, or CI never runs it.
-- `[lints.rust] warnings = "deny"`; edition 2024; no MSRV job. Drop the
-  perf multiplier locally to apply the stricter budget.
+- `[lints.rust] warnings = "deny"`; edition 2024; MSRV is 1.89, declared
+  in `Cargo.toml` and checked by the shared quality gate with
+  `cargo check --locked --all-targets --all-features`. Drop the perf
+  multiplier locally to apply the stricter budget.
 - CI also smoke-tests a packaged musl archive (`scripts/package-release.sh`,
   `scripts/smoke-release.sh`), runs `cargo install --path . --locked`,
   and runs `scripts/termux-ci.sh` in an Android emulator.
