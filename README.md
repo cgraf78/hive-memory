@@ -1,7 +1,10 @@
 # hive-memory
 
-[![Tests](https://github.com/cgraf78/hive-memory/actions/workflows/test.yml/badge.svg)](https://github.com/cgraf78/hive-memory/actions/workflows/test.yml)
-[![Release](https://github.com/cgraf78/hive-memory/actions/workflows/release.yml/badge.svg)](https://github.com/cgraf78/hive-memory/actions/workflows/release.yml)
+[![Tests](https://github.com/cgraf78/hive-memory/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/cgraf78/hive-memory/actions/workflows/test.yml?query=branch%3Amain)
+[![Latest release](https://img.shields.io/github/release-date/cgraf78/hive-memory?display_date=published_at&label=latest%20release)](https://github.com/cgraf78/hive-memory/releases/latest)
+[![License](https://img.shields.io/badge/license-MIT-67ac09)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-%3E%3D1.89-blue)](#development)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL-lightgrey)](#60-second-quick-start)
 
 **Durable, shareable, plain-text memory for AI agents — across sessions,
 agents, and machines.**
