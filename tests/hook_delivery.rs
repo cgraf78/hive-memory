@@ -23,7 +23,11 @@ macro_rules! cargo_bin_cmd {
 
 const GLOBAL_A: &str = "Global delivery fact alpha keeps hook output observable.";
 const GLOBAL_B: &str = "Global delivery fact bravo keeps hook output observable.";
-const PROJECT_B: &str = "Project bravo uses the zephyrine release checklist.";
+const PROJECT_B: &str = "Hook-delivery uses the zephyrine release checklist.";
+// Packing and context-switch tests use this real fixture topic now that prompt
+// backfill intentionally excludes notes unrelated to the current task.
+const DELIVERY_TOPIC: &str = "hook-delivery";
+const GLOBAL_TOPIC: &str = "delivery fact";
 
 struct Fixture {
     config: PathBuf,
@@ -116,7 +120,9 @@ impl Fixture {
                 "project",
             ]);
         }
-        cmd.args(["--text", text]).assert().success();
+        cmd.args(["--tags", DELIVERY_TOPIC, "--text", text])
+            .assert()
+            .success();
     }
 
     fn refresh(&self) {
@@ -270,24 +276,24 @@ fn returning_to_an_earlier_project_resends_nothing_visible() {
     assert_eq!(delivered_ids(&fx.state_json("switch")).len(), 2);
 
     // Project B adds one project memory; the globals are already visible.
-    let to_b = fx.prompt("switch", &fx.repo_b, "Inspect the tests.", PERSISTENT);
+    let to_b = fx.prompt("switch", &fx.repo_b, DELIVERY_TOPIC, PERSISTENT);
     let body = context_body(&to_b).expect("project B context");
     assert!(body.contains(PROJECT_B));
     assert!(!body.contains(GLOBAL_A) && !body.contains(GLOBAL_B));
     assert_eq!(to_b["delivery"]["skipped_delivered"], 2);
 
-    // Back to A: everything is visible, so only the header marks the switch.
-    let back = fx.prompt("switch", &fx.repo_a, "Inspect the tests.", PERSISTENT);
-    let header = context_body(&back).expect("switch header");
-    assert!(header.contains("Hive Memory Context"));
-    assert_eq!(memory_count(&header), 0);
+    // Back to A: everything relevant is visible. The prompt need not spend
+    // context on an empty header, but its delivery bookkeeping still advances.
+    let back = fx.prompt("switch", &fx.repo_a, GLOBAL_TOPIC, PERSISTENT);
+    assert!(context_body(&back).is_none());
+    assert_eq!(memory_count(&context_body(&back).unwrap_or_default()), 0);
     assert_eq!(back["delivery"]["skipped_delivered"], 2);
     assert_eq!(delivered_ids(&fx.state_json("switch")).len(), 3);
 
     // The legacy path re-sends the whole block on the same switch.
     fx.session_start("switch-legacy", &fx.repo_a, &[]);
-    fx.prompt("switch-legacy", &fx.repo_b, "Inspect the tests.", &[]);
-    let legacy_back = fx.prompt("switch-legacy", &fx.repo_a, "Inspect the tests.", &[]);
+    fx.prompt("switch-legacy", &fx.repo_b, DELIVERY_TOPIC, &[]);
+    let legacy_back = fx.prompt("switch-legacy", &fx.repo_a, GLOBAL_TOPIC, &[]);
     let legacy_body = context_body(&legacy_back).expect("legacy re-injection");
     assert!(legacy_body.contains(GLOBAL_A));
 }
@@ -309,7 +315,7 @@ fn context_reset_event_makes_the_next_prompt_resend_context() {
     assert!(delivered_ids(&state).is_empty());
     assert_eq!(state["context_epoch"], 1);
 
-    let next = fx.prompt("reset", &fx.repo_a, "Inspect the tests.", PERSISTENT);
+    let next = fx.prompt("reset", &fx.repo_a, DELIVERY_TOPIC, PERSISTENT);
     let body = context_body(&next).expect("context re-sent after reset");
     assert!(body.contains(GLOBAL_A) && body.contains(GLOBAL_B));
 }
@@ -340,7 +346,7 @@ fn prompt_reset_flag_resends_context() {
     let next = fx.prompt(
         "dirty",
         &fx.repo_a,
-        "Inspect the tests.",
+        DELIVERY_TOPIC,
         &["--delivery", "persistent", "--reset"],
     );
     let body = context_body(&next).expect("context after reset flag");
@@ -353,7 +359,7 @@ fn emitted_memories_count_as_delivered_without_an_acknowledgement() {
     let start = fx.session_start("emit", &fx.repo_a, PERSISTENT);
     assert!(start.get("ack").is_none());
     assert_eq!(delivered_ids(&fx.state_json("emit")).len(), 2);
-    let next = fx.prompt("emit", &fx.repo_a, "Inspect the tests.", PERSISTENT);
+    let next = fx.prompt("emit", &fx.repo_a, GLOBAL_TOPIC, PERSISTENT);
     assert!(context_body(&next).is_none());
 }
 
@@ -453,7 +459,7 @@ fn size_limit_below_header_emits_nothing_and_retries() {
 
     // Nothing was delivered and the selection was not recorded, so a prompt
     // with room sends the startup context.
-    let next = fx.prompt("tiny", &fx.repo_a, "Inspect the tests.", PERSISTENT);
+    let next = fx.prompt("tiny", &fx.repo_a, DELIVERY_TOPIC, PERSISTENT);
     assert!(context_body(&next).expect("context").contains(GLOBAL_A));
 }
 
@@ -503,8 +509,8 @@ fn turn_lifetime_never_suppresses_later_turns() {
     );
     // Turn memories never join the delivered set, so a later change back to
     // the project sends them again.
-    fx.prompt("turn", &fx.repo_a, "Inspect the tests.", turn);
-    let back = fx.prompt("turn", &fx.repo_b, "Inspect the tests.", turn);
+    fx.prompt("turn", &fx.repo_a, DELIVERY_TOPIC, turn);
+    let back = fx.prompt("turn", &fx.repo_b, DELIVERY_TOPIC, turn);
     assert!(context_body(&back).expect("back to B").contains(PROJECT_B));
 }
 
@@ -539,7 +545,7 @@ fn turn_recall_moves_past_hits_it_already_showed() {
     let turn: &[&str] = &["--delivery", "turn"];
     // The first turn sends the project's context selection (if any) instead
     // of recall. The references are search-only, so it never carries them.
-    let first = fx.prompt("advance", &fx.repo_a, "Inspect the tests.", turn);
+    let first = fx.prompt("advance", &fx.repo_a, DELIVERY_TOPIC, turn);
     assert!(!context_body(&first).unwrap_or_default().contains("Quasar"));
 
     // Like untracked recall, each turn moves on to the next hits, so all
@@ -596,7 +602,7 @@ fn recall_envelope_counts_raw_bytes_while_the_host_cap_counts_json() {
         "json",
     ];
     // The first turn sends the context selection; the second runs recall.
-    fx.prompt("envelope", &fx.repo_a, "Inspect the tests.", json_cap);
+    fx.prompt("envelope", &fx.repo_a, DELIVERY_TOPIC, json_cap);
     let response = fx.prompt("envelope", &fx.repo_a, "nebula quoting rule", json_cap);
     assert_eq!(emitted_ids(&response).len(), 3, "{response}");
     assert_eq!(response["delivery"]["skipped_over_budget"], 0);
@@ -628,7 +634,7 @@ fn recall_envelope_counts_raw_bytes_while_the_host_cap_counts_json() {
         "--context-size",
         "json",
     ];
-    fx.prompt("tight", &fx.repo_a, "Inspect the tests.", tight_cap);
+    fx.prompt("tight", &fx.repo_a, DELIVERY_TOPIC, tight_cap);
     let capped = fx.prompt("tight", &fx.repo_a, "nebula quoting rule", tight_cap);
     let body = context_body(&capped).expect("capped recall");
     assert!(serde_json::to_string(&body).expect("json").len() - 2 <= raw_len + 100);
@@ -666,7 +672,7 @@ fn muse_prompts_equal_untracked_output_minus_session_start_memories() {
     let turn: &[&str] = &["--delivery", "turn"];
 
     let prompts: [(&Path, &str); 3] = [
-        (&fx.repo_b, "Inspect the tests."),
+        (&fx.repo_b, DELIVERY_TOPIC),
         (&fx.repo_b, "zephyrine release checklist"),
         (&fx.repo_a, "delivery fact alpha"),
     ];
@@ -687,9 +693,9 @@ fn muse_prompts_equal_untracked_output_minus_session_start_memories() {
             && memory_blocks(&legacy)
                 .iter()
                 .all(|(id, _)| delivered.contains(id))
-            && !legacy.contains("Hive Memory Context")
         {
-            // Recall carrying only session-start memories sends nothing.
+            // Removing every persistently visible block also removes an empty
+            // context header; the header itself is not memory to repeat.
             assert!(tracked.is_empty(), "{text}: {tracked}");
             continue;
         }
@@ -709,15 +715,15 @@ fn turn_recall_offers_the_previous_projects_memories_after_a_switch() {
     );
     fx.refresh();
     let turn: &[&str] = &["--delivery", "turn"];
-    let a = fx.prompt("switch", &fx.repo_a, "Inspect the tests.", turn);
+    let a = fx.prompt("switch", &fx.repo_a, DELIVERY_TOPIC, turn);
     assert!(context_body(&a).expect("A selection").contains("quillon"));
     let in_a = fx.prompt("switch", &fx.repo_a, "quillon deploy runbook", turn);
     assert!(!context_body(&in_a).unwrap_or_default().contains("quillon"));
-    let b = fx.prompt("switch", &fx.repo_b, "Inspect the tests.", turn);
+    let b = fx.prompt("switch", &fx.repo_b, DELIVERY_TOPIC, turn);
     assert!(!context_body(&b).expect("B selection").contains("quillon"));
-    let legacy_a = fx.prompt("legacy", &fx.repo_a, "Inspect the tests.", &[]);
+    let legacy_a = fx.prompt("legacy", &fx.repo_a, DELIVERY_TOPIC, &[]);
     assert!(context_body(&legacy_a).is_some());
-    fx.prompt("legacy", &fx.repo_b, "Inspect the tests.", &[]);
+    fx.prompt("legacy", &fx.repo_b, DELIVERY_TOPIC, &[]);
     let legacy = fx.prompt("legacy", &fx.repo_b, "quillon deploy runbook", &[]);
     let tracked = fx.prompt("switch", &fx.repo_b, "quillon deploy runbook", turn);
     assert_eq!(
@@ -755,7 +761,7 @@ fn persistent_recall_skips_delivered_memories() {
     let fx = Fixture::new("delivery-recall");
     fx.session_start("recall", &fx.repo_a, PERSISTENT);
     fx.hook("recall", &["context-reset"]);
-    fx.prompt("recall", &fx.repo_a, "Inspect the tests.", PERSISTENT);
+    fx.prompt("recall", &fx.repo_a, DELIVERY_TOPIC, PERSISTENT);
 
     let recall = fx.prompt("recall", &fx.repo_a, "delivery fact alpha", PERSISTENT);
     assert!(context_body(&recall).is_none());
@@ -844,18 +850,28 @@ fn turn_lifetime_sends_a_project_switch_once_per_change() {
     // Like untracked hooks, a turn-lifetime selection goes out once per
     // change (prompt recall still runs every turn); session-start memories
     // persist, so they are not repeated.
-    let first = fx.prompt("neutral", &fx.repo_b, "Inspect the tests.", turn);
+    let first = fx.prompt("neutral", &fx.repo_b, DELIVERY_TOPIC, turn);
     let body = context_body(&first).expect("switch to B");
     assert!(body.contains(PROJECT_B));
     assert!(!body.contains(GLOBAL_A));
     for _ in 0..2 {
-        let later = fx.prompt("neutral", &fx.repo_b, "Inspect the tests.", turn);
+        let later = fx.prompt("neutral", &fx.repo_b, DELIVERY_TOPIC, turn);
         assert!(context_body(&later).is_none(), "{later}");
     }
     // A later switch away and back sends it again.
-    fx.prompt("neutral", &fx.repo_a, "Inspect the tests.", turn);
-    let back = fx.prompt("neutral", &fx.repo_b, "Inspect the tests.", turn);
+    fx.prompt("neutral", &fx.repo_a, GLOBAL_TOPIC, turn);
+    let back = fx.prompt("neutral", &fx.repo_b, DELIVERY_TOPIC, turn);
     assert!(context_body(&back).expect("back to B").contains(PROJECT_B));
+    // A topic-free project visit must still expire the previous turn's
+    // selection, without injecting unrelated globals on the generic prompt.
+    let generic = fx.prompt("neutral", &fx.repo_a, "explain #5", turn);
+    assert!(context_body(&generic).is_none(), "{generic}");
+    let back = fx.prompt("neutral", &fx.repo_b, DELIVERY_TOPIC, turn);
+    assert!(
+        context_body(&back)
+            .expect("back after a generic project visit")
+            .contains(PROJECT_B)
+    );
     assert!(delivered_ids(&fx.state_json("neutral")).len() == 2);
 }
 
@@ -903,7 +919,7 @@ fn size_limit_remainder_drains_on_later_prompts() {
     let fx = Fixture::new("delivery-drain");
     for index in 0..4 {
         fx.remember(
-            &format!("Drain fact {index} keeps the remaining startup memories reachable."),
+            &format!("Global delivery fact drain {index} keeps startup memories reachable."),
             None,
         );
     }
@@ -922,10 +938,10 @@ fn size_limit_remainder_drains_on_later_prompts() {
 
     let mut delivered = emitted_ids(&fx.session_start("drain", &fx.repo_a, capped));
     assert!(delivered.len() < total);
-    // Neutral prompts in the same project keep sending the rest, a chunk at a
-    // time, with no repeats, until everything is visible.
+    // Prompts about the same fixture topic keep sending relevant remaining
+    // notes, a chunk at a time, with no repeats, until everything is visible.
     for _ in 0..total {
-        let response = fx.prompt("drain", &fx.repo_a, "Inspect the tests.", capped);
+        let response = fx.prompt("drain", &fx.repo_a, GLOBAL_TOPIC, capped);
         if context_body(&response).is_none() {
             break;
         }
@@ -935,7 +951,7 @@ fn size_limit_remainder_drains_on_later_prompts() {
         }
     }
     assert_eq!(delivered.len(), total);
-    let settled = fx.prompt("drain", &fx.repo_a, "Inspect the tests.", capped);
+    let settled = fx.prompt("drain", &fx.repo_a, GLOBAL_TOPIC, capped);
     assert!(context_body(&settled).is_none());
     assert!(
         fx.state_json("drain")
@@ -952,7 +968,7 @@ fn untracked_hooks_on_the_same_session_cannot_suppress_tracked_resends() {
     // selections before the tracked session prompts again.
     fx.session_start("mixed", &fx.repo_a, PERSISTENT);
     fx.hook("mixed", &["context-reset"]);
-    fx.prompt("mixed", &fx.repo_a, "Inspect the tests.", &[]);
+    fx.prompt("mixed", &fx.repo_a, DELIVERY_TOPIC, &[]);
     fx.prompt("mixed", &fx.repo_a, "zephyrine release checklist", &[]);
     let state = fx.state_json("mixed");
     assert!(state.get("context_key").is_some());
@@ -960,12 +976,7 @@ fn untracked_hooks_on_the_same_session_cannot_suppress_tracked_resends() {
     assert!(state.get("delivered_context_key").is_none());
 
     // The tracked session still re-sends what it lost.
-    let next = fx.prompt(
-        "mixed",
-        &fx.repo_a,
-        "zephyrine release checklist",
-        PERSISTENT,
-    );
+    let next = fx.prompt("mixed", &fx.repo_a, GLOBAL_TOPIC, PERSISTENT);
     let body = context_body(&next).expect("tracked re-send");
     assert!(body.contains(GLOBAL_A) && body.contains(GLOBAL_B));
 }
@@ -977,7 +988,7 @@ fn an_untracked_fallback_starts_from_what_tracked_hooks_sent() {
     // of the selection the session already has, no repeat of recall.
     let fx = Fixture::new("delivery-fallback");
     fx.session_start("fallback", &fx.repo_a, PERSISTENT);
-    let plain = fx.prompt("fallback", &fx.repo_a, "Inspect the tests.", &[]);
+    let plain = fx.prompt("fallback", &fx.repo_a, GLOBAL_TOPIC, &[]);
     assert!(context_body(&plain).is_none(), "{plain}");
 
     let tracked = fx.prompt(
@@ -995,8 +1006,18 @@ fn an_untracked_fallback_starts_from_what_tracked_hooks_sent() {
     fx.remember_reference("Orbit reference note for the fallback.");
     fx.refresh();
     let turn: &[&str] = &["--delivery", "turn"];
-    fx.prompt("fallback-turn", &fx.repo_b, "Inspect the tests.", turn);
-    let plain = fx.prompt("fallback-turn", &fx.repo_b, "Inspect the tests.", &[]);
+    fx.prompt(
+        "fallback-turn",
+        &fx.repo_b,
+        "zephyrine release checklist",
+        turn,
+    );
+    let plain = fx.prompt(
+        "fallback-turn",
+        &fx.repo_b,
+        "zephyrine release checklist",
+        &[],
+    );
     assert!(context_body(&plain).is_none(), "{plain}");
     let recall = fx.prompt("fallback-turn", &fx.repo_b, "orbit reference note", turn);
     assert!(
@@ -1028,7 +1049,7 @@ fn an_untracked_fallback_still_sends_a_selection_cut_by_the_cap() {
     );
     // Untracked hooks would have sent everything at start, so the fallback
     // sends the selection rather than treating it as received.
-    let fallback = fx.prompt("cut", &fx.repo_a, "Inspect the tests.", &[]);
+    let fallback = fx.prompt("cut", &fx.repo_a, DELIVERY_TOPIC, &[]);
     let body = context_body(&fallback).expect("fallback re-sends the selection");
     assert!(body.contains(GLOBAL_A) && body.contains(GLOBAL_B), "{body}");
 }
@@ -1040,7 +1061,7 @@ fn untracked_recall_cannot_suppress_tracked_recall() {
     // Project B's memory is outside A's startup selection, so only recall
     // shows it. An untracked recall of the same query records its key first
     // (the first untracked prompt sends its own startup context).
-    fx.prompt("mixed-recall", &fx.repo_a, "Inspect the tests.", &[]);
+    fx.prompt("mixed-recall", &fx.repo_a, DELIVERY_TOPIC, &[]);
     fx.prompt(
         "mixed-recall",
         &fx.repo_a,
@@ -1111,14 +1132,14 @@ fn recall_respects_the_size_limit() {
 fn untracked_prompt_context_change_respects_the_size_limit() {
     let fx = Fixture::new("delivery-untracked-cap");
     fx.session_start("untracked-cap-full", &fx.repo_a, &[]);
-    let full = fx.prompt("untracked-cap-full", &fx.repo_b, "Inspect the tests.", &[]);
+    let full = fx.prompt("untracked-cap-full", &fx.repo_b, DELIVERY_TOPIC, &[]);
     let full_len = context_body(&full).expect("full").len();
     let cap = (full_len - 1).to_string();
     fx.session_start("untracked-cap", &fx.repo_a, &[]);
     let capped = fx.prompt(
         "untracked-cap",
         &fx.repo_b,
-        "Inspect the tests.",
+        DELIVERY_TOPIC,
         &["--max-context-bytes", cap.as_str()],
     );
     let body = context_body(&capped).expect("capped context change");
@@ -1186,12 +1207,7 @@ fn recall_still_runs_while_the_startup_remainder_drains() {
 
     // The remainder is still draining, and the prompt's own recall (project
     // B's memory, not part of A's startup selection) shares the response.
-    let prompt = fx.prompt(
-        "drain-recall",
-        &fx.repo_a,
-        "zephyrine release checklist",
-        capped,
-    );
+    let prompt = fx.prompt("drain-recall", &fx.repo_a, DELIVERY_TOPIC, capped);
     let body = context_body(&prompt).expect("drain plus recall");
     assert!(body.contains(PROJECT_B), "{prompt}");
     // Both parts together stay inside the host limit.
@@ -1617,7 +1633,7 @@ fn too_large_is_judged_against_the_whole_cap_not_the_space_after_recall() {
     assert!(!body.contains("omitted=\"too-large\""), "{body}");
     assert!(!body.contains("Medium startup note"));
     // It is sent whole on the next prompt instead of becoming a pointer.
-    let next = fx.prompt("alone", &fx.repo_a, "Inspect the tests.", capped);
+    let next = fx.prompt("alone", &fx.repo_a, DELIVERY_TOPIC, capped);
     assert!(
         context_body(&next)
             .expect("drain")
@@ -1628,11 +1644,20 @@ fn too_large_is_judged_against_the_whole_cap_not_the_space_after_recall() {
 #[test]
 fn recall_and_context_share_one_delivery_without_duplicates() {
     let fx = Fixture::new("delivery-merge");
+    // Three hits fill recall's per-prompt selection. Additional relevant notes
+    // must come from normal context, exercising both halves of the receipt.
+    for suffix in ["delta", "echo", "foxtrot"] {
+        fx.remember(
+            &format!("Global delivery fact {suffix} belongs to the shared fixture."),
+            None,
+        );
+    }
+    fx.refresh();
     fx.session_start("merge", &fx.repo_a, PERSISTENT);
     fx.hook("merge", &["context-reset"]);
     // After the reset the context selection is re-sent; the recall query also
     // hits a global memory the selection carries.
-    let response = fx.prompt("merge", &fx.repo_a, "alpha", PERSISTENT);
+    let response = fx.prompt("merge", &fx.repo_a, GLOBAL_TOPIC, PERSISTENT);
     let body = context_body(&response).expect("combined block");
     assert_eq!(response["actions"].as_array().expect("actions").len(), 1);
     assert_eq!(body.matches(GLOBAL_A).count(), 1, "{body}");
@@ -1823,7 +1848,7 @@ impl Fixture {
             .iter()
             .map(|(mode, flags)| {
                 let session = format!("{name}-{mode}");
-                let first = self.prompt(&session, &self.repo_a, "Inspect the tests.", flags);
+                let first = self.session_start(&session, &self.repo_a, flags);
                 let recall = self.prompt(&session, &self.repo_a, text, flags);
                 RecallRun {
                     mode,

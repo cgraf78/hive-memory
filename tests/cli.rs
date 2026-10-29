@@ -4487,7 +4487,7 @@ fn hook_session_start_refreshes_local_projection_after_returning() {
             "--project",
             "/repo/src/main.rs",
             "--text",
-            "Continue the current task.",
+            "background refresh",
             "--json",
         ])
         .assert()
@@ -7960,7 +7960,7 @@ fn hook_prompt_project_switch_hydrates_cold_bound_store_in_same_session() {
             "--project",
             repo.join("src/main.rs").to_str().expect("utf8 project"),
             "--text",
-            "Continue in the bound project.",
+            "cold bound-store context",
             "--json",
         ])
         .assert()
@@ -7995,7 +7995,7 @@ fn hook_prompt_project_switch_hydrates_cold_bound_store_in_same_session() {
             "--project",
             repo.join("src/main.rs").to_str().expect("utf8 project"),
             "--text",
-            "Continue after hydration.",
+            "cold bound-store context",
             "--json",
         ])
         .assert()
@@ -8185,10 +8185,18 @@ fn hook_prompt_submit_does_not_emit_initial_context() {
     let stdout = String::from_utf8(output).expect("utf8 stdout");
     assert!(stdout.contains("\"context_emitted\": false"));
     assert!(!stdout.contains("\"kind\": \"inject_context\""));
+    // A no-hit prompt may record its bounded follow-up topic, but must not
+    // pretend that a startup context selection was emitted.
+    let saved: serde_json::Value = serde_json::from_slice(
+        &fs::read(state.join("runs/session-no-initial/hook-state.json"))
+            .expect("prompt topic state"),
+    )
+    .expect("state JSON");
+    assert!(saved.get("context_key").is_none());
     assert!(
-        !state
-            .join("runs/session-no-initial/hook-state.json")
-            .exists()
+        saved["startup_memory_ids"]
+            .as_array()
+            .is_none_or(|ids| ids.is_empty())
     );
 }
 
@@ -8251,7 +8259,7 @@ fn hook_prompt_submit_emits_context_only_when_selection_changes() {
             "--project",
             "/repo-a/src/main.rs",
             "--text",
-            "Please inspect the tests.",
+            "project selection",
             "--json",
         ])
         .assert()
@@ -8276,7 +8284,7 @@ fn hook_prompt_submit_emits_context_only_when_selection_changes() {
             "--project",
             "/repo-b/src/main.rs",
             "--text",
-            "Please inspect the tests.",
+            "project selection",
             "--json",
         ])
         .assert()
@@ -9388,7 +9396,7 @@ fn hook_tool_complete_receipt_allows_project_context_refresh() {
             "hook",
             "prompt-submit",
             "--text",
-            "Continue with the release process.",
+            "release trains",
             "--json",
         ])
         .assert()
@@ -10742,7 +10750,7 @@ fn prompt_submit_hook_recalls_via_bm25_backend() {
     let personal = dir.join("personal");
     init_store(&personal, "personal");
     // A search-only-at-startup global fact (relevance withholds it). The prompt
-    // recall query trims to two terms ("alpha", "pipeline"); only "alpha" is in
+    // recall query keeps the two subject terms ("alpha", "pipeline"); only "alpha" is in
     // the memory. Lexical search requires both terms (1/2 -> miss); BM25 ranks
     // the record on the one matching term (-> recall).
     let memory = "The alpha service uses a manual verification checklist.";
@@ -10865,7 +10873,7 @@ fn hook_prompt_recall_progresses_beyond_initial_candidate_window() {
                     "--project",
                     active_repo.to_str().expect("utf8 active repo"),
                     "--text",
-                    "Recall window sentinel details.",
+                    "Recall window sentinel",
                     "--json",
                 ])
                 .output()

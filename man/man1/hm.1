@@ -90,6 +90,9 @@ Resolve, bind, unbind, alias, list, and show project identities.
 .B hook
 Handle agent lifecycle events such as session start, prompt submit, tool
 complete, stop, and context reset (the host lost earlier context).
+Prompt submit injects task-supported memories, including deferred startup
+context. Short follow-ups can reuse a bounded store/project-bound session
+topic; an explicit subject replaces it and context reset clears it.
 .TP
 .B doctor
 Run top-level diagnostics. Use

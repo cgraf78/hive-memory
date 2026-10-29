@@ -1493,7 +1493,41 @@ Behavior:
   to the session, and returns an `inject_context` action only when it selects new
   useful context. Because it injects, prompt recall honors explicit
   `supersedes` links as `hm context` does (see Supersession), not as
-  interactive search does. It also runs the durable-memory intent heuristic and
+  interactive search does. Automatic recall keeps up to four meaningful subject
+  terms (at most 256 UTF-8 bytes), preferring concrete code/path terms over
+  conversational framing. It reuses search-owned normalization, inflections,
+  concept aliases, and registered entity aliases. Before deduplication or the
+  three-hit limit, candidates must have phrase, term-coverage, or entity
+  evidence independent of retrieval rank and project boosts. Full lexical
+  evidence takes precedence over entity-only matches, so an incidental host or
+  repository alias cannot promote unrelated notes once the specific answer was
+  shown. Entity aliases remain usable when no full lexical candidate exists.
+  Already-visible strong matches cannot promote weaker unseen matches.
+  If no lexical or entity evidence exists, a retrieval hit anchored to the leading subject may
+  preserve a partial paraphrase; required negation/intent terms still require
+  the full search evidence. No supported new candidate means no injection.
+  Interactive search retains its broader discovery behavior.
+
+  One normalized topic is kept in local session coordination state, bound to
+  the resolved store identity/root and project, independently of whether any
+  memory was emitted. Short subjectless follow-ups can reuse it; an explicit
+  subject replaces it. If a best-supported memory for that topic is already
+  visible, a generic follow-up does not advance through unseen recall or
+  startup-overflow candidates. An explicit subject can request new matches;
+  a generic follow-up can still recall when no best-supported context is visible,
+  including turn-lifetime recall that the host has dropped. Negation or intent
+  terms without a subject do not establish a new topic.
+  Missing, oversized, differently bound, or reset state
+  cannot supply a topic. No raw prompt or conversation is stored. Topic writes
+  use the session lock and context epoch, so an update selected before a reset
+  cannot restore the old topic afterward.
+  Existing secret detectors run on the raw prompt before case or punctuation
+  normalization; detected credentials make the subject unusable and clear the
+  saved topic without logging matched values. The state API also refuses a
+  detectable credential in a supplied topic. These are the existing bounded
+  detectors, not a guarantee that every form of sensitive text is recognized.
+
+  It also runs the durable-memory intent heuristic and
   records `memory-pending` when the heuristic matches. It returns `inject_context`
   and/or `remind` actions as needed.
 - `tool-complete`: after a successful tool event, reads session write receipts,
@@ -1558,18 +1592,26 @@ context behavior stop re-sending memories the model can still see:
   session already received whole, and still sends one it received only in
   part.
 - With tracking, a changed project/store selection re-renders the selection
-  without memories already in the delivered set; selection and budgeting are
-  otherwise unchanged. When every memory is already visible, the response
-  carries only the context header, so the model still sees the project/path
-  switch. A persistent selection is recorded as current once a response
-  carrying everything that was left (or only the header) is emitted; while the
-  size cap leaves memories out, later prompts keep sending them.
+  without memories already in the delivered set. Session-start can carry only
+  the context header when every selected memory is already visible, so the
+  model still sees the project/path switch. Prompt-time selection additionally
+  requires topic support and emits no header-only block. A persistent selection
+  is recorded as current once everything eligible was delivered; while the
+  size cap leaves memories out, later prompts may send the remainder when it
+  supports their current topic. Session-start selection remains unchanged.
 - Persistent prompt-submit runs prompt recall on every prompt, as untracked
   hooks do, and gives it precedence: recall is selected first with the full
-  budget, and the context selection fills what is left and skips any memory
-  recall already carries; both go out in one `inject_context` action. Recall
-  skips delivered memories (by id and digest) and does not repeat its previous
-  selection.
+  budget, and the context selection fills what is left with topic-supported
+  memories, skipping any memory recall already carries; both go out in one
+  `inject_context` action. Prompt-time context uses the same strong lexical or
+  entity evidence as recall, without the retrieval-only partial-match fallback.
+  This gate also applies to untracked and turn-lifetime selection changes,
+  cache hydration, and prompt delivery after a reset. A subjectless prompt with
+  no valid previous topic emits no deferred context. Withheld unrelated sections
+  do not complete the broad context selection: a later explicit topic can still
+  receive them. A selection already visible or carried by recall adds no second
+  header-only action. Recall skips delivered memories (by id and digest) and
+  does not repeat its previous selection.
 - Turn-lifetime prompt-submit follows the untracked order: a changed
   selection is sent instead of recall, once per change and fitted to the cap,
   and prompt recall runs on the other prompts without the repeat check. Its
@@ -1599,10 +1641,11 @@ context behavior stop re-sending memories the model can still see:
   too, and only emitted ids are recorded.
 - `--reset` (requires `--delivery`) and `hm hook context-reset` start a new
   context epoch: they clear the delivered set and the tracked and untracked
-  context and recall selections (plus the emitted-id lists that turn and
-  untracked recall skip), advance
+  context and recall selections and the saved topic (plus the emitted-id lists
+  that turn and untracked recall skip), advance
   `context_epoch`, and keep `memory-pending` and write receipts. The next
-  context-emitting hook sends the session's context again. Adapters call these
+  session-start hook sends the session's context again; prompt hooks require
+  current-topic support before re-sending it. Adapters call these
   on host context-loss events: compaction, a clear, or a resume. Tracked
   bookkeeping records the epoch it was selected in, and bookkeeping from an
   earlier epoch is dropped, so a hook that overlapped a reset cannot mark
