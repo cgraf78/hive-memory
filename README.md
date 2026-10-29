@@ -480,6 +480,12 @@ unknown) fall back to a host-local absolute path and won't match across machines
 declare a `.hive-memory-project` marker or rely on a VCS remote for those.
 **Global-scope memory always recalls everywhere a synced store is present.**
 
+Automatic prompt hooks select memories supported by the current task rather than
+walking through unrelated search results or startup overflow. Short follow-ups
+can reuse a bounded session topic; an explicit subject replaces it, and a context
+reset clears it. This affects automatic injection, while `hm search` remains
+available for broader discovery and session-start context keeps its usual policy.
+
 ### Trust and privacy
 
 Hive Memory treats stored memory as **data, not instructions**, and wraps every

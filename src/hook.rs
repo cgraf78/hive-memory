@@ -14,6 +14,12 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 
+/// Maximum normalized topic size in session coordination state, in UTF-8 bytes.
+pub const RECALL_TOPIC_MAX_BYTES: usize = 256;
+
+/// Maximum term count accepted when reusing a stored automatic-recall topic.
+pub const RECALL_TOPIC_MAX_TERMS: usize = 8;
+
 /// Session-local lifecycle state.
 ///
 /// This file is coordination state, not canonical memory. It lets prompt,
@@ -22,6 +28,9 @@ use time::OffsetDateTime;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HookState {
+    /// Bounded topic for short follow-ups in this store/project and epoch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recall_topic: Option<RecallTopic>,
     /// Whether a prompt has indicated durable memory intent not yet satisfied.
     pub memory_pending: bool,
     /// Short human-readable reason for the pending reminder.
@@ -90,6 +99,28 @@ pub struct HookState {
     /// RFC3339 timestamp of the last context reset, for diagnostics.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_epoch_started_at: Option<String>,
+}
+
+/// Normalized topic metadata, never the raw user conversation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecallTopic {
+    /// At most eight normalized terms and 256 UTF-8 bytes.
+    pub query: String,
+    /// Store cache identity, including its root, rather than an ambiguous alias.
+    pub store_key: String,
+    /// Project binding; a project switch cannot inherit another task's topic.
+    pub project_id: Option<String>,
+}
+
+impl RecallTopic {
+    /// Reject malformed, oversized, or credential-bearing state before reuse.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        !self.query.trim().is_empty()
+            && self.query.len() <= RECALL_TOPIC_MAX_BYTES
+            && self.query.split_whitespace().count() <= RECALL_TOPIC_MAX_TERMS
+            && crate::secret::detect(&self.query).is_empty()
+    }
 }
 
 impl HookState {
@@ -728,6 +759,7 @@ pub fn reset_context_epoch(
         session_id,
         |state| {
             let now = rfc3339(OffsetDateTime::now_utc());
+            state.recall_topic = None;
             state.delivered.clear();
             state.delivered_context_key = None;
             state.delivered_recall_key = None;
@@ -741,6 +773,33 @@ pub fn reset_context_epoch(
             state.prompt_recall_updated_at = None;
             state.context_epoch_started_at = Some(now.clone());
             state.updated_at = Some(now);
+        },
+        options,
+    )
+}
+
+/// Establish a prompt topic independently of whether any memory is delivered.
+///
+/// The shared lock composes this update with receipt/delivery bookkeeping. An
+/// old prompt cannot restore a topic after a concurrent context reset.
+pub fn set_recall_topic(
+    state_dir: &Path,
+    session_id: &str,
+    epoch: u64,
+    topic: Option<RecallTopic>,
+    options: &write::AtomicWriteOptions,
+) -> Result<HookState, HookStateError> {
+    with_state_lock(
+        state_dir,
+        session_id,
+        |state| {
+            if state.context_epoch == epoch {
+                // Coordination state must not become a second credential log.
+                // The CLI also checks the raw prompt before case/punctuation
+                // normalization; this protects other callers of the state API.
+                state.recall_topic = topic.filter(RecallTopic::is_valid);
+                state.updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
+            }
         },
         options,
     )
@@ -1613,6 +1672,94 @@ mod tests {
         assert!(state.has_delivered("a", "old-text"));
         assert!(!state.has_delivered("a", "new-text"));
         assert!(!state.has_delivered("b", "old-text"));
+    }
+
+    fn topic(query: &str) -> RecallTopic {
+        RecallTopic {
+            query: query.to_owned(),
+            store_key: "personal-root".to_owned(),
+            project_id: None,
+        }
+    }
+
+    #[test]
+    fn topic_bounds_count_utf8_bytes_and_reject_empty_or_excess_terms() {
+        assert!(topic(&"é".repeat(128)).is_valid());
+        assert!(!topic(&"é".repeat(129)).is_valid());
+        assert!(topic("one two three four five six seven eight").is_valid());
+        assert!(!topic("one two three four five six seven eight nine").is_valid());
+        assert!(!topic(" \n\t").is_valid());
+    }
+
+    #[test]
+    fn delayed_topic_update_cannot_restore_topic_after_context_reset() {
+        let dir = temp_dir("topic-reset");
+        set_recall_topic(
+            &dir,
+            "s",
+            0,
+            Some(topic("agentguard telemetry")),
+            &options(),
+        )
+        .expect("establish topic");
+        let reset = reset_context_epoch(&dir, "s", &options()).expect("reset");
+        assert!(reset.recall_topic.is_none());
+        let stale = set_recall_topic(&dir, "s", 0, Some(topic("old subject")), &options())
+            .expect("delayed update");
+        assert!(stale.recall_topic.is_none());
+        let current = set_recall_topic(&dir, "s", 1, Some(topic("new subject")), &options())
+            .expect("current update");
+        assert_eq!(current.recall_topic, Some(topic("new subject")));
+    }
+
+    #[test]
+    fn topic_and_delivery_bookkeeping_preserve_each_other_and_pending_debt() {
+        let dir = temp_dir("topic-bookkeeping");
+        mark_memory_pending(&dir, "s", "intent", &options()).expect("pending");
+        set_recall_topic(
+            &dir,
+            "s",
+            0,
+            Some(topic("agentguard telemetry")),
+            &options(),
+        )
+        .expect("topic");
+        let state =
+            apply_delivery(&dir, "s", update(&["a"], Some("ctx")), &options()).expect("delivery");
+        assert_eq!(state.recall_topic, Some(topic("agentguard telemetry")));
+        assert!(state.memory_pending);
+        let state = set_recall_topic(&dir, "s", 0, Some(topic("new subject")), &options())
+            .expect("new topic");
+        assert!(state.has_delivered("a", "d"));
+        assert_eq!(state.delivered_context_key.as_deref(), Some("ctx"));
+        assert!(state.memory_pending);
+        let state = set_recall_topic(&dir, "s", 0, Some(topic(&"x".repeat(257))), &options())
+            .expect("invalid topic clears stale binding");
+        assert!(state.recall_topic.is_none());
+        assert!(state.has_delivered("a", "d"));
+    }
+
+    #[test]
+    fn topic_state_does_not_retain_detectable_credentials() {
+        let dir = temp_dir("topic-credential");
+        set_recall_topic(
+            &dir,
+            "s",
+            0,
+            Some(topic("agentguard telemetry")),
+            &options(),
+        )
+        .expect("initial topic");
+        let credential = format!("ghp_{}", "x".repeat(40));
+        assert!(!topic(&credential).is_valid());
+        let state = set_recall_topic(&dir, "s", 0, Some(topic(&credential)), &options())
+            .expect("unsafe topic clears old subject");
+        assert!(state.recall_topic.is_none());
+        assert!(
+            !fs::read_to_string(state_path(&dir, "s"))
+                .expect("state")
+                .contains(&credential)
+        );
     }
 
     #[test]

@@ -672,17 +672,28 @@ fn run_prompt_submit(args: HookPromptSubmitArgs, context: CliContext) -> Result<
     // agent policy, not leave shell adapters to discover that later.
     let periodic_refresh_store =
         validate_hook_context_read_policy(&config, &context, path_hint.as_deref())?;
+    let prepared = prepare_prompt_recall(
+        &config,
+        &context,
+        path_hint.as_deref(),
+        session_id.as_deref(),
+        tracker.as_ref().map(|tracker| &tracker.state),
+        &args.text,
+    )?;
     let mut context_emitted = false;
     let mut deferred = None;
     let mut delivery = None;
     let (recall, refresh_store) = if let Some(tracker) = &tracker {
         let (selection, recall, refresh_store) =
-            tracked_prompt_selection(&config, &context, path_hint.as_deref(), tracker, &args.text)?;
+            tracked_prompt_selection(&config, &context, path_hint.as_deref(), tracker, &prepared)?;
         let mut report = selection.report;
+        let context_transition = selection.update.context_key.is_some();
         if !selection.body.is_empty() {
             actions.push(HookAction::new("inject_context", selection.body));
             context_emitted = true;
             report.emitted_ids = selection.emitted_ids;
+        }
+        if context_emitted || context_transition {
             deferred = Some(selection.update);
         }
         let recall = Some(recall);
@@ -694,7 +705,7 @@ fn run_prompt_submit(args: HookPromptSubmitArgs, context: CliContext) -> Result<
             &context,
             path_hint.as_deref(),
             session_id.as_deref(),
-            true,
+            &prepared,
             args.delivery.max_context_bytes,
         )?;
         if let Some(action) = context_action {
@@ -710,7 +721,7 @@ fn run_prompt_submit(args: HookPromptSubmitArgs, context: CliContext) -> Result<
                 &context,
                 path_hint.as_deref(),
                 session_id.as_deref(),
-                &args.text,
+                &prepared,
                 args.delivery.max_context_bytes,
             )?;
             if let Some(action) = action {
@@ -1058,32 +1069,237 @@ fn hook_session_id(warnings: &mut Vec<String>) -> Option<String> {
     }
 }
 
+/// Prompt topic prepared before any delivery mode chooses context or recall.
+///
+/// A prompt can emit only normal context (not recall), especially on turn-lived
+/// hosts. Preparing once keeps that path from bypassing topic changes or using
+/// a stale topic merely because recall did not run.
+struct PreparedPromptRecall {
+    query: Option<String>,
+    continuation: bool,
+    visible: RecallKnown,
+    store_name: String,
+    project_id: Option<String>,
+}
+
+fn prepare_prompt_recall(
+    config: &Config,
+    context: &CliContext,
+    path_hint: Option<&str>,
+    session_id: Option<&str>,
+    state: Option<&memory_hook::HookState>,
+    prompt: &str,
+) -> Result<PreparedPromptRecall> {
+    let project_id = resolve_project_id(None, path_hint)?;
+    let project_binding = project_binding_store(config, project_id.as_deref())?;
+    let agent_id = resolve_agent_id(context.as_agent.clone());
+    let resolved = resolve_store(
+        config,
+        context.store.as_deref(),
+        project_binding.as_deref(),
+        agent_id.as_deref(),
+        StoreAccess::Read,
+    )?;
+    let store_name = resolved.name;
+    let store_key = index::store_cache_key(&store_name, &config.stores[&store_name].root);
+    let tracked = state.is_some();
+    let loaded;
+    let state = if let Some(state) = state {
+        state
+    } else {
+        loaded = match session_id {
+            Some(session_id) => memory_hook::load_state(&config.state_dir, session_id)?,
+            None => memory_hook::HookState::default(),
+        };
+        &loaded
+    };
+    let visible = if tracked {
+        RecallKnown::Tracked {
+            delivered: state.delivered.clone(),
+            recalled: std::collections::BTreeSet::new(),
+            selection: state.turn_context_ids.iter().cloned().collect(),
+        }
+    } else {
+        RecallKnown::Ids(memory_hook::known_session_memory_ids(state))
+    };
+    let previous = state.recall_topic.as_ref().filter(|topic| {
+        topic.is_valid() && topic.store_key == store_key && topic.project_id == project_id
+    });
+    let (mut query, continuation) = match prompt_query(prompt, path_hint) {
+        PromptQuery::Subject(query) => (Some(query), false),
+        PromptQuery::Generic => (previous.map(|topic| topic.query.clone()), true),
+        // An explicit subject outside the bounded representation must not turn
+        // into a continuation of an unrelated previous subject.
+        PromptQuery::Unusable => (None, false),
+    };
+    let topic = query.as_ref().map(|query| memory_hook::RecallTopic {
+        query: query.clone(),
+        store_key,
+        project_id: project_id.clone(),
+    });
+    if topic != state.recall_topic
+        && let Some(session_id) = session_id
+    {
+        let updated = memory_hook::set_recall_topic(
+            &config.state_dir,
+            session_id,
+            state.context_epoch,
+            topic,
+            &hook_options(config),
+        )?;
+        if updated.context_epoch != state.context_epoch {
+            query = None;
+        }
+    }
+    Ok(PreparedPromptRecall {
+        query,
+        continuation,
+        visible,
+        store_name,
+        project_id,
+    })
+}
+
+/// Qualify prompt-time context before delivery dedupe or size packing.
+///
+/// SessionStart deliberately keeps its broad stable context. A later prompt
+/// must not drain unrelated sections that merely missed the startup byte cap.
+/// Use the same lexical/entity evidence as recall; context has no BM25 result
+/// proving an anchored partial match, so it cannot use that fallback.
+fn prompt_context_output(
+    config: &Config,
+    context: &CliContext,
+    output: &memory_context::ContextOutput,
+    context_key: String,
+    prepared: &PreparedPromptRecall,
+) -> Result<Option<(memory_context::ContextOutput, String)>> {
+    let filtered_key = format!(
+        "{context_key}:prompt:{}",
+        hive_memory::hash::sha256_hex(prepared.query.as_deref().unwrap_or_default().as_bytes())
+    );
+    let empty = || {
+        let mut output = output.clone();
+        output.sections.clear();
+        output.markdown.clear();
+        output.estimated_tokens = 0;
+        Some((output, filtered_key.clone()))
+    };
+    let Some(query) = prepared.query.as_deref() else {
+        // Even a subjectless project visit ends the previous turn selection.
+        // Record a state-only transition without completing the broad startup
+        // key, so a later concrete topic can still recover withheld memories.
+        return Ok(empty());
+    };
+    let mut candidates = Vec::new();
+    let stores = output
+        .sections
+        .iter()
+        .map(|section| section.store.as_str())
+        .chain(std::iter::once(prepared.store_name.as_str()))
+        .collect::<std::collections::BTreeSet<_>>();
+    for store in stores {
+        let PromptRecallIndex::Indexed(report) = load_prompt_recall_index(config, store)? else {
+            continue;
+        };
+        let registry = &report.projection.entity_registry;
+        let evidence = search::RecallQuery::parse(query, registry)?;
+        let sources = &config.defaults.search_sources;
+        let agent_id = resolve_agent_id(context.as_agent.clone());
+        let include_inbox = super::search::search_include_inbox(false, sources);
+        let superseded = memory_context::explicitly_superseded_ids(
+            &report.projection.entries,
+            sources,
+            include_inbox,
+            agent_id.as_deref(),
+        );
+        let eligible = search::search_local_index(
+            search::SearchInput {
+                store_root: &config.stores[store].root,
+                entries: &report.projection.entries,
+                query,
+                scopes: &config.defaults.search_scopes,
+                sources,
+                include_inbox,
+                agent_id: agent_id.as_deref(),
+                project_id: prepared.project_id.as_deref(),
+                limit: usize::MAX,
+            },
+            registry,
+            &report.projection.project_aliases,
+        )?
+        .into_iter()
+        .filter(|hit| !superseded.contains(&hit.entry.id))
+        .map(|hit| hit.entry.id)
+        .chain(
+            output
+                .sections
+                .iter()
+                .filter(|section| section.store == store)
+                .map(|section| section.id.clone()),
+        )
+        .collect::<std::collections::BTreeSet<_>>();
+        // The normal assembly and recall search own their respective read
+        // policies. Only candidates eligible on one of those surfaces may set
+        // the bar; a forbidden or expired lexical match must not suppress a
+        // legitimate entity-alias memory.
+        for entry in report
+            .projection
+            .entries
+            .iter()
+            .filter(|entry| eligible.contains(&entry.id))
+        {
+            let support = evidence.evidence(entry);
+            if support >= search::RecallEvidence::Entity {
+                candidates.push((
+                    store.to_owned(),
+                    entry.id.clone(),
+                    support,
+                    prepared.visible.visible(entry),
+                ));
+            }
+        }
+    }
+    // Include recall-only references and already-visible records in the bar.
+    // Their absence from normal context must not promote a host-only match.
+    let best = candidates.iter().map(|(_, _, support, _)| *support).max();
+    if prepared.continuation
+        && candidates
+            .iter()
+            .any(|(_, _, support, visible)| Some(*support) == best && *visible)
+    {
+        // Context backfill must obey the same continuation rule as recall.
+        // Otherwise it can drain the unseen tail after recall abstains.
+        return Ok(empty());
+    }
+    let supported = candidates
+        .into_iter()
+        .filter(|(_, _, support, _)| Some(*support) == best)
+        .map(|(store, id, _, _)| (store, id))
+        .collect::<std::collections::BTreeSet<_>>();
+    let keep = |section: &memory_context::ContextSection| {
+        supported.contains(&(section.store.clone(), section.id.clone()))
+    };
+    if !output.sections.iter().any(keep) {
+        return Ok(empty());
+    }
+    let Some(subset) = output.select_sections(keep, None) else {
+        // Unsplittable output cannot prove that every emitted fact is relevant.
+        return Ok(None);
+    };
+    if subset.filtered == 0 {
+        return Ok(Some((subset.output, context_key)));
+    }
+    // Completing a filtered subset must not complete the broad startup key:
+    // another explicit topic can still need one of the withheld sections.
+    Ok(Some((subset.output, filtered_key)))
+}
+
 fn hook_context_action_if_changed(
     config: &Config,
     context: &CliContext,
     path_hint: Option<&str>,
     session_id: Option<&str>,
-    emit_initial: bool,
-    max_bytes: Option<usize>,
-) -> Result<(Option<HookAction>, Option<String>)> {
-    hook_context_action_if_changed_for_project(
-        config,
-        context,
-        None,
-        path_hint,
-        session_id,
-        emit_initial,
-        max_bytes,
-    )
-}
-
-fn hook_context_action_if_changed_for_project(
-    config: &Config,
-    context: &CliContext,
-    project_id: Option<String>,
-    path_hint: Option<&str>,
-    session_id: Option<&str>,
-    emit_initial: bool,
+    prepared: &PreparedPromptRecall,
     max_bytes: Option<usize>,
 ) -> Result<(Option<HookAction>, Option<String>)> {
     let Some(session_id) = session_id else {
@@ -1093,21 +1309,13 @@ fn hook_context_action_if_changed_for_project(
     // Long-lived agents can move between projects while the process stays
     // alive. Cache the resolved selection, not just "context was already sent",
     // so hooks can reinject when path/project/store policy changes.
-    let context_key = hook_context_key_for_project(config, context, project_id.clone(), path_hint)?;
+    let context_key = hook_context_key_for_project(config, context, None, path_hint)?;
     let state = memory_hook::load_state(&config.state_dir, session_id)?;
-    // SessionStart owns initial context injection. Prompt hooks should only
-    // reinject after an existing session selection changes; otherwise hook
-    // runners that fire SessionStart and PromptSubmit close together can show
-    // duplicate "Hive Memory Context" blocks before either process observes the
-    // other's freshly written state.
-    if state.context_key.is_none() && !emit_initial {
-        return Ok((None, None));
-    }
     if state.context_key.as_deref() == Some(context_key.as_str()) {
         return Ok((None, None));
     }
 
-    let assembly = assemble_hook_context(config, context, project_id, path_hint)?;
+    let assembly = assemble_hook_context(config, context, None, path_hint)?;
     let refresh_store = assembly
         .stale
         .then(|| assembly.stores.first().cloned())
@@ -1115,7 +1323,26 @@ fn hook_context_action_if_changed_for_project(
     if assembly.stale && assembly.output.sections.is_empty() {
         return Ok((None, refresh_store));
     }
-    let output = fit_legacy_output(&assembly.output, max_bytes);
+    let Some((output, context_key)) =
+        prompt_context_output(config, context, &assembly.output, context_key, prepared)?
+    else {
+        return Ok((None, refresh_store));
+    };
+    if state.context_key.as_deref() == Some(context_key.as_str()) {
+        return Ok((None, refresh_store));
+    }
+    if output.markdown.is_empty() && output.sections.is_empty() {
+        // A relevance-filtered visit still changes the active selection. Its
+        // empty body does not deliver memory or replace the ids already sent.
+        memory_hook::mark_context_key(
+            &config.state_dir,
+            session_id,
+            context_key,
+            &hook_options(config),
+        )?;
+        return Ok((None, refresh_store));
+    }
+    let output = fit_legacy_output(&output, max_bytes);
     if max_bytes.is_some() && output.markdown.is_empty() {
         return Ok((None, refresh_store));
     }
@@ -1166,6 +1393,7 @@ fn tracked_context_selection(
     context: &CliContext,
     path_hint: Option<&str>,
     tracker: &DeliveryTracker,
+    prepared: &PreparedPromptRecall,
     in_block: &[memory_context::ContextSection],
     max_bytes: Option<usize>,
 ) -> Result<(Option<TrackedEmission>, Option<String>)> {
@@ -1181,14 +1409,22 @@ fn tracked_context_selection(
     if assembly.stale && assembly.output.sections.is_empty() {
         return Ok((None, refresh_store));
     }
+    let Some((output, context_key)) =
+        prompt_context_output(config, context, &assembly.output, context_key, prepared)?
+    else {
+        return Ok((None, refresh_store));
+    };
+    if tracker.state.delivered_context_key.as_deref() == Some(context_key.as_str()) {
+        return Ok((None, refresh_store));
+    }
     let in_block = in_block
         .iter()
         .map(|section| (section.id.as_str(), section.body_digest()))
         .collect::<Vec<_>>();
     // "Too large" is judged against the hook's whole limit: a memory that only
     // misses the space left after recall waits for the next prompt.
-    let selected = select_tracked(
-        &assembly.output,
+    let mut selected = select_tracked(
+        &output,
         assembly.stale,
         |section| {
             tracker.is_delivered(section)
@@ -1198,7 +1434,32 @@ fn tracked_context_selection(
         },
         tracker.limit(max_bytes),
     );
-    let update = tracker.update(&selected, Some(context_key), None);
+    // In-block recall duplicates consume no extra space, but they are not
+    // already-visible memories. Keep the public delivery count precise.
+    selected.filtered = output
+        .sections
+        .iter()
+        .filter(|section| tracker.is_delivered(section))
+        .count();
+    if selected.output.sections.is_empty() && selected.omitted == 0 {
+        // A relevant selection wholly visible already (or in this prompt's
+        // recall block) adds no memory. Do not emit a second header-only block.
+        selected.emitted = false;
+        selected.output.markdown.clear();
+    }
+    let mut update = tracker.update(&selected, Some(context_key.clone()), None);
+    if !selected.emitted && selected.over_budget == 0 {
+        // Every relevant section is already visible or carried by this same
+        // response's recall. A legacy fallback must observe that completed
+        // selection too, even though no extra context body was necessary.
+        update.untracked_context_key = Some(context_key);
+        update.untracked_context_ids = ids(&output);
+    }
+    if tracker.lifetime == memory_hook::DeliveryLifetime::Turn && !selected.emitted {
+        // Visiting a selection with no new visible sections still ends the
+        // previous turn's selection. Returning to it later must send it again.
+        update.turn_context_ids = Some(Vec::new());
+    }
     Ok((Some((selected, update)), refresh_store))
 }
 
@@ -1223,7 +1484,7 @@ fn tracked_prompt_selection(
     context: &CliContext,
     path_hint: Option<&str>,
     tracker: &DeliveryTracker,
-    prompt: &str,
+    prepared: &PreparedPromptRecall,
 ) -> Result<(TrackedPromptSelection, HookRecallReport, Option<String>)> {
     let mut selection = TrackedPromptSelection {
         body: String::new(),
@@ -1235,14 +1496,21 @@ fn tracked_prompt_selection(
         report: tracker.report(None),
     };
     if tracker.lifetime == memory_hook::DeliveryLifetime::Turn {
-        let (context_selection, refresh_store) =
-            tracked_context_selection(config, context, path_hint, tracker, &[], tracker.max_bytes)?;
+        let (context_selection, refresh_store) = tracked_context_selection(
+            config,
+            context,
+            path_hint,
+            tracker,
+            prepared,
+            &[],
+            tracker.max_bytes,
+        )?;
         if let Some((selected, update)) = context_selection {
             selection.report = tracker.report(Some(&selected));
+            selection.update = update;
             if selected.emitted {
                 selection.body = selected.output.markdown.clone();
                 selection.emitted_ids = ids(&selected.output);
-                selection.update = update;
                 return Ok((
                     selection,
                     HookRecallReport::skipped("context-selection-changed"),
@@ -1255,7 +1523,7 @@ fn tracked_prompt_selection(
             context,
             path_hint,
             tracker,
-            prompt,
+            prepared,
             tracker.max_bytes,
         )?;
         if let Some((recalled, update)) = recalled {
@@ -1263,7 +1531,7 @@ fn tracked_prompt_selection(
             selection.report.omitted += recalled.omitted;
             selection.body = recalled.output.markdown.clone();
             selection.emitted_ids = ids(&recalled.output);
-            selection.update = update;
+            merge_recall_update(&mut selection.update, update);
         }
         return Ok((selection, recall, refresh_store));
     }
@@ -1273,7 +1541,7 @@ fn tracked_prompt_selection(
         context,
         path_hint,
         tracker,
-        prompt,
+        prepared,
         tracker.max_bytes,
     )?;
     let recall_sections = recalled
@@ -1288,15 +1556,16 @@ fn tracked_prompt_selection(
         context,
         path_hint,
         tracker,
+        prepared,
         &recall_sections,
         tracker.max_bytes.map(|max| max.saturating_sub(recall_len)),
     )?;
     if let Some((selected, update)) = context_selection {
         selection.report = tracker.report(Some(&selected));
+        selection.update = update;
         if selected.emitted {
             selection.body.push_str(&selected.output.markdown);
             selection.emitted_ids.extend(ids(&selected.output));
-            selection.update = update;
         }
     }
     if let Some((recalled, update)) = recalled {
@@ -1305,15 +1574,24 @@ fn tracked_prompt_selection(
         }
         selection.body.push_str(&recalled.output.markdown);
         selection.emitted_ids.extend(ids(&recalled.output));
-        selection.update.memories.extend(update.memories);
-        selection.update.prompt_recall_key = update.prompt_recall_key;
-        selection.update.untracked_recall_key = update.untracked_recall_key;
-        selection.update.untracked_recall_ids = update.untracked_recall_ids;
+        merge_recall_update(&mut selection.update, update);
         selection.report.skipped_over_budget += recalled.over_budget;
         selection.report.omitted += recalled.omitted;
     }
     Ok((selection, recall, refresh_store))
 }
+/// Combine recall bookkeeping without losing a state-only context transition.
+fn merge_recall_update(
+    target: &mut memory_hook::DeliveryUpdate,
+    recall: memory_hook::DeliveryUpdate,
+) {
+    target.memories.extend(recall.memories);
+    target.prompt_recall_key = recall.prompt_recall_key;
+    target.untracked_recall_key = recall.untracked_recall_key;
+    target.untracked_recall_ids = recall.untracked_recall_ids;
+    target.turn_recall_ids.extend(recall.turn_recall_ids);
+}
+
 /// Memories a prompt recall must not repeat.
 enum RecallKnown {
     /// Legacy: ids emitted anywhere in the session.
@@ -1394,7 +1672,7 @@ fn hook_prompt_recall_action(
     context: &CliContext,
     path_hint: Option<&str>,
     session_id: Option<&str>,
-    prompt: &str,
+    prepared: &PreparedPromptRecall,
     max_bytes: Option<usize>,
 ) -> Result<(Option<HookAction>, HookRecallReport)> {
     let Some(session_id) = session_id else {
@@ -1404,7 +1682,7 @@ fn hook_prompt_recall_action(
         config,
         context,
         path_hint,
-        prompt,
+        prepared,
         max_bytes.map(memory_context::SizeLimit::bytes),
         || {
             let state = memory_hook::load_state(&config.state_dir, session_id)?;
@@ -1442,14 +1720,14 @@ fn tracked_prompt_recall(
     context: &CliContext,
     path_hint: Option<&str>,
     tracker: &DeliveryTracker,
-    prompt: &str,
+    prepared: &PreparedPromptRecall,
     max_bytes: Option<usize>,
 ) -> Result<(Option<TrackedEmission>, HookRecallReport)> {
     let (selection, recall) = select_prompt_recall(
         config,
         context,
         path_hint,
-        prompt,
+        prepared,
         tracker.limit(max_bytes),
         || {
             Ok(RecallSession {
@@ -1491,34 +1769,26 @@ fn select_prompt_recall<F>(
     config: &Config,
     context: &CliContext,
     path_hint: Option<&str>,
-    prompt: &str,
+    prepared: &PreparedPromptRecall,
     limit: Option<memory_context::SizeLimit>,
     load_session: F,
 ) -> Result<(Option<RecallSelection>, HookRecallReport)>
 where
     F: FnOnce() -> Result<RecallSession>,
 {
-    let Some(query) = prompt_recall_query(prompt, path_hint) else {
+    let started = Instant::now();
+    let Some(query) = prepared.query.as_deref() else {
         return Ok((None, HookRecallReport::skipped("budget-empty")));
     };
-
-    let started = Instant::now();
     let agent_id = resolve_agent_id(context.as_agent.clone());
-    let project_id = resolve_project_id(None, path_hint)?;
-    let project_binding = project_binding_store(config, project_id.as_deref())?;
-    let resolved_store = resolve_store(
-        config,
-        context.store.as_deref(),
-        project_binding.as_deref(),
-        agent_id.as_deref(),
-        StoreAccess::Read,
-    )?;
-    let store_name = resolved_store.name.clone();
+    let project_id = &prepared.project_id;
+    let store_name = &prepared.store_name;
     let store_config = &config.stores[store_name.as_str()];
+    let session = load_session()?;
     // Prompt recall is an automatic `hm search`, so it follows the same source
     // defaults. Raw inbox material remains opt-in through that policy.
     let sources = &config.defaults.search_sources;
-    let cached_report = match load_prompt_recall_index(config, &store_name)? {
+    let cached_report = match load_prompt_recall_index(config, store_name)? {
         PromptRecallIndex::Indexed(report) => report,
         PromptRecallIndex::Skip(reason) => {
             let mut recall = HookRecallReport::skipped(reason);
@@ -1528,7 +1798,6 @@ where
     };
     let entries = cached_report.projection.entries.as_slice();
     let include_inbox = super::search::search_include_inbox(false, sources);
-    let session = load_session()?;
     // Recall injects its hits into the agent, so explicit corrections hide
     // their targets the way `hm context` does, not the way interactive search
     // does. Search resolves supersession only among query-matched hits and
@@ -1547,7 +1816,7 @@ where
     let search_input = search::SearchInput {
         store_root: &store_config.root,
         entries,
-        query: &query,
+        query,
         scopes: &config.defaults.search_scopes,
         sources,
         include_inbox,
@@ -1572,7 +1841,7 @@ where
     let project_aliases = &cached_report.projection.project_aliases;
     let mut hits = match super::search::tantivy_search_local_if_fresh(
         config,
-        &store_name,
+        store_name,
         &cached_report.entries,
         search_input.clone(),
         registry,
@@ -1594,6 +1863,35 @@ where
     };
 
     hits.retain(|hit| !superseded.contains(&hit.entry.id));
+
+    let evidence = search::RecallQuery::parse(query, registry)?;
+    let support = |hit: &search::SearchHit| {
+        let support = evidence.evidence(&hit.entry);
+        if support == search::RecallEvidence::Anchored && hit.trace.retrieval == 0 {
+            search::RecallEvidence::None
+        } else {
+            support
+        }
+    };
+    let best = hits
+        .iter()
+        .map(support)
+        .max()
+        .unwrap_or(search::RecallEvidence::None);
+    // Qualify the complete candidate set BEFORE excluding visible memories.
+    // A lexical answer outranks incidental host/entity overlap, and a useful
+    // anchored BM25 paraphrase never becomes an endless novelty fallback.
+    hits.retain(|hit| best > search::RecallEvidence::None && support(hit) == best);
+    if prepared.continuation && hits.iter().any(|hit| session.known.visible(&hit.entry)) {
+        // A conversational followup supplies no new subject. Once the best
+        // evidence is visible, moving down the unseen tail spends context on
+        // weaker interpretations of the same query. Turn-only recall ids do
+        // not count as visible, so an expired turn can still recover its facts.
+        let mut recall = HookRecallReport::skipped("topic-already-visible");
+        recall.candidate_count = hits.len();
+        recall.retrieval_ms = started.elapsed().as_millis();
+        return Ok((None, recall));
+    }
 
     // Incremental prompt recall emits at most three NEW memories at a time. The
     // search above still considers the complete local projection and expands
@@ -1617,7 +1915,7 @@ where
         .iter()
         .map(|entry| entry.id.clone())
         .collect::<Vec<_>>();
-    let recall_key = prompt_recall_key(&query, project_id.as_deref(), &store_name, &selected_ids);
+    let recall_key = prompt_recall_key(query, project_id.as_deref(), store_name, &selected_ids);
     let mut recall = HookRecallReport {
         query_fingerprint: Some(recall_key.clone()),
         candidate_count: hits.len(),
@@ -1733,25 +2031,53 @@ fn prompt_recall_key(
     hive_memory::hash::lower_hex(&digest.finalize())
 }
 
+/// Whether a prompt supplies a usable subject or truly continues the last one.
+enum PromptQuery {
+    Generic,
+    Subject(String),
+    Unusable,
+}
+
+#[cfg(test)]
 fn prompt_recall_query(prompt: &str, path_hint: Option<&str>) -> Option<String> {
+    match prompt_query(prompt, path_hint) {
+        PromptQuery::Subject(query) => Some(query),
+        PromptQuery::Generic | PromptQuery::Unusable => None,
+    }
+}
+
+fn prompt_query(prompt: &str, path_hint: Option<&str>) -> PromptQuery {
+    // Normalize only after the shared detectors inspect the original spelling:
+    // lowercasing hides AWS key shapes, and punctuation removal can hide an
+    // assignment. Unusable clears an old topic rather than inheriting it.
+    if !hive_memory::secret::detect(prompt).is_empty() {
+        return PromptQuery::Unusable;
+    }
     let mut code_terms = Vec::new();
     let mut plain_terms = Vec::new();
-    for token in prompt
+    // Request constraints after "while" describe how to do the work, rather
+    // than a new recall subject. Keep those words out of the saved topic.
+    let lower = prompt
+        .to_ascii_lowercase()
+        .replace('’', "'")
+        .replace("i don't understand", " ")
+        .replace("i do not understand", " ");
+    let subject = lower
+        .split_once(" while ")
+        .map_or(lower.as_str(), |(head, _)| head);
+    let normalized = subject
         .split(|ch: char| {
             ch.is_whitespace() || matches!(ch, ',' | ';' | ':' | '(' | ')' | '[' | ']')
         })
         .map(normalize_prompt_token)
         .filter(|token| !token.is_empty())
-    {
-        if is_prompt_stopword(&token) {
-            continue;
-        }
-        if is_task_intent_term(&token) {
-            continue;
-        }
+        .filter(|token| !is_prompt_stopword(token) && !is_task_intent_term(token))
+        .collect::<Vec<_>>()
+        .join(" ");
+    for token in search::query_terms(&normalized) {
         if is_code_prompt_term(&token) {
             push_unique(&mut code_terms, token);
-        } else if token.len() >= 4 {
+        } else if token.len() >= 2 && token.chars().any(char::is_alphabetic) {
             push_unique(&mut plain_terms, token);
         }
     }
@@ -1771,9 +2097,9 @@ fn prompt_recall_query(prompt: &str, path_hint: Option<&str>) -> Option<String> 
     // This is a bounded relevance sketch for one automatic recall, not a cap on
     // the indexed memory corpus. Concrete code/path terms are more discriminating
     // than task prose, so prefer up to three of them and fill a four-term query
-    // with plain terms. Plain-language-only prompts use two terms: longer queries
-    // raise lexical term-coverage requirements and add little value on this hot
-    // path.
+    // with plain terms. Plain-language subjects get the same four-term budget:
+    // keeping only their first two words discarded concrete subjects in favor
+    // of framing such as "another" or "whether".
     // Manual search and the normal context surfaces keep their existing inputs.
     let terms = if !code_terms.is_empty() {
         let mut terms = code_terms.into_iter().take(3).collect::<Vec<_>>();
@@ -1784,9 +2110,39 @@ fn prompt_recall_query(prompt: &str, path_hint: Option<&str>) -> Option<String> 
         );
         terms
     } else {
-        plain_terms.into_iter().take(2).collect::<Vec<_>>()
+        plain_terms.into_iter().take(4).collect::<Vec<_>>()
     };
-    (!terms.is_empty()).then(|| terms.join(" "))
+    if terms.is_empty()
+        || terms.iter().all(|term| {
+            matches!(
+                term.as_str(),
+                "pr" | "pull" | "request" | "commit" | "branch" | "live" | "ready"
+            )
+        })
+    {
+        // Workflow-only followups describe the next action on the current
+        // subject. A concrete qualifier, such as "PR watch", remains a topic.
+        return PromptQuery::Generic;
+    }
+    let mut query = String::new();
+    for term in terms {
+        if query.len() + term.len() + usize::from(!query.is_empty())
+            > memory_hook::RECALL_TOPIC_MAX_BYTES
+        {
+            continue;
+        }
+        if !query.is_empty() {
+            query.push(' ');
+        }
+        query.push_str(&term);
+    }
+    if query.is_empty() {
+        PromptQuery::Unusable
+    } else if !search::query_has_subject(&query) {
+        PromptQuery::Generic
+    } else {
+        PromptQuery::Subject(query)
+    }
 }
 
 fn normalize_prompt_token(token: &str) -> String {
@@ -1810,6 +2166,10 @@ fn is_task_intent_term(token: &str) -> bool {
         token,
         "analyze"
             | "analyse"
+            | "see"
+            | "create"
+            | "merge"
+            | "deploy"
             | "check"
             | "debug"
             | "debugging"
@@ -1842,9 +2202,65 @@ fn is_task_intent_term(token: &str) -> bool {
 }
 
 fn is_prompt_stopword(token: &str) -> bool {
+    if let Some((pronoun, suffix)) = token.split_once('\'')
+        && matches!(
+            pronoun,
+            "i" | "we" | "you" | "they" | "it" | "he" | "she" | "that"
+        )
+        && matches!(suffix, "m" | "re" | "ve" | "ll" | "d" | "s")
+    {
+        return true;
+    }
     matches!(
         token,
         "about"
+            | "lots"
+            | "lot"
+            | "one"
+            | "ok"
+            | "yes"
+            | "sure"
+            | "my"
+            | "me"
+            | "we"
+            | "our"
+            | "you"
+            | "us"
+            | "another"
+            | "anything"
+            | "actually"
+            | "any"
+            | "else"
+            | "whether"
+            | "useful"
+            | "related"
+            | "those"
+            | "these"
+            | "them"
+            | "their"
+            | "there"
+            | "your"
+            | "ours"
+            | "more"
+            | "other"
+            | "like"
+            | "keeping"
+            | "conversational"
+            | "framing"
+            | "changes"
+            | "change"
+            | "side"
+            | "effects"
+            | "unexpected"
+            | "surprising"
+            | "safe"
+            | "safely"
+            | "made"
+            | "three"
+            | "okay"
+            | "done"
+            | "green"
+            | "scrub"
             | "after"
             | "again"
             | "also"
@@ -2134,7 +2550,7 @@ mod tests {
                 None
             )
             .as_deref(),
-            Some("grafhome cedar")
+            Some("grafhome cedar rego policy")
         );
     }
 

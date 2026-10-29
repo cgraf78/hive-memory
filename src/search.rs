@@ -64,6 +64,98 @@ pub struct SearchHit {
     pub snippet: String,
 }
 
+/// Topic evidence for automatic injection, independent of retrieval rank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RecallEvidence {
+    /// No evidence connecting this entry to the task.
+    None,
+    /// A partial retrieval still names the query's leading subject.
+    /// This tier is usable only for a real retrieval hit, never context backfill.
+    Anchored,
+    /// Registered entities support an alias-only match.
+    Entity,
+    /// Existing phrase or term-coverage semantics support the whole subject.
+    Lexical,
+}
+
+/// Parsed topic used to qualify automatic recall candidates.
+///
+/// Interactive search can offer broad discovery results. An automatic hook
+/// needs evidence before it spends context on them, and must not mistake a
+/// project boost or an already-delivered best hit for evidence about other hits.
+pub struct RecallQuery(SearchQuery);
+
+impl RecallQuery {
+    /// Parse with the same morphology, aliases, and required terms as search.
+    pub fn parse(input: &str, registry: &entity::EntityRegistry) -> Result<Self, SearchError> {
+        Ok(Self(SearchQuery::parse(input, registry)?))
+    }
+
+    /// Assess cached body and metadata without reading canonical storage.
+    #[must_use]
+    pub fn evidence(&self, entry: &IndexEntry) -> RecallEvidence {
+        let query = &self.0;
+        let combined = format!("{} {}", searchable_metadata(entry), entry.body);
+        let lower = combined.to_ascii_lowercase();
+        let score = score_entry(entry, &entry.body, query);
+        // A host or repository alias alone must not qualify incidental notes
+        // when a full subject match exists, even if that best answer was already
+        // delivered. Alias-only recall remains available when it is the best
+        // evidence the complete candidate set has.
+        if score.total() > score.entity {
+            RecallEvidence::Lexical
+        } else if score.entity > 0 {
+            RecallEvidence::Entity
+        } else if !query.has_required_terms()
+            && query
+                .terms
+                .first()
+                .is_some_and(|term| term_score(&lower, term) > 0)
+        {
+            // Required negation/intent terms must be satisfied by the ordinary
+            // full-match path; a partial subject cannot bypass them.
+            RecallEvidence::Anchored
+        } else {
+            RecallEvidence::None
+        }
+    }
+}
+
+/// Normalize meaningful query terms for automatic topic construction.
+///
+/// Sharing search's stopwords and inflections prevents a hook from counting
+/// "memory" and "memories" as independent evidence for the same body word.
+#[must_use]
+pub fn query_terms(input: &str) -> Vec<String> {
+    let mut terms: Vec<QueryTerm> = Vec::new();
+    for value in input
+        .split_whitespace()
+        .filter_map(normalize_query_token)
+        .filter(|term| !is_query_stopword(term))
+    {
+        let term = QueryTerm::new(value);
+        if !terms.iter().any(|known| {
+            known.value == term.value
+                || known.alternatives.contains(&term.value)
+                || term.alternatives.contains(&known.value)
+        }) {
+            terms.push(term);
+        }
+    }
+    terms.into_iter().map(|term| term.value).collect()
+}
+
+/// Whether normalized recall terms name a subject beyond required intent.
+///
+/// Negation and preference constrain a subject; on their own they cannot replace
+/// the topic of a generic follow-up such as a request to check for side effects.
+#[must_use]
+pub fn query_has_subject(input: &str) -> bool {
+    query_terms(input)
+        .iter()
+        .any(|term| !is_required_query_term(term) && !is_required_intent_term(term))
+}
+
 /// Search hits plus non-fatal diagnostics from curated-file collection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchReport {
@@ -2757,6 +2849,44 @@ mod tests {
 
         assert_eq!(query.terms.len(), 14);
         assert_eq!(query.min_matching_terms(), 9);
+    }
+
+    #[test]
+    fn automatic_topic_normalization_deduplicates_inflections_without_losing_negation() {
+        assert_eq!(
+            query_terms("the memory memories telemetry telemetry without archives"),
+            vec!["memory", "telemetry", "without", "archives"]
+        );
+        assert!(!query_has_subject("no never without"));
+        assert!(!query_has_subject("preferred"));
+        assert!(query_has_subject("no VMware"));
+        assert!(query_has_subject("preferred deployment"));
+    }
+
+    #[test]
+    fn automatic_topic_evidence_separates_supported_and_subject_only_matches() {
+        let dir = temp_dir("automatic-topic-evidence");
+        let root = dir.join("store");
+        let cache = dir.join("cache");
+        write_record(
+            &root,
+            note::EntryKind::Remember,
+            "global",
+            "The alpha service uses a manual verification checklist.",
+            timestamp(1_778_946_153),
+            Vec::new(),
+        );
+        let records = entries(&root, &cache);
+        let entry = records.first().expect("record");
+        let registry = entity::EntityRegistry::builtin();
+        let partial = RecallQuery::parse("alpha pipeline", &registry).expect("partial query");
+        assert_eq!(partial.evidence(entry), RecallEvidence::Anchored);
+        let other_subject = RecallQuery::parse("pipeline alpha", &registry).expect("other query");
+        assert_eq!(other_subject.evidence(entry), RecallEvidence::None);
+        let required = RecallQuery::parse("alpha without pipeline", &registry).expect("required");
+        assert_eq!(required.evidence(entry), RecallEvidence::None);
+        let supported = RecallQuery::parse("alpha service", &registry).expect("supported query");
+        assert_eq!(supported.evidence(entry), RecallEvidence::Lexical);
     }
 
     #[test]

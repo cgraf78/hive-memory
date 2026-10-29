@@ -131,12 +131,27 @@ pub fn hermetic_hm() -> assert_cmd::Command {
     assert_cmd::Command::from_std(hermetic_hm_process())
 }
 
+/// Build an isolated command for an explicitly frozen evaluation binary.
+///
+/// Keeping alternate binaries behind the same builder prevents a before/after
+/// replay from accidentally inheriting the caller's stores or selectors.
+#[allow(dead_code)]
+pub fn hermetic_hm_at(binary: &std::path::Path) -> assert_cmd::Command {
+    assert_cmd::Command::from_std(hermetic_hm_process_at(binary))
+}
+
 /// [`hermetic_hm`] as a plain [`std::process::Command`], for tests that need
 /// to drive the child process themselves (for example closing its stdout).
 #[expect(clippy::disallowed_macros)]
 #[allow(dead_code)]
 pub fn hermetic_hm_process() -> std::process::Command {
-    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("hm"));
+    hermetic_hm_process_at(assert_cmd::cargo::cargo_bin!("hm"))
+}
+
+/// Apply the ordinary integration-test isolation to an alternate binary.
+#[allow(dead_code)]
+pub fn hermetic_hm_process_at(binary: &std::path::Path) -> std::process::Command {
+    let mut command = std::process::Command::new(binary);
     for key in inherited_vars("HIVE_MEMORY_") {
         command.env_remove(key);
     }
