@@ -1003,6 +1003,16 @@ Input rules:
   (`privacy_refusal`) by default. The refusal message should say that Hive
   Memory does not store secrets by default and should include only detector IDs,
   not the matched secret text.
+- Assignment-style detection examines credential-named assignment targets
+  immediately before `=` or `:`, including sigils, indexing, quoted configuration
+  keys, and assignments embedded in prose or later on the same line. Earlier
+  prose mentioning a password is not itself an assignment key. Bare or
+  backtick-quoted credential-file path labels are not assignment keys;
+  single/double-quoted configuration keys remain conservatively recognized.
+  File-shaped credential values are not exempted from refusal. Overlapping
+  assignment-target scans have a linear work limit; when parsing exceeds it,
+  a line containing a credential name is conservatively refused rather than
+  skipping potentially hidden credentials.
 
 ### `hm remember`
 

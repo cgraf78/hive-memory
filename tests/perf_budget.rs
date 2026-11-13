@@ -58,6 +58,58 @@ fn temp_dir(name: &str) -> TempDir {
         .expect("create temp dir")
 }
 
+// Malformed assignment syntax must not turn a pasted note into seconds of
+// synchronous secret-scanner work. These small stores isolate write latency.
+#[test]
+#[ignore = "CI runs timing budgets explicitly in release mode"]
+fn remember_colon_run_stays_within_budget() {
+    assert_remember_budget(&":".repeat(80_000), 0);
+}
+
+#[test]
+#[ignore = "CI runs timing budgets explicitly in release mode"]
+fn remember_unclosed_brackets_stays_within_budget() {
+    assert_remember_budget(&"]:".repeat(40_000), 0);
+}
+
+#[test]
+#[ignore = "CI runs timing budgets explicitly in release mode"]
+fn remember_malformed_prefix_with_credential_stays_within_budget() {
+    let text = format!("{} password=syntheticcredentialvalue", "]:".repeat(40_000));
+    assert_remember_budget(&text, 4);
+}
+
+fn assert_remember_budget(text: &str, expected_code: i32) {
+    let dir = temp_dir("assignment-budget");
+    let root = dir.path().join("personal");
+    let config = dir.path().join("config.toml");
+    store::init_store(&StoreInitOptions {
+        name: "personal".to_owned(),
+        root: root.clone(),
+        description: None,
+        sensitivity: Sensitivity::Private,
+    })
+    .expect("init assignment budget store");
+    write_config(
+        &config,
+        &root,
+        &dir.path().join("cache"),
+        &dir.path().join("state"),
+        &dir.path().join("data"),
+        "lexical",
+    );
+    let started = Instant::now();
+    hm_command(&config, ["remember", "--text", text])
+        .assert()
+        .code(expected_code);
+    let elapsed = started.elapsed().as_millis();
+    let budget = budget_ms(200);
+    assert!(
+        elapsed <= budget,
+        "hm remember malformed assignment input took {elapsed}ms, exceeding {budget}ms"
+    );
+}
+
 #[test]
 #[ignore = "CI runs this explicitly because it creates a 5000-note synthetic store"]
 fn context_and_search_stay_within_warm_budget() {

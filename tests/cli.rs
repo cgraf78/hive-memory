@@ -2161,6 +2161,69 @@ fn flush_bind_rejects_corrupt_outbox_id_mismatch() {
 }
 
 #[test]
+fn remember_accepts_password_file_procedure_without_a_credential_assignment() {
+    let dir = temp_dir("remember-password-procedure");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    let text = "Keep the service password in the protected credential file. \
+                Recovery procedure: retrieve the escrow copy through the approved process.";
+
+    let output = common::hermetic_hm()
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            text,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).expect("utf8 stdout");
+    let note_path = PathBuf::from(stdout_value(&stdout, "note:"));
+    let note = fs::read_to_string(note_path).expect("read accepted note");
+    assert!(note.contains(text));
+}
+
+#[test]
+fn remember_refuses_later_credential_without_echoing_or_writing_it() {
+    let dir = temp_dir("remember-later-secret-refusal");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let work = dir.join("work");
+    write_config(&config, &personal, &work);
+    init_store(&personal, "personal");
+    let secret_value = "syntheticcredentialvalue";
+    let text = format!("note: username=service-user; password={secret_value}");
+
+    common::hermetic_hm()
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            &text,
+            "--json",
+        ])
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains("detectors: secret-assignment"))
+        .stderr(predicate::str::contains(secret_value).not())
+        .stdout(predicate::str::contains(secret_value).not());
+    assert_eq!(
+        fs::read_dir(personal.join("inbox/notes"))
+            .expect("read note directory")
+            .count(),
+        0
+    );
+}
+
+#[test]
 fn remember_refuses_likely_secret_without_echoing_value() {
     let dir = temp_dir("remember-secret-refusal");
     let config = dir.join("config.toml");
