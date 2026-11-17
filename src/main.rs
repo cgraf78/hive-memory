@@ -475,7 +475,11 @@ struct CliContext {
 }
 
 fn hook_active(context: &CliContext) -> bool {
-    context.hook_active || std::env::var("HIVE_MEMORY_HOOK_ACTIVE").ok().as_deref() == Some("1")
+    context.hook_active
+        || std::env::var(hive_memory::hook::HOOK_ACTIVE_ENV)
+            .ok()
+            .as_deref()
+            == Some("1")
 }
 
 fn run_doctor(args: DoctorArgs, context: CliContext) -> Result<()> {

@@ -633,7 +633,7 @@ fn maybe_spawn_background_refresh(
         .arg("refresh")
         .arg("--quiet")
         .arg("--background")
-        .env("HIVE_MEMORY_HOOK_ACTIVE", "1")
+        .env(hive_memory::hook::HOOK_ACTIVE_ENV, "1")
         .env_remove("HIVE_MEMORY_BACKGROUND_REFRESH")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

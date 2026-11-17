@@ -817,7 +817,11 @@ General CLI behavior:
   fallback, and maintenance commands such as `hm refresh` use hook-safe
   coalescing locks by default. `hm hook <event>` applies these semantics
   internally, so hook adapters do not need to set this variable for the normal
-  hook workflow.
+  hook workflow. Every LLM backend process (classifier, `hm capture`,
+  `hm reconcile`) also runs with it set, and callers cannot override it:
+  backends are agent CLIs whose own lifecycle hooks would otherwise inject
+  memory context into the prompt and could start another `hm` pass, and hook
+  adapters skip Hive Memory when the variable is set.
 - `--scope a,b` filters scopes for read/search/context commands.
 - `--scope SCOPE` on write commands selects exactly one write scope.
 - `--include-secret` allows read-only inclusion of `secret` stores only when
@@ -2521,7 +2525,8 @@ Test categories per module:
 - `hm hook stop --json` returns a reminder action when memory-pending remains
   and never writes canonical memory.
 - `HIVE_MEMORY_HOOK_ACTIVE=1` is scoped to hook-launched low-level `hm`
-  subprocesses and is not leaked into normal agent tool commands.
+  subprocesses and LLM backend processes, and is not leaked into normal agent
+  tool commands.
 - Hive Memory runtime behavior is implemented in the existing dotfiles
   `agent-hook-*` scripts, not in a parallel hook stack.
 - SessionStart injects the `inject_context` action returned by
