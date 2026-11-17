@@ -1549,7 +1549,12 @@ Behavior:
   or change the session's project selection.
 - `stop`: if `memory-pending` remains, returns a reminder action. It may run
   `hm refresh --force` equivalent maintenance when configured, but it MUST NOT
-  write canonical memory automatically.
+  write canonical memory automatically. When `[classifier].mode` allows it, it
+  starts a detached classifier unless the last run is fresher than
+  `min_interval` or a live worker holds the classifier lock. A lock not
+  refreshed for an hour, or dated more than an hour ahead, is stale: the worker
+  it starts reclaims it, so a worker killed mid-run cannot disable
+  classification.
 - `context-reset`: records that the host lost earlier context (see Delivery
   Tracking). It emits no actions.
 - privacy refusals, manifest identity conflicts, generated-file drift, and
