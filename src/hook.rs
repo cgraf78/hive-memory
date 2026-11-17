@@ -14,6 +14,14 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 
+/// Environment variable that marks a process as running on behalf of an agent
+/// lifecycle hook.
+///
+/// `hm` reads it to choose hook-safe behavior, and AgentGuard skips its Hive
+/// Memory hooks when it is set, which is what keeps `hm` from re-entering itself
+/// through an agent session it started.
+pub const HOOK_ACTIVE_ENV: &str = "HIVE_MEMORY_HOOK_ACTIVE";
+
 /// Maximum normalized topic size in session coordination state, in UTF-8 bytes.
 pub const RECALL_TOPIC_MAX_BYTES: usize = 256;
 
