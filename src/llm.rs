@@ -269,6 +269,13 @@ fn run_backend_raw(
     for (key, value) in env {
         command.env(key, value);
     }
+    // Backends are agent CLIs (`codex exec`, `claude -p`, ...) whose own
+    // lifecycle hooks would otherwise inject Hive Memory context into the
+    // extraction prompt and, from a stop hook, start another capture or
+    // classification pass. Marking every backend as hook-driven makes those
+    // hooks skip Hive Memory, whoever called `hm`. It is set after the caller's
+    // pairs so no caller can switch it off.
+    command.env(crate::hook::HOOK_ACTIVE_ENV, "1");
 
     let mut child = command
         .spawn()
@@ -457,6 +464,30 @@ mod tests {
 
     fn fixture_path(name: &str) -> String {
         format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    #[test]
+    fn backends_run_marked_as_hook_driven() {
+        // Agent CLI backends fire their own lifecycle hooks; the marker is what
+        // makes those hooks skip Hive Memory instead of recursing into it. The
+        // caller pair tries to switch it off, which also keeps the test
+        // meaningful when the test process itself inherited the marker.
+        let backend = Backend::command(vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            format!(
+                "cat >/dev/null; printf '%s' \"${{{HOOK_ACTIVE}:-unset}}\"",
+                HOOK_ACTIVE = crate::hook::HOOK_ACTIVE_ENV
+            ),
+        ]);
+        let out = run_backend_raw(
+            &backend,
+            "prompt",
+            Duration::from_secs(10),
+            &[(crate::hook::HOOK_ACTIVE_ENV, "0")],
+        )
+        .expect("backend runs");
+        assert_eq!(out, "1");
     }
 
     #[test]
