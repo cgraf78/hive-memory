@@ -235,13 +235,12 @@ pub(crate) fn run_refresh(args: RefreshArgs, context: CliContext) -> Result<()> 
     if receipts_covered && let Some(cursor) = receipt_cursor {
         report.record_receipts(cursor.unrefreshed);
         // `hm refresh` owns only maintenance idempotency. Memory-pending debt is
-        // cleared by `hm hook tool-complete`, where the hook knows the tool
-        // actually succeeded and a receipt should satisfy the prompt reminder.
+        // cleared by the hooks, which compare receipts against the count when
+        // the intent was recorded.
         memory_hook::mark_receipts_refreshed(
             &config.state_dir,
             &cursor.session_id,
             cursor.receipt_count,
-            false,
             &hook_options(&config),
         )?;
     }
