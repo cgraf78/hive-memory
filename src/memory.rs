@@ -255,7 +255,8 @@ pub enum ClassifiedUpdate {
 pub struct RetagRecordInput<'a> {
     /// Store root holding the canonical files.
     pub root: &'a Path,
-    /// Store-relative Markdown note path, as carried by the index.
+    /// Store-relative Markdown note path, as carried by the index (case-folded
+    /// on a case-insensitive store).
     pub note_path: &'a str,
     /// Whether to replace the persisted kind.
     pub update_kind: bool,
@@ -303,11 +304,23 @@ pub struct RetagRecordResult {
 /// Rewrites use replace-mode atomic publishing, and the resulting mtime bump
 /// invalidates the index fingerprint so read paths pick up the new kind.
 pub fn retag_record(input: RetagRecordInput<'_>) -> Result<RetagRecordResult, MemoryError> {
-    let note_path = input.root.join(input.note_path);
-    let contents = std::fs::read_to_string(&note_path)
-        .map_err(|err| MemoryError::Note(format!("read {}: {err}", note_path.display())))?;
+    let read_path = input.root.join(input.note_path);
+    let contents = std::fs::read_to_string(&read_path)
+        .map_err(|err| MemoryError::Note(format!("read {}: {err}", read_path.display())))?;
     let mut parsed =
         note::parse_note(&contents).map_err(|err| MemoryError::Note(err.to_string()))?;
+    let created_at = OffsetDateTime::parse(
+        &parsed.front_matter.created_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .map_err(|err| MemoryError::Note(format!("parse created_at: {err}")))?;
+    let note_path = rewrite_path(
+        read_path,
+        input.root.join(note::note_relative_path(
+            &parsed.front_matter.id,
+            created_at,
+        )),
+    );
     let previous_kind = parsed.front_matter.kind;
     let previous_scope = parsed.front_matter.scope.clone();
     let previous_project_id = parsed.front_matter.project_id.clone();
@@ -330,11 +343,6 @@ pub fn retag_record(input: RetagRecordInput<'_>) -> Result<RetagRecordResult, Me
     write::write_atomic(&note_path, rendered.as_bytes(), &input.options)
         .map_err(|err| MemoryError::Note(err.to_string()))?;
 
-    let created_at = OffsetDateTime::parse(
-        &parsed.front_matter.created_at,
-        &time::format_description::well_known::Rfc3339,
-    )
-    .map_err(|err| MemoryError::Note(format!("parse created_at: {err}")))?;
     let event_path = input.root.join(event::event_relative_path(
         &parsed.front_matter.id,
         created_at,
@@ -382,6 +390,44 @@ pub fn retag_record(input: RetagRecordInput<'_>) -> Result<RetagRecordResult, Me
         note_path,
         event_path,
     })
+}
+
+/// Choose the name a retag publishes the note under.
+///
+/// On a case-insensitive store the index carries case-folded paths, which find
+/// the note but must not name it: an atomic replace under the folded spelling
+/// renames the shared file, and case-sensitive peers then miss it. Publish under
+/// the canonical spelling when it names the file that was read, which also
+/// restores a note an older build folded. Otherwise keep the read path, so a
+/// case-sensitive store never gains a second copy.
+fn rewrite_path(read_path: PathBuf, canonical: PathBuf) -> PathBuf {
+    if read_path != canonical && same_file(&read_path, &canonical) {
+        canonical
+    } else {
+        read_path
+    }
+}
+
+#[cfg(unix)]
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+// Without inode identity, a case-only difference that still resolves can only
+// be the same file on the case-insensitive filesystems these platforms use.
+#[cfg(not(unix))]
+fn same_file(a: &Path, b: &Path) -> bool {
+    let folded = |path: &Path| {
+        path.components()
+            .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
+            .collect::<Vec<_>>()
+    };
+    folded(a) == folded(b) && b.exists()
 }
 
 fn apply_classified_update(target: &mut Option<note::ClassifiedBy>, update: &ClassifiedUpdate) {
@@ -482,6 +528,72 @@ mod tests {
         let event = event::parse_event(&fs::read_to_string(event_path).expect("read event"))
             .expect("parse event");
         assert_eq!(event.kind, Some(note::MemoryKind::Incident));
+    }
+
+    fn retag_kind(root: &Path, note_path: &str) -> RetagRecordResult {
+        retag_record(RetagRecordInput {
+            root,
+            note_path,
+            update_kind: true,
+            kind: Some(note::MemoryKind::Incident),
+            scope: None,
+            project_id: None,
+            classified: ClassifiedUpdate::Keep,
+            options: options(),
+        })
+        .expect("retag")
+    }
+
+    fn note_kind(path: &Path) -> Option<note::MemoryKind> {
+        note::parse_note(&fs::read_to_string(path).expect("read note"))
+            .expect("parse note")
+            .front_matter
+            .kind
+    }
+
+    fn case_insensitive(root: &Path) -> bool {
+        crate::path::resolve_case("auto", root) == crate::path::PathCase::Insensitive
+    }
+
+    #[test]
+    fn retag_through_a_case_folded_path_keeps_the_canonical_name() {
+        // A case-insensitive store's index carries folded paths. On a
+        // case-sensitive test filesystem a hard link stands in for one: both
+        // spellings then name one file.
+        let root = temp_dir("retag-case-folded");
+        let written = write(&root, Some(note::MemoryKind::Preference), true);
+        let folded = relative(&root, &written.note_path).to_lowercase();
+        if !case_insensitive(&root) {
+            fs::hard_link(&written.note_path, root.join(&folded)).expect("link folded spelling");
+        }
+
+        let result = retag_kind(&root, &folded);
+
+        assert_eq!(result.note_path, written.note_path);
+        assert_eq!(
+            note_kind(&written.note_path),
+            Some(note::MemoryKind::Incident)
+        );
+    }
+
+    #[test]
+    fn retag_through_a_case_folded_path_on_a_case_sensitive_store_adds_no_copy() {
+        let root = temp_dir("retag-case-sensitive-folded");
+        if case_insensitive(&root) {
+            return;
+        }
+        let written = write(&root, Some(note::MemoryKind::Preference), true);
+        let folded = relative(&root, &written.note_path).to_lowercase();
+        fs::rename(&written.note_path, root.join(&folded)).expect("fold note name");
+
+        let result = retag_kind(&root, &folded);
+
+        assert_eq!(result.note_path, root.join(&folded));
+        assert_eq!(
+            note_kind(&root.join(&folded)),
+            Some(note::MemoryKind::Incident)
+        );
+        assert!(!written.note_path.exists());
     }
 
     #[test]
