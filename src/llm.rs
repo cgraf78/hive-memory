@@ -48,9 +48,11 @@ const ADAPTERS: &[Adapter] = &[
         // permission mode, which may allow tools without prompting. The memory
         // operations only need model output, and a tool-using backend could
         // edit files or run `hm remember` against the store it is classifying,
-        // so offer it no built-in tools, as the Codex adapter's read-only
-        // sandbox does.
-        argv: &["claude", "-p", "--tools", ""],
+        // so offer it no tools, as the Codex adapter's read-only sandbox does.
+        // `--tools ""` removes only built-in tools; `--strict-mcp-config`
+        // also skips the user's MCP servers, whose tools would otherwise stay
+        // available.
+        argv: &["claude", "-p", "--tools", "", "--strict-mcp-config"],
         model_flag: Some("--model"),
     },
     Adapter {
@@ -657,7 +659,15 @@ mod tests {
         assert_eq!(detected.label, "claude");
         assert_eq!(
             detected.argv,
-            ["claude", "-p", "--tools", "", "--model", "fast"]
+            [
+                "claude",
+                "-p",
+                "--tools",
+                "",
+                "--strict-mcp-config",
+                "--model",
+                "fast"
+            ]
         );
 
         assert!(detect(None, &[], None, Some("")).is_none());
