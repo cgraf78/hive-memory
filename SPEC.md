@@ -621,7 +621,12 @@ Canonical-form rules used everywhere paths appear in metadata or comparison:
 
 Paths in front matter and JSON events MUST be normalized at write time.
 Comparison (search, context filtering, alias matching) MUST normalize both
-sides. Having `hm doctor --fix` rewrite non-normalized paths in a safe
+sides. Normalized paths are comparison keys, never file names: canonical note
+and event files keep the spelling their id gives them, which every peer can
+open. A rewrite such as retag publishes under that spelling even when it found
+the note through a case-folded index path, because an atomic replace under the
+folded spelling would rename the shared file out from under case-sensitive
+peers. Having `hm doctor --fix` rewrite non-normalized paths in a safe
 quarantine step rather than mutating canonical files is DEFERRED.
 
 Absolute paths to user code (e.g. `project_path`) are sensitive metadata.
