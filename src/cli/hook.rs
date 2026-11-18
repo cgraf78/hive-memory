@@ -739,46 +739,30 @@ fn run_prompt_submit(args: HookPromptSubmitArgs, context: CliContext) -> Result<
         memory_pending = true;
 
         if let Some(session_id) = session_id.as_deref() {
+            // Only receipts appended after this point satisfy the new intent.
+            // An unreadable receipt stream leaves the base to
+            // `mark_memory_pending`, which uses the refresh cursor.
+            let receipt_base = match memory_hook::load_write_receipts(&config.state_dir, session_id)
+            {
+                Ok(receipts) => Some(receipts.len()),
+                Err(err) => {
+                    warnings.push(format!("Hive Memory write receipts unreadable: {err}"));
+                    None
+                }
+            };
             memory_hook::mark_memory_pending(
                 &config.state_dir,
                 session_id,
                 "prompt contained explicit durable-memory intent",
+                receipt_base,
                 &hook_options(&config),
             )?;
         }
     } else if let Some(session_id) = session_id.as_deref() {
-        // Intent from an earlier prompt that is still pending survived a whole
-        // turn without a write. Deliver the follow-up here rather than relying
-        // on the stop reminder, which several hosts never show to the model.
-        // The unlocked read keeps ordinary prompts from taking the lock.
-        let state = memory_hook::load_state(&config.state_dir, session_id)?;
-        if state.memory_pending && !state.carried_reminder_sent {
-            memory_pending = true;
-            // A receipt tool-complete has not consumed yet means the write
-            // happened (its tool exited nonzero, or the host has no tool hook),
-            // so "still pending" would be wrong. Leave clearing to tool-complete.
-            let unconsumed_write = memory_hook::load_write_receipts(&config.state_dir, session_id)?
-                .len()
-                > state.refreshed_receipts;
-            if !unconsumed_write {
-                // A busy session lock costs only this reminder, never the prompt
-                // and the context already prepared for it.
-                match memory_hook::take_carried_reminder(
-                    &config.state_dir,
-                    session_id,
-                    &hook_options(&config),
-                ) {
-                    Ok(true) => {
-                        actions.push(HookAction::new("remind", carried_memory_reminder()));
-                    }
-                    Ok(false) => {}
-                    Err(err) => {
-                        warnings.push(format!("Hive Memory follow-up reminder skipped: {err}"))
-                    }
-                }
-            }
-        } else if state.memory_pending {
-            memory_pending = true;
+        let carried = carry_pending_intent(&config, session_id, &mut warnings);
+        memory_pending = carried.pending;
+        if carried.remind {
+            actions.push(HookAction::new("remind", carried_memory_reminder()));
         }
     }
 
@@ -872,9 +856,16 @@ fn run_tool_complete(args: HookToolCompleteArgs, context: CliContext) -> Result<
                 BackgroundRefreshTarget::All
             });
             refresh_request = Some((session_id, receipts.len()));
+        }
+
+        // Satisfaction is judged against the receipt count when the intent was
+        // recorded, not the refresh cursor: a refresh that keeps failing leaves
+        // old receipts unrefreshed, and they must not clear a newer intent.
+        if state.memory_pending && state.written_since_intent(receipts.len()) {
             state = memory_hook::mark_memory_satisfied(
                 &config.state_dir,
                 session_id,
+                receipts.len(),
                 &hook_options(&config),
             )?;
         }
@@ -913,7 +904,14 @@ fn run_stop(args: HookStopArgs, context: CliContext) -> Result<()> {
 
     if let Some(session_id) = hook_session_id(&mut warnings) {
         let state = memory_hook::load_state(&config.state_dir, &session_id)?;
-        memory_pending = state.memory_pending;
+        // A receipt past the intent's base means the write happened without a
+        // successful tool-complete; the next prompt clears it, so don't call
+        // it pending here. Stop stays read-only. Unreadable receipts keep the
+        // reminder.
+        let written = state.memory_pending
+            && memory_hook::load_write_receipts(&config.state_dir, &session_id)
+                .is_ok_and(|receipts| state.written_since_intent(receipts.len()));
+        memory_pending = state.memory_pending && !written;
         if memory_pending {
             actions.push(HookAction::new("remind", stop_memory_reminder()));
         }
@@ -2393,6 +2391,92 @@ fn validate_hook_context_read_policy(
 
 fn memory_intent_reminder() -> &'static str {
     "Hive Memory: this prompt sounds like durable memory intent. If it remains useful, write it with `hm remember --scope project --text \"...\"` or `hm remember --text \"...\"`."
+}
+
+/// What `prompt-submit` reports for intent recorded at an earlier prompt.
+struct CarriedIntent {
+    /// Whether intent is still pending after this check.
+    pending: bool,
+    /// Whether this prompt delivers the one follow-up reminder.
+    remind: bool,
+}
+
+/// Resolve intent from an earlier prompt that survived a whole turn.
+///
+/// The turn's stop reminder cannot be relied on, since several hosts never
+/// show stop-hook output to the model, so the next prompt carries a follow-up
+/// once per intent. A write receipt appended after the intent means the write
+/// happened even though no tool-complete cleared it (its tool exited nonzero,
+/// or the host has no tool hook), so the intent is cleared instead.
+///
+/// Failures only skip this bookkeeping with a warning, never the prompt and
+/// the context already prepared for it. Once the state read shows the intent
+/// pending, a later failure still reports it as pending.
+fn carry_pending_intent(
+    config: &Config,
+    session_id: &str,
+    warnings: &mut Vec<String>,
+) -> CarriedIntent {
+    let mut skipped = |err: memory_hook::HookStateError| {
+        warnings.push(format!("Hive Memory follow-up reminder skipped: {err}"));
+    };
+    let idle = CarriedIntent {
+        pending: false,
+        remind: false,
+    };
+    let still_pending = CarriedIntent {
+        pending: true,
+        remind: false,
+    };
+
+    // The unlocked read keeps ordinary prompts from taking the lock.
+    let state = match memory_hook::load_state(&config.state_dir, session_id) {
+        Ok(state) => state,
+        Err(err) => {
+            skipped(err);
+            return idle;
+        }
+    };
+    if !state.memory_pending {
+        return idle;
+    }
+    let receipt_count = match memory_hook::load_write_receipts(&config.state_dir, session_id) {
+        Ok(receipts) => receipts.len(),
+        Err(err) => {
+            skipped(err);
+            return still_pending;
+        }
+    };
+    if state.written_since_intent(receipt_count) {
+        return match memory_hook::mark_memory_satisfied(
+            &config.state_dir,
+            session_id,
+            receipt_count,
+            &hook_options(config),
+        ) {
+            Ok(state) => CarriedIntent {
+                pending: state.memory_pending,
+                remind: false,
+            },
+            Err(err) => {
+                skipped(err);
+                still_pending
+            }
+        };
+    }
+    if state.carried_reminder_sent {
+        return still_pending;
+    }
+    match memory_hook::take_carried_reminder(&config.state_dir, session_id, &hook_options(config)) {
+        Ok(remind) => CarriedIntent {
+            pending: true,
+            remind,
+        },
+        Err(err) => {
+            skipped(err);
+            still_pending
+        }
+    }
 }
 
 fn carried_memory_reminder() -> &'static str {
