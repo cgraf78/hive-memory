@@ -8199,6 +8199,228 @@ fn hook_stop_reminds_when_memory_pending_remains() {
         .stdout(predicate::str::contains("\"memory_pending\": true"));
 }
 
+/// Write a minimal one-store config for hook memory-pending tests.
+fn pending_hook_config(name: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let dir = temp_dir(name);
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    let state = dir.join("state");
+    fs::write(
+        &config,
+        format!(
+            r#"
+            default_store = "personal"
+            state_dir = "{}"
+            cache_dir = "{}"
+
+            [stores.personal]
+            root = "{}"
+            "#,
+            state.display(),
+            state.join("cache").display(),
+            personal.display()
+        ),
+    )
+    .expect("write config");
+    (config, personal, state)
+}
+
+/// Run `hm hook prompt-submit --json` for a session and return stdout.
+fn pending_prompt(config: &std::path::Path, session: &str, text: &str) -> String {
+    let mut cmd = cargo_bin_cmd!("hm");
+    if !session.is_empty() {
+        cmd.env("HIVE_MEMORY_SESSION_ID", session);
+    }
+    let output = cmd
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "hook",
+            "prompt-submit",
+            "--text",
+            text,
+            "--json",
+        ])
+        .output()
+        .expect("run prompt-submit");
+    assert!(output.status.success(), "prompt-submit failed: {output:?}");
+    String::from_utf8(output.stdout).expect("utf8 stdout")
+}
+
+const CARRIED: &str = "durable memory intent from an earlier prompt is still pending";
+
+#[test]
+fn hook_prompt_submit_carries_unsatisfied_intent_to_the_next_prompt_once() {
+    let (config, _, _) = pending_hook_config("hook-carried-once");
+    pending_prompt(
+        &config,
+        "carry-1",
+        "Please remember this repo prefers cargo-dist releases.",
+    );
+
+    // The intent survived a whole turn without a write: the next prompt carries
+    // the reminder, because stop-hook output never reaches some hosts' models.
+    let second = pending_prompt(&config, "carry-1", "Now fix the failing test.");
+    assert!(second.contains(CARRIED), "{second}");
+    assert!(second.contains("\"memory_pending\": true"), "{second}");
+
+    // Once per intent: later prompts do not nag again.
+    let third = pending_prompt(&config, "carry-1", "And update the changelog.");
+    assert!(!third.contains("\"kind\": \"remind\""), "{third}");
+    assert!(third.contains("\"memory_pending\": true"), "{third}");
+}
+
+#[test]
+fn hook_prompt_submit_does_not_carry_intent_after_a_write() {
+    let (config, personal, _) = pending_hook_config("hook-carried-satisfied");
+    init_store(&personal, "personal");
+    pending_prompt(
+        &config,
+        "carry-2",
+        "Please remember this project uses release trains.",
+    );
+
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .env("HIVE_MEMORY_SESSION_ID", "carry-2")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--scope",
+            "project",
+            "--project-id",
+            "repo-b",
+            "--text",
+            "This project uses release trains.",
+        ])
+        .assert()
+        .success();
+    let mut tool = cargo_bin_cmd!("hm");
+    tool.env("HIVE_MEMORY_SESSION_ID", "carry-2")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "hook",
+            "tool-complete",
+            "--status",
+            "0",
+        ])
+        .assert()
+        .success();
+
+    let next = pending_prompt(&config, "carry-2", "Next task, please.");
+    assert!(!next.contains("\"kind\": \"remind\""), "{next}");
+    assert!(next.contains("\"memory_pending\": false"), "{next}");
+}
+
+#[test]
+fn hook_prompt_submit_rearms_the_carried_reminder_for_new_intent() {
+    let (config, _, _) = pending_hook_config("hook-carried-rearm");
+    pending_prompt(
+        &config,
+        "carry-3",
+        "Please remember this repo prefers cargo-dist releases.",
+    );
+    assert!(pending_prompt(&config, "carry-3", "Fix the build.").contains(CARRIED));
+
+    // New intent gets its own prompt-time reminder, then its own follow-up.
+    let intent = pending_prompt(
+        &config,
+        "carry-3",
+        "For future reference, we pin MSRV 1.89.",
+    );
+    assert!(intent.contains("\"kind\": \"remind\""), "{intent}");
+    assert!(!intent.contains(CARRIED), "{intent}");
+    assert!(pending_prompt(&config, "carry-3", "Run the tests.").contains(CARRIED));
+}
+
+#[test]
+fn hook_prompt_submit_skips_the_carried_reminder_when_a_write_receipt_is_unconsumed() {
+    // `hm remember` succeeded but tool-complete never saw a zero exit (the
+    // Bash command failed later, or the host has no tool hook).
+    let (config, personal, _) = pending_hook_config("hook-carried-receipt");
+    init_store(&personal, "personal");
+    pending_prompt(
+        &config,
+        "carry-4",
+        "Please remember this project uses release trains.",
+    );
+    let mut remember = cargo_bin_cmd!("hm");
+    remember
+        .env("HIVE_MEMORY_SESSION_ID", "carry-4")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--scope",
+            "project",
+            "--project-id",
+            "repo-b",
+            "--text",
+            "This project uses release trains.",
+        ])
+        .assert()
+        .success();
+
+    let next = pending_prompt(&config, "carry-4", "Next task, please.");
+    assert!(!next.contains(CARRIED), "{next}");
+}
+
+#[test]
+fn hook_context_reset_rearms_the_carried_reminder() {
+    let (config, _, _) = pending_hook_config("hook-carried-reset");
+    pending_prompt(
+        &config,
+        "carry-5",
+        "Please remember this repo prefers cargo-dist releases.",
+    );
+    assert!(pending_prompt(&config, "carry-5", "Fix the build.").contains(CARRIED));
+
+    let mut reset = cargo_bin_cmd!("hm");
+    reset
+        .env("HIVE_MEMORY_SESSION_ID", "carry-5")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "hook",
+            "context-reset",
+        ])
+        .assert()
+        .success();
+
+    // The host lost the earlier reminder with its context.
+    assert!(pending_prompt(&config, "carry-5", "Continue.").contains(CARRIED));
+}
+
+#[test]
+fn hook_prompt_submit_carries_pending_intent_from_an_older_state_file() {
+    // State written before `carried_reminder_sent` existed has no such field.
+    let (config, _, state) = pending_hook_config("hook-carried-legacy");
+    let run = state.join("runs/carry-6");
+    fs::create_dir_all(&run).expect("create run dir");
+    fs::write(
+        run.join("hook-state.json"),
+        r#"{"memory_pending": true, "pending_reason": "prompt contained explicit durable-memory intent"}"#,
+    )
+    .expect("write legacy state");
+
+    assert!(pending_prompt(&config, "carry-6", "Next task.").contains(CARRIED));
+    assert!(!pending_prompt(&config, "carry-6", "Another task.").contains(CARRIED));
+}
+
+#[test]
+fn hook_prompt_submit_without_a_session_never_carries_a_reminder() {
+    let (config, _, _) = pending_hook_config("hook-carried-no-session");
+    pending_prompt(
+        &config,
+        "",
+        "Please remember this repo prefers cargo-dist releases.",
+    );
+    let next = pending_prompt(&config, "", "Now fix the failing test.");
+    assert!(!next.contains(CARRIED), "{next}");
+}
+
 #[test]
 fn hook_prompt_submit_does_not_emit_initial_context() {
     let dir = temp_dir("hook-prompt-no-initial-context");

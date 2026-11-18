@@ -44,6 +44,14 @@ pub struct HookState {
     /// Short human-readable reason for the pending reminder.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_reason: Option<String>,
+    /// Whether the follow-up reminder for the current pending intent was sent.
+    ///
+    /// Intent still pending at a later prompt means the earlier turn ended
+    /// without the write. That turn's stop reminder cannot be relied on, since
+    /// several hosts never show stop-hook output to the model, so the next
+    /// prompt carries it instead, once per pending intent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub carried_reminder_sent: bool,
     /// RFC3339 timestamp of the last state update.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
@@ -631,10 +639,39 @@ pub fn mark_memory_pending(
         |state| {
             state.memory_pending = true;
             state.pending_reason = Some(reason);
+            // New intent starts a new episode: its own prompt already carries
+            // the intent reminder, and it earns one follow-up of its own.
+            state.carried_reminder_sent = false;
             state.updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
         },
         options,
     )
+}
+
+/// Claim the one follow-up reminder for intent that outlived its turn.
+///
+/// Returns true at most once per pending intent, and only while it is still
+/// pending. The check and the claim happen under the session lock, so parallel
+/// hooks sharing a session (subagents) cannot both deliver it.
+pub fn take_carried_reminder(
+    state_dir: &Path,
+    session_id: &str,
+    options: &write::AtomicWriteOptions,
+) -> Result<bool, HookStateError> {
+    let mut claimed = false;
+    with_state_lock(
+        state_dir,
+        session_id,
+        |state| {
+            if state.memory_pending && !state.carried_reminder_sent {
+                state.carried_reminder_sent = true;
+                state.updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
+                claimed = true;
+            }
+        },
+        options,
+    )?;
+    Ok(claimed)
 }
 
 /// Clear durable-memory intent after a successful write receipt is observed.
@@ -653,6 +690,7 @@ pub fn mark_memory_satisfied(
         |state| {
             state.memory_pending = false;
             state.pending_reason = None;
+            state.carried_reminder_sent = false;
             state.updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
         },
         options,
@@ -677,6 +715,7 @@ pub fn mark_receipts_refreshed(
             if clear_memory_pending {
                 state.memory_pending = false;
                 state.pending_reason = None;
+                state.carried_reminder_sent = false;
             }
             state.updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
         },
@@ -780,6 +819,9 @@ pub fn reset_context_epoch(
             state.prompt_recall_memory_ids.clear();
             state.prompt_recall_updated_at = None;
             state.context_epoch_started_at = Some(now.clone());
+            // The host forgot the earlier reminder along with the rest of its
+            // context, so intent that is still pending earns one more follow-up.
+            state.carried_reminder_sent = false;
             state.updated_at = Some(now);
         },
         options,

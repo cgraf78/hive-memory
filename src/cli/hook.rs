@@ -746,6 +746,40 @@ fn run_prompt_submit(args: HookPromptSubmitArgs, context: CliContext) -> Result<
                 &hook_options(&config),
             )?;
         }
+    } else if let Some(session_id) = session_id.as_deref() {
+        // Intent from an earlier prompt that is still pending survived a whole
+        // turn without a write. Deliver the follow-up here rather than relying
+        // on the stop reminder, which several hosts never show to the model.
+        // The unlocked read keeps ordinary prompts from taking the lock.
+        let state = memory_hook::load_state(&config.state_dir, session_id)?;
+        if state.memory_pending && !state.carried_reminder_sent {
+            memory_pending = true;
+            // A receipt tool-complete has not consumed yet means the write
+            // happened (its tool exited nonzero, or the host has no tool hook),
+            // so "still pending" would be wrong. Leave clearing to tool-complete.
+            let unconsumed_write = memory_hook::load_write_receipts(&config.state_dir, session_id)?
+                .len()
+                > state.refreshed_receipts;
+            if !unconsumed_write {
+                // A busy session lock costs only this reminder, never the prompt
+                // and the context already prepared for it.
+                match memory_hook::take_carried_reminder(
+                    &config.state_dir,
+                    session_id,
+                    &hook_options(&config),
+                ) {
+                    Ok(true) => {
+                        actions.push(HookAction::new("remind", carried_memory_reminder()));
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        warnings.push(format!("Hive Memory follow-up reminder skipped: {err}"))
+                    }
+                }
+            }
+        } else if state.memory_pending {
+            memory_pending = true;
+        }
     }
 
     let response = HookResponse {
@@ -867,6 +901,10 @@ fn run_tool_complete(args: HookToolCompleteArgs, context: CliContext) -> Result<
 }
 
 /// Remind at session end if explicit memory intent has not been satisfied.
+///
+/// Several hosts never show stop-hook output to the model, so this reminder is
+/// best effort; `run_prompt_submit` delivers the reliable follow-up at the next
+/// prompt.
 fn run_stop(args: HookStopArgs, context: CliContext) -> Result<()> {
     let config = load_config(context.config_path.as_deref())?;
     let mut warnings = Vec::new();
@@ -2355,6 +2393,10 @@ fn validate_hook_context_read_policy(
 
 fn memory_intent_reminder() -> &'static str {
     "Hive Memory: this prompt sounds like durable memory intent. If it remains useful, write it with `hm remember --scope project --text \"...\"` or `hm remember --text \"...\"`."
+}
+
+fn carried_memory_reminder() -> &'static str {
+    "Hive Memory: durable memory intent from an earlier prompt is still pending. If it is still useful, write it with `hm remember`; otherwise continue without writing."
 }
 
 fn stop_memory_reminder() -> &'static str {

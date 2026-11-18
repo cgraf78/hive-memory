@@ -1542,8 +1542,14 @@ Behavior:
   detectors, not a guarantee that every form of sensitive text is recognized.
 
   It also runs the durable-memory intent heuristic and
-  records `memory-pending` when the heuristic matches. It returns `inject_context`
-  and/or `remind` actions as needed.
+  records `memory-pending` when the heuristic matches. When the prompt has no
+  new intent but `memory-pending` is still set from an earlier prompt, that turn
+  ended without the write, so it returns one follow-up `remind` action per
+  pending intent (tracked in session state under the session lock). The
+  follow-up is skipped while an unconsumed write receipt shows the write already
+  happened, a busy session lock only skips it with a warning, and a
+  `context-reset` re-arms it because the host lost the earlier reminder. It returns
+  `inject_context` and/or `remind` actions as needed.
 - `tool-complete`: after a successful tool event, reads session write receipts,
   clears `memory-pending` when a new receipt proves a memory write occurred,
   returns without waiting for canonical storage, and schedules detached index
@@ -1551,7 +1557,9 @@ Behavior:
   refreshes all configured stores and advances the receipt cursor only after
   every represented store was refreshed. Tool completion does not emit context
   or change the session's project selection.
-- `stop`: if `memory-pending` remains, returns a reminder action. It may run
+- `stop`: if `memory-pending` remains, returns a reminder action. Several hosts
+  never show stop-hook output to the model, so this reminder is best effort and
+  the reliable follow-up is the next `prompt-submit`. It may run
   `hm refresh --force` equivalent maintenance when configured, but it MUST NOT
   write canonical memory automatically. When `[classifier].mode` allows it, it
   starts a detached classifier unless the last run is fresher than
@@ -1969,8 +1977,11 @@ Required hook behaviors:
   events. `hm` owns immediate receipt acknowledgement, clearing
   `memory-pending`, and detached receipt-aware index refresh. PostToolUse does
   not inject context or wait for canonical storage.
-- **Stop**: call `hm hook stop`. If it returns a reminder action, show it. Stop
-  hooks MUST NOT write new memories automatically.
+- **Stop**: call `hm hook stop`. If it returns a reminder action, show it when
+  the host lets stop output reach the model; adapters that cannot may drop it,
+  because the next `prompt-submit` carries a follow-up. An adapter that defers
+  stop output into the next prompt may show both. Stop hooks MUST NOT write new
+  memories automatically.
 
 Hooks MAY call lower-level `hm context --if-changed` or `hm refresh --quiet` for
 manual debugging or one-off integrations, but v1 dotfiles hooks should prefer
@@ -2524,6 +2535,9 @@ Test categories per module:
   clear memory-pending.
 - `hm hook stop --json` returns a reminder action when memory-pending remains
   and never writes canonical memory.
+- `hm hook prompt-submit` without new intent returns one follow-up reminder per
+  pending intent that survived a turn, none after an unconsumed write receipt,
+  and re-arms it after `context-reset` or new intent.
 - `HIVE_MEMORY_HOOK_ACTIVE=1` is scoped to hook-launched low-level `hm`
   subprocesses and LLM backend processes, and is not leaked into normal agent
   tool commands.
