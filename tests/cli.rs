@@ -4904,12 +4904,9 @@ fn repeated_tool_hooks_do_not_respawn_the_same_receipt_refresh() {
     let state_lock = memory_hook::try_state_lock(&state, session)
         .expect("state attempt lock")
         .expect("hold state attempt lock");
-    tool_hook(session)
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "timed out after 500ms waiting for hook state lock",
-        ));
+    // No intent is pending, so the hook needs no state write and succeeds;
+    // the refresh spawn only tries the lock and skips while it is held.
+    tool_hook(session).assert().success();
     let attempt = memory_hook::receipt_refresh_attempt_path(&state, session);
     assert!(
         !attempt.exists(),
@@ -8336,7 +8333,7 @@ fn hook_prompt_submit_rearms_the_carried_reminder_for_new_intent() {
 }
 
 #[test]
-fn hook_prompt_submit_skips_the_carried_reminder_when_a_write_receipt_is_unconsumed() {
+fn hook_prompt_submit_clears_intent_written_without_a_tool_complete() {
     // `hm remember` succeeded but tool-complete never saw a zero exit (the
     // Bash command failed later, or the host has no tool hook).
     let (config, personal, _) = pending_hook_config("hook-carried-receipt");
@@ -8363,8 +8360,28 @@ fn hook_prompt_submit_skips_the_carried_reminder_when_a_write_receipt_is_unconsu
         .assert()
         .success();
 
+    // Stop does not call a written intent pending, so hosts that defer stop
+    // output into the next prompt get no stale reminder.
+    let stop = cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", "carry-4")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "hook",
+            "stop",
+            "--json",
+        ])
+        .output()
+        .expect("run stop");
+    assert!(stop.status.success(), "stop failed: {stop:?}");
+    let stop = String::from_utf8(stop.stdout).expect("utf8 stdout");
+    assert!(!stop.contains("\"kind\": \"remind\""), "{stop}");
+    assert!(stop.contains("\"memory_pending\": false"), "{stop}");
+
     let next = pending_prompt(&config, "carry-4", "Next task, please.");
     assert!(!next.contains(CARRIED), "{next}");
+    // Cleared here, so later prompts do not report it as pending.
+    assert!(next.contains("\"memory_pending\": false"), "{next}");
 }
 
 #[test]
@@ -8419,6 +8436,88 @@ fn hook_prompt_submit_without_a_session_never_carries_a_reminder() {
     );
     let next = pending_prompt(&config, "", "Now fix the failing test.");
     assert!(!next.contains(CARRIED), "{next}");
+}
+
+/// Run `hm remember` in a session, leaving a write receipt.
+fn pending_remember(config: &std::path::Path, session: &str, text: &str) {
+    cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", session)
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            text,
+        ])
+        .assert()
+        .success();
+}
+
+/// Run a successful `hm hook tool-complete --json` and return stdout.
+fn pending_tool_complete(config: &std::path::Path, session: &str) -> String {
+    let output = cargo_bin_cmd!("hm")
+        .env("HIVE_MEMORY_SESSION_ID", session)
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "hook",
+            "tool-complete",
+            "--status",
+            "0",
+            "--json",
+        ])
+        .output()
+        .expect("run tool-complete");
+    assert!(output.status.success(), "tool-complete failed: {output:?}");
+    String::from_utf8(output.stdout).expect("utf8 stdout")
+}
+
+#[test]
+fn hook_receipts_written_before_the_intent_do_not_satisfy_it() {
+    // A receipt whose index refresh never succeeded stays past the refresh
+    // cursor. It predates the intent, so neither tool-complete nor the next
+    // prompt may treat it as the write the intent asked for.
+    let (config, personal, _) = pending_hook_config("hook-receipt-before-intent");
+    init_store(&personal, "personal");
+    pending_remember(&config, "carry-7", "Release notes live in CHANGELOG.md.");
+    pending_prompt(
+        &config,
+        "carry-7",
+        "Please remember this repo prefers cargo-dist releases.",
+    );
+
+    let tool = pending_tool_complete(&config, "carry-7");
+    assert!(tool.contains("\"memory_pending\": true"), "{tool}");
+    let next = pending_prompt(&config, "carry-7", "Now fix the failing test.");
+    assert!(next.contains(CARRIED), "{next}");
+
+    // A write after the intent satisfies it.
+    pending_remember(&config, "carry-7", "This repo prefers cargo-dist releases.");
+    let tool = pending_tool_complete(&config, "carry-7");
+    assert!(tool.contains("\"memory_pending\": false"), "{tool}");
+}
+
+#[test]
+fn hook_prompt_submit_survives_unreadable_write_receipts() {
+    // Corrupt receipts cost only the receipt-dependent bookkeeping, never the
+    // prompt hook and the context it carries.
+    let (config, _, state) = pending_hook_config("hook-receipts-corrupt");
+    let run = state.join("runs/carry-8");
+    fs::create_dir_all(&run).expect("create run dir");
+    fs::write(run.join("writes.jsonl"), "not json\n").expect("write corrupt receipts");
+
+    let intent = pending_prompt(
+        &config,
+        "carry-8",
+        "Please remember this repo prefers cargo-dist releases.",
+    );
+    assert!(intent.contains("write receipts unreadable"), "{intent}");
+    assert!(intent.contains("\"memory_pending\": true"), "{intent}");
+
+    let next = pending_prompt(&config, "carry-8", "Now fix the failing test.");
+    assert!(next.contains("follow-up reminder skipped"), "{next}");
+    // The state read succeeded, so the intent is still reported as pending.
+    assert!(next.contains("\"memory_pending\": true"), "{next}");
 }
 
 #[test]

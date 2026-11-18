@@ -52,6 +52,17 @@ pub struct HookState {
     /// prompt carries it instead, once per pending intent.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub carried_reminder_sent: bool,
+    /// Write receipt count when the current pending intent was recorded.
+    ///
+    /// Only a receipt appended after this point proves the intent was
+    /// satisfied. `refreshed_receipts` cannot answer that: it advances only
+    /// when detached index refresh succeeds, so a failing refresh would leave
+    /// old receipts looking new and clear every later intent without a write.
+    /// `None` means the intent was recorded by a binary that predates this
+    /// field (or the field was dropped by one); see
+    /// [`HookState::written_since_intent`] for the fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_receipt_base: Option<usize>,
     /// RFC3339 timestamp of the last state update.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
@@ -145,6 +156,17 @@ impl HookState {
         self.delivered
             .iter()
             .any(|memory| memory.id == id && memory.digest == digest)
+    }
+
+    /// Return whether a write receipt was appended after the pending intent.
+    ///
+    /// `receipt_count` is the session's current receipt count. Receipts are
+    /// append-only, so a count above the base means a write happened since the
+    /// intent was recorded. Without a recorded base, fall back to the refresh
+    /// cursor, the rule older binaries used, rather than counting every
+    /// receipt in the session as new.
+    pub fn written_since_intent(&self, receipt_count: usize) -> bool {
+        receipt_count > self.pending_receipt_base.unwrap_or(self.refreshed_receipts)
     }
 }
 
@@ -626,10 +648,16 @@ pub fn save_state(
 }
 
 /// Mark durable-memory intent as pending for a session.
+///
+/// `receipt_base` is the session's write receipt count when the intent was
+/// seen; only receipts appended after it satisfy this intent. `None` (the
+/// receipts could not be read) freezes the refresh cursor as the base, the
+/// most conservative count available without them.
 pub fn mark_memory_pending(
     state_dir: &Path,
     session_id: &str,
     reason: impl Into<String>,
+    receipt_base: Option<usize>,
     options: &write::AtomicWriteOptions,
 ) -> Result<HookState, HookStateError> {
     let reason = reason.into();
@@ -639,6 +667,7 @@ pub fn mark_memory_pending(
         |state| {
             state.memory_pending = true;
             state.pending_reason = Some(reason);
+            state.pending_receipt_base = Some(receipt_base.unwrap_or(state.refreshed_receipts));
             // New intent starts a new episode: its own prompt already carries
             // the intent reminder, and it earns one follow-up of its own.
             state.carried_reminder_sent = false;
@@ -674,35 +703,44 @@ pub fn take_carried_reminder(
     Ok(claimed)
 }
 
-/// Clear durable-memory intent after a successful write receipt is observed.
+/// Clear durable-memory intent if a write receipt arrived after it.
 ///
-/// This is separate from the refresh cursor: latency-sensitive tool hooks can
-/// acknowledge the write immediately while detached index maintenance advances
-/// `refreshed_receipts` only after it succeeds.
+/// `receipt_count` is the session's current receipt count. Pending intent is
+/// cleared only when it is [`HookState::written_since_intent`]; the check runs
+/// under the session lock, so intent recorded concurrently is not cleared by
+/// an older write. This is separate from the refresh cursor: latency-sensitive
+/// tool hooks can acknowledge the write immediately while detached index
+/// maintenance advances `refreshed_receipts` only after it succeeds.
 pub fn mark_memory_satisfied(
     state_dir: &Path,
     session_id: &str,
+    receipt_count: usize,
     options: &write::AtomicWriteOptions,
 ) -> Result<HookState, HookStateError> {
     with_state_lock(
         state_dir,
         session_id,
         |state| {
-            state.memory_pending = false;
-            state.pending_reason = None;
-            state.carried_reminder_sent = false;
-            state.updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
+            if state.memory_pending && state.written_since_intent(receipt_count) {
+                state.memory_pending = false;
+                state.pending_reason = None;
+                state.carried_reminder_sent = false;
+                state.updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
+            }
         },
         options,
     )
 }
 
-/// Record that refresh/tool-complete consumed receipts through `receipt_count`.
+/// Record that index refresh consumed receipts through `receipt_count`.
+///
+/// This never touches memory-pending: refresh progress says nothing about
+/// whether a write happened after the intent (see
+/// [`HookState::written_since_intent`]).
 pub fn mark_receipts_refreshed(
     state_dir: &Path,
     session_id: &str,
     receipt_count: usize,
-    clear_memory_pending: bool,
     options: &write::AtomicWriteOptions,
 ) -> Result<HookState, HookStateError> {
     with_state_lock(
@@ -712,11 +750,6 @@ pub fn mark_receipts_refreshed(
             // Detached refresh children can finish out of launch order. Never
             // let an older child move the durable cursor backward.
             state.refreshed_receipts = state.refreshed_receipts.max(receipt_count);
-            if clear_memory_pending {
-                state.memory_pending = false;
-                state.pending_reason = None;
-                state.carried_reminder_sent = false;
-            }
             state.updated_at = Some(rfc3339(OffsetDateTime::now_utc()));
         },
         options,
@@ -1236,8 +1269,14 @@ mod tests {
             let pending_barrier = std::sync::Arc::clone(&barrier);
             let pending = std::thread::spawn(move || {
                 pending_barrier.wait();
-                mark_memory_pending(&pending_dir, &pending_session, "intent", &options())
-                    .expect("mark pending");
+                mark_memory_pending(
+                    &pending_dir,
+                    &pending_session,
+                    "intent",
+                    Some(0),
+                    &options(),
+                )
+                .expect("mark pending");
             });
 
             let startup_dir = dir.clone();
@@ -1276,8 +1315,14 @@ mod tests {
     fn memory_pending_round_trips() {
         let dir = temp_dir("pending");
 
-        let saved = mark_memory_pending(&dir, "session-1", "explicit memory intent", &options())
-            .expect("mark pending");
+        let saved = mark_memory_pending(
+            &dir,
+            "session-1",
+            "explicit memory intent",
+            Some(0),
+            &options(),
+        )
+        .expect("mark pending");
         let loaded = load_state(&dir, "session-1").expect("load state");
 
         assert!(saved.memory_pending);
@@ -1501,24 +1546,61 @@ mod tests {
     }
 
     #[test]
-    fn refreshed_receipt_count_clears_pending() {
+    fn refreshed_receipt_count_leaves_pending_intent_alone() {
         let dir = temp_dir("receipt-count");
-        mark_memory_pending(&dir, "session-1", "intent", &options()).expect("mark pending");
+        mark_memory_pending(&dir, "session-1", "intent", Some(0), &options())
+            .expect("mark pending");
 
         let state =
-            mark_receipts_refreshed(&dir, "session-1", 2, true, &options()).expect("mark refresh");
+            mark_receipts_refreshed(&dir, "session-1", 2, &options()).expect("mark refresh");
 
-        assert!(!state.memory_pending);
+        assert!(state.memory_pending);
         assert_eq!(state.refreshed_receipts, 2);
+    }
+
+    #[test]
+    fn satisfied_needs_a_receipt_past_the_base_under_the_lock() {
+        // A tool hook that counted receipts before a newer intent recorded its
+        // base must not clear that intent with the stale count.
+        let dir = temp_dir("satisfied-base");
+        mark_memory_pending(&dir, "s", "intent", Some(2), &options()).expect("pending");
+
+        let state = mark_memory_satisfied(&dir, "s", 2, &options()).expect("stale count");
+        assert!(state.memory_pending);
+        let state = mark_memory_satisfied(&dir, "s", 3, &options()).expect("new receipt");
+        assert!(!state.memory_pending);
+    }
+
+    #[test]
+    fn unknown_receipt_base_freezes_the_refresh_cursor() {
+        let dir = temp_dir("pending-base-unknown");
+        mark_receipts_refreshed(&dir, "s", 3, &options()).expect("refresh");
+        let state = mark_memory_pending(&dir, "s", "intent", None, &options()).expect("pending");
+        assert_eq!(state.pending_receipt_base, Some(3));
+
+        // A later refresh must not move the frozen base past a real write.
+        mark_receipts_refreshed(&dir, "s", 4, &options()).expect("refresh again");
+        assert!(load_state(&dir, "s").expect("load").written_since_intent(4));
+    }
+
+    #[test]
+    fn legacy_pending_state_falls_back_to_the_refresh_cursor() {
+        // State saved by a binary that predates `pending_receipt_base` must
+        // not count every receipt in the session as written after the intent.
+        let state: HookState =
+            serde_json::from_str(r#"{"memory_pending": true, "refreshed_receipts": 3}"#)
+                .expect("legacy state");
+        assert_eq!(state.pending_receipt_base, None);
+        assert!(!state.written_since_intent(3));
+        assert!(state.written_since_intent(4));
     }
 
     #[test]
     fn refreshed_receipt_count_is_monotonic_across_out_of_order_workers() {
         let dir = temp_dir("receipt-count-monotonic");
-        mark_receipts_refreshed(&dir, "session-1", 2, false, &options())
-            .expect("newer worker completes");
+        mark_receipts_refreshed(&dir, "session-1", 2, &options()).expect("newer worker completes");
 
-        let state = mark_receipts_refreshed(&dir, "session-1", 1, false, &options())
+        let state = mark_receipts_refreshed(&dir, "session-1", 1, &options())
             .expect("older worker completes later");
 
         assert_eq!(state.refreshed_receipts, 2);
@@ -1576,7 +1658,8 @@ mod tests {
     #[test]
     fn context_key_round_trips_without_clearing_pending() {
         let dir = temp_dir("context-key");
-        mark_memory_pending(&dir, "session-1", "intent", &options()).expect("mark pending");
+        mark_memory_pending(&dir, "session-1", "intent", Some(0), &options())
+            .expect("mark pending");
 
         let state = mark_context_key(&dir, "session-1", "agent=codex|store=personal", &options())
             .expect("mark context key");
@@ -1765,7 +1848,7 @@ mod tests {
     #[test]
     fn topic_and_delivery_bookkeeping_preserve_each_other_and_pending_debt() {
         let dir = temp_dir("topic-bookkeeping");
-        mark_memory_pending(&dir, "s", "intent", &options()).expect("pending");
+        mark_memory_pending(&dir, "s", "intent", Some(0), &options()).expect("pending");
         set_recall_topic(
             &dir,
             "s",
@@ -1815,7 +1898,7 @@ mod tests {
     #[test]
     fn reset_context_epoch_clears_visibility_state_only() {
         let dir = temp_dir("delivery-reset");
-        mark_memory_pending(&dir, "s", "intent", &options()).expect("pending");
+        mark_memory_pending(&dir, "s", "intent", Some(0), &options()).expect("pending");
         mark_startup_context(&dir, "s", "ctx", vec!["legacy".to_owned()], &options())
             .expect("startup");
         mark_prompt_recall(&dir, "s", "recall", vec!["r".to_owned()], &options()).expect("recall");

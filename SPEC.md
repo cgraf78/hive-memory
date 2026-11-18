@@ -1545,22 +1545,33 @@ Behavior:
   detectors, not a guarantee that every form of sensitive text is recognized.
 
   It also runs the durable-memory intent heuristic and
-  records `memory-pending` when the heuristic matches. When the prompt has no
-  new intent but `memory-pending` is still set from an earlier prompt, that turn
-  ended without the write, so it returns one follow-up `remind` action per
-  pending intent (tracked in session state under the session lock). The
-  follow-up is skipped while an unconsumed write receipt shows the write already
-  happened, a busy session lock only skips it with a warning, and a
-  `context-reset` re-arms it because the host lost the earlier reminder. It returns
-  `inject_context` and/or `remind` actions as needed.
+  records `memory-pending` when the heuristic matches, together with the
+  session's write receipt count at that moment (`pending_receipt_base`). Only a
+  receipt appended after that base satisfies the intent; the refresh cursor
+  (`refreshed_receipts`) is not used, because it stalls while index refresh
+  fails and would make old receipts look like new writes. If the receipts
+  cannot be read, the base is the refresh cursor at that moment; state written
+  without a base (older binaries) falls back to the current refresh cursor.
+  When the prompt has no new intent but `memory-pending` is still set from an
+  earlier prompt, a receipt past the base means the write happened without a
+  successful tool-complete (its tool exited nonzero, or the host has no tool
+  hook), so it clears `memory-pending`. Otherwise that turn ended without the
+  write, and it returns one follow-up `remind` action per pending intent
+  (tracked in session state under the session lock). On this follow-up path,
+  unreadable receipts or a busy session lock only skip the follow-up with a
+  warning and never fail the prompt; the intent is still reported as pending.
+  (Unreadable hook state still fails prompt-submit earlier, as before.) A
+  `context-reset` re-arms the follow-up because the host lost the earlier
+  reminder. It returns `inject_context` and/or `remind` actions as needed.
 - `tool-complete`: after a successful tool event, reads session write receipts,
-  clears `memory-pending` when a new receipt proves a memory write occurred,
-  returns without waiting for canonical storage, and schedules detached index
+  clears `memory-pending` when a receipt past its base proves a memory write
+  occurred, returns without waiting for canonical storage, and schedules detached index
   refresh. A single-store receipt batch targets that store; a mixed batch
   refreshes all configured stores and advances the receipt cursor only after
   every represented store was refreshed. Tool completion does not emit context
   or change the session's project selection.
-- `stop`: if `memory-pending` remains, returns a reminder action. Several hosts
+- `stop`: if `memory-pending` remains and no receipt appended after the
+  intent shows the write happened, returns a reminder action. Several hosts
   never show stop-hook output to the model, so this reminder is best effort and
   the reliable follow-up is the next `prompt-submit`. It may run
   `hm refresh --force` equivalent maintenance when configured, but it MUST NOT
@@ -2531,7 +2542,9 @@ Test categories per module:
   is sent once per change, as untracked hooks send it, and turn recall moves
   on to hits it has not shown in the epoch before repeating any.
 - `hm hook tool-complete --status 0 --json` clears memory-pending immediately
-  when a receipt proves a write, then schedules bounded detached index refresh.
+  when a receipt appended after the intent proves a write, then schedules
+  bounded detached index refresh. Receipts from before the intent never clear
+  it, even while their refresh keeps failing.
   The child advances `refreshed_receipts` only after every selected store was
   actually refreshed; foreground tool-complete never waits on canonical I/O.
 - `hm hook tool-complete --status nonzero` does not run refresh and does not
@@ -2539,8 +2552,11 @@ Test categories per module:
 - `hm hook stop --json` returns a reminder action when memory-pending remains
   and never writes canonical memory.
 - `hm hook prompt-submit` without new intent returns one follow-up reminder per
-  pending intent that survived a turn, none after an unconsumed write receipt,
-  and re-arms it after `context-reset` or new intent.
+  pending intent that survived a turn, clears the intent instead when a receipt
+  appended after it shows the write happened, skips with a warning when
+  receipts are unreadable, and re-arms it after `context-reset` or new intent.
+- `hm hook stop --json` does not remind when a receipt appended after the
+  intent shows the write happened.
 - `HIVE_MEMORY_HOOK_ACTIVE=1` is scoped to hook-launched low-level `hm`
   subprocesses and LLM backend processes, and is not leaked into normal agent
   tool commands.
