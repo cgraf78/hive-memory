@@ -44,7 +44,13 @@ const ADAPTERS: &[Adapter] = &[
     },
     Adapter {
         label: "claude",
-        argv: &["claude", "-p"],
+        // `claude -p` is a full headless agent session with the user's
+        // permission mode, which may allow tools without prompting. The memory
+        // operations only need model output, and a tool-using backend could
+        // edit files or run `hm remember` against the store it is classifying,
+        // so offer it no built-in tools, as the Codex adapter's read-only
+        // sandbox does.
+        argv: &["claude", "-p", "--tools", ""],
         model_flag: Some("--model"),
     },
     Adapter {
@@ -644,8 +650,15 @@ mod tests {
             ]
         );
 
-        let detected = detect(Some("claude"), &[], None, Some(&path)).expect("detect claude");
+        // The empty `--tools` value must stay its own argument so Claude gets
+        // no built-in tools, and the model flag must follow it.
+        let detected =
+            detect(Some("claude"), &[], Some("fast"), Some(&path)).expect("detect claude");
         assert_eq!(detected.label, "claude");
+        assert_eq!(
+            detected.argv,
+            ["claude", "-p", "--tools", "", "--model", "fast"]
+        );
 
         assert!(detect(None, &[], None, Some("")).is_none());
     }
