@@ -185,10 +185,10 @@ Validation rules:
 - In `mode = "auto"`, backend auto-detection only considers known backend labels
   that also exist under `[agents]`; `mode = "on"` or explicit `backend = ...`
   opts into the selected adapter. When multiple allowed backends are installed,
-  auto-detection prefers `codex`, then `claude`, then `gemini`. Built-in
-  adapters must not give the backend tools that change state: `codex` runs
-  with a read-only sandbox and `claude` with no built-in tools (`--tools ""`),
-  because the backend needs only model output. `grok` is a
+  auto-detection prefers `codex`, then `claude`, then `gemini`. The backend
+  needs only model output, so built-in adapters restrict tools where the CLI
+  allows it: `codex` runs with a read-only sandbox, and `claude` runs with no
+  built-in tools and no MCP servers (`--tools "" --strict-mcp-config`). `grok` is a
   first-class memory agent (`[agents.grok]`) but not a built-in classifier
   backend: `grok -p` has tool access, so use `backend = "command"` /
   `mode = "on"` with a stdin-only wrapper instead. Secret stores are never sent
