@@ -180,6 +180,12 @@ pub fn stamp_path(state_dir: &Path, store_name: &str) -> PathBuf {
 }
 
 /// Return whether `hm hook stop` should spawn a detached worker.
+///
+/// A lock only blocks spawning while it is fresh. A worker killed mid-run never
+/// runs `LockGuard`'s `Drop`, so its lock file outlives it; treating any
+/// existing lock as live would disable classification forever, because the
+/// stale-lock reclaim in `LockGuard::acquire` only runs inside a worker this
+/// check refused to start. Staleness uses the same mtime rule as acquire.
 pub fn should_spawn(
     mode: &str,
     min_interval: Duration,
@@ -187,7 +193,8 @@ pub fn should_spawn(
     store_name: &str,
     now: OffsetDateTime,
 ) -> bool {
-    if mode == "off" || lock_path(state_dir, store_name).exists() {
+    let lock = lock_path(state_dir, store_name);
+    if mode == "off" || (lock.exists() && !lock_is_stale(&lock)) {
         return false;
     }
     !stamp_is_fresh(&stamp_path(state_dir, store_name), min_interval, now)
@@ -512,10 +519,13 @@ fn lock_is_stale(path: &Path) -> bool {
     let Ok(modified) = metadata.modified() else {
         return false;
     };
-    SystemTime::now()
-        .duration_since(modified)
-        .map(|age| age > STALE_LOCK)
-        .unwrap_or(false)
+    // A clock that jumped backwards leaves the mtime in the future. Treating
+    // that as fresh forever would recreate the permanent outage `should_spawn`
+    // guards against, so a lock dated more than STALE_LOCK ahead is stale too.
+    match SystemTime::now().duration_since(modified) {
+        Ok(age) => age > STALE_LOCK,
+        Err(ahead) => ahead.duration() > STALE_LOCK,
+    }
 }
 
 #[cfg(test)]
@@ -716,6 +726,86 @@ mod tests {
         let lock = lock_path(&state, "personal");
         fs::create_dir_all(lock.parent().expect("parent")).expect("create parent");
         fs::write(&lock, "pid").expect("write lock");
+        assert!(!should_spawn(
+            "auto",
+            Duration::from_secs(60),
+            &state,
+            "personal",
+            now
+        ));
+    }
+
+    #[test]
+    fn should_spawn_reclaims_a_stale_lock() {
+        // A worker killed mid-run leaves its lock behind; once it is older
+        // than STALE_LOCK it must not block new workers forever.
+        let state = temp_dir("spawn-stale");
+        let now = OffsetDateTime::now_utc();
+        let lock = lock_path(&state, "personal");
+        fs::create_dir_all(lock.parent().expect("parent")).expect("create parent");
+        fs::write(&lock, "4018739\n").expect("write lock");
+        let old = SystemTime::now() - STALE_LOCK - Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(&lock)
+            .expect("open lock")
+            .set_modified(old)
+            .expect("age lock");
+
+        assert!(should_spawn(
+            "auto",
+            Duration::from_secs(60),
+            &state,
+            "personal",
+            now
+        ));
+        assert!(
+            LockGuard::acquire(&state, "personal")
+                .expect("acquire")
+                .is_some(),
+            "the spawned worker reclaims the stale lock"
+        );
+    }
+
+    #[test]
+    fn should_spawn_reclaims_a_lock_dated_far_in_the_future() {
+        let state = temp_dir("spawn-future");
+        let now = OffsetDateTime::now_utc();
+        let lock = lock_path(&state, "personal");
+        fs::create_dir_all(lock.parent().expect("parent")).expect("create parent");
+        fs::write(&lock, "1\n").expect("write lock");
+        let future = SystemTime::now() + STALE_LOCK + Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(&lock)
+            .expect("open lock")
+            .set_modified(future)
+            .expect("date lock");
+
+        assert!(should_spawn(
+            "auto",
+            Duration::from_secs(60),
+            &state,
+            "personal",
+            now
+        ));
+    }
+
+    #[test]
+    fn should_spawn_respects_a_lock_just_under_the_stale_age() {
+        let state = temp_dir("spawn-fresh-edge");
+        let now = OffsetDateTime::now_utc();
+        let lock = lock_path(&state, "personal");
+        fs::create_dir_all(lock.parent().expect("parent")).expect("create parent");
+        fs::write(&lock, "1\n").expect("write lock");
+        let recent = SystemTime::now() - STALE_LOCK + Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(&lock)
+            .expect("open lock")
+            .set_modified(recent)
+            .expect("age lock");
+
         assert!(!should_spawn(
             "auto",
             Duration::from_secs(60),
