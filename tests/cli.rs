@@ -1483,6 +1483,69 @@ fn doctor_full_warns_for_event_declaring_missing_note() {
 }
 
 #[test]
+fn doctor_full_accepts_folded_note_filename_without_rewriting_a_pair() {
+    let dir = temp_dir("doctor-folded-note-pair");
+    let config = dir.join("config.toml");
+    let data = dir.join("data");
+    let personal = dir.join("personal");
+    write_data_config(&config, &data, &personal);
+    init_store(&personal, "personal");
+
+    let output = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "paired local memory",
+        ])
+        .output()
+        .expect("run remember");
+    assert!(output.status.success(), "remember succeeds");
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let note_path = PathBuf::from(stdout_value(&stdout, "note:"));
+    let event_path = PathBuf::from(stdout_value(&stdout, "event:"));
+    let name = note_path.file_name().expect("note filename");
+    let folded = note_path.with_file_name(name.to_ascii_lowercase());
+    fs::rename(&note_path, &folded).expect("simulate legacy filename");
+    let note_before = fs::read(&folded).expect("read folded note");
+    let event_before = fs::read(&event_path).expect("read event");
+    let list_note_files = || {
+        fs::read_dir(folded.parent().expect("note directory"))
+            .expect("list note directory")
+            .map(|entry| entry.expect("note entry").file_name())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let filenames_before = list_note_files();
+
+    let output = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "doctor",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: serde_json::Value = serde_json::from_slice(&output).expect("doctor report");
+    assert!(
+        report["checks"]
+            .as_array()
+            .expect("doctor checks")
+            .iter()
+            .any(|check| {
+                check["id"] == "store.personal.event-pairs" && check["status"] == "pass"
+            })
+    );
+    assert_eq!(fs::read(&folded).expect("read folded note"), note_before);
+    assert_eq!(fs::read(&event_path).expect("read event"), event_before);
+    assert_eq!(list_note_files(), filenames_before);
+}
+
+#[test]
 fn doctor_full_warns_for_likely_secret_in_private_note_without_echoing_value() {
     let dir = temp_dir("doctor-note-secret");
     let config = dir.join("config.toml");

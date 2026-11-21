@@ -6,8 +6,8 @@
 //! relies on them?
 
 use crate::{
-    classify, config, event, index, note, outbox, project, retrieval, secret, store, supersession,
-    write,
+    classify, config, event, index, note, outbox, path as memory_path, project, retrieval, secret,
+    store, supersession, write,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -76,6 +76,31 @@ struct NoteInventoryData {
 impl NoteInventoryData {
     fn get(&self, path: &Path) -> Option<&AuditedNote> {
         self.by_path.get(path).map(|index| &self.notes[*index])
+    }
+
+    /// Look for legacy spellings in the declared note's own directory.
+    fn filename_matches<'a>(&'a self, expected: &'a Path) -> impl Iterator<Item = &'a AuditedNote> {
+        let parent = expected.parent().expect("validated note path has a parent");
+        let filename = expected
+            .file_name()
+            .expect("validated note path has a name");
+        let filename =
+            memory_path::relative_string(Path::new(filename), memory_path::PathCase::Insensitive);
+        // The sorted inventory bounds the search to this subtree without
+        // issuing a directory listing for every missing sidecar target.
+        self.by_path
+            .range(parent.to_path_buf()..)
+            .take_while(move |(candidate, _)| candidate.starts_with(parent))
+            .filter(move |(candidate, _)| {
+                candidate.parent() == Some(parent)
+                    && candidate.file_name().is_some_and(|name| {
+                        memory_path::relative_string(
+                            Path::new(name),
+                            memory_path::PathCase::Insensitive,
+                        ) == filename
+                    })
+            })
+            .map(|(_, index)| &self.notes[*index])
     }
 }
 
@@ -1380,6 +1405,10 @@ fn check_events_with_declared_notes(
     };
 
     let mut issues = 0usize;
+    let inventory = match notes {
+        NoteInventory::Ready(inventory) => Some(inventory),
+        NoteInventory::Missing { .. } | NoteInventory::Failed { .. } => None,
+    };
     for path in event_paths {
         let contents = match fs::read_to_string(&path) {
             Ok(contents) => contents,
@@ -1409,18 +1438,51 @@ fn check_events_with_declared_notes(
             continue;
         };
         let expected = store_config.root.join(note_path);
-        if !expected.is_file() {
-            issues += 1;
-            checks.push(warn(
-                format!("store.{store_name}.event-pairs"),
-                format!("event {} declares missing note", parsed.id),
-                vec![path.display().to_string(), expected.display().to_string()],
-            ));
-            continue;
-        }
-        let inventory_note = match notes {
-            NoteInventory::Ready(inventory) => inventory.get(&expected),
-            NoteInventory::Missing { .. } | NoteInventory::Failed { .. } => None,
+        let (note_path, inventory_note) = if expected.is_file() {
+            (
+                expected.as_path(),
+                inventory.and_then(|notes| notes.get(&expected)),
+            )
+        } else {
+            // Older case-insensitive peers could rename notes to their folded
+            // spelling while leaving the event unchanged. Keep the fallback
+            // local to one regular file. An occupied exact path is a broken
+            // target rather than a legacy spelling.
+            let legacy_target_missing = note_path.ends_with(".md")
+                && expected
+                    .symlink_metadata()
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+            let mut matches = inventory
+                .filter(|_| legacy_target_missing)
+                .into_iter()
+                .flat_map(|notes| notes.filename_matches(&expected))
+                .filter(|note| {
+                    note.path
+                        .symlink_metadata()
+                        .is_ok_and(|metadata| metadata.is_file())
+                });
+            match (matches.next(), matches.next()) {
+                (Some(note), None) => (note.path.as_path(), Some(note)),
+                (first, second) => {
+                    let mut paths =
+                        vec![path.display().to_string(), expected.display().to_string()];
+                    let issue = match (first, second) {
+                        (Some(first), Some(second)) => {
+                            paths.push(first.path.display().to_string());
+                            paths.push(second.path.display().to_string());
+                            "an ambiguous note filename"
+                        }
+                        _ => "missing note",
+                    };
+                    issues += 1;
+                    checks.push(warn(
+                        format!("store.{store_name}.event-pairs"),
+                        format!("event {} declares {issue}", parsed.id),
+                        paths,
+                    ));
+                    continue;
+                }
+            }
         };
         let note_id = match inventory_note {
             Some(note) => note
@@ -1430,7 +1492,7 @@ fn check_events_with_declared_notes(
                 .map_err(|failure| failure.message().to_owned()),
             // Preserve validation for normalized event paths outside the
             // canonical inbox/notes tree; canonical notes use the inventory.
-            None => fs::read_to_string(&expected)
+            None => fs::read_to_string(note_path)
                 .map_err(|err| err.to_string())
                 .and_then(|contents| {
                     note::parse_note(&contents)
@@ -1448,7 +1510,7 @@ fn check_events_with_declared_notes(
                         "event {} declares note with different id {}",
                         parsed.id, note_id
                     ),
-                    vec![path.display().to_string(), expected.display().to_string()],
+                    vec![path.display().to_string(), note_path.display().to_string()],
                 ));
             }
             Err(message) => {
@@ -1456,7 +1518,7 @@ fn check_events_with_declared_notes(
                 checks.push(warn(
                     format!("store.{store_name}.event-pairs"),
                     format!("failed to parse paired note: {message}"),
-                    vec![path.display().to_string(), expected.display().to_string()],
+                    vec![path.display().to_string(), note_path.display().to_string()],
                 ));
             }
         }
@@ -2596,28 +2658,18 @@ confidence = "medium"
         fs::remove_dir_all(root).ok();
     }
 
-    #[test]
-    fn reverse_event_pairing_uses_inventoried_note() {
-        let root = doctor_temp_dir("inventory-event-pair");
-        let note_path = root.join("inbox/notes/2026/05/16/note-a.md");
+    fn event_pair_fixture(label: &str) -> (config::StoreConfig, PathBuf) {
+        let root = doctor_temp_dir(label);
+        let note_path = root.join("inbox/notes/2026/05/16/Note-A.md");
         fs::create_dir_all(note_path.parent().expect("note parent")).expect("create notes");
-        fs::write(&note_path, doctor_note("note-a", "ordinary memory")).expect("write note");
-
-        let inventory = load_note_inventory(&root.join("inbox/notes"), true);
-        fs::write(
-            &note_path,
-            doctor_note("changed-after-audit", "ordinary memory"),
-        )
-        .expect("mutate note after inventory");
-
-        let event_path = root.join("inbox/events/2026/05/16/note-a.json");
+        let event_path = root.join("inbox/events/2026/05/16/Note-A.json");
         fs::create_dir_all(event_path.parent().expect("event parent")).expect("create events");
         fs::write(
             &event_path,
             serde_json::to_vec_pretty(&serde_json::json!({
                 "schema_version": 1,
                 "type": "memory.observation",
-                "id": "note-a",
+                "id": "Note-A",
                 "store_id": "store-id",
                 "store_name": "personal",
                 "created_at": "2026-05-16T00:00:00Z",
@@ -2626,25 +2678,217 @@ confidence = "medium"
                 "scope": "global",
                 "confidence": "medium",
                 "body": "ordinary memory",
-                "note_path": "inbox/notes/2026/05/16/note-a.md"
+                "note_path": "inbox/notes/2026/05/16/Note-A.md"
             }))
             .expect("serialize event"),
         )
         .expect("write event");
 
         let store = config::StoreConfig {
-            root: root.clone(),
+            root,
             expected_id: None,
             description: None,
             sensitivity: config::Sensitivity::Private,
         };
+        (store, note_path)
+    }
+
+    #[test]
+    fn reverse_event_pairing_uses_inventoried_note() {
+        let (store, note_path) = event_pair_fixture("inventory-event-pair");
+        fs::write(&note_path, doctor_note("Note-A", "ordinary memory")).expect("write note");
+
+        let inventory = load_note_inventory(&store.root.join("inbox/notes"), true);
+        fs::write(
+            &note_path,
+            doctor_note("changed-after-audit", "ordinary memory"),
+        )
+        .expect("mutate note after inventory");
+
         let mut checks = Vec::new();
         assert_eq!(
             check_events_with_declared_notes("personal", &store, &inventory, &mut checks),
             0
         );
         assert!(checks.is_empty());
-        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(store.root).ok();
+    }
+
+    #[test]
+    fn reverse_event_pairing_accepts_a_legacy_lowercase_filename() {
+        let (store, expected) = event_pair_fixture("inventory-folded-event-pair");
+        let actual = expected.with_file_name("note-a.md");
+        fs::write(&actual, doctor_note("Note-A", "ordinary memory")).expect("write folded note");
+
+        let inventory = load_note_inventory(&store.root.join("inbox/notes"), true);
+        let mut checks = Vec::new();
+        assert_eq!(
+            check_events_with_declared_notes("personal", &store, &inventory, &mut checks),
+            0,
+            "{checks:?}",
+        );
+        assert!(actual.is_file());
+        fs::remove_dir_all(store.root).ok();
+    }
+
+    #[test]
+    fn reverse_event_pairing_rejects_a_folded_note_with_a_different_id() {
+        let (store, expected) = event_pair_fixture("inventory-folded-event-wrong-id");
+        let actual = expected.with_file_name("note-a.md");
+        fs::write(&actual, doctor_note("note-a", "ordinary memory")).expect("write folded note");
+
+        let inventory = load_note_inventory(&store.root.join("inbox/notes"), true);
+        let mut checks = Vec::new();
+        assert_eq!(
+            check_events_with_declared_notes("personal", &store, &inventory, &mut checks),
+            1,
+        );
+        assert!(checks[0].message.contains("different id"));
+        fs::remove_dir_all(store.root).ok();
+    }
+
+    #[test]
+    fn reverse_event_pairing_warns_about_ambiguous_filenames() {
+        let (store, expected) = event_pair_fixture("inventory-folded-event-ambiguous");
+        fs::write(
+            expected.with_file_name("note-a.md"),
+            doctor_note("Note-A", "ordinary memory"),
+        )
+        .expect("write folded note");
+        // A case-insensitive filesystem cannot hold these two names at once.
+        if expected.is_file() {
+            fs::remove_dir_all(store.root).ok();
+            return;
+        }
+        fs::write(
+            expected.with_file_name("NOTE-A.md"),
+            doctor_note("unrelated", "ordinary memory"),
+        )
+        .expect("write a second spelling");
+
+        let inventory = load_note_inventory(&store.root.join("inbox/notes"), true);
+        let mut checks = Vec::new();
+        assert_eq!(
+            check_events_with_declared_notes("personal", &store, &inventory, &mut checks),
+            1,
+        );
+        assert!(checks[0].message.contains("ambiguous"));
+        fs::remove_dir_all(store.root).ok();
+    }
+
+    #[test]
+    fn reverse_event_pairing_ignores_a_folded_note_in_a_subdirectory() {
+        let (store, expected) = event_pair_fixture("inventory-folded-event-subdirectory");
+        let nested = expected.parent().expect("note parent").join("nested");
+        fs::create_dir(&nested).expect("create nested directory");
+        fs::write(
+            nested.join("note-a.md"),
+            doctor_note("Note-A", "ordinary memory"),
+        )
+        .expect("write nested note");
+
+        let inventory = load_note_inventory(&store.root.join("inbox/notes"), true);
+        let mut checks = Vec::new();
+        assert_eq!(
+            check_events_with_declared_notes("personal", &store, &inventory, &mut checks),
+            1,
+        );
+        assert!(checks[0].message.contains("missing note"));
+        fs::remove_dir_all(store.root).ok();
+    }
+
+    #[test]
+    fn reverse_event_pairing_keeps_warning_for_an_occupied_target() {
+        let (store, expected) = event_pair_fixture("inventory-folded-event-occupied");
+        fs::write(
+            expected.with_file_name("note-a.md"),
+            doctor_note("Note-A", "ordinary memory"),
+        )
+        .expect("write folded note");
+        if expected.is_file() {
+            fs::remove_dir_all(store.root).ok();
+            return;
+        }
+        fs::create_dir(&expected).expect("occupy the exact path with a directory");
+
+        let inventory = load_note_inventory(&store.root.join("inbox/notes"), true);
+        let mut checks = Vec::new();
+        assert_eq!(
+            check_events_with_declared_notes("personal", &store, &inventory, &mut checks),
+            1,
+        );
+        assert!(checks[0].message.contains("missing note"));
+        fs::remove_dir_all(store.root).ok();
+    }
+
+    #[test]
+    fn reverse_event_pairing_keeps_warning_for_a_declared_directory() {
+        let (store, expected) = event_pair_fixture("inventory-folded-event-directory-target");
+        fs::write(
+            expected.with_file_name("note-a.md"),
+            doctor_note("Note-A", "ordinary memory"),
+        )
+        .expect("write folded note");
+        let event_path = store.root.join("inbox/events/2026/05/16/Note-A.json");
+        let event = fs::read_to_string(&event_path).expect("read event");
+        fs::write(&event_path, event.replace("Note-A.md", "Note-A.md/."))
+            .expect("declare a directory as the target");
+
+        let inventory = load_note_inventory(&store.root.join("inbox/notes"), true);
+        let mut checks = Vec::new();
+        assert_eq!(
+            check_events_with_declared_notes("personal", &store, &inventory, &mut checks),
+            1,
+        );
+        assert!(checks[0].message.contains("missing note"));
+        fs::remove_dir_all(store.root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reverse_event_pairing_ignores_a_folded_symlink() {
+        let (store, expected) = event_pair_fixture("inventory-folded-event-symlink");
+        let target = store.root.join("outside-inventory.md");
+        fs::write(&target, doctor_note("Note-A", "ordinary memory")).expect("write target");
+        std::os::unix::fs::symlink(&target, expected.with_file_name("note-a.md"))
+            .expect("link to a note outside the inventory");
+        if expected.is_file() {
+            fs::remove_dir_all(store.root).ok();
+            return;
+        }
+
+        let inventory = load_note_inventory(&store.root.join("inbox/notes"), true);
+        let mut checks = Vec::new();
+        assert_eq!(
+            check_events_with_declared_notes("personal", &store, &inventory, &mut checks),
+            1,
+        );
+        assert!(checks[0].message.contains("missing note"));
+        fs::remove_dir_all(store.root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reverse_event_pairing_counts_regular_files_for_ambiguity() {
+        let (store, expected) = event_pair_fixture("inventory-folded-event-regular");
+        let actual = expected.with_file_name("note-a.md");
+        fs::write(&actual, doctor_note("Note-A", "ordinary memory")).expect("write folded note");
+        if expected.is_file() {
+            fs::remove_dir_all(store.root).ok();
+            return;
+        }
+        // A symlink is not a second canonical note, even if it resolves.
+        std::os::unix::fs::symlink(&actual, expected.with_file_name("NOTE-A.md"))
+            .expect("link a second spelling");
+
+        let inventory = load_note_inventory(&store.root.join("inbox/notes"), true);
+        let mut checks = Vec::new();
+        assert_eq!(
+            check_events_with_declared_notes("personal", &store, &inventory, &mut checks),
+            0,
+            "{checks:?}",
+        );
+        fs::remove_dir_all(store.root).ok();
     }
 
     fn supersedes_entry(id: &str, scope: &str, supersedes: Vec<String>) -> index::IndexEntry {
