@@ -6,12 +6,13 @@
 //! relies on them?
 
 use crate::{
-    classify, config, event, index, note, outbox, path as memory_path, project, retrieval, secret,
-    store, supersession, write,
+    classify, config, event, hash, index, note, outbox, path as memory_path, project, retrieval,
+    secret, store, supersession, write,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use time::format_description::well_known::Rfc3339;
@@ -19,6 +20,7 @@ use time::{Date, Month, OffsetDateTime};
 
 const STALE_TEMP_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const OLD_OUTBOX_ITEM_DAYS: i64 = 7;
+const ASSIGNMENT_REVIEW_STATE: &str = "doctor/secret-assignment-reviews";
 
 #[derive(Debug)]
 struct FullDoctorAudit {
@@ -117,6 +119,7 @@ struct StrictNoteAudit {
     created_at: String,
     related_event_id: Option<String>,
     secret_detectors: Vec<String>,
+    secret_assignment_digest: Option<String>,
     prompt_detectors: Vec<&'static str>,
 }
 
@@ -124,6 +127,203 @@ struct StrictNoteAudit {
 struct AudienceAudit {
     scope: String,
     audience_empty: bool,
+}
+
+fn note_secret_detectors(body: &str) -> Vec<String> {
+    secret::detect(body)
+        .into_iter()
+        .map(|finding| finding.detector_id)
+        .collect()
+}
+
+/// Bind a review to the entire saved note, including its internal ID. A
+/// finding from any other detector makes the note ineligible.
+fn secret_assignment_digest(contents: &str, detectors: &[String]) -> Option<String> {
+    (detectors == [secret::ASSIGNMENT_DETECTOR]).then(|| hash::sha256_hex(contents.as_bytes()))
+}
+
+/// Bind reviews to a validated store identity and its resolved root.
+fn assignment_review_store(
+    store_config: &config::StoreConfig,
+) -> Result<(PathBuf, String), String> {
+    let root = store_config
+        .root
+        .canonicalize()
+        .map_err(|err| format!("cannot resolve selected store: {err}"))?;
+    let manifest = store::read_manifest(&root)
+        .map_err(|_| "cannot validate selected store's manifest".to_owned())?;
+    let identity = manifest.store.id;
+    if store_config
+        .expected_id
+        .as_ref()
+        .is_some_and(|id| *id != identity)
+    {
+        return Err("selected store's ID does not match its configuration".into());
+    }
+    if store::stricter_sensitivity(store_config.sensitivity, manifest.store.sensitivity)
+        == config::Sensitivity::Secret
+    {
+        return Err("doctor does not scan secret stores for note secrets".into());
+    }
+    Ok((root, identity))
+}
+
+/// Resolve the existing prefix of a planned path. A dangling symlink is an
+/// error, because treating it as a missing directory would hide its target.
+fn resolve_planned_path(path: &Path) -> io::Result<PathBuf> {
+    match path.canonicalize() {
+        Ok(resolved) => Ok(resolved),
+        Err(err)
+            if err.kind() == io::ErrorKind::NotFound
+                && path
+                    .symlink_metadata()
+                    .is_err_and(|err| err.kind() == io::ErrorKind::NotFound) =>
+        {
+            let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+                return Err(err);
+            };
+            Ok(resolve_planned_path(parent)?.join(name))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Check each existing directory before trusting any of its descendants.
+/// A missing directory is allowed here so the writer can create it privately.
+fn check_review_directory(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err("review directories cannot be redirected by symlinks".into())
+        }
+        Ok(metadata) if metadata.is_dir() && owner_controls_review_state(&metadata) => Ok(()),
+        Ok(_) => Err("review state directories must be writable only by their owner".into()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn owner_controls_review_state(metadata: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // geteuid takes no arguments and only reads the process identity.
+        let uid = unsafe { libc::geteuid() };
+        metadata.uid() == uid && metadata.mode() & 0o022 == 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        true
+    }
+}
+
+/// Review markers are empty regular files created by the current user.
+fn is_review_marker(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.is_file() && metadata.len() == 0 && owner_controls_review_state(&metadata)
+    })
+}
+
+/// Establish the local review boundary once, regardless of the number of stores.
+fn assignment_reviews_root(config: &config::Config) -> Result<PathBuf, String> {
+    let resolve = |path: &Path| {
+        std::path::absolute(path)
+            .and_then(|absolute| resolve_planned_path(&absolute))
+            .map_err(|err| err.to_string())
+    };
+    let state_dir = resolve(&config.state_dir)?;
+    check_review_directory(&state_dir)?;
+    let mut dir = state_dir;
+    for component in Path::new(ASSIGNMENT_REVIEW_STATE).components() {
+        dir.push(component);
+        check_review_directory(&dir)?;
+    }
+    for store in config.stores.values() {
+        let store_root = resolve(&store.root)?;
+        if dir.starts_with(&store_root) || store_root.starts_with(&dir) {
+            return Err("review state must be outside configured memory stores".into());
+        }
+    }
+    Ok(dir)
+}
+
+/// Give each store its own directory, without following an alias to another
+/// store's reviews.
+fn reviewed_assignments_dir(
+    reviews_root: &Path,
+    store_root: &Path,
+    store_id: &str,
+) -> Result<PathBuf, String> {
+    let root_namespace =
+        reviews_root.join(hash::sha256_hex(store_root.as_os_str().as_encoded_bytes()));
+    check_review_directory(&root_namespace)?;
+    let dir = root_namespace.join(hash::sha256_hex(store_id.as_bytes()));
+    check_review_directory(&dir)?;
+    Ok(dir)
+}
+
+/// Acknowledge a note's sole secret-assignment finding at a reviewed revision.
+/// The selected store must already be authorized by the caller.
+pub fn acknowledge_secret_assignment(
+    config: &config::Config,
+    store: &config::StoreConfig,
+    path: &Path,
+    reviewed_sha256: &str,
+) -> Result<(), String> {
+    let (store_root, store_id) = assignment_review_store(store)?;
+    let notes_root = store_root.join("inbox/notes");
+    let path = path
+        .canonicalize()
+        .map_err(|err| format!("cannot resolve note path: {err}"))?;
+    if !path.starts_with(notes_root)
+        || path.extension().and_then(|extension| extension.to_str()) != Some("md")
+        || !path.is_file()
+    {
+        return Err("expected a Markdown note under the selected store's inbox/notes".into());
+    }
+    let contents =
+        fs::read_to_string(&path).map_err(|err| format!("cannot read reviewed note: {err}"))?;
+    // Parser errors can include source excerpts from invalid front matter.
+    let note = note::parse_note(&contents).map_err(|_| "cannot parse reviewed note")?;
+    if note.front_matter.store_id != store_id {
+        return Err("reviewed note's store ID does not match the selected store".into());
+    }
+    let digest = secret_assignment_digest(&contents, &note_secret_detectors(&note.body))
+        .ok_or_else(|| {
+            "expected secret-assignment to be the note's only secret finding".to_owned()
+        })?;
+    if digest != reviewed_sha256 {
+        return Err("reviewed SHA-256 does not match the saved note".into());
+    }
+    let reviews_root = assignment_reviews_root(config)?;
+    let reviews_dir = reviewed_assignments_dir(&reviews_root, &store_root, &store_id)?;
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(&reviews_dir)
+        .map_err(|err| format!("cannot create review state: {err}"))?;
+    // Creating an empty file exclusively is atomic and never follows a marker
+    // symlink. Concurrent acknowledgments of the same review are idempotent.
+    let marker = reviews_dir.join(digest);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(&marker) {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists && is_review_marker(&marker) => {
+            Ok(())
+        }
+        Err(err) => Err(format!("cannot create review marker: {err}")),
+    }
 }
 
 #[derive(Debug)]
@@ -247,18 +447,20 @@ fn load_note_inventory_with(
                         scope: parsed.front_matter.scope.clone(),
                         audience_empty: parsed.front_matter.audience.is_empty(),
                     };
+                    let secret_detectors = if scan_secrets {
+                        note_secret_detectors(&parsed.body)
+                    } else {
+                        Vec::new()
+                    };
                     let strict = StrictNoteAudit {
                         id: parsed.front_matter.id,
                         created_at: parsed.front_matter.created_at,
                         related_event_id: parsed.front_matter.related_event_id,
-                        secret_detectors: if scan_secrets {
-                            secret::detect(&parsed.body)
-                                .into_iter()
-                                .map(|finding| finding.detector_id)
-                                .collect()
-                        } else {
-                            Vec::new()
-                        },
+                        secret_assignment_digest: secret_assignment_digest(
+                            &contents,
+                            &secret_detectors,
+                        ),
+                        secret_detectors,
                         prompt_detectors: prompt_risk_detectors(&parsed.body),
                     };
                     (Ok(strict), Some(audience))
@@ -1842,6 +2044,11 @@ fn check_note_secrets(
     audit: &FullDoctorAudit,
     checks: &mut Vec<DoctorCheck>,
 ) {
+    let reviews_root = if config.state_dir.join(ASSIGNMENT_REVIEW_STATE).is_dir() {
+        assignment_reviews_root(config).ok()
+    } else {
+        None
+    };
     for (store_name, store_config) in &config.stores {
         if store_config.sensitivity == config::Sensitivity::Secret {
             checks.push(pass(
@@ -1874,10 +2081,35 @@ fn check_note_secrets(
             NoteInventory::Ready(inventory) => &inventory.notes,
         };
 
+        let reviews_dir = reviews_root
+            .as_deref()
+            .filter(|_| {
+                notes.iter().any(|note| {
+                    note.strict
+                        .as_ref()
+                        .is_ok_and(|audit| audit.secret_assignment_digest.is_some())
+                })
+            })
+            .and_then(|reviews_root| {
+                assignment_review_store(store_config)
+                    .and_then(|(root, store_id)| {
+                        reviewed_assignments_dir(reviews_root, &root, &store_id)
+                    })
+                    .ok()
+            });
         let mut issues = 0usize;
+        let mut reviewed = 0usize;
         for note in notes {
             match &note.strict {
                 Ok(note) if note.secret_detectors.is_empty() => {}
+                Ok(note)
+                    if reviews_dir
+                        .as_ref()
+                        .zip(note.secret_assignment_digest.as_ref())
+                        .is_some_and(|(dir, digest)| is_review_marker(&dir.join(digest))) =>
+                {
+                    reviewed += 1;
+                }
                 Ok(note_audit) => {
                     issues += 1;
                     checks.push(warn(
@@ -1907,10 +2139,17 @@ fn check_note_secrets(
             }
         }
 
+        if reviewed > 0 {
+            checks.push(pass(
+                format!("store.{store_name}.note-secrets-reviewed"),
+                format!("store {store_name} has {reviewed} reviewed secret-assignment findings"),
+                Vec::new(),
+            ));
+        }
         if issues == 0 {
             checks.push(pass(
                 format!("store.{store_name}.note-secrets"),
-                format!("store {store_name} notes contain no likely secrets"),
+                format!("store {store_name} notes contain no unreviewed secret findings"),
                 vec![notes_root.display().to_string()],
             ));
         }

@@ -1592,6 +1592,329 @@ fn doctor_full_warns_for_likely_secret_in_private_note_without_echoing_value() {
         .stdout(predicate::str::contains(secret_value).not());
 }
 
+fn assignment_review_fixture(config: &std::path::Path) -> (PathBuf, PathBuf, String) {
+    let output = cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "remember",
+            "--text",
+            "Describe the login mode.",
+        ])
+        .output()
+        .expect("run remember");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let note = PathBuf::from(stdout_value(&stdout, "note:"));
+    let event = PathBuf::from(stdout_value(&stdout, "event:"));
+    let original = fs::read_to_string(&note).expect("read note");
+    let reviewed =
+        format!("{original}\nSet SERVICE_AUTH_TOKEN=1; this selects the local login mode.\n");
+    fs::write(&note, &reviewed).expect("simulate a preexisting false positive");
+    (note, event, reviewed)
+}
+
+#[test]
+fn doctor_acknowledges_only_the_reviewed_version_of_a_secret_assignment() {
+    let dir = temp_dir("doctor-reviewed-assignment");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    write_data_config(&config, &dir.join("data"), &personal);
+    init_store(&personal, "personal");
+    let hm = || {
+        let mut command = cargo_bin_cmd!("hm");
+        command.args(["--config", config.to_str().expect("utf8 config")]);
+        command
+    };
+    let (note, event, reviewed) = assignment_review_fixture(&config);
+    let reviewed_sha256 = hive_memory::hash::sha256_hex(reviewed.as_bytes());
+    let event_before = fs::read(&event).expect("read event");
+
+    hm().args(["doctor", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("detectors: secret-assignment"));
+    hm().args(["doctor", "--acknowledge-secret-assignment"])
+        .arg(&note)
+        .args(["--reviewed-sha256", &reviewed_sha256])
+        .assert()
+        .success();
+    hm().args(["doctor", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("detectors: secret-assignment").not())
+        .stdout(predicate::str::contains("1 reviewed secret-assignment"));
+    assert_eq!(fs::read_to_string(&note).expect("read note"), reviewed);
+    assert_eq!(fs::read(&event).expect("read event"), event_before);
+    hm().args([
+        "remember",
+        "--text",
+        "Set SERVICE_AUTH_TOKEN=1; this selects the local login mode.",
+    ])
+    .assert()
+    .code(4)
+    .stderr(predicate::str::contains("secret-assignment"));
+
+    fs::write(&note, format!("{reviewed}\nAnother line.\n")).expect("edit the reviewed note");
+    hm().args(["doctor", "--acknowledge-secret-assignment"])
+        .arg(&note)
+        .args(["--reviewed-sha256", &reviewed_sha256])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "reviewed SHA-256 does not match the saved note",
+        ));
+    hm().args(["doctor", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("detectors: secret-assignment"));
+}
+
+#[test]
+fn doctor_rejects_review_state_inside_the_store_before_creating_it() {
+    let dir = temp_dir("doctor-review-state-in-store");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    write_data_config(&config, &dir.join("data"), &personal);
+    init_store(&personal, "personal");
+    let (note, _, reviewed) = assignment_review_fixture(&config);
+    let reviewed_sha256 = hive_memory::hash::sha256_hex(reviewed.as_bytes());
+    let nested = personal.join("proposed-state");
+    let settings = fs::read_to_string(&config).expect("read fixture config");
+    fs::write(
+        &config,
+        settings.replace(
+            &format!("state_dir = \"{}\"", dir.join("state").display()),
+            &format!("state_dir = \"{}\"", nested.display()),
+        ),
+    )
+    .expect("configure unsafe state path");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "doctor",
+            "--acknowledge-secret-assignment",
+        ])
+        .arg(&note)
+        .args(["--reviewed-sha256", &reviewed_sha256])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "review state must be outside configured memory stores",
+        ));
+    assert!(!nested.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_rejects_review_state_redirected_by_a_symlink() {
+    let dir = temp_dir("doctor-review-symlink");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    write_data_config(&config, &dir.join("data"), &personal);
+    init_store(&personal, "personal");
+    let (note, _, reviewed) = assignment_review_fixture(&config);
+    let hash = hive_memory::hash::sha256_hex;
+    let reviewed_sha256 = hash(reviewed.as_bytes());
+    let outside = dir.join("outside");
+    fs::create_dir_all(dir.join("state")).expect("create state");
+    fs::create_dir(&outside).expect("create external directory");
+    std::os::unix::fs::symlink(&outside, dir.join("state/doctor")).expect("redirect review state");
+    let config = config.to_str().expect("utf8 config");
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config,
+            "doctor",
+            "--acknowledge-secret-assignment",
+        ])
+        .arg(&note)
+        .args(["--reviewed-sha256", &reviewed_sha256])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "review directories cannot be redirected by symlinks",
+        ));
+    assert!(
+        fs::read_dir(&outside)
+            .expect("list external directory")
+            .next()
+            .is_none()
+    );
+
+    let root = personal.canonicalize().expect("resolve root");
+    let manifest = hive_memory::store::read_manifest(&root).expect("read manifest");
+    let outside_reviews = outside
+        .join("secret-assignment-reviews")
+        .join(hash(root.as_os_str().as_encoded_bytes()))
+        .join(hash(manifest.store.id.as_bytes()));
+    fs::create_dir_all(&outside_reviews).expect("create external namespace");
+    fs::write(outside_reviews.join(reviewed_sha256), b"").expect("create external marker");
+    cargo_bin_cmd!("hm")
+        .args(["--config", config, "doctor", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("detectors: secret-assignment"));
+}
+
+#[test]
+#[cfg(unix)]
+fn doctor_ignores_review_markers_in_a_group_writable_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_dir("doctor-review-group-writable");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    write_data_config(&config, &dir.join("data"), &personal);
+    init_store(&personal, "personal");
+    let (note, _, reviewed) = assignment_review_fixture(&config);
+    let reviewed_sha256 = hive_memory::hash::sha256_hex(reviewed.as_bytes());
+    let config = config.to_str().expect("utf8 config");
+    let acknowledge = || {
+        let mut command = cargo_bin_cmd!("hm");
+        command
+            .args([
+                "--config",
+                config,
+                "doctor",
+                "--acknowledge-secret-assignment",
+            ])
+            .arg(&note)
+            .args(["--reviewed-sha256", &reviewed_sha256]);
+        command
+    };
+    acknowledge().assert().success();
+    let doctor_state = dir.join("state/doctor");
+    fs::set_permissions(&doctor_state, fs::Permissions::from_mode(0o770))
+        .expect("make review directory group-writable");
+    acknowledge()
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "review state directories must be writable only by their owner",
+        ));
+    cargo_bin_cmd!("hm")
+        .args(["--config", config, "doctor", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("detectors: secret-assignment"));
+}
+
+#[test]
+fn doctor_review_does_not_follow_an_identical_relative_alias_to_another_root() {
+    let dir = temp_dir("doctor-review-relative-store");
+    let config = dir.join("config.toml");
+    let first = dir.join("first/personal");
+    let second = dir.join("second/personal");
+    write_data_config(&config, &dir.join("data"), &first);
+    init_store(&first, "personal");
+    init_store(&second, "personal");
+    let (note, _, reviewed) = assignment_review_fixture(&config);
+    let reviewed_sha256 = hive_memory::hash::sha256_hex(reviewed.as_bytes());
+    let copy = second.join(note.strip_prefix(&first).expect("store-relative note"));
+    fs::create_dir_all(copy.parent().expect("parent")).expect("create destination");
+    fs::copy(&note, copy).expect("copy exact note version");
+    // Hold manifest identity constant too. The resolved root must still
+    // distinguish these otherwise identical stores.
+    fs::copy(first.join("manifest.toml"), second.join("manifest.toml")).expect("copy manifest");
+    write_data_config(&config, &dir.join("data"), std::path::Path::new("personal"));
+    let config = config.to_str().expect("utf8 config");
+
+    cargo_bin_cmd!("hm")
+        .current_dir(first.parent().expect("first cwd"))
+        .args([
+            "--config",
+            config,
+            "doctor",
+            "--acknowledge-secret-assignment",
+        ])
+        .arg(&note)
+        .args(["--reviewed-sha256", &reviewed_sha256])
+        .assert()
+        .success();
+    cargo_bin_cmd!("hm")
+        .current_dir(second.parent().expect("second cwd"))
+        .args(["--config", config, "doctor", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("detectors: secret-assignment"))
+        .stdout(predicate::str::contains("reviewed secret-assignment findings").not());
+}
+
+#[test]
+fn doctor_rejects_an_assignment_review_outside_the_selected_store() {
+    let dir = temp_dir("doctor-review-outside-store");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    write_data_config(&config, &dir.join("data"), &personal);
+    init_store(&personal, "personal");
+    let outside = dir.join("outside.md");
+    fs::write(&outside, "outside note").expect("create external file");
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config.to_str().expect("utf8 config"),
+            "doctor",
+            "--acknowledge-secret-assignment",
+        ])
+        .arg(&outside)
+        .args(["--reviewed-sha256", &"0".repeat(64)])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "expected a Markdown note under the selected store",
+        ));
+}
+
+#[test]
+fn doctor_rejects_an_assignment_review_when_another_detector_also_fires() {
+    let dir = temp_dir("doctor-review-multiple-detectors");
+    let config = dir.join("config.toml");
+    let personal = dir.join("personal");
+    write_data_config(&config, &dir.join("data"), &personal);
+    init_store(&personal, "personal");
+    let config = config.to_str().expect("utf8 config");
+    let output = cargo_bin_cmd!("hm")
+        .args(["--config", config, "remember", "--text", "Ordinary note"])
+        .output()
+        .expect("run remember");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let note = PathBuf::from(stdout_value(&stdout, "note:"));
+    let original = fs::read_to_string(&note).expect("read note");
+    let synthetic_marker = ["-----BEGIN OPENSSH", " PRIVATE KEY-----"].concat();
+    fs::write(
+        &note,
+        format!("{original}\napi_key = syntheticcredentialvalue\n{synthetic_marker}\n"),
+    )
+    .expect("add synthetic detector fixtures");
+    let reviewed_sha256 = hive_memory::hash::sha256_hex(&fs::read(&note).expect("read note"));
+
+    cargo_bin_cmd!("hm")
+        .args([
+            "--config",
+            config,
+            "doctor",
+            "--acknowledge-secret-assignment",
+        ])
+        .arg(&note)
+        .args(["--reviewed-sha256", &reviewed_sha256])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("the note's only secret finding"))
+        .stderr(predicate::str::contains("syntheticcredentialvalue").not());
+    cargo_bin_cmd!("hm")
+        .args(["--config", config, "doctor", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "detectors: private-key,secret-assignment",
+        ));
+}
+
 #[test]
 fn doctor_full_warns_for_prompt_risk_without_echoing_body() {
     let dir = temp_dir("doctor-prompt-risk");

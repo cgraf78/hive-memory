@@ -7,6 +7,9 @@
 use serde::Serialize;
 use std::collections::BTreeSet;
 
+/// Stable detector ID for likely credentials in assignments.
+pub(crate) const ASSIGNMENT_DETECTOR: &str = "secret-assignment";
+
 /// One likely-secret detector hit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SecretFinding {
@@ -32,7 +35,7 @@ pub fn detect(text: &str) -> Vec<SecretFinding> {
         detectors.insert("github-token");
     }
     if contains_assignment_secret(text) {
-        detectors.insert("secret-assignment");
+        detectors.insert(ASSIGNMENT_DETECTOR);
     }
 
     detectors

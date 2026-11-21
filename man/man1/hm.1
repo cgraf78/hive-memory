@@ -98,6 +98,11 @@ topic; an explicit subject replaces it and context reset clears it.
 Run top-level diagnostics. Use
 .B --quick
 for hook-friendly checks.
+After reviewing a false positive, use
+.BI "--acknowledge-secret-assignment " note-path
+with
+.BI "--reviewed-sha256 " sha256
+to record a local review for the exact saved note.
 .TP
 .B promote
 Promote a raw inbox note into curated memory.
