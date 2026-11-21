@@ -561,6 +561,11 @@ JSON event is the machine-readable view. Implementations MUST:
 - consider the pair "complete" only when both files are present after flush.
 - treat a Markdown-without-event or event-without-Markdown as a doctor warning
   (paired writes from a single `hm` invocation should produce both).
+- when an event's declared `.md` note path is absent, doctor may match one
+  regular `.md` file under `inbox/notes/` by its case-folded filename in the
+  same directory. The note must have the same internal ID the event would
+  accept at the declared path. Multiple regular matches still warn. This
+  read-only fallback preserves both files.
 
 When to write JSON:
 
