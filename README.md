@@ -403,6 +403,7 @@ hm doctor             # full diagnostics
 hm doctor --quick     # hook/update-safe subset
 hm doctor --fix       # safe layout repairs only
 hm doctor --json
+hm doctor --acknowledge-secret-assignment <note-path> --reviewed-sha256 <sha256>
 ```
 
 `hm doctor` checks config, store availability and layout, generated `.gitignore`
@@ -410,7 +411,15 @@ files, sensitive-store permissions and cloud-root policy, project bindings, agen
 policies, outbox state, event pairing, agent-private audiences, classifier
 status, secret-looking content, and cloud-sync conflicts. `--fix` performs only
 safe layout repairs — it never initializes missing stores or rewrites your
-memory. `hm sync-status` reports store and index health without mutating
+memory. After privately reviewing the entire note for a false positive, use
+`--acknowledge-secret-assignment` with the path from the diagnostic and
+the SHA-256 of the exact file you reviewed. The note must be in the selected
+store and have `secret-assignment` as its only secret detector ID. The
+review is stored in the host's `state_dir`, outside configured stores. Use
+a trusted, host-local `state_dir`. Edits require a fresh review. Secret
+detection on new writes and the other doctor checks still apply.
+
+`hm sync-status` reports store and index health without mutating
 anything. By default it stays cheap on a cloud mount: it reads the manifest
 and lists only the top level of each canonical tree. `--scan` walks the whole
 store to add index staleness, the newest record times, and the cloud conflict

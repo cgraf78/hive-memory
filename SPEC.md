@@ -1852,6 +1852,16 @@ Modes:
 
 - default: read-only diagnostics.
 - `--quick`: config/root checks suitable for hooks.
+- `--acknowledge-secret-assignment <note-path> --reviewed-sha256 <sha256>`:
+  record a reviewed false positive for a Markdown note under the selected
+  store's `inbox/notes/`. This mode requires store write affinity and cannot
+  be combined with `--quick`, `--fix`, or `--json`. The note's only secret
+  detector ID must be `secret-assignment`, and its exact saved bytes
+  must match the reviewed digest. Full doctor binds the review to those bytes,
+  the resolved store root, and the store's manifest identity. Reviews are
+  recorded under a trusted, host-local `state_dir`, outside every configured
+  store. This mode performs no store writes and does not alter the secret
+  detector.
 - `--fix`: safe repairs only, e.g. create missing directories, restore the
   managed generated `.gitignore`, and quarantine stale temp files and cloud
   conflict copies under `<store>/.quarantine/<category>/<timestamp>/`

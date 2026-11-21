@@ -126,6 +126,12 @@ struct DoctorArgs {
     /// Perform safe layout repairs before reporting diagnostics.
     #[arg(long)]
     fix: bool,
+    /// Acknowledge a reviewed false positive for this exact note on this host.
+    #[arg(long, value_name = "NOTE_PATH", requires = "reviewed_sha256", conflicts_with_all = ["quick", "fix", "json"])]
+    acknowledge_secret_assignment: Option<PathBuf>,
+    /// SHA-256 of the exact saved note that was reviewed.
+    #[arg(long, requires = "acknowledge_secret_assignment")]
+    reviewed_sha256: Option<String>,
     /// Emit machine-readable output.
     #[arg(long)]
     json: bool,
@@ -483,6 +489,31 @@ fn hook_active(context: &CliContext) -> bool {
 }
 
 fn run_doctor(args: DoctorArgs, context: CliContext) -> Result<()> {
+    if let Some(path) = args.acknowledge_secret_assignment {
+        // Review validates its state path before creating any directories.
+        let config = read_config_with_warnings(context.config_path.as_deref())?.config;
+        let agent = resolve_agent_id(context.as_agent);
+        let resolved = resolve_store(
+            &config,
+            context.store.as_deref(),
+            None,
+            agent.as_deref(),
+            StoreAccess::Write,
+        )?;
+        let sha256 = args
+            .reviewed_sha256
+            .as_deref()
+            .expect("required review digest");
+        doctor::acknowledge_secret_assignment(
+            &config,
+            &config.stores[&resolved.name],
+            &path,
+            sha256,
+        )
+        .map_err(anyhow::Error::msg)?;
+        println!("acknowledged secret-assignment for {}", path.display());
+        return Ok(());
+    }
     let config = load_config(context.config_path.as_deref())?;
     let fix_report = if args.fix {
         Some(doctor::fix(doctor::DoctorFixInput { config: &config }))
@@ -691,12 +722,18 @@ fn load_config(config_path: Option<&std::path::Path>) -> Result<Config> {
 /// The stderr lines are still printed: they are the long-standing interface
 /// for humans and for older tooling that greps them.
 fn load_config_with_warnings(config_path: Option<&std::path::Path>) -> Result<LoadedConfig> {
+    let loaded = read_config_with_warnings(config_path)?;
+    protect_local_support_roots(&loaded.config)?;
+    Ok(loaded)
+}
+
+/// Read config for a command that validates its own write paths.
+fn read_config_with_warnings(config_path: Option<&std::path::Path>) -> Result<LoadedConfig> {
     let paths = ConfigPaths::resolve(config_path)?;
     let loaded = paths.load()?;
     for warning in &loaded.warnings {
         eprintln!("warning: {warning}");
     }
-    protect_local_support_roots(&loaded.config)?;
     Ok(loaded)
 }
 
