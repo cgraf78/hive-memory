@@ -3,7 +3,7 @@
 
 set -uo pipefail
 
-HIVE_MEMORY_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+HIVE_MEMORY_DIR="$(CDPATH='' cd "$(dirname "$0")/../.." && pwd)"
 
 # shellcheck source=tests/shell/helpers.sh
 . "$(dirname "$0")/helpers.sh"

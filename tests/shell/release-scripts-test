@@ -13,7 +13,7 @@
 
 set -uo pipefail
 
-HIVE_MEMORY_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+HIVE_MEMORY_DIR="$(CDPATH='' cd "$(dirname "$0")/../.." && pwd)"
 
 # shellcheck source=helpers.sh
 . "$(dirname "$0")/helpers.sh"
@@ -126,7 +126,7 @@ _assert_contains "tests workflow: uses the standard display name" \
 _assert_contains "ci workflow: verifies the complete shared CI snapshot" \
   "cgraf78/actions/.github/actions/verify-consumer-sync@" "$_ci_workflow"
 _assert_contains "ci workflow: multiline shell suites fail on the first error" \
-  $'test-command: |\n        set -euo pipefail\n        tests/shell/install-test' \
+  $'test-command: |\n        set -euo pipefail\n        CDPATH=. tests/shell/install-test' \
   "$_ci_workflow"
 
 _test_summary
