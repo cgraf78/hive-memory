@@ -68,9 +68,10 @@ jobs:
       shellcheck-inventory-path: .github/shellcheck-files.txt
       # Shell-owned release behavior lives under tests/shell. Cargo integration
       # tests stay in the conventional tests/*.rs location.
+      # Exercise relative fixture entry points with a caller's CDPATH set.
       test-command: |
         set -euo pipefail
-        tests/shell/install-test
+        CDPATH=. tests/shell/install-test
         tests/shell/release-scripts-test
         tests/shell/automation-test
 
