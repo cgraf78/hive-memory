@@ -9,6 +9,12 @@
 # already sourced it by now, which is harmless: no stub is on PATH yet.
 unset BASH_ENV
 
+# Fixture commands only shadow host tools when their directory is one PATH entry.
+if [[ ${TMPDIR:-} == *:* ]]; then
+  printf '%s\n' 'test fixtures: TMPDIR must not contain a colon' >&2
+  exit 1
+fi
+
 PASS=0
 FAIL=0
 CLEANUP_DIRS=()
