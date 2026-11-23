@@ -54,13 +54,43 @@ _declared() {
   return 1
 }
 
-while IFS= read -r _tracked; do
-  if _declared "$_tracked"; then
-    _pass "release config: ships tracked man page: $_tracked"
-  else
-    _fail "release config: ships tracked man page: $_tracked"
-  fi
-done < <(git -C "$HIVE_MEMORY_DIR" ls-files -- 'man/man1/*.1')
+_check_tracked_manpages() {
+  local inventory tracked
+  inventory=$(
+    unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE
+    git -C "$HIVE_MEMORY_DIR" ls-files -- 'man/man1/*.1'
+  ) || return
+  [[ -n "$inventory" ]] || return 0
+  while IFS= read -r tracked; do
+    if _declared "$tracked"; then
+      _pass "release config: ships tracked man page: $tracked"
+    else
+      _fail "release config: ships tracked man page: $tracked"
+    fi
+  done <<<"$inventory"
+}
+
+_check_tracked_manpages || _fail "release config: enumerates tracked man pages"
+probe_status=0
+probe_output=$(
+  # shellcheck disable=SC2329 # Used by _check_tracked_manpages below.
+  git() {
+    printf '%s\n' man/man1/hm.1
+    return 17
+  }
+  _check_tracked_manpages
+) || probe_status=$?
+_assert_exit "release config: rejects incomplete man page enumeration" 17 "$probe_status"
+_assert_eq "release config: ignores a partial man page list" "" "$probe_output"
+
+caller=$(_tmpdir)
+probe_status=0
+probe_output=$(GIT_DIR="$caller/caller.git" GIT_WORK_TREE="$caller" \
+  GIT_COMMON_DIR="$caller/common" GIT_INDEX_FILE="$caller/index" \
+  _check_tracked_manpages) || probe_status=$?
+_assert_exit "release config: locates the fixture index despite caller Git selectors" 0 "$probe_status"
+_assert_contains "release config: caller selectors cannot omit the tracked man page" \
+  "ships tracked man page: man/man1/hm.1" "$probe_output"
 
 # --- Smoke hook -------------------------------------------------------------
 
