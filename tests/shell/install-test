@@ -17,6 +17,21 @@ HIVE_MEMORY_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 
 echo "=== Standalone release installer ==="
 
+fixture_colon_dir=$(mktemp -d)
+CLEANUP_DIRS+=("$fixture_colon_dir")
+fixture_colon_tmp=$fixture_colon_dir/has:colon
+mkdir "$fixture_colon_tmp"
+fixture_status=0
+# The child shell expands its own positional parameter.
+# shellcheck disable=SC2016
+fixture_output=$(TMPDIR="$fixture_colon_tmp" "$BASH" -c '
+  . "$1"
+  printf "fixture setup continued\n"
+' bash "$(dirname "$0")/helpers.sh" 2>&1) || fixture_status=$?
+_assert_exit "isolation: rejects a temporary root that cannot be used in PATH" 1 "$fixture_status"
+_assert_contains "isolation: explains how to select a usable TMPDIR" \
+  'TMPDIR must not contain a colon' "$fixture_output"
+
 # helpers.sh must keep the caller's BASH_ENV out of the bash stubs this suite
 # puts on PATH (see its header). Source it under a startup file that counts
 # its reads: the shell doing the sourcing reads it once, and a child bash must
