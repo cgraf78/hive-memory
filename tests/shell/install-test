@@ -134,6 +134,14 @@ speed_time_count=0
 retry_count=0
 retry_all_errors_count=0
 retry_delay_count=0
+retry_max_count=0
+# The provider canary also runs this fixture against the next template.
+# curl only honors --disable as its first option.
+disabled=0
+if [[ ${1:-} == --disable ]]; then
+  disabled=1
+  shift
+fi
 while [[ $# -gt 0 ]]; do
   case $1 in
     -fsSL)
@@ -184,6 +192,11 @@ while [[ $# -gt 0 ]]; do
       retry_delay_count=$((retry_delay_count + 1))
       shift 2
       ;;
+    --retry-max-time)
+      [[ $# -ge 2 && $2 == 122 ]] || exit 64
+      retry_max_count=$((retry_max_count + 1))
+      shift 2
+      ;;
     -o)
       [[ $# -ge 2 ]] || exit 64
       output=$2
@@ -215,30 +228,43 @@ done
   "$speed_time_count" -eq 1 && "$retry_count" -eq 1 &&
   "$retry_all_errors_count" -eq 1 && "$retry_delay_count" -eq 1 ]] ||
   exit 64
+[[ "$retry_max_count" -eq "$disabled" ]] || exit 64
 [[ -n "$url" ]] || {
   printf 'curl URL is missing\n' >&2
   exit 64
 }
 printf '%s\n' "$url" >>"$INSTALL_TEST_CURL_LOG"
 
+latest_format='%{url_effective}'
+asset_format=
+if [[ $disabled -eq 1 ]]; then
+  latest_format='%{http_code} %{url_effective}'
+  asset_format=$latest_format
+fi
+
+effective_url=$url
 case $url in
   "$INSTALL_TEST_LATEST_URL")
-    [[ "$output" == /dev/null && "$write_format" == '%{url_effective}' ]] ||
+    [[ "$output" == /dev/null && "$write_format" == "$latest_format" ]] ||
       exit 64
-    printf '%s' "$INSTALL_TEST_TAG_URL"
+    effective_url=$INSTALL_TEST_TAG_URL
     ;;
   "$INSTALL_TEST_CHECKSUM_URL")
-    [[ -n "$output" && -z "$write_format" ]] || exit 64
+    [[ -n "$output" && "$write_format" == "$asset_format" ]] || exit 64
     cp "$INSTALL_TEST_CHECKSUM" "$output"
     ;;
   "$INSTALL_TEST_ARCHIVE_URL")
-    [[ -n "$output" && -z "$write_format" ]] || exit 64
+    [[ -n "$output" && "$write_format" == "$asset_format" ]] || exit 64
     cp "$INSTALL_TEST_ARCHIVE" "$output"
     ;;
   *)
     printf 'unexpected curl URL: %s\n' "$url" >&2
     exit 64
     ;;
+esac
+case $write_format in
+  '%{http_code} %{url_effective}') printf '200 %s' "$effective_url" ;;
+  '%{url_effective}') printf '%s' "$effective_url" ;;
 esac
 EOF
   chmod 0755 "$directory/curl"
@@ -457,6 +483,14 @@ if [[ -x /usr/bin/env ]]; then
     env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
     -fsSL --proto '=https' --proto-redir '=all' "${curl_network_args[@]}" \
     -o /dev/null -w '%{url_effective}' "$latest_url"
+  _assert_curl_stub_rejects "installer fixture: status-aware curl requires a retry window" \
+    env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
+    --disable -fsSL --proto '=https' --proto-redir '=https' "${curl_network_args[@]}" \
+    -o /dev/null -w '%{http_code} %{url_effective}' "$latest_url"
+  _assert_curl_stub_rejects "installer fixture: status-aware curl rejects a widened retry window" \
+    env "${curl_stub_env[@]}" "$latest_curl_bin/curl" \
+    --disable -fsSL --proto '=https' --proto-redir '=https' "${curl_network_args[@]}" \
+    --retry-max-time 999 -o /dev/null -w '%{http_code} %{url_effective}' "$latest_url"
   rc=0
   PATH="$latest_curl_bin:$PATH" \
     HOME="$latest_home" XDG_DATA_HOME="$latest_data" \
