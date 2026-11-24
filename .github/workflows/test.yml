@@ -19,7 +19,7 @@ env:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@e9922d129ba6d9dc43793247409197b0b07b81c8
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@5a9710d5c5fd986bfbddf8b2c594d035c5152807
     with:
       # Cargo's minimum is a source-install contract; keep it exercised in the
       # shared quality gate alongside the default stable toolchain.
@@ -61,7 +61,7 @@ jobs:
           .termux-ci/hm
 
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@e9922d129ba6d9dc43793247409197b0b07b81c8
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@5a9710d5c5fd986bfbddf8b2c594d035c5152807
     with:
       matrix-set: full
       profiles: base
@@ -94,7 +94,7 @@ jobs:
       # files, so `.github/cgraf78-actions.lock` cannot be interpolated. This
       # gate verifies every unavoidable action literal and all vendored release
       # scripts still match that single reviewed dependency decision.
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@e9922d129ba6d9dc43793247409197b0b07b81c8
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@5a9710d5c5fd986bfbddf8b2c594d035c5152807
 
   source-install:
     name: Locked source install
@@ -111,7 +111,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: cgraf78/actions/.github/actions/rust-toolchain@e9922d129ba6d9dc43793247409197b0b07b81c8
+        uses: cgraf78/actions/.github/actions/rust-toolchain@5a9710d5c5fd986bfbddf8b2c594d035c5152807
 
       - name: Install from the locked checkout
         run: cargo install --path . --locked --root "$RUNNER_TEMP/hive-memory-install"
@@ -135,7 +135,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: cgraf78/actions/.github/actions/rust-toolchain@e9922d129ba6d9dc43793247409197b0b07b81c8
+        uses: cgraf78/actions/.github/actions/rust-toolchain@5a9710d5c5fd986bfbddf8b2c594d035c5152807
 
       # These tests are intentionally separate from the default suite because
       # they create large synthetic stores/outboxes and measure real CLI
@@ -166,7 +166,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: cgraf78/actions/.github/actions/rust-toolchain@e9922d129ba6d9dc43793247409197b0b07b81c8
+        uses: cgraf78/actions/.github/actions/rust-toolchain@5a9710d5c5fd986bfbddf8b2c594d035c5152807
 
       # Simulate the file-level behaviors cloud drives tend to produce around
       # agent writes: independent files merging, conflict copies, and renames.
