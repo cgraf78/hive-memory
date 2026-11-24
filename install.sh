@@ -77,7 +77,8 @@ cleanup() {
   status=$?
   # Cleanup owns the verified probe group once it starts. Ignore repeated
   # termination signals so they cannot interrupt the bounded TERM/KILL reap.
-  trap - EXIT HUP INT TERM
+  trap '' HUP INT TERM
+  trap - EXIT
   # Public links are all-or-nothing. Destination preflight catches ordinary
   # collisions, but a late filesystem or ln failure can still occur after an
   # earlier link was created. Roll back only links first published by this
@@ -748,12 +749,15 @@ check_parent "$bin_dir"
 if [[ -n "$release_manpage_path" ]]; then
   check_parent "$man_dir"
 fi
+create_control_root=0
 if [[ -e "$control_root" || -L "$control_root" ]]; then
   [[ -d "$control_root" && ! -L "$control_root" ]] ||
     die "standalone control path is already user-owned: $control_root"
   [[ -f "$owner_file" && ! -L "$owner_file" &&
     $(cat "$owner_file") == "$owner_marker" ]] ||
     die "standalone control path lacks its ownership marker: $control_root"
+else
+  create_control_root=1
 fi
 check_parent "$releases_root"
 check_link "$stable_root" "$stable_target" 'stable release root'
@@ -770,14 +774,6 @@ mkdir -p "$cgraf_root" "$bin_dir"
 if [[ -n "$release_manpage_path" ]]; then
   mkdir -p "$man_dir"
 fi
-if [[ ! -e "$control_root" && ! -L "$control_root" ]]; then
-  mkdir -m 0700 "$control_root"
-  printf '%s\n' "$owner_marker" >"$owner_file"
-  chmod 0600 "$owner_file"
-fi
-mkdir -p "$releases_root"
-chmod 0700 "$control_root" "$releases_root"
-
 # shellcheck shell=bash
 # Included in the standalone and legacy checkout installer templates.
 
@@ -786,13 +782,51 @@ installer_exclusive_mkdir() {
   # Ubuntu's uutils mkdir can return success on EEXIST when another process
   # created the directory first. Ubuntu also ships GNU mkdir as gnumkdir.
   mkdir_command=$(type -P gnumkdir) || mkdir_command='mkdir'
-  command "$mkdir_command" "$1"
+  command "$mkdir_command" "$@"
 }
 
+# Bash dispatches a pending trap after a foreground command, before the next
+# assignment. Record the command's real outcome before EXIT cleanup can use
+# lock_held. The command also ignores group-directed signals so it cannot die
+# between its successful system call and reporting that success.
+installer_acquire_lock() {
+  local directory=$1 status=0 pending='' saved_traps
+  saved_traps=$(trap -p HUP INT TERM)
+  trap 'pending=${pending:-129}' HUP
+  trap 'pending=${pending:-130}' INT
+  trap 'pending=${pending:-143}' TERM
+  if (
+    trap '' HUP INT TERM
+    installer_exclusive_mkdir "$directory"
+  ); then
+    # shellcheck disable=SC2034 # The generated installer's EXIT trap reads this.
+    lock_held=1
+  else
+    status=$?
+  fi
+  # trap -p emits shell-quoted commands that restore the installer's handlers.
+  eval "$saved_traps"
+  [[ -z "$pending" ]] || exit "$pending"
+  return "$status"
+}
+
+if [[ "$create_control_root" -eq 1 ]]; then
+  # Complete the marker under umask 077 before the waiting parent handles
+  # cancellation. A contender that appeared after preflight owns its path.
+  (
+    trap '' HUP INT TERM
+    installer_exclusive_mkdir -m 0700 "$control_root" ||
+      die "cannot create standalone control directory: $control_root"
+    printf '%s\n' "$owner_marker" >"$owner_file"
+    chmod 0600 "$owner_file"
+  )
+fi
+mkdir -p "$releases_root"
+chmod 0700 "$control_root" "$releases_root"
+
 lock_dir=$control_root/lock
-installer_exclusive_mkdir "$lock_dir" 2>/dev/null ||
+installer_acquire_lock "$lock_dir" 2>/dev/null ||
   die "another installer is active (or left a stale lock): $lock_dir"
-lock_held=1
 
 if [[ -e "$release_dir" || -L "$release_dir" ]]; then
   [[ -d "$release_dir" && ! -L "$release_dir" ]] ||
