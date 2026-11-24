@@ -387,8 +387,9 @@ if [[ -z "$archive" ]]; then
   fi
 
   # Bound connection setup, silent bodies, trickling transfers, and transient
-  # failures for all three release-download requests. At their worst-case retry
-  # windows they consume 546 seconds, below a ten-minute download budget.
+  # failures for all three release-download requests. Retry-After can override
+  # the retry delay. Cap retry starts at 122 seconds, plus at most 60 seconds
+  # for the last attempt. Three requests fit within 546 seconds.
   curl_net_opts=(
     --connect-timeout 10
     --max-time 60
@@ -397,13 +398,23 @@ if [[ -z "$archive" ]]; then
     --retry 2
     --retry-all-errors
     --retry-delay 1
+    --retry-max-time 122
   )
+
+  fetch_release() {
+    local response
+    response=$(curl --disable "${curl_net_opts[@]}" -fsSL \
+      --proto '=https' --proto-redir '=https' \
+      -w '%{http_code} %{url_effective}' "$@") || return
+    # Some curl versions return success when a Retry-After would overrun its
+    # retry window. Trust the final status before using the bytes or redirect.
+    [[ ${response%% *} == 2[0-9][0-9] ]] || return 22
+    printf '%s\n' "${response#* }"
+  }
 
   if [[ -z "$requested_version" ]]; then
     latest_url=https://github.com/$release_repo/releases/latest
-    resolved_url=$(curl "${curl_net_opts[@]}" -fsSL \
-      --proto '=https' --proto-redir '=https' \
-      -o /dev/null -w '%{url_effective}' "$latest_url") ||
+    resolved_url=$(fetch_release -o /dev/null "$latest_url") ||
       die "cannot resolve the latest $release_repo release"
     latest_prefix=https://github.com/$release_repo/releases/tag/
     case "$resolved_url" in
@@ -422,16 +433,18 @@ if [[ -z "$archive" ]]; then
   archive_is_private=1
   checksum=$archive.sha256
   download_base=https://github.com/$release_repo/releases/download/$requested_version
-  curl "${curl_net_opts[@]}" -fsSL --proto '=https' --proto-redir '=https' \
-    "$download_base/$archive_name.sha256" -o "$checksum" ||
+  fetch_release -o "$checksum" "$download_base/$archive_name.sha256" >/dev/null ||
     die "cannot download checksum for $archive_name"
-  curl "${curl_net_opts[@]}" -fsSL --proto '=https' --proto-redir '=https' \
-    "$download_base/$archive_name" -o "$archive" ||
+  fetch_release -o "$archive" "$download_base/$archive_name" >/dev/null ||
     die "cannot download $archive_name"
 fi
 [[ -f "$archive" && ! -L "$archive" ]] ||
   die "archive must be a regular non-symlink file: $archive"
-archive_dir=$(cd "$(dirname "$archive")" && pwd)
+case "$archive" in
+  /*) ;;
+  *) archive=./$archive ;;
+esac
+archive_dir=$(CDPATH='' cd -- "$(dirname -- "$archive")" && pwd)
 archive=$archive_dir/$(basename "$archive")
 
 archive_name=$(basename "$archive")
@@ -765,8 +778,19 @@ fi
 mkdir -p "$releases_root"
 chmod 0700 "$control_root" "$releases_root"
 
+# shellcheck shell=bash
+# Included in the standalone and legacy checkout installer templates.
+
+installer_exclusive_mkdir() {
+  local mkdir_command
+  # Ubuntu's uutils mkdir can return success on EEXIST when another process
+  # created the directory first. Ubuntu also ships GNU mkdir as gnumkdir.
+  mkdir_command=$(type -P gnumkdir) || mkdir_command='mkdir'
+  command "$mkdir_command" "$1"
+}
+
 lock_dir=$control_root/lock
-mkdir "$lock_dir" 2>/dev/null ||
+installer_exclusive_mkdir "$lock_dir" 2>/dev/null ||
   die "another installer is active (or left a stale lock): $lock_dir"
 lock_held=1
 
@@ -789,14 +813,19 @@ if [[ -e "$release_dir" || -L "$release_dir" ]]; then
   # a directory name alone is not an integrity receipt.
   validate_metadata_identity "$existing_metadata"
   archive_sorted=$scratch/archive.sorted
+  existing_list=$scratch/existing.list
   existing_normalized=$scratch/existing.normalized
   existing_sorted=$scratch/existing.sorted
   sort "$archive_normalized" >"$archive_sorted"
+  # A failed traversal may still report every expected path while hiding
+  # extra entries. Require a complete listing before comparing inventories.
+  (cd "$release_dir" && find . -mindepth 1 -print) >"$existing_list" ||
+    die "cannot enumerate existing release tree: $release_dir"
   : >"$existing_normalized"
   while IFS= read -r entry || [[ -n "$entry" ]]; do
     relative=${entry#./}
     printf '%s\n' "$relative" >>"$existing_normalized"
-  done < <(cd "$release_dir" && find . -mindepth 1 -print)
+  done <"$existing_list"
   sort "$existing_normalized" >"$existing_sorted"
   archive_digest=$(sha256_file "$archive_sorted")
   existing_digest=$(sha256_file "$existing_sorted")
